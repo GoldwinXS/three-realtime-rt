@@ -70,7 +70,13 @@ function buildMaterialsTexture(materials) {
   materials.forEach((mat, i) => {
     const o = i * 8;
     const color = mat.color ?? new THREE.Color(1, 1, 1);
-    const emissive = mat.emissive ?? new THREE.Color(0, 0, 0);
+    // If emission is masked by an emissiveMap we can't evaluate it at GI hit
+    // points (no textures in the hit shader yet — stage 6); treating the whole
+    // surface as emissive would flood the scene with light, so drop it instead.
+    const emissive =
+      mat.emissiveMap != null
+        ? new THREE.Color(0, 0, 0)
+        : (mat.emissive ?? new THREE.Color(0, 0, 0));
     const emissiveIntensity = mat.emissiveIntensity ?? 1;
     data[o + 0] = color.r;
     data[o + 1] = color.g;

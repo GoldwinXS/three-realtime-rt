@@ -34,17 +34,23 @@ uniform float uMetalness;
 uniform vec3 uEmissive;
 uniform sampler2D uMap;
 uniform bool uHasMap;
+uniform sampler2D uEmissiveMap;
+uniform bool uHasEmissiveMap;
 
 void main() {
   vec3 albedo = uColor;
   if (uHasMap) {
     albedo *= texture(uMap, vUvCoord).rgb;
   }
+  vec3 emissive = uEmissive;
+  if (uHasEmissiveMap) {
+    emissive *= texture(uEmissiveMap, vUvCoord).rgb;
+  }
   vec3 n = normalize(vWorldNormal) * (gl_FrontFacing ? 1.0 : -1.0);
   gAlbedoRough = vec4(albedo, uRoughness);
   gNormalMetal = vec4(n, uMetalness);
   gWorldPos = vec4(vWorldPos, 1.0); // w=1 marks "geometry here" (background stays 0)
-  gEmissive = vec4(uEmissive, 1.0);
+  gEmissive = vec4(emissive, 1.0);
 }
 `;
 
@@ -127,6 +133,8 @@ export class GBufferPass {
           uEmissive: { value: new THREE.Color(0, 0, 0) },
           uMap: { value: null },
           uHasMap: { value: false },
+          uEmissiveMap: { value: null },
+          uHasEmissiveMap: { value: false },
         },
         side: THREE.FrontSide,
       });
@@ -146,6 +154,8 @@ export class GBufferPass {
     }
     u.uMap.value = src.map ?? null;
     u.uHasMap.value = !!src.map;
+    u.uEmissiveMap.value = src.emissiveMap ?? null;
+    u.uHasEmissiveMap.value = !!src.emissiveMap;
     u.uNormalMatrixWorld.value.getNormalMatrix(mesh.matrixWorld);
     material.side = src.side ?? THREE.FrontSide;
     return material;
