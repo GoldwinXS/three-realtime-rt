@@ -1,0 +1,20 @@
+{
+  "name": "three-realtime-rt",
+  "version": "0.1.0",
+  "description": "Turn-on ray traced lighting for three.js: hybrid deferred renderer with BVH-traced shadows and GI",
+  "type": "module",
+  "main": "src/index.js",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.160.1",
+    "three-mesh-bvh": "^0.7.8"
+  },
+  "devDependencies": {
+    "vite": "^5.0.11"
+  }
+}

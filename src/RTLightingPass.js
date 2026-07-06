@@ -1,0 +1,293 @@
+import * as THREE from "three";
+import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
+import { MAX_LIGHTS } from "./SceneCompiler.js";
+
+const fullscreenVert = /* glsl */ `
+out vec2 vUv;
+void main() {
+  vUv = uv;
+  gl_Position = vec4(position.xy, 0.0, 1.0);
+}
+`;
+
+const rtLightingFrag = /* glsl */ `
+precision highp float;
+precision highp isampler2D;
+precision highp usampler2D;
+
+${shaderStructs}
+${shaderIntersectFunction}
+
+#define MAX_LIGHTS ${MAX_LIGHTS}
+#define PI 3.14159265358979
+
+layout(location = 0) out vec4 outIrradiance;
+
+in vec2 vUv;
+
+uniform BVH bvh;
+uniform sampler2D uNormalAttr;      // per-vertex normals of merged geometry
+uniform sampler2D uMatIndexAttr;    // per-vertex material index
+uniform sampler2D uMaterialsTex;    // 2 texels per material
+
+uniform sampler2D uGWorldPos;
+uniform sampler2D uGNormalMetal;
+
+uniform sampler2D uPrevAccum;
+uniform float uSampleCount;   // 1 = first frame after reset
+
+uniform vec4 uLightPosType[MAX_LIGHTS];     // xyz pos|dir, w: 0 point, 1 directional
+uniform vec4 uLightColorRadius[MAX_LIGHTS]; // rgb color*intensity, w radius
+uniform int uLightCount;
+
+uniform vec3 uEnvColor;
+uniform float uEnvIntensity;
+uniform float uFrame;
+uniform float uEps;
+
+// ---------- RNG (PCG) ----------
+uint gSeed;
+uint pcgHash(uint s) {
+  uint state = s * 747796405u + 2891336453u;
+  uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+  return (word >> 22u) ^ word;
+}
+float rand() {
+  gSeed = pcgHash(gSeed);
+  return float(gSeed) * (1.0 / 4294967296.0);
+}
+vec2 rand2() { return vec2(rand(), rand()); }
+
+vec3 orthoBasisSample(vec3 n, vec2 u, out vec3 t, out vec3 b) {
+  t = normalize(abs(n.x) > 0.9 ? cross(n, vec3(0, 1, 0)) : cross(n, vec3(1, 0, 0)));
+  b = cross(n, t);
+  return vec3(0.0);
+}
+
+vec3 cosineSampleHemisphere(vec3 n, vec2 u) {
+  float a = 2.0 * PI * u.x;
+  float r = sqrt(u.y);
+  vec3 t, b;
+  orthoBasisSample(n, u, t, b);
+  return normalize(t * (r * cos(a)) + b * (r * sin(a)) + n * sqrt(max(0.0, 1.0 - u.y)));
+}
+
+vec3 randUnitVector() {
+  vec2 u = rand2();
+  float z = u.x * 2.0 - 1.0;
+  float a = u.y * 2.0 * PI;
+  float r = sqrt(max(0.0, 1.0 - z * z));
+  return vec3(r * cos(a), r * sin(a), z);
+}
+
+// ---------- BVH helpers ----------
+bool traceRay(vec3 ro, vec3 rd, out uvec4 faceIndices, out vec3 faceNormal,
+              out vec3 barycoord, out float side, out float dist) {
+  return bvhIntersectFirstHit(bvh, ro, rd, faceIndices, faceNormal, barycoord, side, dist);
+}
+
+bool occluded(vec3 ro, vec3 rd, float maxDist) {
+  uvec4 fi; vec3 fn; vec3 bc; float side; float dist;
+  bool hit = bvhIntersectFirstHit(bvh, ro, rd, fi, fn, bc, side, dist);
+  return hit && dist < maxDist - 2.0 * uEps;
+}
+
+void fetchMaterial(float matIndex, out vec3 albedo, out float roughness,
+                   out vec3 emissive, out float metalness) {
+  int mi = int(round(matIndex)) * 2;
+  vec4 t0 = texelFetch(uMaterialsTex, ivec2(mi, 0), 0);
+  vec4 t1 = texelFetch(uMaterialsTex, ivec2(mi + 1, 0), 0);
+  albedo = t0.rgb;
+  roughness = t0.a;
+  emissive = t1.rgb;
+  metalness = t1.a;
+}
+
+// ---------- lighting ----------
+// Direct irradiance (demodulated: no albedo) at point P with normal N,
+// from light i, with one shadow ray. Area-samples point lights for soft shadows.
+vec3 lightContribution(int i, vec3 P, vec3 N) {
+  vec4 posType = uLightPosType[i];
+  vec4 colRad = uLightColorRadius[i];
+
+  vec3 L;
+  float dist2 = 1.0;
+  float maxDist = 1e7;
+
+  if (posType.w < 0.5) {
+    // point light: sample a point on its sphere for soft shadows
+    vec3 lp = posType.xyz + randUnitVector() * colRad.w;
+    vec3 d = lp - P;
+    float dl = length(d);
+    if (dl < 1e-5) return vec3(0.0);
+    L = d / dl;
+    dist2 = dl * dl;
+    maxDist = dl;
+  } else {
+    // directional light: jitter within a small cone
+    L = normalize(-posType.xyz + randUnitVector() * colRad.w);
+    dist2 = 1.0;
+  }
+
+  float NdotL = dot(N, L);
+  if (NdotL <= 0.0) return vec3(0.0);
+
+  if (occluded(P + N * uEps, L, maxDist)) return vec3(0.0);
+  return colRad.rgb * (NdotL / dist2);
+}
+
+// Direct light at a GI bounce hit: sample ONE random light (weighted by count).
+vec3 sampleOneLight(vec3 P, vec3 N) {
+  if (uLightCount == 0) return vec3(0.0);
+  int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
+  return lightContribution(i, P, N) * float(uLightCount);
+}
+
+void main() {
+  vec4 wp = texture(uGWorldPos, vUv);
+  if (wp.w < 0.5) {
+    outIrradiance = vec4(0.0);
+    return;
+  }
+
+  ivec2 px = ivec2(gl_FragCoord.xy);
+  gSeed = uint(px.x) * 1973u + uint(px.y) * 9277u + uint(uFrame) * 26699u;
+  gSeed = pcgHash(gSeed);
+
+  vec3 P = wp.xyz;
+  vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
+
+  // --- direct lighting: one shadow ray per light ---
+  vec3 direct = vec3(0.0);
+  for (int i = 0; i < MAX_LIGHTS; i++) {
+    if (i >= uLightCount) break;
+    direct += lightContribution(i, P, N);
+  }
+
+  // --- 1-bounce indirect (cosine-weighted; pdf cancels the NdotL/PI) ---
+  vec3 indirect = vec3(0.0);
+  {
+    vec3 dir = cosineSampleHemisphere(N, rand2());
+    uvec4 faceIndices; vec3 faceNormal; vec3 barycoord; float side; float dist;
+    if (traceRay(P + N * uEps, dir, faceIndices, faceNormal, barycoord, side, dist)) {
+      float matIndex = textureSampleBarycoord(uMatIndexAttr, barycoord, faceIndices.xyz).r;
+      vec3 hAlbedo; float hRough; vec3 hEmissive; float hMetal;
+      fetchMaterial(matIndex, hAlbedo, hRough, hEmissive, hMetal);
+
+      vec3 hN = normalize(textureSampleBarycoord(uNormalAttr, barycoord, faceIndices.xyz).xyz);
+      if (dot(hN, dir) > 0.0) hN = -hN;
+
+      vec3 hP = P + dir * dist;
+      vec3 Ld = sampleOneLight(hP + hN * uEps, hN);
+      // Incoming radiance from the hit surface (its emission + reflected direct light)
+      indirect = hEmissive + hAlbedo * Ld * (1.0 / PI);
+    } else {
+      indirect = uEnvColor * uEnvIntensity;
+    }
+  }
+
+  vec3 irradiance = direct + indirect;
+
+  // --- temporal accumulation (progressive average) ---
+  vec3 prev = texture(uPrevAccum, vUv).rgb;
+  float blend = 1.0 / uSampleCount;
+  outIrradiance = vec4(mix(prev, irradiance, blend), 1.0);
+}
+`;
+
+/**
+ * Fullscreen pass: for every G-buffer pixel, trace shadow rays to every light and
+ * one cosine-weighted GI bounce against the BVH. Outputs demodulated irradiance,
+ * progressively accumulated into a ping-pong float target while the camera is still.
+ */
+export class RTLightingPass {
+  constructor(width, height) {
+    this.targetA = this._makeTarget(width, height);
+    this.targetB = this._makeTarget(width, height);
+
+    this.material = new THREE.ShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      vertexShader: fullscreenVert,
+      fragmentShader: rtLightingFrag,
+      uniforms: {
+        bvh: { value: null },
+        uNormalAttr: { value: null },
+        uMatIndexAttr: { value: null },
+        uMaterialsTex: { value: null },
+        uGWorldPos: { value: null },
+        uGNormalMetal: { value: null },
+        uPrevAccum: { value: null },
+        uSampleCount: { value: 1 },
+        uLightPosType: { value: [] },
+        uLightColorRadius: { value: [] },
+        uLightCount: { value: 0 },
+        uEnvColor: { value: new THREE.Color(0.03, 0.04, 0.06) },
+        uEnvIntensity: { value: 1.0 },
+        uFrame: { value: 0 },
+        uEps: { value: 1e-3 },
+      },
+      depthTest: false,
+      depthWrite: false,
+    });
+
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    this.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.material);
+    this.quad.frustumCulled = false;
+    this.scene.add(this.quad);
+  }
+
+  _makeTarget(width, height) {
+    const t = new THREE.WebGLRenderTarget(width, height, {
+      minFilter: THREE.NearestFilter,
+      magFilter: THREE.NearestFilter,
+      format: THREE.RGBAFormat,
+      type: THREE.FloatType,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+    t.texture.generateMipmaps = false;
+    return t;
+  }
+
+  setSize(width, height) {
+    this.targetA.setSize(width, height);
+    this.targetB.setSize(width, height);
+  }
+
+  setCompiledScene(compiled) {
+    const u = this.material.uniforms;
+    u.bvh.value = compiled.bvhUniform;
+    u.uNormalAttr.value = compiled.normalAttrTex;
+    u.uMatIndexAttr.value = compiled.matIndexAttrTex;
+    u.uMaterialsTex.value = compiled.materialsTex;
+    u.uLightPosType.value = compiled.lightPosType;
+    u.uLightColorRadius.value = compiled.lightColorRadius;
+    u.uLightCount.value = compiled.lightCount;
+  }
+
+  /** Renders into targetA (reading targetB as history), then swaps. Returns the fresh accum texture. */
+  render(renderer, gbuffer, sampleCount, frame) {
+    const u = this.material.uniforms;
+    u.uGWorldPos.value = gbuffer.worldPos;
+    u.uGNormalMetal.value = gbuffer.normalMetal;
+    u.uPrevAccum.value = this.targetB.texture;
+    u.uSampleCount.value = sampleCount;
+    u.uFrame.value = frame;
+
+    renderer.setRenderTarget(this.targetA);
+    renderer.render(this.scene, this.camera);
+    renderer.setRenderTarget(null);
+
+    const out = this.targetA;
+    [this.targetA, this.targetB] = [this.targetB, this.targetA];
+    return out.texture;
+  }
+
+  dispose() {
+    this.targetA.dispose();
+    this.targetB.dispose();
+    this.material.dispose();
+    this.quad.geometry.dispose();
+  }
+}

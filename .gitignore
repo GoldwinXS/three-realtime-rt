@@ -1,0 +1,5 @@
+node_modules/
+dist/
+# reference clone of the original voxel tracer (has its own git history)
+RealTimeJSRayTracer/
+.shots/
