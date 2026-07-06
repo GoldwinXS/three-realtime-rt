@@ -91,6 +91,22 @@ export class RealtimeRaytracer {
       color: options.fog?.color ?? new THREE.Color(0.5, 0.6, 0.7),
       density: options.fog?.density ?? 0.05,
     };
+
+    /**
+     * Procedural sky. When enabled it is BOTH the background and the ambient
+     * light for GI rays that escape the scene — the core of natural outdoor
+     * lighting. `sunDir` points toward the sun (keep it in sync with your
+     * DirectionalLight for matching direct shadows).
+     */
+    this.sky = {
+      enabled: options.sky?.enabled ?? false,
+      sunDir: options.sky?.sunDir ?? new THREE.Vector3(0.4, 0.8, 0.45).normalize(),
+      sunColor: options.sky?.sunColor ?? new THREE.Color(1.0, 0.9, 0.75),
+      zenith: options.sky?.zenith ?? new THREE.Color(0.18, 0.34, 0.62),
+      horizon: options.sky?.horizon ?? new THREE.Color(0.7, 0.8, 0.9),
+      intensity: options.sky?.intensity ?? 1.0,
+    };
+    this._invViewProj = new THREE.Matrix4();
     this._jitterIndex = 0;
     this._jitteredViewProj = new THREE.Matrix4();
 
@@ -217,6 +233,12 @@ export class RealtimeRaytracer {
     rtU.uMaxHistory.value = this.maxHistory;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
     rtU.uGIEnabled.value = this.gi;
+    rtU.uSkyEnabled.value = this.sky.enabled;
+    rtU.uSunDir.value.copy(this.sky.sunDir);
+    rtU.uSunColor.value.copy(this.sky.sunColor);
+    rtU.uSkyZenith.value.copy(this.sky.zenith);
+    rtU.uSkyHorizon.value.copy(this.sky.horizon);
+    rtU.uSkyIntensity.value = this.sky.intensity;
     rtU.uPrevViewProj.value.copy(this._prevViewProj);
     rtU.uViewProj.value.copy(this._jitteredViewProj);
     rtU.uCameraPos.value.copy(camera.getWorldPosition(this._camWorldPos));
@@ -246,6 +268,13 @@ export class RealtimeRaytracer {
     cU.uFogEnabled.value = this.fog.enabled;
     cU.uFogColor.value.copy(this.fog.color);
     cU.uFogDensity.value = this.fog.density;
+    cU.uSkyEnabled.value = this.sky.enabled;
+    cU.uInvViewProj.value.copy(this._invViewProj.copy(this._jitteredViewProj).invert());
+    cU.uSunDir.value.copy(this.sky.sunDir);
+    cU.uSunColor.value.copy(this.sky.sunColor);
+    cU.uSkyZenith.value.copy(this.sky.zenith);
+    cU.uSkyHorizon.value.copy(this.sky.horizon);
+    cU.uSkyIntensity.value = this.sky.intensity;
     this.composite.render(
       this.renderer,
       irradiance,

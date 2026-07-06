@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { SKY_GLSL } from "./sky.glsl.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -14,6 +15,8 @@ precision highp float;
 layout(location = 0) out vec4 outColor;
 
 in vec2 vUv;
+
+${SKY_GLSL}
 
 uniform sampler2D uIrradiance;
 uniform sampler2D uGAlbedoRough;
@@ -33,6 +36,21 @@ uniform vec3 uCameraPos;
 uniform bool uFogEnabled;
 uniform vec3 uFogColor;
 uniform float uFogDensity;
+
+// procedural sky background
+uniform bool uSkyEnabled;
+uniform mat4 uInvViewProj;
+uniform vec3 uSunDir;
+uniform vec3 uSunColor;
+uniform vec3 uSkyZenith;
+uniform vec3 uSkyHorizon;
+uniform float uSkyIntensity;
+
+// Reconstruct the world-space view ray for this pixel from the inverse VP.
+vec3 viewRay(vec2 uv) {
+  vec4 far = uInvViewProj * vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+  return normalize(far.xyz / far.w - uCameraPos);
+}
 
 vec3 acesFilm(vec3 x) {
   const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
@@ -84,9 +102,12 @@ void main() {
 
   vec3 color;
   if (wp.w < 0.5) {
-    // Sky/background: dissolve into the fog colour when fog is on so silhouettes
-    // read against atmosphere instead of a hard void.
-    color = uFogEnabled ? uFogColor : uBackgroundColor;
+    // Background: the procedural sky (with sun), else fog colour, else flat.
+    if (uSkyEnabled) {
+      color = skyColor(viewRay(vUv), uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity);
+    } else {
+      color = uFogEnabled ? uFogColor : uBackgroundColor;
+    }
   } else {
     color = albedoRough.rgb * irradiance + emissive;
     if (uFogEnabled) {
@@ -128,6 +149,13 @@ export class CompositePass {
         uFogEnabled: { value: false },
         uFogColor: { value: new THREE.Color(0.5, 0.6, 0.7) },
         uFogDensity: { value: 0.05 },
+        uSkyEnabled: { value: false },
+        uInvViewProj: { value: new THREE.Matrix4() },
+        uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.45).normalize() },
+        uSunColor: { value: new THREE.Color(1.0, 0.9, 0.75) },
+        uSkyZenith: { value: new THREE.Color(0.18, 0.34, 0.62) },
+        uSkyHorizon: { value: new THREE.Color(0.7, 0.8, 0.9) },
+        uSkyIntensity: { value: 1.0 },
       },
       depthTest: false,
       depthWrite: false,

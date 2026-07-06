@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS } from "./SceneCompiler.js";
+import { SKY_GLSL } from "./sky.glsl.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -17,6 +18,7 @@ precision highp usampler2D;
 
 ${shaderStructs}
 ${shaderIntersectFunction}
+${SKY_GLSL}
 
 #define MAX_LIGHTS ${MAX_LIGHTS}
 #define PI 3.14159265358979
@@ -53,6 +55,15 @@ uniform float uEnvIntensity;
 uniform float uFrame;
 uniform float uEps;
 uniform bool uGIEnabled;
+
+// Procedural sky (when enabled, replaces the flat env colour as the "miss" term
+// for GI rays — this is what gives natural outdoor bounce light).
+uniform bool uSkyEnabled;
+uniform vec3 uSunDir;      // direction toward the sun
+uniform vec3 uSunColor;
+uniform vec3 uSkyZenith;
+uniform vec3 uSkyHorizon;
+uniform float uSkyIntensity;
 
 // ---------- RNG (PCG) ----------
 uint gSeed;
@@ -191,7 +202,10 @@ void main() {
       // Incoming radiance from the hit surface (its emission + reflected direct light)
       indirect = hEmissive + hAlbedo * Ld * (1.0 / PI);
     } else {
-      indirect = uEnvColor * uEnvIntensity;
+      // GI ray escaped to the sky — this is the natural ambient bounce.
+      indirect = uSkyEnabled
+        ? skyColor(dir, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity)
+        : uEnvColor * uEnvIntensity;
     }
   }
 
@@ -280,6 +294,12 @@ export class RTLightingPass {
         uFrame: { value: 0 },
         uEps: { value: 1e-3 },
         uGIEnabled: { value: true },
+        uSkyEnabled: { value: false },
+        uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.45).normalize() },
+        uSunColor: { value: new THREE.Color(1.0, 0.9, 0.75) },
+        uSkyZenith: { value: new THREE.Color(0.18, 0.34, 0.62) },
+        uSkyHorizon: { value: new THREE.Color(0.7, 0.8, 0.9) },
+        uSkyIntensity: { value: 1.0 },
       },
       depthTest: false,
       depthWrite: false,

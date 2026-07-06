@@ -60,6 +60,7 @@ const ICON = {
   burst: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l3 3M16 16l3 3M19 5l-3 3M8 16l-3 3"/></svg>',
   reset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5"/></svg>',
   fog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 8h16M4 12h16M4 16h16"/></svg>',
+  sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 1v3M12 20v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1 12h3M20 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>',
 };
 
 function el(tag, cls, html) {
@@ -121,9 +122,10 @@ function lightRow(name, light, hasColor, rt, scene) {
   const sw = el("label", "sw");
   const input = el("input");
   input.type = "checkbox";
-  input.checked = light.visible;
+  input.checked = light.visible && light.intensity > 0;
   input.addEventListener("change", () => {
     light.visible = input.checked;
+    rt.updateLights(scene);
     rt.resetAccumulation();
   });
   sw.append(input, el("span", "track"), el("span", "knob"));
@@ -134,6 +136,7 @@ function lightRow(name, light, hasColor, rt, scene) {
     col.value = "#" + light.color.getHexString();
     col.addEventListener("input", () => {
       light.color.set(col.value);
+      rt.updateLights(scene);
       rt.resetAccumulation();
     });
     row.append(col);
@@ -142,7 +145,7 @@ function lightRow(name, light, hasColor, rt, scene) {
   return row;
 }
 
-export function buildUI({ rt, physics, waterfall, lights, scene, state }) {
+export function buildUI({ rt, physics, waterfall, lights, sky, scene, state, refreshLights }) {
   document.head.append(el("style", null, CSS));
 
   const panel = el("div");
@@ -172,22 +175,23 @@ export function buildUI({ rt, physics, waterfall, lights, scene, state }) {
   );
   panel.append(rSec);
 
-  // --- Scene / atmosphere ---
+  // --- Sky / atmosphere ---
   const sSec = el("div", "sec");
-  sSec.append(el("h3", null, `${ICON.fog} Atmosphere`));
-  sSec.append(toggle("fog", rt.fog.enabled, (v) => { rt.fog.enabled = v; rt.resetAccumulation(); }).row);
-  sSec.append(slider("density", 0.01, 0.14, 0.005, rt.fog.density, (x) => x.toFixed(2), (v) => (rt.fog.density = v)));
-  sSec.append(toggle("waterfall", true, (v) => waterfall.setVisible(v)).row);
+  sSec.append(el("h3", null, `${ICON.sun} Sky & Sun`));
+  sSec.append(toggle("procedural sky", rt.sky.enabled, (v) => { rt.sky.enabled = v; rt.resetAccumulation(); }).row);
+  sSec.append(slider("sky light", 0.2, 2.0, 0.05, rt.sky.intensity, (x) => x.toFixed(2), (v) => { rt.sky.intensity = v; rt.resetAccumulation(); }));
+  sSec.append(lightRow("sun", lights.sun, false, rt, scene));
+  sSec.append(slider("sun power", 0, 6, 0.1, lights.sun.intensity, (x) => x.toFixed(1), (v) => { lights.sun.intensity = v; refreshLights(); rt.resetAccumulation(); }));
   panel.append(sSec);
 
-  // --- Lights ---
-  const lSec = el("div", "sec");
-  lSec.append(el("h3", null, `${ICON.bulb} Lights`));
-  lSec.append(lightRow("warm point", lights.warm, true, rt, scene));
-  lSec.append(lightRow("cool point", lights.cool, true, rt, scene));
-  lSec.append(lightRow("sun (directional)", lights.sun, false, rt, scene));
-  lSec.append(lightRow("emissive panel", lights.panel, false, rt, scene));
-  panel.append(lSec);
+  // --- Atmosphere ---
+  const aSec = el("div", "sec");
+  aSec.append(el("h3", null, `${ICON.fog} Atmosphere`));
+  aSec.append(toggle("fog / haze", rt.fog.enabled, (v) => { rt.fog.enabled = v; rt.resetAccumulation(); }).row);
+  aSec.append(slider("density", 0.005, 0.09, 0.005, rt.fog.density, (x) => x.toFixed(3), (v) => (rt.fog.density = v)));
+  aSec.append(toggle("bounce fill light", lights.fill.intensity > 0, (v) => { lights.fill.intensity = v ? 6 : 0; refreshLights(); rt.resetAccumulation(); }).row);
+  aSec.append(toggle("pond", true, (v) => waterfall.setVisible(v)).row);
+  panel.append(aSec);
 
   // --- Physics ---
   const pSec = el("div", "sec");

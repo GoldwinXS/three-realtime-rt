@@ -1,21 +1,51 @@
 {
   "name": "three-realtime-rt",
-  "version": "0.1.0",
-  "description": "Turn-on ray traced lighting for three.js: hybrid deferred renderer with BVH-traced shadows and GI",
+  "version": "0.2.0",
+  "description": "Turn-on ray traced lighting for three.js: a hybrid deferred renderer with BVH-traced soft shadows, one-bounce global illumination, temporal reprojection, an a-trous denoiser and TAA.",
   "type": "module",
   "main": "src/index.js",
-  "license": "MIT",
+  "module": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src"
+  ],
+  "sideEffects": false,
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "deploy": "vite build && gh-pages -d dist -t true"
   },
-  "dependencies": {
-    "@dimforge/rapier3d-compat": "^0.14.0",
-    "three": "^0.160.1",
-    "three-mesh-bvh": "^0.7.8"
+  "keywords": [
+    "three",
+    "threejs",
+    "raytracing",
+    "path-tracing",
+    "global-illumination",
+    "webgl",
+    "bvh",
+    "denoiser",
+    "taa",
+    "renderer"
+  ],
+  "homepage": "https://goldwinxs.github.io/three-realtime-rt/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GoldwinXS/three-realtime-rt.git"
+  },
+  "author": "Goldwin Stewart",
+  "license": "MIT",
+  "peerDependencies": {
+    "three": ">=0.155.0",
+    "three-mesh-bvh": ">=0.7.0"
   },
   "devDependencies": {
+    "@dimforge/rapier3d-compat": "^0.14.0",
+    "gh-pages": "^6.3.0",
+    "three": "^0.160.1",
+    "three-mesh-bvh": "^0.7.8",
     "vite": "^5.0.11"
   }
 }

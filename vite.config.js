@@ -36,6 +36,12 @@ function shotSaver() {
 }
 
 export default defineConfig({
+  // Relative asset paths so the production build works when served from a
+  // GitHub Pages project sub-path (https://user.github.io/three-realtime-rt/).
+  base: "./",
+  // The example uses top-level await; target a modern engine (WebGL2 already
+  // requires one). esbuild's default "modules" target rejects TLA.
+  build: { target: "esnext" },
   plugins: [shotSaver()],
   server: {
     host: "0.0.0.0",

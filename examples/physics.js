@@ -174,6 +174,16 @@ export class Physics {
     this.sync();
   }
 
+  /**
+   * True while any body is still awake. Rapier sleeps bodies once they settle,
+   * so this lets the render loop skip the (relatively expensive) per-frame BVH
+   * refit whenever the pile is at rest — a big FPS win in the common case.
+   */
+  anyAwake() {
+    for (const { body } of this.props) if (!body.isSleeping()) return true;
+    return false;
+  }
+
   /** Copy body transforms onto their meshes. */
   sync() {
     for (const { mesh, body } of this.props) {
