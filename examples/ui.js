@@ -145,7 +145,7 @@ function lightRow(name, light, hasColor, rt, scene) {
   return row;
 }
 
-export function buildUI({ rt, physics, waterfall, lights, sky, scene, state, refreshLights }) {
+export function buildUI({ rt, physics, lights, scene, state, refreshLights }) {
   document.head.append(el("style", null, CSS));
 
   const panel = el("div");
@@ -175,22 +175,19 @@ export function buildUI({ rt, physics, waterfall, lights, sky, scene, state, ref
   );
   panel.append(rSec);
 
-  // --- Sky / atmosphere ---
-  const sSec = el("div", "sec");
-  sSec.append(el("h3", null, `${ICON.sun} Sky & Sun`));
-  sSec.append(toggle("procedural sky", rt.sky.enabled, (v) => { rt.sky.enabled = v; rt.resetAccumulation(); }).row);
-  sSec.append(slider("sky light", 0.2, 2.0, 0.05, rt.sky.intensity, (x) => x.toFixed(2), (v) => { rt.sky.intensity = v; rt.resetAccumulation(); }));
-  sSec.append(lightRow("sun", lights.sun, false, rt, scene));
-  sSec.append(slider("sun power", 0, 6, 0.1, lights.sun.intensity, (x) => x.toFixed(1), (v) => { lights.sun.intensity = v; refreshLights(); rt.resetAccumulation(); }));
-  panel.append(sSec);
+  // --- Lights ---
+  const lSec = el("div", "sec");
+  lSec.append(el("h3", null, `${ICON.bulb} Lights`));
+  for (const { label, light, color } of lights) {
+    lSec.append(lightRow(label, light, color, rt, scene));
+  }
+  panel.append(lSec);
 
   // --- Atmosphere ---
   const aSec = el("div", "sec");
   aSec.append(el("h3", null, `${ICON.fog} Atmosphere`));
   aSec.append(toggle("fog / haze", rt.fog.enabled, (v) => { rt.fog.enabled = v; rt.resetAccumulation(); }).row);
-  aSec.append(slider("density", 0.005, 0.09, 0.005, rt.fog.density, (x) => x.toFixed(3), (v) => (rt.fog.density = v)));
-  aSec.append(toggle("bounce fill light", lights.fill.intensity > 0, (v) => { lights.fill.intensity = v ? 6 : 0; refreshLights(); rt.resetAccumulation(); }).row);
-  aSec.append(toggle("pond", true, (v) => waterfall.setVisible(v)).row);
+  aSec.append(slider("density", 0.01, 0.12, 0.005, rt.fog.density, (x) => x.toFixed(2), (v) => (rt.fog.density = v)));
   panel.append(aSec);
 
   // --- Physics ---

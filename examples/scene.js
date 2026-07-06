@@ -1,153 +1,109 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { TeapotGeometry } from "three/addons/geometries/TeapotGeometry.js";
 
 import helmetUrl from "./assets/DamagedHelmet.glb?url";
 import duckUrl from "./assets/Duck.glb?url";
 
-import { createWaterfall } from "./waterfall.js";
-
-// Mottled-green grass texture so the ground reads as natural under sky light.
-function makeGrassTexture() {
-  const s = 256;
-  const cv = document.createElement("canvas");
-  cv.width = s; cv.height = s;
-  const ctx = cv.getContext("2d");
-  ctx.fillStyle = "#4a6b2e";
-  ctx.fillRect(0, 0, s, s);
-  const greens = ["#3d5c26", "#557a34", "#456b2b", "#61833c", "#3a5322"];
-  for (let i = 0; i < 9000; i++) {
-    ctx.fillStyle = greens[(Math.random() * greens.length) | 0];
-    const x = Math.random() * s, y = Math.random() * s;
-    const w = 1 + Math.random() * 2, h = 2 + Math.random() * 4;
-    ctx.fillRect(x, y, w, h);
-  }
-  const tex = new THREE.CanvasTexture(cv);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(16, 16);
-  tex.anisotropy = 4;
-  return tex;
-}
-
-const ROCK_MAT = new THREE.MeshStandardMaterial({ color: 0x8a8378, roughness: 0.95 });
-
-// Low-poly angular boulder.
-function makeRock(x, z, scale, ground = 0) {
-  const geo = new THREE.DodecahedronGeometry(scale, 0);
-  // jitter the vertices a touch so no two rocks are identical
-  const p = geo.getAttribute("position");
-  for (let i = 0; i < p.count; i++) {
-    p.setXYZ(
-      i,
-      p.getX(i) * (0.8 + Math.random() * 0.4),
-      p.getY(i) * (0.7 + Math.random() * 0.5),
-      p.getZ(i) * (0.8 + Math.random() * 0.4)
-    );
-  }
-  geo.computeVertexNormals();
-  const m = new THREE.Mesh(geo, ROCK_MAT);
-  m.position.set(x, ground + scale * 0.45, z);
-  m.rotation.set(Math.random(), Math.random() * 6.28, Math.random());
-  return m;
-}
-
-// Stylized low-poly tree: tapered trunk + a couple of foliage blobs.
-function makeTree(x, z, h = 3.2) {
-  const g = new THREE.Group();
-  const trunk = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.14, 0.24, h, 6),
-    new THREE.MeshStandardMaterial({ color: 0x5b432a, roughness: 0.9 })
-  );
-  trunk.position.y = h / 2;
-  g.add(trunk);
-  const leafMat = new THREE.MeshStandardMaterial({ color: 0x3f7d2f, roughness: 0.85 });
-  const blobs = [
-    [0, h + 0.1, 0, 1.25],
-    [0.5, h - 0.4, 0.2, 0.95],
-    [-0.4, h - 0.2, -0.3, 0.85],
-  ];
-  for (const [bx, by, bz, r] of blobs) {
-    const leaf = new THREE.Mesh(new THREE.IcosahedronGeometry(r, 1), leafMat);
-    leaf.position.set(bx, by, bz);
-    g.add(leaf);
-  }
-  g.position.set(x, 0, z);
-  return g;
-}
-
 /**
- * Outdoor natural scene: grassy ground under a procedural sky, a warm sun, a
- * waterfall spilling off a rock shelf into a pond, scattered boulders and
- * low-poly trees, plus a few glTF "found objects" (a duck by the water, a
- * lantern, a weathered helmet on a rock). Natural light here is almost entirely
- * sky ambient + a single sun — exactly what ray traced GI + soft shadows sell.
+ * An indoor "Cornell-style" room: a floor and three saturated coloured walls,
+ * open at the top, lit by an emissive panel + two coloured point lights. This is
+ * the strongest showcase for ray traced GI — you can clearly watch light bounce
+ * off the coloured walls and bleed onto the white floor and the objects.
  */
 export function buildScene() {
   const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x05070c);
 
   const camera = new THREE.PerspectiveCamera(
     58,
     window.innerWidth / window.innerHeight,
     0.1,
-    200
+    100
   );
-  camera.position.set(9, 5.5, 13);
+  camera.position.set(6.0, 3.8, 8.0);
 
-  // Sky + sun. sunDir points TOWARD the sun; the DirectionalLight travels the
-  // other way so its shadows line up with the visible sun.
-  const sunDir = new THREE.Vector3(0.55, 0.62, 0.55).normalize();
-  const sky = {
-    enabled: true,
-    sunDir,
-    sunColor: new THREE.Color(1.0, 0.92, 0.78),
-    zenith: new THREE.Color(0.20, 0.40, 0.72),
-    horizon: new THREE.Color(0.78, 0.85, 0.92),
-    intensity: 1.0,
-  };
+  const bounds = { x: 7, z: 7, wallH: 6, floorY: 0 };
 
-  const bounds = { x: 9, z: 9, wallH: 0.5, floorY: 0 };
+  // Room shell — thin boxes. Saturated side walls so colour bleed is obvious.
+  const white = new THREE.MeshStandardMaterial({ color: 0xc4c4c4, roughness: 0.92 });
+  const red = new THREE.MeshStandardMaterial({ color: 0xc42f2a, roughness: 0.85 });
+  const green = new THREE.MeshStandardMaterial({ color: 0x2f9d4f, roughness: 0.85 });
 
-  // Ground.
-  const ground = new THREE.Mesh(
-    new THREE.BoxGeometry(80, 0.4, 80),
-    new THREE.MeshStandardMaterial({ map: makeGrassTexture(), roughness: 0.98 })
-  );
-  ground.position.y = -0.2;
+  const ground = new THREE.Mesh(new THREE.BoxGeometry(14, 0.2, 14), white);
+  ground.position.y = -0.1;
   scene.add(ground);
 
-  // Waterfall / pond / cliff (back-left).
-  const waterfall = createWaterfall(scene, { x: -6.5, z: -6.0, floorY: 0 });
+  const backWall = new THREE.Mesh(new THREE.BoxGeometry(14, 6, 0.2), white);
+  backWall.position.set(0, 3, -7);
+  scene.add(backWall);
 
-  // Scattered boulders.
-  const rockSpots = [
-    [4.6, -5.5, 1.1], [6.2, -3.0, 0.8], [-8.0, -1.0, 1.3],
-    [7.5, 2.5, 0.9], [-2.5, -7.2, 0.7], [2.0, -7.6, 0.6],
+  const leftWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 6, 14), red);
+  leftWall.position.set(-7, 3, 0);
+  scene.add(leftWall);
+
+  const rightWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 6, 14), green);
+  rightWall.position.set(7, 3, 0);
+  scene.add(rightWall);
+
+  function pedestal(x, z, height = 1.0) {
+    const p = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.9, 1.05, height, 24),
+      new THREE.MeshStandardMaterial({ color: 0x777d88, roughness: 0.6 })
+    );
+    p.position.set(x, height / 2, z);
+    scene.add(p);
+    return p;
+  }
+
+  // Hero pieces (static beauty anchors).
+  const teapot = new THREE.Mesh(
+    new TeapotGeometry(0.8, 10),
+    new THREE.MeshStandardMaterial({ color: 0xd8cfc0, roughness: 0.35, metalness: 0.1 })
+  );
+  pedestal(3.6, -2.6);
+  teapot.position.set(3.6, 1.75, -2.6);
+  scene.add(teapot);
+
+  const knot = new THREE.Mesh(
+    new THREE.TorusKnotGeometry(0.7, 0.23, 140, 20),
+    new THREE.MeshStandardMaterial({ color: 0xc0c8d0, roughness: 0.3, metalness: 0.2 })
+  );
+  pedestal(0.2, -0.4, 0.8);
+  knot.position.set(0.2, 1.7, -0.4);
+  scene.add(knot);
+
+  // Emissive panel — an area light that lights the room purely through GI.
+  const panel = new THREE.Mesh(
+    new THREE.BoxGeometry(2.6, 1.5, 0.1),
+    new THREE.MeshStandardMaterial({
+      color: 0x000000,
+      emissive: 0xfff2d8,
+      emissiveIntensity: 6,
+    })
+  );
+  panel.position.set(-2.0, 2.4, -6.85);
+  scene.add(panel);
+
+  // Two coloured point lights for soft shadows + warm/cool contrast.
+  const warm = new THREE.PointLight(0xffd9a0, 13);
+  warm.position.set(-3.2, 4.6, 3.4);
+  warm.userData.rtRadius = 0.35;
+  scene.add(warm);
+
+  const cool = new THREE.PointLight(0x9fc4ff, 9);
+  cool.position.set(4.4, 5.0, 2.2);
+  cool.userData.rtRadius = 0.3;
+  scene.add(cool);
+
+  // Light descriptors for the UI (label + whether to show a colour swatch).
+  const lights = [
+    { label: "warm light", light: warm, color: true },
+    { label: "cool light", light: cool, color: true },
   ];
-  for (const [x, z, s] of rockSpots) scene.add(makeRock(x, z, s));
-  const helmetRock = makeRock(5.6, 4.0, 1.2);
-  scene.add(helmetRock);
 
-  // Trees around the edges for a framed, natural skyline.
-  const treeSpots = [
-    [-9, -8, 3.6], [-11, -2, 4.2], [10, -7, 3.9],
-    [12, 1, 3.4], [-10, 5, 3.7], [9.5, 6.5, 3.2], [-3, -9.5, 3.0],
-  ];
-  for (const [x, z, h] of treeSpots) scene.add(makeTree(x, z, h));
-
-  // Sun light (matches the sky's sun).
-  const sun = new THREE.DirectionalLight(0xfff1d8, 3.0);
-  sun.position.copy(sunDir).multiplyScalar(30);
-  sun.target.position.set(0, 0, 0);
-  sun.userData.rtRadius = 0.035; // crisp-ish natural sun shadows
-  scene.add(sun);
-  scene.add(sun.target);
-
-  // A soft warm bounce/fill (like light kicking off the ground), off by default.
-  const fill = new THREE.PointLight(0xffdca8, 0.0);
-  fill.position.set(-4, 3, 6);
-  fill.userData.rtRadius = 0.6;
-  scene.add(fill);
-
-  const lights = { sun, fill };
+  // No procedural sky indoors — a low ambient fills GI rays that escape the room.
+  const sky = { enabled: false };
 
   const ready = (async () => {
     const loader = new GLTFLoader();
@@ -155,18 +111,17 @@ export function buildScene() {
       new Promise((res, rej) => loader.load(url, res, undefined, rej));
     const [helmet, duck] = await Promise.all([load(helmetUrl), load(duckUrl)]);
 
-    // Weathered helmet resting on a boulder.
-    helmet.scene.scale.setScalar(1.2);
-    helmet.scene.position.set(5.6, 1.5, 4.0);
-    helmet.scene.rotation.y = -0.6;
+    helmet.scene.scale.setScalar(1.4);
+    helmet.scene.position.set(-2.8, 2.4, -1.8);
+    helmet.scene.rotation.y = 0.7;
+    pedestal(-2.8, -1.8, 1.4);
     scene.add(helmet.scene);
 
-    // Rubber duck by the pond.
     duck.scene.scale.setScalar(0.9);
-    duck.scene.position.set(-4.4, 0.0, -3.4);
-    duck.scene.rotation.y = 2.2;
+    duck.scene.position.set(-5.0, 0.0, 2.6);
+    duck.scene.rotation.y = -0.9;
     scene.add(duck.scene);
   })();
 
-  return { scene, camera, bounds, lights, sky, waterfall, ready };
+  return { scene, camera, bounds, lights, sky, ready };
 }

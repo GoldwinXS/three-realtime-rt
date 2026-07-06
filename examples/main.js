@@ -13,7 +13,7 @@
  *      `renderer.render(...)`. For moving objects call `rt.updateDynamic()`
  *      first; when lights change call `rt.updateLights(scene)`.
  *
- * Everything else here (physics, waterfall, UI) is ordinary three.js / app code.
+ * Everything else here (physics, UI) is ordinary three.js / app code.
  */
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -27,8 +27,8 @@ const bootMsg = document.getElementById("boot-msg");
 const setBoot = (t) => { if (bootMsg) bootMsg.textContent = t; };
 
 async function main() {
-  // 1. An ordinary three.js scene (grassy ground, sky/sun params, hero props).
-  const { scene, camera, bounds, lights, sky, waterfall, ready } = buildScene();
+  // 1. An ordinary three.js scene (coloured room, lights, hero props).
+  const { scene, camera, bounds, lights, sky, ready } = buildScene();
 
   // A Rapier physics playground drops a pool of props onto the ground. Their
   // meshes are plain three.js meshes — we'll hand them to the raytracer as the
@@ -51,8 +51,9 @@ async function main() {
   const rt = new RealtimeRaytracer(renderer, {
     renderScale: 0.5,   // trace lighting at half res; upsample + TAA reconstruct
     maxHistory: 48,     // shorter history so moving shadows keep up
-    sky,                // procedural sky doubles as the GI ambient light source
-    fog: { enabled: false, color: new THREE.Color(0.72, 0.8, 0.88), density: 0.03 },
+    envColor: new THREE.Color(0x0a0f18), // low ambient for GI rays that escape the room
+    sky,                // (disabled indoors) procedural sky as GI ambient + background
+    fog: { enabled: false, color: new THREE.Color(0.5, 0.55, 0.62), density: 0.04 },
   });
 
   // 3. Compile once. `dynamicMeshes` marks meshes that move every frame — they
@@ -82,7 +83,7 @@ async function main() {
   // instead of us polling every frame.
   const refreshLights = () => rt.updateLights(scene);
   const state = { rtEnabled: true, physicsPaused: false };
-  const ui = buildUI({ rt, physics, waterfall, lights, sky, scene, state, refreshLights });
+  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights });
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;
@@ -105,7 +106,6 @@ async function main() {
 
     controls.update();
     if (!state.physicsPaused) physics.step();
-    waterfall.update(dt);
 
     if (state.rtEnabled) {
       // Only re-bake the BVH while something is actually moving — at rest this
