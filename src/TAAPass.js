@@ -82,6 +82,12 @@ void main() {
   if (!valid) { outColor = vec4(current, 1.0); return; }
 
   vec3 history = texture(uHistory, prevUv).rgb;
+  // Guard against a stray non-finite history value poisoning the buffer (it
+  // would otherwise re-blend with itself every frame and stick as black).
+  if (any(isnan(history)) || any(isinf(history))) {
+    outColor = vec4(current, 1.0);
+    return;
+  }
   // Clamp history into the current neighbourhood box: removes ghosting on
   // motion and rejects bright edge speckles that history would otherwise keep.
   history = clamp(history, nmin, nmax);

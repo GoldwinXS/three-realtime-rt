@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { compileScene } from "./SceneCompiler.js";
+import { compileScene, syncLights } from "./SceneCompiler.js";
 import { GBufferPass } from "./GBufferPass.js";
 import { RTLightingPass } from "./RTLightingPass.js";
 import { DenoisePass } from "./DenoisePass.js";
@@ -68,6 +68,8 @@ export class RealtimeRaytracer {
     this.maxHistory = options.maxHistory ?? 128;
     /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
     this.fireflyClamp = options.fireflyClamp ?? 4.0;
+    /** 1-bounce global illumination (traced indirect). Toggle for a direct-only look. */
+    this.gi = options.gi ?? true;
     /** Edge-aware à-trous denoise on the irradiance buffer. */
     this.denoise = options.denoise ?? true;
     /** À-trous iterations (steps 1, 2, 4, ...). */
@@ -82,6 +84,13 @@ export class RealtimeRaytracer {
     this.taa = options.taa ?? true;
     /** Fresh-sample weight in the TAA blend (lower = smoother/more AA, more lag). */
     this.taaBlend = options.taaBlend ?? 0.1;
+
+    /** Distance fog (composited in linear space before tonemap). */
+    this.fog = {
+      enabled: options.fog?.enabled ?? false,
+      color: options.fog?.color ?? new THREE.Color(0.5, 0.6, 0.7),
+      density: options.fog?.density ?? 0.05,
+    };
     this._jitterIndex = 0;
     this._jitteredViewProj = new THREE.Matrix4();
 
@@ -103,13 +112,33 @@ export class RealtimeRaytracer {
     return t;
   }
 
-  /** Build/rebuild BVH + material and light tables from the scene. Call after scene changes. */
-  compileScene(scene) {
+  /**
+   * Build/rebuild BVH + material and light tables from the scene. Call after
+   * structural scene changes. Pass `{ dynamicMeshes: [...] }` to mark meshes
+   * whose transforms will change every frame (drive them with updateDynamic()).
+   */
+  compileScene(scene, options) {
     if (this.compiled) this.compiled.dispose();
-    this.compiled = compileScene(scene);
+    this.compiled = compileScene(scene, options);
     this.rtPass.setCompiledScene(this.compiled);
     this.resetAccumulation();
     return this.compiled;
+  }
+
+  /** Re-bake moving (dynamic) meshes into the BVH. Call each frame after moving them. */
+  updateDynamic() {
+    if (this.compiled) this.compiled.updateDynamic(this.frame % 8 === 0);
+  }
+
+  /**
+   * Refresh light positions/colors from the scene without a full recompile —
+   * lets the demo toggle, move, and recolor lights live. Lights with intensity
+   * 0 (or invisible) are dropped so they can be switched off.
+   */
+  updateLights(scene) {
+    if (!this.compiled) return;
+    syncLights(scene, this.compiled);
+    this.rtPass.setCompiledScene(this.compiled);
   }
 
   resetAccumulation() {
@@ -187,6 +216,7 @@ export class RealtimeRaytracer {
     rtU.uTemporalReprojection.value = this.temporalReprojection;
     rtU.uMaxHistory.value = this.maxHistory;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
+    rtU.uGIEnabled.value = this.gi;
     rtU.uPrevViewProj.value.copy(this._prevViewProj);
     rtU.uViewProj.value.copy(this._jitteredViewProj);
     rtU.uCameraPos.value.copy(camera.getWorldPosition(this._camWorldPos));
@@ -213,6 +243,9 @@ export class RealtimeRaytracer {
     cU.uUpsample.value = this._renderScale < 1;
     cU.uIrrTexelSize.value.set(1 / this._scaledW, 1 / this._scaledH);
     cU.uCameraPos.value.copy(this._camWorldPos);
+    cU.uFogEnabled.value = this.fog.enabled;
+    cU.uFogColor.value.copy(this.fog.color);
+    cU.uFogDensity.value = this.fog.density;
     this.composite.render(
       this.renderer,
       irradiance,

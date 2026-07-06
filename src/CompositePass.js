@@ -29,6 +29,11 @@ uniform bool uUpsample;
 uniform vec2 uIrrTexelSize;
 uniform vec3 uCameraPos;
 
+// distance fog (applied in linear space, before tonemap)
+uniform bool uFogEnabled;
+uniform vec3 uFogColor;
+uniform float uFogDensity;
+
 vec3 acesFilm(vec3 x) {
   const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
   return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
@@ -79,9 +84,16 @@ void main() {
 
   vec3 color;
   if (wp.w < 0.5) {
-    color = uBackgroundColor;
+    // Sky/background: dissolve into the fog colour when fog is on so silhouettes
+    // read against atmosphere instead of a hard void.
+    color = uFogEnabled ? uFogColor : uBackgroundColor;
   } else {
     color = albedoRough.rgb * irradiance + emissive;
+    if (uFogEnabled) {
+      float dist = distance(wp.xyz, uCameraPos);
+      float f = 1.0 - exp(-uFogDensity * uFogDensity * dist * dist);
+      color = mix(color, uFogColor, clamp(f, 0.0, 1.0));
+    }
   }
 
   if (uOutputMode == 1) color = albedoRough.rgb;
@@ -113,6 +125,9 @@ export class CompositePass {
         uUpsample: { value: false },
         uIrrTexelSize: { value: new THREE.Vector2() },
         uCameraPos: { value: new THREE.Vector3() },
+        uFogEnabled: { value: false },
+        uFogColor: { value: new THREE.Color(0.5, 0.6, 0.7) },
+        uFogDensity: { value: 0.05 },
       },
       depthTest: false,
       depthWrite: false,

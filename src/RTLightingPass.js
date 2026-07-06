@@ -52,6 +52,7 @@ uniform vec3 uEnvColor;
 uniform float uEnvIntensity;
 uniform float uFrame;
 uniform float uEps;
+uniform bool uGIEnabled;
 
 // ---------- RNG (PCG) ----------
 uint gSeed;
@@ -174,7 +175,7 @@ void main() {
 
   // --- 1-bounce indirect (cosine-weighted; pdf cancels the NdotL/PI) ---
   vec3 indirect = vec3(0.0);
-  {
+  if (uGIEnabled) {
     vec3 dir = cosineSampleHemisphere(N, rand2());
     uvec4 faceIndices; vec3 faceNormal; vec3 barycoord; float side; float dist;
     if (traceRay(P + N * uEps, dir, faceIndices, faceNormal, barycoord, side, dist)) {
@@ -278,6 +279,7 @@ export class RTLightingPass {
         uEnvIntensity: { value: 1.0 },
         uFrame: { value: 0 },
         uEps: { value: 1e-3 },
+        uGIEnabled: { value: true },
       },
       depthTest: false,
       depthWrite: false,
