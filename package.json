@@ -16,7 +16,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "deploy": "vite build && gh-pages -d dist -t true"
+    "deploy": "vite build && gh-pages -d dist -t"
   },
   "keywords": [
     "three",
