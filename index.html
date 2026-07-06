@@ -5,13 +5,32 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>three-realtime-rt — ray traced three.js</title>
   <style>
-    html, body { margin: 0; height: 100%; overflow: hidden; background: #05070c; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
     #app { width: 100%; height: 100%; }
     #app canvas { display: block; }
+    #boot {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px; z-index: 50;
+      color: #cfe0ea; font: 14px/1.5 ui-monospace, Consolas, monospace;
+      background: radial-gradient(circle at 50% 40%, #16202b, #0a0f16);
+      transition: opacity 0.5s; text-align: center; padding: 20px;
+    }
+    #boot.hidden { opacity: 0; pointer-events: none; }
+    #boot .spin {
+      width: 34px; height: 34px; border: 3px solid #223240;
+      border-top-color: #38d0e0; border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    #boot .err { color: #ff8a80; max-width: 520px; white-space: pre-wrap; }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
-  <script type="module" crossorigin src="./assets/index-DiBP7Iy6.js"></script>
+  <script type="module" crossorigin src="./assets/index-D4xtJlq7.js"></script>
 </head>
 <body>
   <div id="app"></div>
+  <div id="boot">
+    <div class="spin"></div>
+    <div id="boot-msg">loading ray tracer…</div>
+  </div>
 </body>
 </html>
