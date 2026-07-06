@@ -28,7 +28,6 @@ export class RealtimeRaytracer {
     this.composite = new CompositePass();
 
     this.compiled = null;
-    this.sampleCount = 0;
     this.frame = 0;
 
     /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive */
@@ -38,9 +37,16 @@ export class RealtimeRaytracer {
     this.envIntensity = options.envIntensity ?? 1.0;
     /** Ray offset epsilon — raise for large scenes if you see acne. */
     this.eps = options.eps ?? 1e-3;
+    /** Reproject accumulated lighting through camera motion (stage 2). */
+    this.temporalReprojection = options.temporalReprojection ?? true;
+    /** History length cap: higher = smoother but slower to react. */
+    this.maxHistory = options.maxHistory ?? 128;
+    /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
+    this.fireflyClamp = options.fireflyClamp ?? 4.0;
 
-    this._prevCameraMatrix = new THREE.Matrix4();
-    this._prevProjMatrix = new THREE.Matrix4();
+    this._prevViewProj = new THREE.Matrix4();
+    this._camWorldPos = new THREE.Vector3();
+    this._needsClear = true;
   }
 
   /** Build/rebuild BVH + material and light tables from the scene. Call after scene changes. */
@@ -53,7 +59,7 @@ export class RealtimeRaytracer {
   }
 
   resetAccumulation() {
-    this.sampleCount = 0;
+    this._needsClear = true;
   }
 
   setSize(width, height) {
@@ -64,54 +70,45 @@ export class RealtimeRaytracer {
     this.resetAccumulation();
   }
 
-  _cameraMoved(camera) {
-    camera.updateMatrixWorld();
-    const m = camera.matrixWorld.elements;
-    const p = camera.projectionMatrix.elements;
-    const pm = this._prevCameraMatrix.elements;
-    const pp = this._prevProjMatrix.elements;
-    let moved = false;
-    for (let i = 0; i < 16; i++) {
-      if (Math.abs(m[i] - pm[i]) > 1e-6 || Math.abs(p[i] - pp[i]) > 1e-6) {
-        moved = true;
-        break;
-      }
-    }
-    this._prevCameraMatrix.copy(camera.matrixWorld);
-    this._prevProjMatrix.copy(camera.projectionMatrix);
-    return moved;
-  }
-
   render(scene, camera) {
     if (!this.compiled) this.compileScene(scene);
 
-    if (this._cameraMoved(camera)) this.resetAccumulation();
-    this.sampleCount += 1;
     this.frame += 1;
+    camera.updateMatrixWorld();
 
     const prevAutoClear = this.renderer.autoClear;
     this.renderer.autoClear = false;
 
-    // 1. rasterize G-buffer
+    if (this._needsClear) {
+      this.rtPass.clearHistory(this.renderer);
+      this._needsClear = false;
+    }
+
+    // 1. rasterize G-buffer (ping-pongs internally; previous frame kept)
     this.gbuffer.render(this.renderer, scene, camera);
 
-    // 2. ray traced lighting, accumulated
+    // 2. ray traced lighting with temporal reprojection
     const rtU = this.rtPass.material.uniforms;
     rtU.uEnvColor.value.copy(this.envColor);
     rtU.uEnvIntensity.value = this.envIntensity;
     rtU.uEps.value = this.eps;
-    const irradiance = this.rtPass.render(
-      this.renderer,
-      this.gbuffer,
-      this.sampleCount,
-      this.frame
-    );
+    rtU.uTemporalReprojection.value = this.temporalReprojection;
+    rtU.uMaxHistory.value = this.maxHistory;
+    rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
+    rtU.uPrevViewProj.value.copy(this._prevViewProj);
+    rtU.uCameraPos.value.copy(camera.getWorldPosition(this._camWorldPos));
+    const irradiance = this.rtPass.render(this.renderer, this.gbuffer, this.frame);
 
     // 3. composite to screen
     this.composite.material.uniforms.uOutputMode.value = this.outputMode;
     this.composite.render(this.renderer, irradiance, this.gbuffer, scene.background);
 
     this.renderer.autoClear = prevAutoClear;
+
+    // Record this frame's view-projection for next frame's reprojection.
+    this._prevViewProj
+      .copy(camera.projectionMatrix)
+      .multiply(camera.matrixWorldInverse);
   }
 
   dispose() {

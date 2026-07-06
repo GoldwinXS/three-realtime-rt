@@ -38,7 +38,10 @@ function shotSaver() {
 export default defineConfig({
   plugins: [shotSaver()],
   server: {
+    host: "0.0.0.0",
     port: 8115,
     strictPort: true,
+    // dev box is only reachable inside the tailnet/LAN; allow hostnames like "desktop"
+    allowedHosts: true,
   },
 });

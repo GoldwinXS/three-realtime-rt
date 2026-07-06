@@ -33,8 +33,15 @@ uniform sampler2D uMaterialsTex;    // 2 texels per material
 uniform sampler2D uGWorldPos;
 uniform sampler2D uGNormalMetal;
 
-uniform sampler2D uPrevAccum;
-uniform float uSampleCount;   // 1 = first frame after reset
+// temporal reprojection (stage 2)
+uniform sampler2D uPrevAccum;        // rgb = irradiance history, a = sample count
+uniform sampler2D uPrevGWorldPos;    // previous frame's G-buffer, for validation
+uniform sampler2D uPrevGNormalMetal;
+uniform mat4 uPrevViewProj;
+uniform vec3 uCameraPos;
+uniform float uMaxHistory;
+uniform bool uTemporalReprojection;
+uniform float uFireflyClamp;
 
 uniform vec4 uLightPosType[MAX_LIGHTS];     // xyz pos|dir, w: 0 point, 1 directional
 uniform vec4 uLightColorRadius[MAX_LIGHTS]; // rgb color*intensity, w radius
@@ -186,12 +193,43 @@ void main() {
     }
   }
 
-  vec3 irradiance = direct + indirect;
+  // Firefly clamp: suppress rare huge GI samples (big perceived-noise win,
+  // slightly biased). Applied to indirect only; direct is analytic.
+  float lum = dot(indirect, vec3(0.299, 0.587, 0.114));
+  if (lum > uFireflyClamp) indirect *= uFireflyClamp / lum;
 
-  // --- temporal accumulation (progressive average) ---
-  vec3 prev = texture(uPrevAccum, vUv).rgb;
-  float blend = 1.0 / uSampleCount;
-  outIrradiance = vec4(mix(prev, irradiance, blend), 1.0);
+  vec3 sampleIrr = direct + indirect;
+
+  // --- temporal reprojection: pull validated history from last frame ---
+  float count = 1.0;
+  vec3 history = vec3(0.0);
+  if (uTemporalReprojection) {
+    vec4 clip = uPrevViewProj * vec4(P, 1.0);
+    if (clip.w > 0.0) {
+      vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
+      if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
+        vec4 prevPos = texture(uPrevGWorldPos, prevUv);
+        vec3 prevN = texture(uPrevGNormalMetal, prevUv).xyz;
+        // Plane-distance test: robust at grazing angles (position error from
+        // texel quantization lies along the surface, not along the normal).
+        float distToCam = distance(P, uCameraPos);
+        float tol = 0.005 * distToCam + 20.0 * uEps;
+        bool valid = prevPos.w > 0.5
+          && abs(dot(P - prevPos.xyz, N)) < tol
+          && dot(N, normalize(prevN)) > 0.9;
+        if (valid) {
+          vec4 h = texture(uPrevAccum, prevUv); // bilinear
+          count = clamp(h.a, 0.0, uMaxHistory) + 1.0;
+          history = h.rgb;
+        }
+      }
+    }
+  }
+
+  // Exponential moving average; count=1 (disocclusion / first frame) means
+  // the fresh sample is used as-is.
+  vec3 blended = mix(history, sampleIrr, 1.0 / count);
+  outIrradiance = vec4(blended, count);
 }
 `;
 
@@ -217,7 +255,13 @@ export class RTLightingPass {
         uGWorldPos: { value: null },
         uGNormalMetal: { value: null },
         uPrevAccum: { value: null },
-        uSampleCount: { value: 1 },
+        uPrevGWorldPos: { value: null },
+        uPrevGNormalMetal: { value: null },
+        uPrevViewProj: { value: new THREE.Matrix4() },
+        uCameraPos: { value: new THREE.Vector3() },
+        uMaxHistory: { value: 128 },
+        uTemporalReprojection: { value: true },
+        uFireflyClamp: { value: 4.0 },
         uLightPosType: { value: [] },
         uLightColorRadius: { value: [] },
         uLightCount: { value: 0 },
@@ -238,16 +282,34 @@ export class RTLightingPass {
   }
 
   _makeTarget(width, height) {
+    // Half-float + linear: history is sampled bilinearly at reprojected UVs,
+    // and fp16 halves the bandwidth (EMA blending never accumulates a raw sum,
+    // so fp16 precision is sufficient).
     const t = new THREE.WebGLRenderTarget(width, height, {
-      minFilter: THREE.NearestFilter,
-      magFilter: THREE.NearestFilter,
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
-      type: THREE.FloatType,
+      type: THREE.HalfFloatType,
       depthBuffer: false,
       stencilBuffer: false,
     });
     t.texture.generateMipmaps = false;
     return t;
+  }
+
+  /** Clear both history buffers (e.g. after scene recompile or resize). */
+  clearHistory(renderer) {
+    const prevTarget = renderer.getRenderTarget();
+    const prevColor = new THREE.Color();
+    renderer.getClearColor(prevColor);
+    const prevAlpha = renderer.getClearAlpha();
+    renderer.setClearColor(0x000000, 0);
+    for (const t of [this.targetA, this.targetB]) {
+      renderer.setRenderTarget(t);
+      renderer.clear(true, false, false);
+    }
+    renderer.setRenderTarget(prevTarget);
+    renderer.setClearColor(prevColor, prevAlpha);
   }
 
   setSize(width, height) {
@@ -267,12 +329,13 @@ export class RTLightingPass {
   }
 
   /** Renders into targetA (reading targetB as history), then swaps. Returns the fresh accum texture. */
-  render(renderer, gbuffer, sampleCount, frame) {
+  render(renderer, gbuffer, frame) {
     const u = this.material.uniforms;
     u.uGWorldPos.value = gbuffer.worldPos;
     u.uGNormalMetal.value = gbuffer.normalMetal;
+    u.uPrevGWorldPos.value = gbuffer.prevWorldPos;
+    u.uPrevGNormalMetal.value = gbuffer.prevNormalMetal;
     u.uPrevAccum.value = this.targetB.texture;
-    u.uSampleCount.value = sampleCount;
     u.uFrame.value = frame;
 
     renderer.setRenderTarget(this.targetA);

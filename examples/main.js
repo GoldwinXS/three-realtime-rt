@@ -128,10 +128,14 @@ controls.update();
 
 // HUD
 const rtToggle = document.getElementById("rtToggle");
+const reprojToggle = document.getElementById("reprojToggle");
 const viewMode = document.getElementById("viewMode");
 const statsEl = document.getElementById("stats");
 viewMode.addEventListener("change", () => {
   rt.outputMode = parseInt(viewMode.value, 10);
+});
+reprojToggle.addEventListener("change", () => {
+  rt.temporalReprojection = reprojToggle.checked;
 });
 
 window.addEventListener("resize", () => {
@@ -169,7 +173,7 @@ function animate() {
     lastFpsTime = now;
     statsEl.textContent =
       `${fps} fps\n` +
-      `samples ${rt.sampleCount}\n` +
+      `frame ${rt.frame}\n` +
       `tris ${rt.compiled ? rt.compiled.triangleCount : 0}`;
   }
 }

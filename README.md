@@ -33,8 +33,8 @@ Temporal accumulation refines the image; WebGL2, no build step required by consu
 
 | Stage | Status | What |
 |-------|--------|------|
-| 1. Core | in progress | Scene→GPU sync, BVH, G-buffer, traced shadows + 1-bounce GI, accumulation |
-| 2. Reprojection | — | Motion vectors + history reprojection: keep samples while moving (real-time unlock) |
+| 1. Core | done | Scene→GPU sync, BVH, G-buffer, traced shadows + 1-bounce GI, accumulation |
+| 2. Reprojection | done | Motion vectors + history reprojection: keep samples while moving (real-time unlock) |
 | 3. Denoiser | — | Edge-avoiding à-trous (SVGF-lite) guided by G-buffer → clean 1spp |
 | 4. Many lights | — | Power-weighted light sampling → ReSTIR DI for hundreds of emitters |
 | 5. Dynamic scenes | — | TLAS/BLAS two-level BVH: rigid motion free, refit for deformables |

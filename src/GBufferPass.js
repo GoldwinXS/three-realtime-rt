@@ -58,17 +58,35 @@ void main() {
  */
 export class GBufferPass {
   constructor(width, height) {
-    this.target = new THREE.WebGLMultipleRenderTargets(width, height, 4, {
+    // Two G-buffers, ping-ponged each frame: the previous frame's worldPos +
+    // normals are needed to validate reprojected history (stage 2).
+    this._targets = [
+      this._makeTarget(width, height),
+      this._makeTarget(width, height),
+    ];
+    this._current = 0;
+
+    this._materialCache = new WeakMap(); // mesh -> gbuffer ShaderMaterial
+    this._swapped = []; // [mesh, originalMaterial] pairs during render
+    this._normalMat3 = new THREE.Matrix3();
+  }
+
+  _makeTarget(width, height) {
+    const t = new THREE.WebGLMultipleRenderTargets(width, height, 4, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       type: THREE.FloatType,
       depthBuffer: true,
     });
-    for (const tex of this.target.texture) tex.generateMipmaps = false;
+    for (const tex of t.texture) tex.generateMipmaps = false;
+    return t;
+  }
 
-    this._materialCache = new WeakMap(); // mesh -> gbuffer ShaderMaterial
-    this._swapped = []; // [mesh, originalMaterial] pairs during render
-    this._normalMat3 = new THREE.Matrix3();
+  get target() {
+    return this._targets[this._current];
+  }
+  get _prev() {
+    return this._targets[1 - this._current];
   }
 
   get albedoRough() {
@@ -83,9 +101,15 @@ export class GBufferPass {
   get emissive() {
     return this.target.texture[3];
   }
+  get prevNormalMetal() {
+    return this._prev.texture[1];
+  }
+  get prevWorldPos() {
+    return this._prev.texture[2];
+  }
 
   setSize(width, height) {
-    this.target.setSize(width, height);
+    for (const t of this._targets) t.setSize(width, height);
   }
 
   _gbufferMaterialFor(mesh) {
@@ -128,6 +152,9 @@ export class GBufferPass {
   }
 
   render(renderer, scene, camera) {
+    // Ping-pong: what was "current" becomes "previous".
+    this._current = 1 - this._current;
+
     // Swap in G-buffer materials.
     this._swapped.length = 0;
     scene.traverse((obj) => {
@@ -152,6 +179,6 @@ export class GBufferPass {
   }
 
   dispose() {
-    this.target.dispose();
+    for (const t of this._targets) t.dispose();
   }
 }
