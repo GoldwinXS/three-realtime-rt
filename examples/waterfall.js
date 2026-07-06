@@ -87,8 +87,7 @@ export function createWaterfall(scene, { x = -6.5, z = -6.0, floorY = 0 } = {}) 
     setVisible(v) { group.visible = v; },
     update(dt) {
       if (!group.visible) return;
-      fallTex.offset.y -= dt * 1.2;
-      poolTex.offset.y -= dt * 0.12;
+      poolTex.offset.y -= dt * 0.12; // gentle ripple drift on the pond surface
       poolTex.offset.x += dt * 0.03;
     },
   };
