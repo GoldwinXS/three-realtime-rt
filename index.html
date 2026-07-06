@@ -28,6 +28,14 @@
     <div id="title">three-realtime-rt</div>
     <label><input type="checkbox" id="rtToggle" checked /> ray tracing</label>
     <label><input type="checkbox" id="reprojToggle" checked /> reprojection</label>
+    <label><input type="checkbox" id="denoiseToggle" checked /> denoise</label>
+    <label>lighting res
+      <select id="scaleMode">
+        <option value="1">100%</option>
+        <option value="0.75">75%</option>
+        <option value="0.5" selected>50%</option>
+      </select>
+    </label>
     <label>view
       <select id="viewMode">
         <option value="0" selected>composite</option>

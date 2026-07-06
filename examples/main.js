@@ -185,6 +185,14 @@ viewMode.addEventListener("change", () => {
 reprojToggle.addEventListener("change", () => {
   rt.temporalReprojection = reprojToggle.checked;
 });
+const denoiseToggle = document.getElementById("denoiseToggle");
+denoiseToggle.addEventListener("change", () => {
+  rt.denoise = denoiseToggle.checked;
+});
+const scaleMode = document.getElementById("scaleMode");
+scaleMode.addEventListener("change", () => {
+  rt.renderScale = parseFloat(scaleMode.value);
+});
 
 window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;

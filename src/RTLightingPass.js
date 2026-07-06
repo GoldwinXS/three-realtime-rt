@@ -38,6 +38,7 @@ uniform sampler2D uPrevAccum;        // rgb = irradiance history, a = sample cou
 uniform sampler2D uPrevGWorldPos;    // previous frame's G-buffer, for validation
 uniform sampler2D uPrevGNormalMetal;
 uniform mat4 uPrevViewProj;
+uniform mat4 uViewProj;
 uniform vec3 uCameraPos;
 uniform float uMaxHistory;
 uniform bool uTemporalReprojection;
@@ -205,8 +206,15 @@ void main() {
   vec3 history = vec3(0.0);
   if (uTemporalReprojection) {
     vec4 clip = uPrevViewProj * vec4(P, 1.0);
-    if (clip.w > 0.0) {
+    vec4 clipC = uViewProj * vec4(P, 1.0);
+    if (clip.w > 0.0 && clipC.w > 0.0) {
       vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
+      // P comes from a full-res G-buffer texel, which sits sub-pixel off this
+      // half-res fragment's center. That constant offset would bias bilinear
+      // history reads every frame (content drifts/smears at renderScale < 1).
+      // Cancel it: measure P's offset in the CURRENT frame and subtract.
+      vec2 currUv = (clipC.xy / clipC.w) * 0.5 + 0.5;
+      prevUv -= currUv - vUv;
       if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
         vec4 prevPos = texture(uPrevGWorldPos, prevUv);
         vec3 prevN = texture(uPrevGNormalMetal, prevUv).xyz;
@@ -258,6 +266,7 @@ export class RTLightingPass {
         uPrevGWorldPos: { value: null },
         uPrevGNormalMetal: { value: null },
         uPrevViewProj: { value: new THREE.Matrix4() },
+        uViewProj: { value: new THREE.Matrix4() },
         uCameraPos: { value: new THREE.Vector3() },
         uMaxHistory: { value: 128 },
         uTemporalReprojection: { value: true },
