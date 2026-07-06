@@ -4,6 +4,21 @@ import { GBufferPass } from "./GBufferPass.js";
 import { RTLightingPass } from "./RTLightingPass.js";
 import { DenoisePass } from "./DenoisePass.js";
 import { CompositePass } from "./CompositePass.js";
+import { TAAPass } from "./TAAPass.js";
+
+// Van der Corput / Halton radical inverse — deterministic low-discrepancy
+// sub-pixel offsets for temporal jitter.
+function halton(index, base) {
+  let f = 1;
+  let r = 0;
+  let i = index;
+  while (i > 0) {
+    f /= base;
+    r += f * (i % base);
+    i = Math.floor(i / base);
+  }
+  return r;
+}
 
 /**
  * Drop-in ray traced renderer for three.js scenes.
@@ -34,6 +49,8 @@ export class RealtimeRaytracer {
     this.rtPass = new RTLightingPass(this._scaledW, this._scaledH);
     this.denoisePass = new DenoisePass(this._scaledW, this._scaledH);
     this.composite = new CompositePass();
+    this.taaPass = new TAAPass(this._width, this._height);
+    this._sceneColor = this._makeColorTarget(this._width, this._height);
 
     this.compiled = null;
     this.frame = 0;
@@ -56,9 +73,34 @@ export class RealtimeRaytracer {
     /** À-trous iterations (steps 1, 2, 4, ...). */
     this.denoiseIterations = options.denoiseIterations ?? 3;
 
+    /**
+     * Temporal anti-aliasing: sub-pixel projection jitter + a full-res history
+     * resolve with neighbourhood clamp. Supersamples silhouettes over time and
+     * clears the bright disocclusion speckles at edges. Analytic (FSR2 / TAAU
+     * family), not a learned upscaler.
+     */
+    this.taa = options.taa ?? true;
+    /** Fresh-sample weight in the TAA blend (lower = smoother/more AA, more lag). */
+    this.taaBlend = options.taaBlend ?? 0.1;
+    this._jitterIndex = 0;
+    this._jitteredViewProj = new THREE.Matrix4();
+
     this._prevViewProj = new THREE.Matrix4();
     this._camWorldPos = new THREE.Vector3();
     this._needsClear = true;
+  }
+
+  _makeColorTarget(width, height) {
+    const t = new THREE.WebGLRenderTarget(width, height, {
+      minFilter: THREE.LinearFilter,
+      magFilter: THREE.LinearFilter,
+      format: THREE.RGBAFormat,
+      type: THREE.HalfFloatType,
+      depthBuffer: false,
+      stencilBuffer: false,
+    });
+    t.texture.generateMipmaps = false;
+    return t;
   }
 
   /** Build/rebuild BVH + material and light tables from the scene. Call after scene changes. */
@@ -72,6 +114,7 @@ export class RealtimeRaytracer {
 
   resetAccumulation() {
     this._needsClear = true;
+    if (this.taaPass) this.taaPass.reset();
   }
 
   get _scaledW() {
@@ -95,6 +138,8 @@ export class RealtimeRaytracer {
     this.gbuffer.setSize(this._width, this._height);
     this.rtPass.setSize(this._scaledW, this._scaledH);
     this.denoisePass.setSize(this._scaledW, this._scaledH);
+    this.taaPass.setSize(this._width, this._height);
+    this._sceneColor.setSize(this._width, this._height);
     this.resetAccumulation();
   }
 
@@ -103,6 +148,25 @@ export class RealtimeRaytracer {
 
     this.frame += 1;
     camera.updateMatrixWorld();
+
+    // --- sub-pixel jitter (TAA): offset the projection a fraction of a pixel
+    // each frame so the whole pipeline (raster G-buffer + traced lighting)
+    // samples slightly different positions; the TAA resolve averages them into
+    // supersampled edges. Restored after the frame so callers see a clean matrix.
+    const proj = camera.projectionMatrix;
+    const savedProj8 = proj.elements[8];
+    const savedProj9 = proj.elements[9];
+    if (this.taa) {
+      this._jitterIndex = (this._jitterIndex + 1) % 16;
+      const jx = (halton(this._jitterIndex + 1, 2) - 0.5) * 2 / this._width;
+      const jy = (halton(this._jitterIndex + 1, 3) - 0.5) * 2 / this._height;
+      proj.elements[8] += jx;
+      proj.elements[9] += jy;
+    }
+    // View-projection actually used to render this frame (jittered if TAA on).
+    this._jitteredViewProj
+      .copy(proj)
+      .multiply(camera.matrixWorldInverse);
 
     const prevAutoClear = this.renderer.autoClear;
     this.renderer.autoClear = false;
@@ -124,9 +188,7 @@ export class RealtimeRaytracer {
     rtU.uMaxHistory.value = this.maxHistory;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
     rtU.uPrevViewProj.value.copy(this._prevViewProj);
-    rtU.uViewProj.value
-      .copy(camera.projectionMatrix)
-      .multiply(camera.matrixWorldInverse);
+    rtU.uViewProj.value.copy(this._jitteredViewProj);
     rtU.uCameraPos.value.copy(camera.getWorldPosition(this._camWorldPos));
     let irradiance = this.rtPass.render(this.renderer, this.gbuffer, this.frame);
 
@@ -142,20 +204,47 @@ export class RealtimeRaytracer {
       );
     }
 
-    // 4. composite to screen (bilateral upsample if lighting is sub-res)
+    // 4. composite (bilateral upsample if lighting is sub-res). With TAA on,
+    // render to an offscreen colour target so the resolve can accumulate it;
+    // otherwise straight to screen. Debug views bypass TAA (raw buffers).
+    const useTaa = this.taa && this.outputMode === 0;
     const cU = this.composite.material.uniforms;
     cU.uOutputMode.value = this.outputMode;
     cU.uUpsample.value = this._renderScale < 1;
     cU.uIrrTexelSize.value.set(1 / this._scaledW, 1 / this._scaledH);
     cU.uCameraPos.value.copy(this._camWorldPos);
-    this.composite.render(this.renderer, irradiance, this.gbuffer, scene.background);
+    this.composite.render(
+      this.renderer,
+      irradiance,
+      this.gbuffer,
+      scene.background,
+      useTaa ? this._sceneColor : null
+    );
+
+    // 5. temporal anti-aliasing resolve (jitter + neighbourhood-clamped history).
+    if (useTaa) {
+      this.taaPass.render(
+        this.renderer,
+        this._sceneColor.texture,
+        this.gbuffer,
+        this._prevViewProj, // last frame's jittered VP
+        this._camWorldPos,
+        this.eps,
+        this.taaBlend
+      );
+    } else if (this.taa) {
+      // In a debug view: keep history fresh so switching back doesn't ghost.
+      this.taaPass.reset();
+    }
 
     this.renderer.autoClear = prevAutoClear;
 
-    // Record this frame's view-projection for next frame's reprojection.
-    this._prevViewProj
-      .copy(camera.projectionMatrix)
-      .multiply(camera.matrixWorldInverse);
+    // Restore the caller's projection matrix (remove this frame's jitter).
+    proj.elements[8] = savedProj8;
+    proj.elements[9] = savedProj9;
+
+    // Record this frame's (jittered) view-projection for next frame's reprojection.
+    this._prevViewProj.copy(this._jitteredViewProj);
   }
 
   dispose() {
@@ -163,6 +252,8 @@ export class RealtimeRaytracer {
     this.rtPass.dispose();
     this.denoisePass.dispose();
     this.composite.dispose();
+    this.taaPass.dispose();
+    this._sceneColor.dispose();
     if (this.compiled) this.compiled.dispose();
   }
 }

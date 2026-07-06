@@ -125,7 +125,7 @@ export class CompositePass {
     this.scene.add(this.quad);
   }
 
-  render(renderer, irradianceTexture, gbuffer, background) {
+  render(renderer, irradianceTexture, gbuffer, background, target = null) {
     const u = this.material.uniforms;
     u.uIrradiance.value = irradianceTexture;
     u.uGAlbedoRough.value = gbuffer.albedoRough;
@@ -135,7 +135,7 @@ export class CompositePass {
     if (background && background.isColor) {
       u.uBackgroundColor.value.copy(background);
     }
-    renderer.setRenderTarget(null);
+    renderer.setRenderTarget(target);
     renderer.render(this.scene, this.camera);
   }
 

@@ -189,6 +189,10 @@ const denoiseToggle = document.getElementById("denoiseToggle");
 denoiseToggle.addEventListener("change", () => {
   rt.denoise = denoiseToggle.checked;
 });
+const taaToggle = document.getElementById("taaToggle");
+taaToggle.addEventListener("change", () => {
+  rt.taa = taaToggle.checked;
+});
 const scaleMode = document.getElementById("scaleMode");
 scaleMode.addEventListener("change", () => {
   rt.renderScale = parseFloat(scaleMode.value);
