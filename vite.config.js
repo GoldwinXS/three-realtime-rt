@@ -42,6 +42,11 @@ export default defineConfig({
   // The example uses top-level await; target a modern engine (WebGL2 already
   // requires one). esbuild's default "modules" target rejects TLA.
   build: { target: "esnext" },
+  // Only scan OUR entry. By default vite crawls every .html under root, which
+  // pulls in RealTimeJSRayTracer/ (a git-ignored reference clone) whose bare
+  // imports (vox-reader) aren't installed — failing dep optimization and
+  // stalling the dev server.
+  optimizeDeps: { entries: ["index.html"] },
   plugins: [shotSaver()],
   server: {
     host: "0.0.0.0",

@@ -65,9 +65,11 @@ rt.updateDynamic();       // re-bakes them into the BVH (refit) — cheap
 rt.render(scene, camera);
 ```
 
-`updateDynamic()` re-bakes only the dynamic meshes and refits the BVH; skip it
-on frames where nothing moved. (A full two-level TLAS/BLAS is the roadmap item
-for large dynamic scenes.)
+Under the hood this is a **two-level BVH**: static geometry lives in one BVH
+uploaded to the GPU once at compile time, dynamic meshes in a second small BVH
+that is re-baked and refit per frame. `updateDynamic()` therefore costs
+~1 ms for dozens of moving objects *regardless of how big the static world is* —
+skip it entirely on frames where nothing moved.
 
 ## Live lighting & sky
 
@@ -134,8 +136,8 @@ it to GitHub Pages.
 | 2. Reprojection | ✅ | Motion-validated history — samples survive camera motion |
 | 3. Denoiser | ✅ | Edge-avoiding à-trous (SVGF-lite) → clean 1spp |
 | 4. TAA | ✅ | Sub-pixel jitter + neighbourhood-clamped resolve → AA, no speckles |
-| 4b. Dynamic BVH | ✅ | Rigid-body refit → correct shadows on moving objects (+ procedural sky) |
-| 5. Two-level BVH | — | TLAS/BLAS for large/deformable dynamic scenes |
+| 4b. Sky | ✅ | Procedural sky as background + GI ambient light source |
+| 5. Two-level BVH | ✅ | Static BVH uploaded once; movers in a small per-frame BVH → dynamic shadows at ~1 ms |
 | 6. Specular | — | Glossy reflections + refractive water; npm publish |
 
 ## Credits

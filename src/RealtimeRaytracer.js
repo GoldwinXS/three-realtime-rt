@@ -141,9 +141,14 @@ export class RealtimeRaytracer {
     return this.compiled;
   }
 
-  /** Re-bake moving (dynamic) meshes into the BVH. Call each frame after moving them. */
+  /**
+   * Re-bake moving (dynamic) meshes into the dynamic BVH level. Call each frame
+   * after moving them. Only the dynamic level is touched — the static BVH was
+   * uploaded once at compile time — so cost scales with the moving triangle
+   * count, not the scene size.
+   */
   updateDynamic() {
-    if (this.compiled) this.compiled.updateDynamic(this.frame % 8 === 0);
+    if (this.compiled) this.compiled.updateDynamic();
   }
 
   /**

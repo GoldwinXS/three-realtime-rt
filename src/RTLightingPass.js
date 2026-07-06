@@ -27,10 +27,15 @@ layout(location = 0) out vec4 outIrradiance;
 
 in vec2 vUv;
 
-uniform BVH bvh;
-uniform sampler2D uNormalAttr;      // per-vertex normals of merged geometry
-uniform sampler2D uMatIndexAttr;    // per-vertex material index
-uniform sampler2D uMaterialsTex;    // 2 texels per material
+// Two-level BVH: static (uploaded once) + dynamic (small, refit each frame).
+uniform BVH bvhStatic;
+uniform BVH bvhDynamic;
+uniform bool uHasDynamic;
+// One packed per-vertex texture per level: normal.xyz + materialIndex.w.
+// (Two BVH structs already use 8 samplers; WebGL2 guarantees only 16 total.)
+uniform sampler2D uAttrStatic;
+uniform sampler2D uAttrDynamic;
+uniform sampler2D uMaterialsTex;        // 2 texels per material (shared)
 
 uniform sampler2D uGWorldPos;
 uniform sampler2D uGNormalMetal;
@@ -100,16 +105,25 @@ vec3 randUnitVector() {
   return vec3(r * cos(a), r * sin(a), z);
 }
 
-// ---------- BVH helpers ----------
-bool traceRay(vec3 ro, vec3 rd, out uvec4 faceIndices, out vec3 faceNormal,
-              out vec3 barycoord, out float side, out float dist) {
-  return bvhIntersectFirstHit(bvh, ro, rd, faceIndices, faceNormal, barycoord, side, dist);
+// ---------- two-level BVH helpers ----------
+// Closest hit across both levels; isDyn says which one so the caller samples
+// the matching vertex-attribute textures. (No backticks in these GLSL comments —
+// they would terminate the enclosing JS template literal.)
+bool traceBoth(vec3 ro, vec3 rd, out uvec4 fi, out vec3 bary, out float dist, out bool isDyn) {
+  uvec4 fiS; vec3 fnS; vec3 bcS; float sideS; float distS;
+  bool hitS = bvhIntersectFirstHit(bvhStatic, ro, rd, fiS, fnS, bcS, sideS, distS);
+  uvec4 fiD; vec3 fnD; vec3 bcD; float sideD; float distD;
+  bool hitD = uHasDynamic && bvhIntersectFirstHit(bvhDynamic, ro, rd, fiD, fnD, bcD, sideD, distD);
+  if (hitS && (!hitD || distS <= distD)) { fi = fiS; bary = bcS; dist = distS; isDyn = false; return true; }
+  if (hitD) { fi = fiD; bary = bcD; dist = distD; isDyn = true; return true; }
+  return false;
 }
 
 bool occluded(vec3 ro, vec3 rd, float maxDist) {
   uvec4 fi; vec3 fn; vec3 bc; float side; float dist;
-  bool hit = bvhIntersectFirstHit(bvh, ro, rd, fi, fn, bc, side, dist);
-  return hit && dist < maxDist - 2.0 * uEps;
+  if (bvhIntersectFirstHit(bvhStatic, ro, rd, fi, fn, bc, side, dist) && dist < maxDist - 2.0 * uEps) return true;
+  if (uHasDynamic && bvhIntersectFirstHit(bvhDynamic, ro, rd, fi, fn, bc, side, dist) && dist < maxDist - 2.0 * uEps) return true;
+  return false;
 }
 
 void fetchMaterial(float matIndex, out vec3 albedo, out float roughness,
@@ -188,13 +202,16 @@ void main() {
   vec3 indirect = vec3(0.0);
   if (uGIEnabled) {
     vec3 dir = cosineSampleHemisphere(N, rand2());
-    uvec4 faceIndices; vec3 faceNormal; vec3 barycoord; float side; float dist;
-    if (traceRay(P + N * uEps, dir, faceIndices, faceNormal, barycoord, side, dist)) {
-      float matIndex = textureSampleBarycoord(uMatIndexAttr, barycoord, faceIndices.xyz).r;
+    uvec4 faceIndices; vec3 barycoord; float dist; bool isDyn;
+    if (traceBoth(P + N * uEps, dir, faceIndices, barycoord, dist, isDyn)) {
+      // One packed fetch: normal.xyz + materialIndex.w for the hit level.
+      vec4 attr = isDyn
+        ? textureSampleBarycoord(uAttrDynamic, barycoord, faceIndices.xyz)
+        : textureSampleBarycoord(uAttrStatic, barycoord, faceIndices.xyz);
       vec3 hAlbedo; float hRough; vec3 hEmissive; float hMetal;
-      fetchMaterial(matIndex, hAlbedo, hRough, hEmissive, hMetal);
+      fetchMaterial(attr.w, hAlbedo, hRough, hEmissive, hMetal);
 
-      vec3 hN = normalize(textureSampleBarycoord(uNormalAttr, barycoord, faceIndices.xyz).xyz);
+      vec3 hN = normalize(attr.xyz);
       if (dot(hN, dir) > 0.0) hN = -hN;
 
       vec3 hP = P + dir * dist;
@@ -271,9 +288,11 @@ export class RTLightingPass {
       vertexShader: fullscreenVert,
       fragmentShader: rtLightingFrag,
       uniforms: {
-        bvh: { value: null },
-        uNormalAttr: { value: null },
-        uMatIndexAttr: { value: null },
+        bvhStatic: { value: null },
+        bvhDynamic: { value: null },
+        uHasDynamic: { value: false },
+        uAttrStatic: { value: null },
+        uAttrDynamic: { value: null },
         uMaterialsTex: { value: null },
         uGWorldPos: { value: null },
         uGNormalMetal: { value: null },
@@ -350,9 +369,11 @@ export class RTLightingPass {
 
   setCompiledScene(compiled) {
     const u = this.material.uniforms;
-    u.bvh.value = compiled.bvhUniform;
-    u.uNormalAttr.value = compiled.normalAttrTex;
-    u.uMatIndexAttr.value = compiled.matIndexAttrTex;
+    u.bvhStatic.value = compiled.staticBvhUniform;
+    u.bvhDynamic.value = compiled.dynamicBvhUniform;
+    u.uHasDynamic.value = compiled.hasDynamic;
+    u.uAttrStatic.value = compiled.staticAttrTex;
+    u.uAttrDynamic.value = compiled.dynamicAttrTex;
     u.uMaterialsTex.value = compiled.materialsTex;
     u.uLightPosType.value = compiled.lightPosType;
     u.uLightColorRadius.value = compiled.lightColorRadius;
