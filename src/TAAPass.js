@@ -25,19 +25,27 @@ in vec2 vUv;
 uniform sampler2D uCurrent;        // this frame's composited LDR colour
 uniform sampler2D uHistory;        // previous resolved colour
 uniform sampler2D uGWorldPos;      // current full-res G-buffer
-uniform sampler2D uGNormalMetal;
-uniform sampler2D uPrevGWorldPos;  // previous frame's G-buffer (validation)
-uniform sampler2D uPrevGNormalMetal;
 uniform mat4 uPrevViewProj;
-uniform vec3 uCameraPos;
 uniform vec2 uTexelSize;
-uniform float uEps;
+uniform vec2 uJitter;              // this frame's projection jitter (UV space)
+uniform vec2 uPrevJitter;          // last frame's projection jitter (UV space)
 uniform float uBlend;              // fresh-sample weight when history is valid (~0.1)
 uniform bool uReset;               // first frame after a scene/size change
 
+// The raster (and the whole lighting chain guided by it) wobbles with the
+// sub-pixel jitter. Resolving on that wobbling grid drags history along with
+// it — the image shimmers. So the resolve UNJITTERS its input: content that
+// unjittered would sit at u is rasterized at u + jitter, hence sample there.
+// Output then lives on a stable grid and jitter only contributes sub-pixel
+// coverage information over time (which is what gives the anti-aliasing).
+vec3 sampleCurrent(vec2 uv) {
+  return texture(uCurrent, uv + uJitter).rgb;
+}
+
 void main() {
-  vec3 current = texture(uCurrent, vUv).rgb;
-  vec4 wp = texture(uGWorldPos, vUv);
+  vec3 current = sampleCurrent(vUv);
+  // World position of the (unjittered) content at this pixel — same offset.
+  vec4 wp = texture(uGWorldPos, vUv + uJitter);
 
   // Background (no geometry): no useful reprojection, show current directly.
   if (wp.w < 0.5 || uReset) {
@@ -46,7 +54,6 @@ void main() {
   }
 
   vec3 P = wp.xyz;
-  vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
 
   // Neighbourhood colour AABB (used to clamp history — the core anti-ghost /
   // anti-speckle step). Also the min corner tells us the local floor, so a
@@ -55,32 +62,29 @@ void main() {
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       if (dx == 0 && dy == 0) continue;
-      vec3 c = texture(uCurrent, vUv + vec2(float(dx), float(dy)) * uTexelSize).rgb;
+      vec3 c = sampleCurrent(vUv + vec2(float(dx), float(dy)) * uTexelSize);
       nmin = min(nmin, c);
       nmax = max(nmax, c);
     }
   }
 
-  // Reproject this pixel's world point into the previous frame.
+  // Reproject this pixel's world point into the previous frame. The history is
+  // a STABILIZED (unjittered-grid) image, so remove last frame's jitter from
+  // the projected position before sampling it.
   vec4 clip = uPrevViewProj * vec4(P, 1.0);
   if (clip.w <= 0.0) { outColor = vec4(current, 1.0); return; }
-  vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
+  vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5 - uPrevJitter;
   if (prevUv.x < 0.0 || prevUv.x > 1.0 || prevUv.y < 0.0 || prevUv.y > 1.0) {
     outColor = vec4(current, 1.0);
     return;
   }
 
-  // Validate against the previous G-buffer: same surface (plane distance) and
-  // same orientation. Rejecting here is what stops smeared trails on motion.
-  vec4 prevPos = texture(uPrevGWorldPos, prevUv);
-  vec3 prevN = texture(uPrevGNormalMetal, prevUv).xyz;
-  float distToCam = distance(P, uCameraPos);
-  float tol = 0.01 * distToCam + 20.0 * uEps;
-  bool valid = prevPos.w > 0.5
-    && abs(dot(P - prevPos.xyz, N)) < tol
-    && dot(N, normalize(prevN)) > 0.9;
-  if (!valid) { outColor = vec4(current, 1.0); return; }
-
+  // NOTE: no geometric (depth/normal) history validation here, on purpose.
+  // Under sub-pixel jitter such tests fail on every hard edge each frame,
+  // dropping those pixels to the raw jittered current — the whole image
+  // shimmers. The neighbourhood clamp below already bounds any stale history
+  // (disocclusions resolve within a frame or two), which is exactly how
+  // production TAA implementations handle rejection.
   vec3 history = texture(uHistory, prevUv).rgb;
   // Guard against a stray non-finite history value poisoning the buffer (it
   // would otherwise re-blend with itself every frame and stick as black).
@@ -126,13 +130,10 @@ export class TAAPass {
         uCurrent: { value: null },
         uHistory: { value: null },
         uGWorldPos: { value: null },
-        uGNormalMetal: { value: null },
-        uPrevGWorldPos: { value: null },
-        uPrevGNormalMetal: { value: null },
         uPrevViewProj: { value: new THREE.Matrix4() },
-        uCameraPos: { value: new THREE.Vector3() },
         uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) },
-        uEps: { value: 1e-3 },
+        uJitter: { value: new THREE.Vector2() },
+        uPrevJitter: { value: new THREE.Vector2() },
         uBlend: { value: 0.1 },
         uReset: { value: true },
       },
@@ -185,20 +186,19 @@ export class TAAPass {
 
   /**
    * @param currentColor tonemapped LDR colour texture for this frame
-   * @param gbuffer      current GBufferPass (provides curr + prev G-buffer)
+   * @param gbuffer      current GBufferPass (provides the world-pos guide)
    * @param prevViewProj the *jittered* view-projection used last frame
+   * @param jitterUv     this frame's projection jitter in UV space
+   * @param prevJitterUv last frame's projection jitter in UV space
    */
-  render(renderer, currentColor, gbuffer, prevViewProj, cameraPos, eps, blend) {
+  render(renderer, currentColor, gbuffer, prevViewProj, jitterUv, prevJitterUv, blend) {
     const u = this.material.uniforms;
     u.uCurrent.value = currentColor;
     u.uHistory.value = this.targetB.texture; // previous resolved
     u.uGWorldPos.value = gbuffer.worldPos;
-    u.uGNormalMetal.value = gbuffer.normalMetal;
-    u.uPrevGWorldPos.value = gbuffer.prevWorldPos;
-    u.uPrevGNormalMetal.value = gbuffer.prevNormalMetal;
     u.uPrevViewProj.value.copy(prevViewProj);
-    u.uCameraPos.value.copy(cameraPos);
-    u.uEps.value = eps;
+    u.uJitter.value.copy(jitterUv);
+    u.uPrevJitter.value.copy(prevJitterUv);
     u.uBlend.value = blend;
     u.uReset.value = this._reset;
 

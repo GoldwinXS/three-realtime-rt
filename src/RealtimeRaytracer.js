@@ -109,6 +109,8 @@ export class RealtimeRaytracer {
     this._invViewProj = new THREE.Matrix4();
     this._jitterIndex = 0;
     this._jitteredViewProj = new THREE.Matrix4();
+    this._jitterUv = new THREE.Vector2(); // this frame's jitter in UV space
+    this._prevJitterUv = new THREE.Vector2();
 
     this._prevViewProj = new THREE.Matrix4();
     this._camWorldPos = new THREE.Vector3();
@@ -212,6 +214,12 @@ export class RealtimeRaytracer {
       const jy = (halton(this._jitterIndex + 1, 3) - 0.5) * 2 / this._height;
       proj.elements[8] += jx;
       proj.elements[9] += jy;
+      // Where this jitter moves the image, in UV space: elements[8/9] multiply
+      // view-space z (= -w), so NDC shifts by -j → UV by -j/2. The TAA resolve
+      // uses this to unjitter its input back onto a stable grid.
+      this._jitterUv.set(-jx * 0.5, -jy * 0.5);
+    } else {
+      this._jitterUv.set(0, 0);
     }
     // View-projection actually used to render this frame (jittered if TAA on).
     this._jitteredViewProj
@@ -295,8 +303,8 @@ export class RealtimeRaytracer {
         this._sceneColor.texture,
         this.gbuffer,
         this._prevViewProj, // last frame's jittered VP
-        this._camWorldPos,
-        this.eps,
+        this._jitterUv,
+        this._prevJitterUv,
         this.taaBlend
       );
     } else if (this.taa) {
@@ -310,8 +318,9 @@ export class RealtimeRaytracer {
     proj.elements[8] = savedProj8;
     proj.elements[9] = savedProj9;
 
-    // Record this frame's (jittered) view-projection for next frame's reprojection.
+    // Record this frame's (jittered) view-projection + jitter for next frame.
     this._prevViewProj.copy(this._jitteredViewProj);
+    this._prevJitterUv.copy(this._jitterUv);
   }
 
   dispose() {
