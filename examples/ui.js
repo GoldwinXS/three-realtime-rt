@@ -45,6 +45,8 @@ const CSS = `
 #panel .stats { border-top: 1px solid var(--panel-br); padding: 9px 14px; color: var(--ink-dim);
   white-space: pre; font-size: 11px; line-height: 1.5; }
 #panel .stats b { color: var(--accent-2); }
+#panel .stats a { color: var(--accent-2); text-decoration: none; }
+#panel .stats a:hover { text-decoration: underline; }
 #hint { position: fixed; bottom: 12px; left: 14px; z-index: 20; color: #6b7f8c;
   font: 11px ui-monospace, Consolas, monospace; background: rgba(14,18,24,0.7);
   border: 1px solid #26323c; border-radius: 6px; padding: 6px 10px; }
@@ -211,6 +213,12 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights }) {
 
   const stats = el("div", "stats");
   panel.append(stats);
+
+  const links = el("div", "stats");
+  links.innerHTML =
+    `<a href="https://github.com/GoldwinXS/three-realtime-rt" target="_blank" rel="noopener">GitHub (MIT)</a>` +
+    ` &middot; <a href="https://goldwinxs.itch.io/three-realtime-rt-supporter-pack" target="_blank" rel="noopener">Supporter pack</a>`;
+  panel.append(links);
 
   document.body.append(panel);
 
