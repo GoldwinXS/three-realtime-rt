@@ -30,7 +30,15 @@ const setBoot = (t) => { if (bootMsg) bootMsg.textContent = t; };
 // tab during the heavy RT shader compile or run out of texture memory. When
 // that happens we reload with ?safe=1 and render plain rasterized three.js
 // instead of crashing the browser.
-const SAFE = new URLSearchParams(location.search).has("safe");
+// iOS kills the whole tab process (jetsam) during the heavy RT shader
+// compile — no JS error handler ever runs, so a reactive fallback can't
+// save us there. Instead iOS starts in compatibility mode and full RT is
+// opt-in via ?rt=1.
+const PARAMS = new URLSearchParams(location.search);
+const IOS =
+  /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const SAFE = PARAMS.has("safe") || (IOS && !PARAMS.has("rt"));
 let safeModeTriggered = false;
 const enterSafeMode = (why) => {
   if (SAFE || safeModeTriggered) return;
@@ -80,7 +88,15 @@ async function main() {
     note.style.cssText =
       "position:fixed;top:12px;left:14px;z-index:30;color:#8fa3b3;font:11px ui-monospace,Consolas,monospace;" +
       "background:rgba(14,18,24,0.8);border:1px solid #26323c;border-radius:6px;padding:6px 10px;";
-    note.textContent = "compatibility mode — ray tracing off on this device (works on desktop)";
+    if (IOS && !PARAMS.has("safe")) {
+      const u = new URL(location.href);
+      u.searchParams.set("rt", "1");
+      note.innerHTML =
+        `compatibility mode — the RT pipeline is heavy for iOS Safari. ` +
+        `<a href="${u.pathname + u.search}" style="color:#7fd8c8">try full ray tracing anyway</a>`;
+    } else {
+      note.textContent = "compatibility mode — ray tracing off on this device (works on desktop)";
+    }
     document.body.append(note);
 
     const controls2 = new OrbitControls(camera, renderer.domElement);
