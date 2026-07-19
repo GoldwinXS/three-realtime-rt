@@ -6,6 +6,7 @@ import { DenoisePass } from "./DenoisePass.js";
 import { CompositePass } from "./CompositePass.js";
 import { TAAPass } from "./TAAPass.js";
 import { VolumetricPass } from "./VolumetricPass.js";
+import { RestirPass } from "./RestirPass.js";
 
 // Van der Corput / Halton radical inverse — deterministic low-discrepancy
 // sub-pixel offsets for temporal jitter.
@@ -253,6 +254,15 @@ export class RealtimeRaytracer {
     };
     this.volumetricPass = new VolumetricPass(this._scaledW, this._scaledH);
 
+    /**
+     * ReSTIR direct lighting: per-pixel reservoirs converge onto the light
+     * that matters most to each pixel (temporal reuse, one visibility ray at
+     * shading). Cost is flat in light count; also greatly reduces emissive
+     * area-light noise. On by default — turn off to compare estimators.
+     */
+    this.restir = options.restir ?? true;
+    this.restirPass = new RestirPass(this._scaledW, this._scaledH);
+
     /** Distance fog (composited in linear space before tonemap). */
     this.fog = {
       enabled: options.fog?.enabled ?? false,
@@ -313,6 +323,7 @@ export class RealtimeRaytracer {
     }
     this.rtPass.setCompiledScene(this.compiled);
     this.volumetricPass.setCompiledScene(this.compiled);
+    this.restirPass.setCompiledScene(this.compiled);
     this.resetAccumulation();
     return this.compiled;
   }
@@ -337,6 +348,7 @@ export class RealtimeRaytracer {
     syncLights(scene, this.compiled);
     this.rtPass.setCompiledScene(this.compiled);
     this.volumetricPass.setCompiledScene(this.compiled);
+    this.restirPass.setCompiledScene(this.compiled);
   }
 
   resetAccumulation() {
@@ -368,6 +380,7 @@ export class RealtimeRaytracer {
     this.rtPass.setSize(this._scaledW, this._scaledH);
     this.denoisePass.setSize(this._scaledW, this._scaledH);
     this.volumetricPass.setSize(this._scaledW, this._scaledH);
+    this.restirPass.setSize(this._scaledW, this._scaledH);
     this.taaPass.setSize(this._width, this._height);
     this._sceneColor.setSize(this._width, this._height);
     this.resetAccumulation();
@@ -452,6 +465,7 @@ export class RealtimeRaytracer {
     if (this._needsClear) {
       this.rtPass.clearHistory(this.renderer);
       this.volumetricPass.clearHistory(this.renderer);
+      this.restirPass.clearHistory(this.renderer);
       this._needsClear = false;
     }
 
@@ -481,7 +495,21 @@ export class RealtimeRaytracer {
     rtU.uPrevViewProj.value.copy(this._prevViewProj);
     rtU.uViewProj.value.copy(this._jitteredViewProj);
     rtU.uCameraPos.value.copy(camera.getWorldPosition(this._camWorldPos));
-    let irradiance = this.rtPass.render(this.renderer, this.gbuffer, this.frame);
+
+    // 2a. ReSTIR reservoirs (ALU-only, no rays) — the lighting pass shades
+    // each pixel's winner with a single visibility ray.
+    let reservoirTex = null;
+    if (this.restir) {
+      reservoirTex = this.restirPass.render(
+        this.renderer,
+        this.gbuffer,
+        this._prevViewProj,
+        this._camWorldPos,
+        this.frame,
+        this.eps
+      );
+    }
+    let irradiance = this.rtPass.render(this.renderer, this.gbuffer, this.frame, reservoirTex);
 
     // 3. denoise (display-only: history keeps accumulating raw samples)
     if (this.denoise && this.denoiseIterations > 0) {
@@ -576,6 +604,7 @@ export class RealtimeRaytracer {
     this.composite.dispose();
     this.taaPass.dispose();
     this.volumetricPass.dispose();
+    this.restirPass.dispose();
     this._sceneColor.dispose();
     if (this.compiled) this.compiled.dispose();
   }

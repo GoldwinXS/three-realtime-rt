@@ -193,6 +193,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   fSec.append(toggle("emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);
   fSec.append(toggle("reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
   fSec.append(toggle("refraction", rt.refraction, (v) => setFeature("refraction", v)).row);
+  fSec.append(toggle("ReSTIR lights", rt.restir, (v) => { rt.restir = v; rt.resetAccumulation(); }).row);
   fSec.append(toggle("fast lights (1 ray)", rt.stochasticLights, (v) => { rt.stochasticLights = v; rt.adaptiveQuality = false; rt.resetAccumulation(); }).row);
   fSec.append(slider("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v)));
   fSec.append(slider("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v)));

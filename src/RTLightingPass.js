@@ -42,10 +42,12 @@ uniform sampler2D uMaterialsTex;        // 2 texels per material (shared)
 uniform sampler2D uGWorldPos;
 uniform sampler2D uGNormalMetal;
 
-// temporal reprojection (stage 2)
+// temporal reprojection (stage 2). Validation is plane-distance only — the
+// normal test was dropped to free a sampler for the ReSTIR reservoir (same
+// simplification the TAA resolve already made, no observed regressions).
 uniform sampler2D uPrevAccum;        // rgb = irradiance history, a = sample count
 uniform sampler2D uPrevGWorldPos;    // previous frame's G-buffer, for validation
-uniform sampler2D uPrevGNormalMetal;
+uniform sampler2D uReservoir;        // ReSTIR winner per pixel (see RestirPass)
 uniform mat4 uPrevViewProj;
 uniform mat4 uViewProj;
 uniform vec3 uCameraPos;
@@ -61,6 +63,7 @@ uniform bool uReflEnabled;  // traced reflections on metallic surfaces
 uniform bool uRefrEnabled;  // traced refraction on transmissive surfaces
 uniform float uIor;         // index of refraction for transmissive materials
 uniform bool uLightStochastic; // 1 direct shadow ray/pixel/frame instead of 1/light
+uniform bool uRestirEnabled;   // shade the reservoir winner instead of sampling
 
 uniform vec3 uEnvColor;
 uniform float uEnvIntensity;
@@ -254,6 +257,73 @@ vec3 sampleEmissiveTri(vec3 P, vec3 N) {
   return e;
 }
 
+// Shade this pixel's ReSTIR reservoir winner: recompute the (unshadowed)
+// contribution — MUST match RestirPass.candidateContribution — then pay the
+// one visibility ray and weight by W = wSum / (M · p̂). Analytic lights
+// re-draw their soft-radius jitter here (the reservoir stores which light,
+// not the jitter). The estimator inherently tames near-emitter spikes: a huge
+// contribution comes with a proportionally huge p̂, and W divides it out.
+vec3 shadeReservoir(vec3 P, vec3 N) {
+  vec4 res = texture(uReservoir, vUv);
+  float M = mod(res.r, 64.0);
+  if (M < 1.0 || res.a <= 0.0) return vec3(0.0);
+  float id = floor(res.r / 64.0);
+
+  vec3 C;
+  vec3 wi;
+  float maxDist;
+  if (id < float(MAX_LIGHTS)) {
+    int i = int(id);
+    vec4 posType = uLightPosType[i];
+    vec4 colRad = uLightColorRadius[i];
+    if (posType.w < 0.5) {
+      vec3 d = posType.xyz - P;
+      float dl = length(d);
+      if (dl < 1e-5) return vec3(0.0);
+      float NdotL = dot(N, d / dl);
+      if (NdotL <= 0.0) return vec3(0.0);
+      C = colRad.rgb * (NdotL / (dl * dl));
+      vec3 lp = posType.xyz + randUnitVector() * colRad.w; // soft shadows
+      vec3 dj = lp - P;
+      maxDist = length(dj);
+      if (maxDist < 1e-5) return vec3(0.0);
+      wi = dj / maxDist;
+    } else {
+      float NdotL = dot(N, -posType.xyz);
+      if (NdotL <= 0.0) return vec3(0.0);
+      C = colRad.rgb * NdotL;
+      wi = normalize(-posType.xyz + randUnitVector() * colRad.w);
+      maxDist = 1e7;
+    }
+  } else {
+    int t = (int(id) - MAX_LIGHTS) * 4;
+    vec4 t0 = texelFetch(uMaterialsTex, ivec2(t, 1), 0);
+    vec4 t1 = texelFetch(uMaterialsTex, ivec2(t + 1, 1), 0);
+    vec4 t2 = texelFetch(uMaterialsTex, ivec2(t + 2, 1), 0);
+    vec4 t3 = texelFetch(uMaterialsTex, ivec2(t + 3, 1), 0);
+    vec3 lp = t0.xyz + t1.xyz * res.g + t2.xyz * res.b;
+    vec3 d = lp - P;
+    float d2 = dot(d, d);
+    maxDist = sqrt(d2);
+    if (maxDist < 1e-4) return vec3(0.0);
+    wi = d / maxDist;
+    float cosS = dot(N, wi);
+    float cosL = abs(dot(t3.xyz, wi));
+    if (cosS <= 0.0 || cosL < 1e-4) return vec3(0.0);
+    C = vec3(t1.w, t2.w, t3.w) * (cosS * cosL * t0.w / max(d2, 1e-6));
+  }
+
+  float phat = dot(C, vec3(0.299, 0.587, 0.114));
+  if (phat <= 0.0) return vec3(0.0);
+  if (occluded(P + N * uEps, wi, maxDist)) return vec3(0.0);
+  vec3 e = C * (res.a / (M * phat));
+  // Safety clamp, same budget as the emissive direct clamp elsewhere.
+  float l = dot(e, vec3(0.299, 0.587, 0.114));
+  float cap = uFireflyClamp * 2.0;
+  if (l > cap) e *= cap / l;
+  return e;
+}
+
 // ONE light sample for secondary path vertices: stochastically pick either the
 // analytic lights or the emissive set (weighted 1/p). Costs a single shadow
 // ray — same ray budget the GI bounce had before emissive NEE existed —
@@ -366,12 +436,13 @@ void main() {
   float rough = clamp(wp.w - 1.0, 0.0, 1.0);
 
   // --- direct lighting ---
-  // Full quality: one shadow ray per light + one for the emissive set.
-  // Stochastic (mobile/fast): ONE shadow ray total, source picked at random and
-  // weighted by 1/p — temporal accumulation averages it out, the denoiser
-  // covers the extra variance. Biggest single lever on ray count.
+  // ReSTIR: shade the reservoir's winner with one visibility ray (flat cost in
+  // light count). Stochastic: one blind random sample. Full: one shadow ray
+  // per light + one for the emissive set.
   vec3 direct = vec3(0.0);
-  if (uLightStochastic) {
+  if (uRestirEnabled) {
+    direct = shadeReservoir(P, N);
+  } else if (uLightStochastic) {
     direct = sampleOneAny(P, N);
   } else {
     for (int i = 0; i < MAX_LIGHTS; i++) {
@@ -434,14 +505,12 @@ void main() {
       prevUv -= currUv - vUv;
       if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
         vec4 prevPos = texture(uPrevGWorldPos, prevUv);
-        vec3 prevN = texture(uPrevGNormalMetal, prevUv).xyz;
         // Plane-distance test: robust at grazing angles (position error from
         // texel quantization lies along the surface, not along the normal).
         float distToCam = distance(P, uCameraPos);
         float tol = 0.005 * distToCam + 20.0 * uEps;
         bool valid = prevPos.w > 0.5
-          && abs(dot(P - prevPos.xyz, N)) < tol
-          && dot(N, normalize(prevN)) > 0.9;
+          && abs(dot(P - prevPos.xyz, N)) < tol;
         if (valid) {
           vec4 h = texture(uPrevAccum, prevUv); // bilinear
           // Mirror-like pixels keep a SHORT history: their reflected content
@@ -489,7 +558,8 @@ export class RTLightingPass {
         uGNormalMetal: { value: null },
         uPrevAccum: { value: null },
         uPrevGWorldPos: { value: null },
-        uPrevGNormalMetal: { value: null },
+        uReservoir: { value: null },
+        uRestirEnabled: { value: false },
         uPrevViewProj: { value: new THREE.Matrix4() },
         uViewProj: { value: new THREE.Matrix4() },
         uCameraPos: { value: new THREE.Vector3() },
@@ -578,13 +648,14 @@ export class RTLightingPass {
   }
 
   /** Renders into targetA (reading targetB as history), then swaps. Returns the fresh accum texture. */
-  render(renderer, gbuffer, frame) {
+  render(renderer, gbuffer, frame, reservoirTexture = null) {
     const u = this.material.uniforms;
     u.uGWorldPos.value = gbuffer.worldPos;
     u.uGNormalMetal.value = gbuffer.normalMetal;
     u.uPrevGWorldPos.value = gbuffer.prevWorldPos;
-    u.uPrevGNormalMetal.value = gbuffer.prevNormalMetal;
     u.uPrevAccum.value = this.targetB.texture;
+    u.uReservoir.value = reservoirTexture;
+    u.uRestirEnabled.value = reservoirTexture !== null;
     u.uFrame.value = frame;
 
     renderer.setRenderTarget(this.targetA);
