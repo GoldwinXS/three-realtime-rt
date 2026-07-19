@@ -230,6 +230,18 @@ export class RealtimeRaytracer {
     this.adaptiveQuality = options.adaptiveQuality ?? false;
     /** Frame-rate target for the adaptive governor. */
     this.targetFps = options.targetFps ?? 55;
+    /**
+     * Emergency overload brake — independent of adaptiveQuality and ON by
+     * default. Two protections: an oversized first buffer gets its lighting
+     * scale clamped (with a loud warning), and consecutive catastrophic
+     * frames (>400ms) force quality down before the GPU driver gives up.
+     * Weak GPUs fed high settings can otherwise hang the whole machine
+     * (observed: full system crash on an Intel-Mac in Chrome). Set
+     * overloadProtection: false to opt out.
+     */
+    this.overloadProtection = options.overloadProtection ?? true;
+    this._overloadStrikes = 0;
+    this._obLastT = null;
     this._qEma = null;
     this._qLastT = null;
     this._qLastChange = 0;
@@ -308,6 +320,55 @@ export class RealtimeRaytracer {
     this._prevViewProj = new THREE.Matrix4();
     this._camWorldPos = new THREE.Vector3();
     this._needsClear = true;
+
+    // First-frame guard: a 4K/5K drawing buffer at high lighting scale can
+    // hang a weak GPU on the very first frame — before any frame-time
+    // measurement can react. Start those safe; adaptiveQuality (or the app)
+    // can raise quality once frames are proven survivable.
+    if (this.overloadProtection && this._width * this._height > 3.2e6 && this._renderScale > 0.375) {
+      console.warn(
+        `three-realtime-rt: ${(this._width * this._height / 1e6).toFixed(1)}M-pixel drawing buffer — ` +
+          `clamping lighting renderScale to 0.375 (overloadProtection). Raise renderScale manually, ` +
+          `enable adaptiveQuality, or pass overloadProtection: false to opt out.`
+      );
+      this._renderScale = 0.375;
+    }
+  }
+
+  // Consecutive catastrophic frames mean the GPU is drowning — cut quality
+  // hard and loudly before the driver resets (or takes the machine with it).
+  // Hidden tabs are exempt (browser throttling looks like huge frame times).
+  _overloadBrake() {
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      this._obLastT = null;
+      return;
+    }
+    const now = performance.now();
+    const dt = this._obLastT == null ? null : now - this._obLastT;
+    this._obLastT = now;
+    if (dt == null) return;
+    if (dt > 400 && dt < 10000) this._overloadStrikes++;
+    else if (dt < 200) this._overloadStrikes = 0;
+    if (this._overloadStrikes < 3) return;
+    this._overloadStrikes = 0;
+
+    if (this._renderScale > 0.2) {
+      this.denoiseIterations = Math.min(this.denoiseIterations, 3);
+      this.stochasticLights = true;
+      this.renderScale = Math.max(0.2, Math.round(this._renderScale * 0.5 * 20) / 20);
+      console.warn(
+        `three-realtime-rt: frames exceeding 400ms — overload brake cut lighting to ` +
+          `${Math.round(this._renderScale * 100)}%. Lower your canvas resolution or enable adaptiveQuality.`
+      );
+    } else if (this.volumetric.enabled || this.reflections || this.refraction) {
+      this.volumetric.enabled = false;
+      this.reflections = false;
+      this.refraction = false;
+      console.warn(
+        "three-realtime-rt: still overloaded at minimum lighting scale — " +
+          "disabling volumetric/reflections/refraction."
+      );
+    }
   }
 
   _makeColorTarget(width, height) {
@@ -481,6 +542,7 @@ export class RealtimeRaytracer {
       return;
     }
     if (this.adaptiveQuality) this._adaptQuality();
+    if (this.overloadProtection) this._overloadBrake();
     if (!this.compiled) this.compileScene(scene);
 
     this.frame += 1;

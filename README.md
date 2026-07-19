@@ -20,7 +20,14 @@ release lands, install straight from the Git repo (see [Getting started](#gettin
 
 > **Support this project:** the [supporter pack on itch.io](https://goldwinxs.itch.io/three-realtime-rt-supporter-pack) gets you a ready-to-run starter template, all example scenes, and a 12-section deep-dive guide to how the whole pipeline works. The library itself is and stays MIT.
 
-![Ray traced outdoor scene](docs/hero.png)
+![Ray traced room: emissive area light, reflections, glass, volumetric haze](docs/hero.png)
+
+Same scene, same camera, same lights — plain three.js (shadow maps + ACES) on
+the left, `rt.render` on the right:
+
+| Rasterized three.js | three-realtime-rt |
+|---|---|
+| ![raster](docs/compare-raster.jpg) | ![ray traced](docs/compare-rt.jpg) |
 
 ## Getting started
 
@@ -33,6 +40,9 @@ npm i three-realtime-rt three three-mesh-bvh
 
 > **Not published to npm yet.** Until the first release, install from the repo:
 > `npm i github:GoldwinXS/three-realtime-rt three three-mesh-bvh`
+
+No bundler? [`standalone.html`](standalone.html) is a single copy-paste file
+that runs the raytracer via CDN import maps — open it from any static server.
 
 A complete, copy-pasteable minimal app — a lit sphere on a floor, one point light:
 

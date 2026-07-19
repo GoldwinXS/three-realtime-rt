@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>three-realtime-rt — standalone demo</title>
+<!--
+  TRY IT IN 10 SECONDS
+  ====================
+  This is a single self-contained HTML file. No npm, no bundler, no build step.
+  Drop it in the repo root (next to src/) and open it with ANY static server, e.g.
+
+      npx serve .        (or)   python -m http.server
+
+  then browse to /standalone.html. It also works unchanged under the repo's
+  `vite` dev server, which serves any root .html file.
+
+  Everything is wired below with heavy comments — treat this file as a tutorial
+  for adding ray traced lighting to a plain three.js scene.
+-->
+<style>
+  /* Minimal dark page. The canvas fills the viewport; CSS stretches the
+     (possibly lower-res) drawing buffer to fit — that's the whole trick behind
+     renderScale being cheap. */
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #fps {
+    position: fixed; top: 10px; left: 12px; z-index: 10;
+    color: #9fe8c0; font: 12px/1.4 ui-monospace, Consolas, monospace;
+    background: rgba(8,14,20,.6); padding: 4px 8px; border-radius: 5px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="fps">starting…</div>
+
+<!--
+  IMPORT MAP — resolves bare specifiers ("three", "three/addons/…",
+  "three-mesh-bvh") to real ES-module URLs on unpkg. This is what lets us skip
+  npm entirely: the browser fetches the dependencies directly.
+  All three URLs are verified to serve real ES modules (HTTP 200, text/javascript).
+-->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.1/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.1/examples/jsm/",
+    "three-mesh-bvh": "https://unpkg.com/three-mesh-bvh@0.7.8/build/index.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+// The library is imported RELATIVELY so this file works sitting next to src/.
+// After the package is published to npm you can swap this single line for:
+//   import { RealtimeRaytracer } from "https://unpkg.com/three-realtime-rt/src/index.js";
+import { RealtimeRaytracer } from "./src/index.js";
+
+const fpsEl = document.getElementById("fps");
+
+// ── 1. Renderer ────────────────────────────────────────────────────────────
+// A perfectly ordinary WebGLRenderer. The raytracer takes over lighting; three
+// still rasterizes primary visibility (the G-buffer) for us. IMPORTANT: leave
+// tone mapping OFF — the raytracer's composite pass does its own tone mapping,
+// so applying ACES here too would double it.
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.NoToneMapping;
+document.body.appendChild(renderer.domElement);
+
+// ── 2. A plain three.js scene ────────────────────────────────────────────────
+// Nothing here knows about ray tracing — it's just meshes, materials, lights.
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0f16);
+
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(4.5, 3.2, 6);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.8, 0);
+controls.enableDamping = true;
+
+// Floor — mildly glossy so it catches reflections and the coloured area light.
+const floor = new THREE.Mesh(
+  new THREE.BoxGeometry(14, 0.2, 14),
+  new THREE.MeshStandardMaterial({ color: 0x30363d, roughness: 0.6, metalness: 0.0 })
+);
+floor.position.y = -0.1;
+scene.add(floor);
+
+// Three hero primitives with deliberately varied roughness / metalness so the
+// PBR response reads clearly under ray traced light.
+const chrome = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 48, 48),
+  new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.05, metalness: 1.0 })
+);
+chrome.position.set(-2, 1, 0);
+scene.add(chrome);
+
+const gold = new THREE.Mesh(
+  new THREE.IcosahedronGeometry(0.95, 0),
+  new THREE.MeshStandardMaterial({ color: 0xffb347, roughness: 0.25, metalness: 1.0 })
+);
+gold.position.set(0.2, 0.95, 1.2);
+scene.add(gold);
+
+const matte = new THREE.Mesh(
+  new THREE.CylinderGeometry(0.8, 0.8, 1.8, 40),
+  new THREE.MeshStandardMaterial({ color: 0x3a7bd5, roughness: 0.9, metalness: 0.0 })
+);
+matte.position.set(2.1, 0.9, -0.4);
+scene.add(matte);
+
+// ── 3. Lights ────────────────────────────────────────────────────────────────
+// (a) An EMISSIVE panel. Static emissive meshes are automatically turned into
+//     NEE area lights by the scene compiler — no light object needed. This is
+//     what makes soft coloured bounce light appear on the floor and spheres.
+const panel = new THREE.Mesh(
+  new THREE.PlaneGeometry(3.5, 2),
+  new THREE.MeshStandardMaterial({
+    color: 0x000000,
+    emissive: 0x66ccff,
+    emissiveIntensity: 6,   // >0 → contributes as an area light
+    side: THREE.DoubleSide,
+  })
+);
+panel.position.set(0, 2.4, -3.2);
+scene.add(panel);
+
+// (b) A PointLight for sharp key lighting. `userData.rtRadius` gives it a
+//     physical radius so the raytracer produces soft (penumbra) shadows —
+//     0 would be a hard pinpoint light.
+const key = new THREE.PointLight(0xfff2d6, 40, 0, 2);
+key.position.set(3, 5, 3);
+key.userData.rtRadius = 0.4;
+scene.add(key);
+
+// ── 4. Wrap the renderer in a RealtimeRaytracer ──────────────────────────────
+// renderScale 0.5 traces lighting at quarter-pixel-count (upsampled + denoised).
+// adaptiveQuality lets the governor trade resolution for a stable frame rate.
+const rt = new RealtimeRaytracer(renderer, { renderScale: 0.5, adaptiveQuality: true });
+// Compile once for this static scene (builds the BVH + material/light tables).
+// (render() would auto-compile on first frame, but doing it up front is cleaner.)
+rt.compileScene(scene);
+
+// ── 5. Resize handling ───────────────────────────────────────────────────────
+// The raytracer sizes its internal targets in DRAWING-BUFFER pixels, so pass
+// the real buffer size (canvas size × pixelRatio), not CSS pixels.
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  const buf = renderer.getDrawingBufferSize(new THREE.Vector2());
+  rt.setSize(buf.x, buf.y);
+}
+window.addEventListener("resize", onResize);
+onResize(); // sync rt to the initial buffer size
+
+// ── 6. Render loop ───────────────────────────────────────────────────────────
+// The one substitution vs. plain three.js: rt.render(scene, camera) replaces
+// renderer.render(scene, camera). Everything else is a normal loop.
+let frames = 0, lastFpsT = performance.now();
+function tick() {
+  controls.update();
+  rt.render(scene, camera);
+  frames++;
+  const now = performance.now();
+  if (now - lastFpsT >= 500) {               // update the readout twice a second
+    const fps = (frames * 1000) / (now - lastFpsT);
+    fpsEl.textContent =
+      `${fps.toFixed(0)} fps · lighting @ ${Math.round(rt.renderScale * 100)}%` +
+      (rt.supported ? "" : " · RT unsupported (plain three.js)");
+    frames = 0; lastFpsT = now;
+  }
+  requestAnimationFrame(tick);
+}
+tick();
+</script>
+</body>
+</html>
