@@ -89,12 +89,23 @@ vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
   // per-triangle contribution uses area only (count folds into pick pdf).
   return vec3(t1.w, t2.w, t3.w) * (cosS * cosL * t0.w / max(d2, 1e-6));
 }
+
+// v3: reservoirs select TRIANGLES, not points. The selection target is the
+// candidate's contribution at a FIXED proxy point (the centroid) — any fixed
+// score keeps RIS consistent as long as shading divides by the same one. The
+// actual surface point is re-drawn fresh every frame at shading, so soft
+// area lighting keeps averaging instead of freezing onto one winning point.
+// (Known approximation: a triangle whose centroid contributes zero but whose
+// far corner doesn't can be under-selected at grazing setups.)
+float phatOf(float id, vec3 P, vec3 N) {
+  return luminance(candidateContribution(id, vec2(1.0 / 3.0), P, N));
+}
 `;
 
 // TEMPORAL stage. Streams K fresh candidates through a weighted reservoir,
 // merges with the reprojected previous frame's reservoir. Output encoding
 // (fed back as history next frame):
-//   r = candidateId * 64 + min(M, 63), g,b = tri uv, a = wSum
+//   r = candidateId * 64 + min(M, 63), g,b = unused, a = wSum
 const temporalFrag = /* glsl */ `
 precision highp float;
 
@@ -132,25 +143,18 @@ void main() {
   }
 
   float rId = 0.0;
-  vec2 rUv = vec2(0.0);
   float wSum = 0.0;
   float M = 0.0;
   for (int k = 0; k < CANDIDATES; k++) {
     int pick = min(int(rand() * float(S)), S - 1);
-    float id;
-    vec2 uv = vec2(0.0);
-    if (pick < uLightCount) {
-      id = float(pick);
-    } else {
-      id = float(MAX_LIGHTS + (pick - uLightCount));
-      uv = vec2(rand(), rand());
-      if (uv.x + uv.y > 1.0) uv = 1.0 - uv;
-    }
+    float id = pick < uLightCount
+      ? float(pick)
+      : float(MAX_LIGHTS + (pick - uLightCount));
     // source pdf = 1/S -> RIS weight = p̂ * S
-    float w = luminance(candidateContribution(id, uv, P, N)) * float(S);
+    float w = phatOf(id, P, N) * float(S);
     wSum += w;
     M += 1.0;
-    if (w > 0.0 && rand() * wSum < w) { rId = id; rUv = uv; }
+    if (w > 0.0 && rand() * wSum < w) { rId = id; }
   }
 
   // temporal reuse: previous reservoir as ONE candidate carrying its history
@@ -169,17 +173,17 @@ void main() {
         if (hM > 0.0 && h.a > 0.0) {
           // RIS weight = p̂_now · W_prev · M_prev; with p̂_prev ≈ p̂_now on a
           // validated surface this reduces to (wSum/M)·M.
-          float hPhat = luminance(candidateContribution(hId, h.gb, P, N));
+          float hPhat = phatOf(hId, P, N);
           float w = hPhat > 0.0 ? (h.a / max(mod(h.r, 64.0), 1.0)) * hM : 0.0;
           wSum += w;
           M += hM;
-          if (w > 0.0 && rand() * wSum < w) { rId = hId; rUv = h.gb; }
+          if (w > 0.0 && rand() * wSum < w) { rId = hId; }
         }
       }
     }
   }
 
-  outReservoir = vec4(rId * 64.0 + min(M, 63.0), rUv.x, rUv.y, wSum);
+  outReservoir = vec4(rId * 64.0 + min(M, 63.0), 0.0, 0.0, wSum);
 }
 `;
 
@@ -188,7 +192,7 @@ void main() {
 // convergence speed and area-light (emissive) noise. Output is consumed by
 // the lighting pass THIS frame only (never fed back), so it trades the
 // history encoding for a precomputed weight:
-//   r = candidateId, g,b = tri uv, a = W = wSum / (M · p̂)
+//   r = candidateId, g,b = unused, a = W = wSum / (M · p̂centroid)
 const spatialFrag = /* glsl */ `
 precision highp float;
 
@@ -220,7 +224,6 @@ void main() {
 
   vec4 c = texture(uReservoirIn, vUv);
   float rId = floor(c.r / 64.0);
-  vec2 rUv = c.gb;
   float M = mod(c.r, 64.0);
   float wSum = c.a;
 
@@ -244,16 +247,16 @@ void main() {
     if (hM < 1.0 || h.a <= 0.0) continue;
     float hId = floor(h.r / 64.0);
     // neighbor reservoir as one candidate, re-weighted at THIS surface
-    float hPhat = luminance(candidateContribution(hId, h.gb, P, N));
+    float hPhat = phatOf(hId, P, N);
     float w = hPhat > 0.0 ? (h.a / hM) * min(hM, 40.0) : 0.0;
     wSum += w;
     M += min(hM, 40.0);
-    if (w > 0.0 && rand() * wSum < w) { rId = hId; rUv = h.gb; }
+    if (w > 0.0 && rand() * wSum < w) { rId = hId; }
   }
 
-  float phat = luminance(candidateContribution(rId, rUv, P, N));
+  float phat = phatOf(rId, P, N);
   float W = (M > 0.0 && phat > 0.0) ? wSum / (M * phat) : 0.0;
-  outReservoir = vec4(rId, rUv.x, rUv.y, W);
+  outReservoir = vec4(rId, 0.0, 0.0, W);
 }
 `;
 

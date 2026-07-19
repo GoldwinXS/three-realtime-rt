@@ -30,15 +30,12 @@ const setBoot = (t) => { if (bootMsg) bootMsg.textContent = t; };
 // tab during the heavy RT shader compile or run out of texture memory. When
 // that happens we reload with ?safe=1 and render plain rasterized three.js
 // instead of crashing the browser.
-// iOS kills the whole tab process (jetsam) during the heavy RT shader
-// compile — no JS error handler ever runs, so a reactive fallback can't
-// save us there. Instead iOS starts in compatibility mode and full RT is
-// opt-in via ?rt=1.
+// iOS now defaults to full ray tracing — recent perf work runs at 60fps on an
+// iPad, so the old "iOS starts in compatibility mode" opt-out is gone. Safe
+// mode is now purely reactive (webglcontextlost / RT setup failure, below)
+// plus an explicit ?safe=1 opt-in.
 const PARAMS = new URLSearchParams(location.search);
-const IOS =
-  /iP(hone|ad|od)/.test(navigator.userAgent) ||
-  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-const SAFE = PARAMS.has("safe") || (IOS && !PARAMS.has("rt"));
+const SAFE = PARAMS.has("safe");
 let safeModeTriggered = false;
 const enterSafeMode = (why) => {
   if (SAFE || safeModeTriggered) return;
@@ -109,17 +106,9 @@ async function main() {
       "background:rgba(14,18,24,0.8);border:1px solid #26323c;border-radius:6px;padding:6px 10px;";
     let reason = "";
     try { reason = sessionStorage.getItem("rtSafeReason") || ""; } catch {}
-    if (IOS && !PARAMS.has("safe")) {
-      const u = new URL(location.href);
-      u.searchParams.set("rt", "1");
-      note.innerHTML =
-        `compatibility mode — the RT pipeline is heavy for iOS Safari. ` +
-        `<a href="${u.pathname + u.search}" style="color:#7fd8c8">try full ray tracing anyway</a>`;
-    } else {
-      note.textContent =
-        "compatibility mode — ray tracing off on this device" +
-        (reason ? ` (reason: ${reason})` : " (works on desktop)");
-    }
+    note.textContent =
+      "compatibility mode — ray tracing off on this device" +
+      (reason ? ` (reason: ${reason})` : " (works on desktop)");
     document.body.append(note);
 
     const controls2 = new OrbitControls(camera, renderer.domElement);

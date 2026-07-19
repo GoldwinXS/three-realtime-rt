@@ -30,6 +30,10 @@ const cameraUrl = khronos("AntiqueCamera");
 const boomBoxUrl = khronos("BoomBox");
 const corsetUrl = khronos("Corset");
 const waterBottleUrl = khronos("WaterBottle");
+const toyCarUrl = khronos("ToyCar");
+const iridescenceLampUrl = khronos("IridescenceLamp");
+const mosquitoUrl = khronos("MosquitoInAmber");
+const foxUrl = khronos("Fox");
 import helmetUrl from "./assets/DamagedHelmet.glb?url";
 import duckUrl from "./assets/Duck.glb?url";
 
@@ -40,6 +44,7 @@ const setBoot = (t) => { boot.classList.remove("hidden"); if (bootMsg) bootMsg.t
 const statsEl = document.getElementById("stats");
 const pickEl = document.getElementById("scene-pick");
 const rtBtn = document.getElementById("rt-toggle");
+const holdBtn = document.getElementById("rt-hold");
 
 const renderer = new THREE.WebGLRenderer({ antialias: false });
 renderer.setPixelRatio(1);
@@ -177,6 +182,48 @@ const SCENES = {
     const sky = sunAndSky(scene, 2.6);
     return { scene, sky, cam: [5, 5, 7], target: [0, 3.2, 0] };
   },
+  async toycar() {
+    // Sub-centimetre clearcoat asset — scaled up so the metallic paint and the
+    // reflective clearcoat over it read on the raytraced side.
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1017);
+    const gltf = await loadGltf(toyCarUrl);
+    normalize(gltf.scene, 7);
+    scene.add(gltf.scene, groundPlane(0x777d85));
+    const sky = sunAndSky(scene, 2.8);
+    return { scene, sky, cam: [5, 4, 7], target: [0, 2.2, 0] };
+  },
+  async iridescence() {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1017);
+    const gltf = await loadGltf(iridescenceLampUrl);
+    normalize(gltf.scene, 7);
+    scene.add(gltf.scene, groundPlane(0x8d939b));
+    const sky = sunAndSky(scene, 2.6);
+    return { scene, sky, cam: [6, 5, 8], target: [0, 3.2, 0] };
+  },
+  async mosquito() {
+    // Amber block — a refractive/transmissive hero, so it shows best with the
+    // glass paths on.
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1017);
+    const gltf = await loadGltf(mosquitoUrl);
+    normalize(gltf.scene, 7);
+    scene.add(gltf.scene, groundPlane(0x8d939b));
+    const sky = sunAndSky(scene, 2.6);
+    return { scene, sky, cam: [5, 5, 7], target: [0, 3.4, 0] };
+  },
+  async fox() {
+    // Fox is a skinned/animated asset — we load it and render the bind pose
+    // (no mixer), which is fine for a static lighting showcase.
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1017);
+    const gltf = await loadGltf(foxUrl);
+    normalize(gltf.scene, 7);
+    scene.add(gltf.scene, groundPlane(0x8d939b));
+    const sky = sunAndSky(scene, 2.8, [10, 15, 8]);
+    return { scene, sky, cam: [6, 5, 8], target: [0, 3, 0] };
+  },
 };
 
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
@@ -186,6 +233,7 @@ controls.enableDamping = true;
 let rt = null;
 let scene = null;
 let rtEnabled = true;
+let forceRaster = false; // momentary "hold: raster" override (see holdBtn below)
 let triCount = 0;
 
 // Single source of truth for the feature toggles. The gallery builds a fresh
@@ -257,6 +305,20 @@ rtBtn.addEventListener("click", () => {
   if (rt) rt.resetAccumulation();
 });
 
+// Hold-to-compare: while the button is held, forceRaster routes the loop through
+// plain renderer.render (same path as rtEnabled === false) for an instant
+// before/after. On release we reset accumulation so RT re-converges cleanly.
+const holdRaster = (on) => {
+  forceRaster = on;
+  holdBtn.classList.toggle("on", on);
+  if (!on && rt) rt.resetAccumulation();
+};
+holdBtn.addEventListener("pointerdown", () => holdRaster(true));
+holdBtn.addEventListener("pointerup", () => holdRaster(false));
+holdBtn.addEventListener("pointerleave", () => holdRaster(false));
+holdBtn.addEventListener("touchstart", (e) => { e.preventDefault(); holdRaster(true); });
+holdBtn.addEventListener("touchend", (e) => { e.preventDefault(); holdRaster(false); });
+
 // Options strip — each checkbox mirrors a boolean in `settings`; the lighting-res
 // select drives renderScale (and forces auto-quality off, matching the main
 // demo's manual override). Everything routes through applySettings().
@@ -298,7 +360,7 @@ function animate() {
   else requestAnimationFrame(animate);
   if (!scene || !rt) return;
   controls.update();
-  if (rtEnabled) rt.render(scene, camera);
+  if (rtEnabled && !forceRaster) rt.render(scene, camera);
   else renderer.render(scene, camera);
 
   frames++;

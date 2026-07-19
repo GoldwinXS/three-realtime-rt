@@ -264,7 +264,7 @@ vec3 sampleEmissiveTri(vec3 P, vec3 N) {
 // not the jitter). The estimator inherently tames near-emitter spikes: a huge
 // contribution comes with a proportionally huge p̂, and W divides it out.
 vec3 shadeReservoir(vec3 P, vec3 N) {
-  // Spatial-stage encoding: r = id, g,b = tri uv, a = precomputed W.
+  // Spatial-stage encoding: r = id, a = precomputed W (vs. centroid score).
   vec4 res = texture(uReservoir, vUv);
   if (res.a <= 0.0) return vec3(0.0);
   float id = res.r;
@@ -301,7 +301,13 @@ vec3 shadeReservoir(vec3 P, vec3 N) {
     vec4 t1 = texelFetch(uMaterialsTex, ivec2(t + 1, 1), 0);
     vec4 t2 = texelFetch(uMaterialsTex, ivec2(t + 2, 1), 0);
     vec4 t3 = texelFetch(uMaterialsTex, ivec2(t + 3, 1), 0);
-    vec3 lp = t0.xyz + t1.xyz * res.g + t2.xyz * res.b;
+    // v3: the reservoir chose the TRIANGLE; draw a FRESH point on it every
+    // frame so the area light keeps averaging (no frozen-point noise). W was
+    // normalized against the centroid score, and E[point sample] = the
+    // triangle's true contribution, so the estimator stays consistent.
+    vec2 uv = rand2();
+    if (uv.x + uv.y > 1.0) uv = 1.0 - uv;
+    vec3 lp = t0.xyz + t1.xyz * uv.x + t2.xyz * uv.y;
     vec3 d = lp - P;
     float d2 = dot(d, d);
     maxDist = sqrt(d2);
