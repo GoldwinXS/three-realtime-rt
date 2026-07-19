@@ -48,8 +48,13 @@ void main() {
 
   // Fewer accumulated samples -> noisier pixel -> wider luminance tolerance.
   // A converged pixel (high count) is barely touched, preserving detail.
+  // The widening is CAPPED at 3x: during camera motion every pixel is fresh,
+  // and an 8x-wide gate across five à-trous passes erased small contact
+  // shadows entirely — objects visibly floated while orbiting ("ghostly
+  // apparitions") and only grounded once the camera stopped. Blue-noise
+  // sampling + ReSTIR keep fresh pixels clean enough for the tighter gate.
   float count = max(center.a, 1.0);
-  float sigmaL = uLumSigma * clamp(8.0 / sqrt(count), 0.75, 8.0);
+  float sigmaL = uLumSigma * clamp(8.0 / sqrt(count), 0.75, 3.0);
 
   float distToCam = distance(P, uCameraPos);
   float planeTol = 0.01 * distToCam + 20.0 * uEps;
