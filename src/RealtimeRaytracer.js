@@ -201,6 +201,13 @@ export class RealtimeRaytracer {
     /** 1-bounce global illumination (traced indirect). Toggle for a direct-only look. */
     this.gi = options.gi ?? true;
     /**
+     * Half-rate GI: trace the bounce on alternating checkerboard parity each
+     * frame (doubled — unbiased, temporal accumulation converges to the same
+     * brightness). Halves GI's ray cost for a small convergence-speed hit;
+     * the cheapest way to keep GI "worth turning on" on weaker GPUs.
+     */
+    this.giHalfRate = options.giHalfRate ?? false;
+    /**
      * Sample static emissive meshes as area lights (next-event estimation).
      * Dramatically less noise than waiting for GI rays to hit the emitter, and
      * emitters gain direct lighting + shadows. Off = legacy hit-only behaviour.
@@ -606,6 +613,7 @@ export class RealtimeRaytracer {
     rtU.uMaxHistory.value = this.maxHistory;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
     rtU.uGIEnabled.value = this.gi;
+    rtU.uGIHalfRate.value = this.giHalfRate;
     rtU.uEmissiveCount.value = this.emissiveNEE ? this.compiled.emissiveTriCount : 0;
     rtU.uReflEnabled.value = this.reflections;
     rtU.uRefrEnabled.value = this.refraction;

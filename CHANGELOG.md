@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1 — 2026-07-19
+
+- **SpotLight support** across every estimator (lighting, ReSTIR, volumetric):
+  cone + penumbra, soft shadows, visible light cones in fog.
+- **Volumetric rework**: quarter-resolution stratified march (4 steps/ray)
+  instead of one sample — moving lights (patrolling flashlights) render
+  grain-free; cheaper than before.
+- **Half-rate GI** option (`giHalfRate`): bounce traced on alternating
+  checkerboard parity, doubled — unbiased, ~35% off GI's frame cost.
+- Denoiser: disocclusion luminance widening capped at 3x — objects no longer
+  lose contact shadows ("float") while the camera moves.
+- Adaptive governor can drive an app-owned canvas scale as its deepest lever;
+  demo/gallery expose a resolution control.
+
 ## 0.3.0 — 2026-07-19
 
 The "how well can you do this" release.

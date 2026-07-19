@@ -65,6 +65,7 @@ uniform bool uRefrEnabled;  // traced refraction on transmissive surfaces
 uniform float uIor;         // index of refraction for transmissive materials
 uniform bool uLightStochastic; // 1 direct shadow ray/pixel/frame instead of 1/light
 uniform bool uRestirEnabled;   // shade the reservoir winner instead of sampling
+uniform bool uGIHalfRate;      // GI ray on alternating checkerboard, doubled
 
 uniform vec3 uEnvColor;
 uniform float uEnvIntensity;
@@ -475,9 +476,17 @@ void main() {
   // --- 1-bounce indirect (cosine-weighted; pdf cancels the NdotL/PI).
   // traceRadiance shades the hit with direct + NEE light, or returns the
   // sky/env colour when the ray escapes (the natural ambient bounce).
+  // Half-rate mode traces on alternating checkerboard parity each frame,
+  // DOUBLED — the temporal average converges to the same brightness
+  // (unbiased) while GI's ray cost halves; accumulation + denoise absorb
+  // the alternation.
   vec3 indirect = vec3(0.0);
   if (uGIEnabled) {
-    indirect = traceRadiance(P + N * uEps, cosineSampleHemisphere(N, rand2()), false);
+    bool trace = !uGIHalfRate || (((px.x + px.y + int(uFrame)) & 1) == 0);
+    if (trace) {
+      indirect = traceRadiance(P + N * uEps, cosineSampleHemisphere(N, rand2()), false);
+      if (uGIHalfRate) indirect *= 2.0;
+    }
   }
 
   // Firefly clamp: suppress rare huge GI samples (big perceived-noise win,
@@ -594,6 +603,7 @@ export class RTLightingPass {
         uRefrEnabled: { value: true },
         uIor: { value: 1.5 },
         uLightStochastic: { value: false },
+        uGIHalfRate: { value: false },
         uEnvColor: { value: new THREE.Color(0.03, 0.04, 0.06) },
         uEnvIntensity: { value: 1.0 },
         uFrame: { value: 0 },

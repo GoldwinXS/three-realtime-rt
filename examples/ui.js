@@ -197,6 +197,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // sphere and recompile the BVH, which main() owns. Initial state reads the
   // current rt values (all false at the minimal start).
   fSec.append(toggle("global illumination", rt.gi, (v) => setFeature("gi", v)).row);
+  fSec.append(toggle("half-rate GI (fast)", rt.giHalfRate, (v) => { rt.giHalfRate = v; rt.resetAccumulation(); }).row);
   fSec.append(toggle("emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);
   fSec.append(toggle("reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
   fSec.append(toggle("refraction", rt.refraction, (v) => setFeature("refraction", v)).row);
