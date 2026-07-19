@@ -7,6 +7,7 @@ import {
   SAH,
   CENTER,
 } from "three-mesh-bvh";
+import { decodeBlueNoise, BLUE_NOISE_SIZE } from "./blueNoise.js";
 
 const MAX_LIGHTS = 16; // stage-1 cap; a data-texture light list is future work
 
@@ -171,11 +172,14 @@ function emissiveColor(mat) {
 // Row 0: materials, 2 texels each (albedo+rough, emissive+metal).
 // Row 1: emissive triangles for NEE, 4 texels each:
 //   [v0.xyz | area] [e1.xyz | emit.r] [e2.xyz | emit.g] [n.xyz | emit.b]
-// Packed into ONE texture because the lighting pass already sits at the
-// WebGL2-guaranteed 16-sampler limit — a second sampler is not available.
+// Rows 2..65: a 64x64 RGBA blue-noise tile for low-discrepancy sampling.
+// All packed into ONE texture because the lighting pass already sits at the
+// WebGL2-guaranteed 16-sampler limit — extra samplers are not available.
 function buildSceneDataTexture(materials, emissiveTris) {
-  const width = Math.max(materials.length * 2, emissiveTris.length * 4, 2);
-  const data = new Float32Array(width * 2 * 4);
+  const bn = decodeBlueNoise();
+  const width = Math.max(materials.length * 2, emissiveTris.length * 4, BLUE_NOISE_SIZE);
+  const height = 2 + BLUE_NOISE_SIZE;
+  const data = new Float32Array(width * height * 4);
   materials.forEach((mat, i) => {
     const o = i * 8;
     const color = mat.color ?? new THREE.Color(1, 1, 1);
@@ -197,7 +201,14 @@ function buildSceneDataTexture(materials, emissiveTris) {
     data[o + 8] = t.e2[0]; data[o + 9] = t.e2[1]; data[o + 10] = t.e2[2]; data[o + 11] = t.emit[1];
     data[o + 12] = t.n[0]; data[o + 13] = t.n[1]; data[o + 14] = t.n[2]; data[o + 15] = t.emit[2];
   });
-  const tex = new THREE.DataTexture(data, width, 2, THREE.RGBAFormat, THREE.FloatType);
+  for (let y = 0; y < BLUE_NOISE_SIZE; y++) {
+    const o = (2 + y) * row;
+    const src = y * BLUE_NOISE_SIZE * 4;
+    for (let i = 0; i < BLUE_NOISE_SIZE * 4; i++) {
+      data[o + i] = (bn[src + i] + 0.5) / 256.0;
+    }
+  }
+  const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
   tex.minFilter = THREE.NearestFilter;
   tex.magFilter = THREE.NearestFilter;
   tex.needsUpdate = true;

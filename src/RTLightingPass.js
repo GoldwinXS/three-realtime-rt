@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS } from "./SceneCompiler.js";
 import { SKY_GLSL } from "./sky.glsl.js";
+import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -18,6 +19,7 @@ precision highp usampler2D;
 
 ${shaderStructs}
 ${shaderIntersectFunction}
+${BVH_ANY_HIT_GLSL}
 ${SKY_GLSL}
 
 #define MAX_LIGHTS ${MAX_LIGHTS}
@@ -75,18 +77,40 @@ uniform vec3 uSkyZenith;
 uniform vec3 uSkyHorizon;
 uniform float uSkyIntensity;
 
-// ---------- RNG (PCG) ----------
+// ---------- RNG ----------
+// The FIRST four random numbers each frame come from a 64x64 blue-noise tile
+// (rows 2..65 of the scene-data texture), rotated over time with an R2
+// low-discrepancy sequence. Those dimensions drive direct lighting — light
+// pick + area-sample position — where noise is most visible; blue noise turns
+// the residual error high-frequency, which temporal accumulation and the
+// denoiser remove far better than white-noise clumps. Later dimensions fall
+// back to PCG white noise (correlating many dimensions hurts).
 uint gSeed;
+int gBnDim;
+vec4 gBlueNoise;
 uint pcgHash(uint s) {
   uint state = s * 747796405u + 2891336453u;
   uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
   return (word >> 22u) ^ word;
 }
 float rand() {
+  if (gBnDim < 4) {
+    float v = gBlueNoise[gBnDim];
+    gBnDim++;
+    return v;
+  }
   gSeed = pcgHash(gSeed);
   return float(gSeed) * (1.0 / 4294967296.0);
 }
 vec2 rand2() { return vec2(rand(), rand()); }
+
+vec4 fetchBlueNoise() {
+  ivec2 p = ivec2(gl_FragCoord.xy) & 63;
+  vec4 bn = texelFetch(uMaterialsTex, ivec2(p.x, 2 + p.y), 0);
+  // R2 sequence: per-frame toroidal shift, decorrelated per channel.
+  vec4 shift = fract(float(uFrame) * vec4(0.6180340, 0.7548777, 0.5698403, 0.8191725));
+  return fract(bn + shift);
+}
 
 // Branchless orthonormal basis (Duff et al. 2017) — cheaper and stable for
 // every n, including the poles the old cross-product picker handled branchily.
@@ -128,10 +152,11 @@ bool traceBoth(vec3 ro, vec3 rd, out uvec4 fi, out vec3 bary, out float dist, ou
   return false;
 }
 
+// Shadow rays only need to know IF something blocks, not what's closest —
+// the unordered any-hit traversal early-outs on the first blocker.
 bool occluded(vec3 ro, vec3 rd, float maxDist) {
-  uvec4 fi; vec3 fn; vec3 bc; float side; float dist;
-  if (bvhIntersectFirstHit(bvhStatic, ro, rd, fi, fn, bc, side, dist) && dist < maxDist - 2.0 * uEps) return true;
-  if (uHasDynamic && bvhIntersectFirstHit(bvhDynamic, ro, rd, fi, fn, bc, side, dist) && dist < maxDist - 2.0 * uEps) return true;
+  if (bvhIntersectAnyHit(bvhStatic, ro, rd, maxDist - 2.0 * uEps)) return true;
+  if (uHasDynamic && bvhIntersectAnyHit(bvhDynamic, ro, rd, maxDist - 2.0 * uEps)) return true;
   return false;
 }
 
@@ -329,6 +354,8 @@ void main() {
   ivec2 px = ivec2(gl_FragCoord.xy);
   gSeed = uint(px.x) * 1973u + uint(px.y) * 9277u + uint(uFrame) * 26699u;
   gSeed = pcgHash(gSeed);
+  gBlueNoise = fetchBlueNoise();
+  gBnDim = 0;
 
   vec3 P = wp.xyz;
   vec4 nmSample = texture(uGNormalMetal, vUv);

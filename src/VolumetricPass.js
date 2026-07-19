@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS } from "./SceneCompiler.js";
+import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -23,6 +24,7 @@ precision highp usampler2D;
 
 ${shaderStructs}
 ${shaderIntersectFunction}
+${BVH_ANY_HIT_GLSL}
 
 #define MAX_LIGHTS ${MAX_LIGHTS}
 #define PI 3.14159265358979
@@ -54,18 +56,35 @@ uniform float uEps;
 uniform float uDensity;   // scatter coefficient
 uniform float uMaxDist;   // cap for rays that hit nothing / far surfaces
 
-// ---------- RNG (PCG) ----------
+// ---------- RNG ----------
+// First four dims from the shared blue-noise tile (rows 2..65 of the
+// scene-data texture) with an R2 temporal shift; the rest is PCG. Same
+// scheme as RTLightingPass — see the comment there.
 uint gSeed;
+int gBnDim;
+vec4 gBlueNoise;
 uint pcgHash(uint s) {
   uint state = s * 747796405u + 2891336453u;
   uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
   return (word >> 22u) ^ word;
 }
 float rand() {
+  if (gBnDim < 4) {
+    float v = gBlueNoise[gBnDim];
+    gBnDim++;
+    return v;
+  }
   gSeed = pcgHash(gSeed);
   return float(gSeed) * (1.0 / 4294967296.0);
 }
 vec2 rand2() { return vec2(rand(), rand()); }
+
+vec4 fetchBlueNoise() {
+  ivec2 p = ivec2(gl_FragCoord.xy) & 63;
+  vec4 bn = texelFetch(uMaterialsTex, ivec2(p.x, 2 + p.y), 0);
+  vec4 shift = fract(float(uFrame) * vec4(0.6180340, 0.7548777, 0.5698403, 0.8191725));
+  return fract(bn + shift);
+}
 
 vec3 randUnitVector() {
   vec2 u = rand2();
@@ -75,10 +94,10 @@ vec3 randUnitVector() {
   return vec3(r * cos(a), r * sin(a), z);
 }
 
+// Any-hit: first blocker wins, no closest-hit sorting (see bvhAnyHit.glsl.js).
 bool occluded(vec3 ro, vec3 rd, float maxDist) {
-  uvec4 fi; vec3 fn; vec3 bc; float side; float dist;
-  if (bvhIntersectFirstHit(bvhStatic, ro, rd, fi, fn, bc, side, dist) && dist < maxDist - 2.0 * uEps) return true;
-  if (uHasDynamic && bvhIntersectFirstHit(bvhDynamic, ro, rd, fi, fn, bc, side, dist) && dist < maxDist - 2.0 * uEps) return true;
+  if (bvhIntersectAnyHit(bvhStatic, ro, rd, maxDist - 2.0 * uEps)) return true;
+  if (uHasDynamic && bvhIntersectAnyHit(bvhDynamic, ro, rd, maxDist - 2.0 * uEps)) return true;
   return false;
 }
 
@@ -134,6 +153,8 @@ void main() {
   ivec2 px = ivec2(gl_FragCoord.xy);
   gSeed = uint(px.x) * 2153u + uint(px.y) * 9277u + uint(uFrame) * 26699u;
   gSeed = pcgHash(gSeed);
+  gBlueNoise = fetchBlueNoise();
+  gBnDim = 0;
 
   // Segment to integrate: camera → surface (or the fog cap on a miss).
   bool hit = wp.w > 0.5;
