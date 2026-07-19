@@ -55,8 +55,9 @@ uniform float uMaxHistory;
 uniform bool uTemporalReprojection;
 uniform float uFireflyClamp;
 
-uniform vec4 uLightPosType[MAX_LIGHTS];     // xyz pos|dir, w: 0 point, 1 directional
+uniform vec4 uLightPosType[MAX_LIGHTS];     // xyz pos|dir, w: 0 point, 1 directional, >=2 spot (w-2 = cosInner)
 uniform vec4 uLightColorRadius[MAX_LIGHTS]; // rgb color*intensity, w radius
+uniform vec4 uLightDirCone[MAX_LIGHTS];     // spot: direction.xyz + cos(outer angle)
 uniform int uLightCount;
 uniform int uEmissiveCount; // NEE area-light triangles in row 1 of uMaterialsTex
 uniform bool uReflEnabled;  // traced reflections on metallic surfaces
@@ -177,6 +178,15 @@ void fetchMaterial(float matIndex, out vec3 albedo, out float roughness,
 // ---------- lighting ----------
 // Direct irradiance (demodulated: no albedo) at point P with normal N,
 // from light i, with one shadow ray. Area-samples point lights for soft shadows.
+// Spot cone falloff: smooth between the outer and inner cone cosines
+// (posType.w = 2 + cosInner; dirCone.w = cosOuter).
+float spotFalloff(int i, vec3 lightToP) {
+  vec4 posType = uLightPosType[i];
+  if (posType.w < 1.5) return 1.0;
+  vec4 dc = uLightDirCone[i];
+  return smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, lightToP));
+}
+
 vec3 lightContribution(int i, vec3 P, vec3 N) {
   vec4 posType = uLightPosType[i];
   vec4 colRad = uLightColorRadius[i];
@@ -184,9 +194,10 @@ vec3 lightContribution(int i, vec3 P, vec3 N) {
   vec3 L;
   float dist2 = 1.0;
   float maxDist = 1e7;
+  float cone = 1.0;
 
-  if (posType.w < 0.5) {
-    // point light: sample a point on its sphere for soft shadows
+  if (posType.w < 0.5 || posType.w >= 1.5) {
+    // point/spot light: sample a point on its sphere for soft shadows
     vec3 lp = posType.xyz + randUnitVector() * colRad.w;
     vec3 d = lp - P;
     float dl = length(d);
@@ -194,6 +205,8 @@ vec3 lightContribution(int i, vec3 P, vec3 N) {
     L = d / dl;
     dist2 = dl * dl;
     maxDist = dl;
+    cone = spotFalloff(i, -L);
+    if (cone <= 0.0) return vec3(0.0);
   } else {
     // directional light: jitter within a small cone
     L = normalize(-posType.xyz + randUnitVector() * colRad.w);
@@ -204,7 +217,7 @@ vec3 lightContribution(int i, vec3 P, vec3 N) {
   if (NdotL <= 0.0) return vec3(0.0);
 
   if (occluded(P + N * uEps, L, maxDist)) return vec3(0.0);
-  return colRad.rgb * (NdotL / dist2);
+  return colRad.rgb * (cone * NdotL / dist2);
 }
 
 // Direct light at a GI bounce hit: sample ONE random light (weighted by count).
@@ -276,13 +289,15 @@ vec3 shadeReservoir(vec3 P, vec3 N) {
     int i = int(id);
     vec4 posType = uLightPosType[i];
     vec4 colRad = uLightColorRadius[i];
-    if (posType.w < 0.5) {
+    if (posType.w < 0.5 || posType.w >= 1.5) {
       vec3 d = posType.xyz - P;
       float dl = length(d);
       if (dl < 1e-5) return vec3(0.0);
       float NdotL = dot(N, d / dl);
       if (NdotL <= 0.0) return vec3(0.0);
-      C = colRad.rgb * (NdotL / (dl * dl));
+      float cone = spotFalloff(i, -d / dl);
+      if (cone <= 0.0) return vec3(0.0);
+      C = colRad.rgb * (cone * NdotL / (dl * dl));
       vec3 lp = posType.xyz + randUnitVector() * colRad.w; // soft shadows
       vec3 dj = lp - P;
       maxDist = length(dj);
@@ -572,6 +587,7 @@ export class RTLightingPass {
         uFireflyClamp: { value: 4.0 },
         uLightPosType: { value: [] },
         uLightColorRadius: { value: [] },
+        uLightDirCone: { value: [] },
         uLightCount: { value: 0 },
         uEmissiveCount: { value: 0 },
         uReflEnabled: { value: true },
@@ -647,6 +663,7 @@ export class RTLightingPass {
     u.uMaterialsTex.value = compiled.materialsTex;
     u.uLightPosType.value = compiled.lightPosType;
     u.uLightColorRadius.value = compiled.lightColorRadius;
+    u.uLightDirCone.value = compiled.lightDirCone;
     u.uLightCount.value = compiled.lightCount;
     u.uEmissiveCount.value = compiled.emissiveTriCount;
   }

@@ -47,6 +47,7 @@ uniform float uMaxHistory;
 
 uniform vec4 uLightPosType[MAX_LIGHTS];
 uniform vec4 uLightColorRadius[MAX_LIGHTS];
+uniform vec4 uLightDirCone[MAX_LIGHTS]; // spot: direction.xyz + cos(outer)
 uniform int uLightCount;
 uniform int uEmissiveCount;
 
@@ -107,13 +108,20 @@ bool occluded(vec3 ro, vec3 rd, float maxDist) {
 vec3 lightAt(int i, vec3 S) {
   vec4 posType = uLightPosType[i];
   vec4 colRad = uLightColorRadius[i];
-  if (posType.w < 0.5) {
+  if (posType.w < 0.5 || posType.w >= 1.5) {
     vec3 lp = posType.xyz + randUnitVector() * colRad.w;
     vec3 d = lp - S;
     float dist = length(d);
     if (dist < 1e-4) return vec3(0.0);
+    float cone = 1.0;
+    if (posType.w >= 1.5) {
+      // spot: this is what draws visible light CONES in fog
+      vec4 dc = uLightDirCone[i];
+      cone = smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, -d / dist));
+      if (cone <= 0.0) return vec3(0.0);
+    }
     if (occluded(S, d / dist, dist)) return vec3(0.0);
-    return colRad.rgb / (dist * dist);
+    return colRad.rgb * (cone / (dist * dist));
   }
   vec3 L = normalize(-posType.xyz + randUnitVector() * colRad.w);
   if (occluded(S, L, 1e7)) return vec3(0.0);
@@ -240,6 +248,7 @@ export class VolumetricPass {
         uMaxHistory: { value: 48 },
         uLightPosType: { value: [] },
         uLightColorRadius: { value: [] },
+        uLightDirCone: { value: [] },
         uLightCount: { value: 0 },
         uEmissiveCount: { value: 0 },
         uCameraPos: { value: new THREE.Vector3() },
@@ -280,6 +289,7 @@ export class VolumetricPass {
     u.uMaterialsTex.value = compiled.materialsTex;
     u.uLightPosType.value = compiled.lightPosType;
     u.uLightColorRadius.value = compiled.lightColorRadius;
+    u.uLightDirCone.value = compiled.lightDirCone;
     u.uLightCount.value = compiled.lightCount;
     u.uEmissiveCount.value = compiled.emissiveTriCount;
   }

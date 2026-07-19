@@ -73,7 +73,7 @@ floor.rotation.x = -Math.PI / 2;
 floor.position.y = -1;
 scene.add(floor);
 
-const light = new THREE.PointLight(0xffffff, 40);   // PointLight / DirectionalLight (up to 16)
+const light = new THREE.PointLight(0xffffff, 40);   // Point / Spot / Directional (up to 16)
 light.position.set(3, 5, 2);
 scene.add(light);
 
@@ -242,7 +242,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `PointLight` | ✅ | `light.userData.rtRadius` (default `0.15`) sets soft-shadow size. |
 | `DirectionalLight` | ✅ | `light.userData.rtRadius` (default `0.02`) sets sun softness; keep its direction in sync with `sky.sunDir`. |
 | Emissive meshes | ✅ static | Sampled directly as area lights. **Dynamic** emitters are *not* in the NEE list — they light only via GI-ray hits. |
-| `SpotLight` | ❌ | Ignored. |
+| `SpotLight` | ✅ | Cone + penumbra respected; soft shadows via `rtRadius`; visible light cones in volumetric fog. |
 | `RectAreaLight` | ❌ | Use an emissive mesh instead. |
 | `HemisphereLight` / `AmbientLight` | ❌ | Ignored — the procedural `sky` (or `envColor`) provides ambient. |
 

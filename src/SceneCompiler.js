@@ -47,6 +47,7 @@ export class CompiledScene {
     this.materials = [];
     this.lightPosType = [];
     this.lightColorRadius = [];
+    this.lightDirCone = []; // spot direction.xyz + cos(outer angle)
     this.lightCount = 0;
     this.emissiveTriCount = 0;
     this.triangleCount = 0;
@@ -380,8 +381,10 @@ export function compileScene(scene, options = {}) {
 export function syncLights(scene, compiled) {
   const posType = compiled.lightPosType;
   const colorRadius = compiled.lightColorRadius;
+  const dirCone = compiled.lightDirCone;
   posType.length = 0;
   colorRadius.length = 0;
+  dirCone.length = 0;
   let count = 0;
   const tmpP = new THREE.Vector3();
   const tmpT = new THREE.Vector3();
@@ -389,7 +392,24 @@ export function syncLights(scene, compiled) {
   scene.traverse((obj) => {
     if (!obj.isLight || !obj.visible || obj.intensity <= 0) return;
     if (count >= MAX_LIGHTS) return;
-    if (obj.isPointLight) {
+    if (obj.isSpotLight) {
+      // posType.w encodes type AND the inner-cone cosine: w = 2 + cosInner
+      // (any w >= 1.5 is a spot). Direction + outer cosine live in dirCone.
+      obj.getWorldPosition(tmpP);
+      obj.target.getWorldPosition(tmpT);
+      const dir = tmpT.sub(tmpP).normalize();
+      const cosOuter = Math.cos(obj.angle);
+      const cosInner = Math.cos(obj.angle * (1 - (obj.penumbra ?? 0)));
+      posType.push(tmpP.x, tmpP.y, tmpP.z, 2 + cosInner);
+      colorRadius.push(
+        obj.color.r * obj.intensity,
+        obj.color.g * obj.intensity,
+        obj.color.b * obj.intensity,
+        obj.userData.rtRadius ?? 0.1
+      );
+      dirCone.push(dir.x, dir.y, dir.z, cosOuter);
+      count++;
+    } else if (obj.isPointLight) {
       obj.getWorldPosition(tmpP);
       posType.push(tmpP.x, tmpP.y, tmpP.z, 0);
       colorRadius.push(
@@ -398,6 +418,7 @@ export function syncLights(scene, compiled) {
         obj.color.b * obj.intensity,
         obj.userData.rtRadius ?? 0.15
       );
+      dirCone.push(0, 0, 0, 0);
       count++;
     } else if (obj.isDirectionalLight) {
       obj.getWorldPosition(tmpP);
@@ -410,6 +431,7 @@ export function syncLights(scene, compiled) {
         obj.color.b * obj.intensity,
         obj.userData.rtRadius ?? 0.02
       );
+      dirCone.push(0, 0, 0, 0);
       count++;
     }
   });
@@ -418,6 +440,7 @@ export function syncLights(scene, compiled) {
   while (posType.length < MAX_LIGHTS * 4) {
     posType.push(0, 0, 0, 0);
     colorRadius.push(0, 0, 0, 0);
+    dirCone.push(0, 0, 0, 0);
   }
 }
 

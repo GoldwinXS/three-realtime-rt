@@ -21,6 +21,7 @@ uniform sampler2D uGNormalMetal;
 uniform sampler2D uMaterialsTex;  // row 1: emissive tris, rows 2..65: blue noise
 uniform vec4 uLightPosType[MAX_LIGHTS];
 uniform vec4 uLightColorRadius[MAX_LIGHTS];
+uniform vec4 uLightDirCone[MAX_LIGHTS]; // spot: direction.xyz + cos(outer)
 uniform int uLightCount;
 uniform int uEmissiveCount;
 uniform float uFrame;
@@ -59,13 +60,20 @@ vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
     int i = int(id);
     vec4 posType = uLightPosType[i];
     vec4 colRad = uLightColorRadius[i];
-    if (posType.w < 0.5) {
+    if (posType.w < 0.5 || posType.w >= 1.5) {
       vec3 d = posType.xyz - P; // light CENTER: soft-radius jitter re-drawn at shading
       float dl = length(d);
       if (dl < 1e-5) return vec3(0.0);
       float NdotL = dot(N, d / dl);
       if (NdotL <= 0.0) return vec3(0.0);
-      return colRad.rgb * (NdotL / (dl * dl));
+      float cone = 1.0;
+      if (posType.w >= 1.5) {
+        // spot cone — MUST match RTLightingPass.spotFalloff for a consistent estimator
+        vec4 dc = uLightDirCone[i];
+        cone = smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, -d / dl));
+        if (cone <= 0.0) return vec3(0.0);
+      }
+      return colRad.rgb * (cone * NdotL / (dl * dl));
     }
     float NdotL = dot(N, -posType.xyz);
     if (NdotL <= 0.0) return vec3(0.0);
@@ -283,6 +291,7 @@ export class RestirPass {
           uMaterialsTex: { value: null },
           uLightPosType: { value: [] },
           uLightColorRadius: { value: [] },
+          uLightDirCone: { value: [] },
           uLightCount: { value: 0 },
           uEmissiveCount: { value: 0 },
           uFrame: { value: 0 },
@@ -334,6 +343,7 @@ export class RestirPass {
       u.uMaterialsTex.value = compiled.materialsTex;
       u.uLightPosType.value = compiled.lightPosType;
       u.uLightColorRadius.value = compiled.lightColorRadius;
+      u.uLightDirCone.value = compiled.lightDirCone;
       u.uLightCount.value = compiled.lightCount;
       u.uEmissiveCount.value = compiled.emissiveTriCount;
     }
