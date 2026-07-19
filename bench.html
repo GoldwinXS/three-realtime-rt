@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt — benchmark</title>
+  <style>
+    html, body { margin: 0; min-height: 100%; background: #0a0f16; }
+    body {
+      color: #cfe0ea; font: 13px/1.6 ui-monospace, Consolas, monospace;
+      padding: 20px; box-sizing: border-box;
+    }
+    h1 { font-size: 15px; color: #7fd8c8; margin: 0 0 14px; }
+    #run {
+      font: inherit; color: inherit; background: #16202b;
+      border: 1px solid #2c3a46; border-radius: 6px; padding: 7px 14px;
+      cursor: pointer;
+    }
+    #run:hover { border-color: #38d0e0; color: #7fd8c8; }
+    #run:disabled { opacity: 0.5; cursor: default; }
+    #status { color: #8fa3b3; margin: 12px 0; min-height: 1.6em; }
+    #out {
+      white-space: pre; color: #cfe0ea; background: #0e131a;
+      border: 1px solid #26323c; border-radius: 8px; padding: 12px;
+      overflow-x: auto; margin: 0;
+    }
+    /* Bench canvas is fixed 1280x720; keep it off-flow but on-screen (readPixels
+       needs the drawing buffer to actually exist / not be display:none). */
+    #app { position: fixed; left: -20000px; top: 0; }
+  </style>
+  <script type="module" crossorigin src="./assets/bench-DH8H22vV.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/Duck-CiocAlMX.js">
+  <link rel="modulepreload" crossorigin href="./assets/DRACOLoader-2bzV41wi.js">
+  <link rel="modulepreload" crossorigin href="./assets/scene---4jmJFy.js">
+</head>
+<body>
+  <h1>three-realtime-rt — benchmark</h1>
+  <button id="run">Run benchmark</button>
+  <div id="status">idle.</div>
+  <pre id="out"></pre>
+  <div id="app"></div>
+</body>
+</html>

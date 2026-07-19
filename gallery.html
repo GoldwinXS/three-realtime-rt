@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt — premade scene gallery</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
+    #app { width: 100%; height: 100%; }
+    #app canvas { display: block; }
+    #boot {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px; z-index: 50;
+      color: #cfe0ea; font: 14px/1.5 ui-monospace, Consolas, monospace;
+      background: radial-gradient(circle at 50% 40%, #16202b, #0a0f16);
+      transition: opacity 0.5s; text-align: center; padding: 20px;
+    }
+    #boot.hidden { opacity: 0; pointer-events: none; }
+    #boot .spin {
+      width: 34px; height: 34px; border: 3px solid #223240;
+      border-top-color: #38d0e0; border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    #boot .err { color: #ff8a80; max-width: 520px; white-space: pre-wrap; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #hud {
+      position: fixed; top: 12px; left: 12px; z-index: 30;
+      display: flex; flex-direction: column; gap: 8px;
+      color: #cfe0ea; font: 12px/1.5 ui-monospace, Consolas, monospace;
+      background: rgba(14, 18, 24, 0.85); border: 1px solid #26323c;
+      border-radius: 8px; padding: 10px 12px; min-width: 220px;
+    }
+    #hud b { color: #7fd8c8; }
+    #hud select, #hud button {
+      font: inherit; color: inherit; background: #16202b;
+      border: 1px solid #2c3a46; border-radius: 6px; padding: 5px 8px;
+      cursor: pointer;
+    }
+    #hud button.on { border-color: #38d0e0; color: #7fd8c8; }
+    #stats { white-space: pre; color: #8fa3b3; }
+  </style>
+  <script type="module" crossorigin src="./assets/gallery-BCJxWATk.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/Duck-CiocAlMX.js">
+  <link rel="modulepreload" crossorigin href="./assets/OrbitControls-DdjA5vKz.js">
+  <link rel="modulepreload" crossorigin href="./assets/DRACOLoader-2bzV41wi.js">
+</head>
+<body>
+  <div id="app"></div>
+  <div id="hud">
+    <div><b>three-realtime-rt</b> — premade scenes</div>
+    <select id="scene-pick">
+      <option value="tokyo">Littlest Tokyo (DRACO glTF)</option>
+      <option value="lantern">Lantern (Khronos sample)</option>
+      <option value="helmet">Damaged Helmet + props</option>
+    </select>
+    <button id="rt-toggle" class="on">ray tracing: ON</button>
+    <div id="stats"></div>
+  </div>
+  <div id="boot">
+    <div class="spin"></div>
+    <div id="boot-msg">loading scene…</div>
+  </div>
+</body>
+</html>
