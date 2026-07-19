@@ -13,8 +13,8 @@ Runs on plain WebGL2.
 The library ships as **untranspiled ES modules** (the `src/` folder) — it has no
 build step of its own, so you consume it through your bundler (Vite, webpack,
 esbuild, …) or a browser import map that resolves the bare `three` /
-`three-mesh-bvh` specifiers. MIT licensed. **Not on npm yet** — until the first
-release lands, install straight from the Git repo (see [Getting started](#getting-started)).
+`three-mesh-bvh` specifiers. MIT licensed.
+[On npm](https://www.npmjs.com/package/three-realtime-rt): `npm i three-realtime-rt three three-mesh-bvh`.
 
 ### ▶ [Live demo](https://goldwinxs.github.io/three-realtime-rt/) — drag to orbit, drop the pile, toggle every feature.
 
@@ -37,9 +37,6 @@ of `three` and `three-mesh-bvh`:
 ```bash
 npm i three-realtime-rt three three-mesh-bvh
 ```
-
-> **Not published to npm yet.** Until the first release, install from the repo:
-> `npm i github:GoldwinXS/three-realtime-rt three three-mesh-bvh`
 
 No bundler? [`standalone.html`](standalone.html) is a single copy-paste file
 that runs the raytracer via CDN import maps — open it from any static server.

@@ -55,8 +55,9 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 // The library is imported RELATIVELY so this file works sitting next to src/.
-// After the package is published to npm you can swap this single line for:
-//   import { RealtimeRaytracer } from "https://unpkg.com/three-realtime-rt/src/index.js";
+// Copied this file somewhere on its own? Swap this single line for the
+// published package on a CDN:
+//   import { RealtimeRaytracer } from "https://unpkg.com/three-realtime-rt@0.3.0/src/index.js";
 import { RealtimeRaytracer } from "./src/index.js";
 
 const fpsEl = document.getElementById("fps");
