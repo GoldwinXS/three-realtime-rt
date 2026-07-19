@@ -279,7 +279,10 @@ export class RealtimeRaytracer {
       density: options.volumetric?.density ?? 0.015,
       maxDist: options.volumetric?.maxDist ?? 40,
     };
-    this.volumetricPass = new VolumetricPass(this._scaledW, this._scaledH);
+    // Quarter CANVAS resolution, independent of renderScale: fog is
+    // low-frequency, so resolution buys nothing — the budget goes into
+    // multiple march steps per ray instead (see VolumetricPass).
+    this.volumetricPass = new VolumetricPass(this._volW, this._volH);
 
     /**
      * ReSTIR direct lighting: per-pixel reservoirs converge onto the light
@@ -439,6 +442,12 @@ export class RealtimeRaytracer {
   get _scaledH() {
     return Math.max(1, Math.floor(this._height * this._renderScale));
   }
+  get _volW() {
+    return Math.max(1, this._width >> 2);
+  }
+  get _volH() {
+    return Math.max(1, this._height >> 2);
+  }
 
   get renderScale() {
     return this._renderScale;
@@ -455,7 +464,7 @@ export class RealtimeRaytracer {
     this.gbuffer.setSize(this._width, this._height);
     this.rtPass.setSize(this._scaledW, this._scaledH);
     this.denoisePass.setSize(this._scaledW, this._scaledH);
-    this.volumetricPass.setSize(this._scaledW, this._scaledH);
+    this.volumetricPass.setSize(this._volW, this._volH);
     this.restirPass.setSize(this._scaledW, this._scaledH);
     this.taaPass.setSize(this._width, this._height);
     this._sceneColor.setSize(this._width, this._height);
@@ -680,6 +689,7 @@ export class RealtimeRaytracer {
     cU.uSkyIntensity.value = this.sky.intensity;
     cU.uVolumetric.value = volumetricTex;
     cU.uVolEnabled.value = volumetricTex !== null;
+    cU.uVolTexelSize.value.set(1 / this._volW, 1 / this._volH);
     this.composite.render(
       this.renderer,
       irradiance,

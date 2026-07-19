@@ -23,7 +23,8 @@ uniform sampler2D uGAlbedoRough;
 uniform sampler2D uGNormalMetal;
 uniform sampler2D uGWorldPos;
 uniform sampler2D uGEmissive;
-uniform sampler2D uVolumetric; // in-scattered light (lighting res, smooth)
+uniform sampler2D uVolumetric; // in-scattered light (quarter canvas res, smooth)
+uniform vec2 uVolTexelSize;
 uniform bool uVolEnabled;
 uniform vec3 uBackgroundColor;
 // 0 composite, 1 albedo, 2 normal, 3 irradiance (direct+GI), 4 worldPos, 5 emissive
@@ -127,8 +128,8 @@ void main() {
     // in-scatter field changes every frame and temporal accumulation alone
     // can never converge it (grain carpeted dark scenes otherwise).
     if (uVolEnabled) {
-      vec2 o1 = uIrrTexelSize * 1.5;
-      vec2 o2 = uIrrTexelSize * 3.5;
+      vec2 o1 = uVolTexelSize * 1.5;
+      vec2 o2 = uVolTexelSize * 3.5;
       vec3 vol = texture(uVolumetric, vUv).rgb * 0.24
         + texture(uVolumetric, vUv + vec2( o1.x,  o1.y)).rgb * 0.12
         + texture(uVolumetric, vUv + vec2(-o1.x,  o1.y)).rgb * 0.12
@@ -172,6 +173,7 @@ export class CompositePass {
         uGWorldPos: { value: null },
         uGEmissive: { value: null },
         uVolumetric: { value: null },
+        uVolTexelSize: { value: new THREE.Vector2() },
         uVolEnabled: { value: false },
         uBackgroundColor: { value: new THREE.Color(0.01, 0.012, 0.02) },
         uOutputMode: { value: 0 },

@@ -172,34 +172,40 @@ void main() {
     ? normalize(P - uCameraPos)
     : vec3(0.0); // background without geometry: skip (no stable ray direction here)
 
+  // STRATIFIED MARCH: several jittered steps per ray instead of one point.
+  // This pass runs at quarter canvas resolution (fog is low-frequency), so
+  // the extra steps cost less than the old single-sample full-lighting-res
+  // version — and MOVING lights, whose in-scatter field changes every frame
+  // and can never converge temporally, get real per-frame averaging.
+  #define VOL_STEPS 4
   vec3 sample_ = vec3(0.0);
   if (hit && segLen > 1e-3) {
-    // ONE jittered point on the segment (uniform pdf 1/segLen).
-    float t = rand() * segLen;
-    vec3 S = uCameraPos + rd * t;
-    vec3 Lin = vec3(0.0);
-    // Stochastically pick analytic lights or the emissive set, weighted 1/p.
     bool hasL = uLightCount > 0;
     bool hasE = uEmissiveCount > 0;
-    if (hasL && hasE) {
-      if (rand() < 0.5) {
+    for (int k = 0; k < VOL_STEPS; k++) {
+      float t = (float(k) + rand()) * (segLen / float(VOL_STEPS));
+      vec3 S = uCameraPos + rd * t;
+      vec3 Lin = vec3(0.0);
+      // Stochastically pick analytic lights or the emissive set, weighted 1/p.
+      if (hasL && hasE) {
+        if (rand() < 0.5) {
+          int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
+          Lin = lightAt(i, S) * float(uLightCount) * 2.0;
+        } else {
+          Lin = emissiveAt(S) * 2.0;
+        }
+      } else if (hasL) {
         int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
-        Lin = lightAt(i, S) * float(uLightCount) * 2.0;
-      } else {
-        Lin = emissiveAt(S) * 2.0;
+        Lin = lightAt(i, S) * float(uLightCount);
+      } else if (hasE) {
+        Lin = emissiveAt(S);
       }
-    } else if (hasL) {
-      int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
-      Lin = lightAt(i, S) * float(uLightCount);
-    } else if (hasE) {
-      Lin = emissiveAt(S);
+      vec3 c = Lin * uDensity * (segLen / float(VOL_STEPS)) * exp(-uDensity * t);
+      // per-step spike clamp — outliers decay only as 1/count in the EMA
+      float sl = dot(c, vec3(0.299, 0.587, 0.114));
+      if (sl > 2.0) c *= 2.0 / sl;
+      sample_ += c;
     }
-    // transmittance to the camera + estimator weight (segLen / pdf-normalized)
-    sample_ = Lin * uDensity * segLen * exp(-uDensity * t);
-    // Single-sample spike clamp — same reasoning as the surface firefly clamp:
-    // the EMA decays outliers only as 1/count, so they read as grain.
-    float sl = dot(sample_, vec3(0.299, 0.587, 0.114));
-    if (sl > 4.0) sample_ *= 4.0 / sl;
   }
 
   // --- temporal accumulation, reprojected through the surface point ---
