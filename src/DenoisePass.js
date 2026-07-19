@@ -97,7 +97,11 @@ void main() {
       float k = (dx == 0 || dy == 0) ? 2.0 : 1.0;
       float wN = pow(max(dot(N, Nt), 0.0), 32.0);
       float wZ = exp(-abs(dot(g.xyz - P, N)) / planeTol);
-      float wL = exp(-abs(luminance(s.rgb) - lumC) / sigmaL);
+      // Tighten the luminance gate as the à-trous step widens: a shadow on a
+      // flat floor has no geometric edge to protect it, so at high iteration
+      // counts the wide passes would average it away ("floating" objects with
+      // no contact shadow). Wide steps only get to blend near-equal luminance.
+      float wL = exp(-abs(luminance(s.rgb) - lumC) / (sigmaL * inversesqrt(uStep)));
       float w = k * wN * wZ * wL * (1.0 - specKeep);
       sum += s.rgb * w;
       wsum += w;

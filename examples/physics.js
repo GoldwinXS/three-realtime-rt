@@ -171,6 +171,16 @@ export class Physics {
 
   step() {
     this.world.step();
+    // Kill floor: an "Explode" can launch a prop over the walls, after which
+    // it falls forever — hundreds of units below the room it still bloats the
+    // dynamic BVH's bounds (and its shadow rays). Drop escapees back in from
+    // above their home spot instead.
+    for (const prop of this.props) {
+      if (prop.body.translation().y < -10) {
+        this._place(prop, prop.home.x, 8, prop.home.z);
+        prop.body.wakeUp();
+      }
+    }
     this.sync();
   }
 
