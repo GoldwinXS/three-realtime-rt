@@ -156,6 +156,10 @@ async function main() {
     reflections: false,
     refraction: false,
     targetFps: 55,
+    // Deepest governor lever: canvas scale is app-owned (we own the canvas + CSS
+    // stretch), so hand the governor our setter. setCanvasScale is declared
+    // below; the closure only fires at render time, after it exists.
+    canvasScaleHook: (s) => setCanvasScale(s),
     maxHistory: 48,     // shorter history so moving shadows keep up
     envColor: new THREE.Color(0x0a0f18), // low ambient for GI rays that escape the room
     sky,                // (disabled indoors) procedural sky as GI ambient + background

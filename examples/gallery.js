@@ -48,7 +48,36 @@ const holdBtn = document.getElementById("rt-hold");
 
 const renderer = new THREE.WebGLRenderer({ antialias: false });
 renderer.setPixelRatio(1);
-renderer.setSize(window.innerWidth, window.innerHeight);
+
+// Canvas resolution scale (same win as the main demo): shrink the drawing
+// buffer while the CSS canvas stays fullscreen, so the browser upscales a
+// cheaper buffer — every full-res pass gets quadratically cheaper. This is the
+// governor's deepest lever, driven through canvasScaleHook below.
+let canvasScale = 1;
+const bufferSize = () => {
+  const pr = renderer.getPixelRatio();
+  return [
+    Math.floor(window.innerWidth * canvasScale * pr),
+    Math.floor(window.innerHeight * canvasScale * pr),
+  ];
+};
+const applyCanvasSize = () => {
+  renderer.setSize(
+    Math.floor(window.innerWidth * canvasScale),
+    Math.floor(window.innerHeight * canvasScale),
+    false
+  );
+  renderer.domElement.style.width = "100%";
+  renderer.domElement.style.height = "100%";
+};
+// Manual/governor canvas-scale setter — resizes the buffer and re-syncs the
+// live rt's targets. Guarded because rt is built lazily per scene.
+const setCanvasScale = (s) => {
+  canvasScale = s;
+  applyCanvasSize();
+  if (rt) rt.setSize(...bufferSize());
+};
+applyCanvasSize();
 document.getElementById("app").appendChild(renderer.domElement);
 
 // Google-hosted DRACO decoder (same one the official three.js examples use).
@@ -250,7 +279,10 @@ const settings = {
   taa: true,
   volumetric: false,
   renderScale: 0.5,
-  adaptiveQuality: false,
+  // Auto quality ON out of the box — the governor steers renderScale, denoise,
+  // and (via canvasScaleHook) canvas scale to hold the frame-rate target on
+  // whatever hardware loads the gallery.
+  adaptiveQuality: true,
 };
 
 function applySettings() {
@@ -285,8 +317,15 @@ async function switchScene(key) {
     sky: def.sky,
     envColor: def.env?.color ?? new THREE.Color(0x121821),
     envIntensity: def.env?.intensity ?? 1.0,
+    // Governor's deepest lever. A fresh rt is built per scene, but this closure
+    // captures the module-level canvasScale/renderer so it keeps working across
+    // switches.
+    canvasScaleHook: (s) => setCanvasScale(s),
   });
   applySettings();
+  // Re-apply the current canvas scale so the new rt's buffers match (its ctor
+  // read the renderer size, but be explicit in case scale changed mid-session).
+  rt.setSize(...bufferSize());
   const t0 = performance.now();
   rt.compileScene(scene);
   triCount = rt.compiled.triangleCount;
@@ -323,6 +362,7 @@ holdBtn.addEventListener("touchend", (e) => { e.preventDefault(); holdRaster(fal
 // select drives renderScale (and forces auto-quality off, matching the main
 // demo's manual override). Everything routes through applySettings().
 const resSelect = document.getElementById("opt-res");
+const canvasSelect = document.getElementById("opt-canvas");
 const autoBox = document.getElementById("opt-adaptive");
 document.querySelectorAll("#options input[data-flag]").forEach((box) => {
   box.checked = settings[box.dataset.flag];
@@ -340,12 +380,24 @@ if (resSelect) {
     applySettings();
   });
 }
+// Canvas resolution select — same override pattern as lighting res: manual
+// choice sets canvas scale directly and turns auto quality off so the governor
+// stops steering it.
+if (canvasSelect) {
+  canvasSelect.value = String(canvasScale);
+  canvasSelect.addEventListener("change", () => {
+    setCanvasScale(parseFloat(canvasSelect.value));
+    settings.adaptiveQuality = false; // manual res selection overrides auto
+    if (autoBox) autoBox.checked = false;
+    applySettings();
+  });
+}
 
 window.addEventListener("resize", () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
-  renderer.setSize(innerWidth, innerHeight);
-  if (rt) rt.setSize(innerWidth, innerHeight);
+  applyCanvasSize();
+  if (rt) rt.setSize(...bufferSize());
 });
 
 const fail = (err) => {

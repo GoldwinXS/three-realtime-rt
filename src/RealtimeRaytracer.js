@@ -126,6 +126,14 @@ export class RealtimeRaytracer {
     };
   }
 
+  // Canvas-scale ladder for the governor's deepest lever. Canvas scale shrinks
+  // the drawing buffer, so EVERY pass (raster G-buffer, lighting, denoise, TAA,
+  // resolve) gets quadratically cheaper — unlike renderScale, which only touches
+  // the lighting buffer. It's app-owned (the demo/gallery own the canvas + CSS
+  // stretch), so the governor drives it through canvasScaleHook rather than
+  // touching the renderer directly.
+  static CANVAS_LEVELS = [1, 0.85, 0.75, 0.62, 0.5];
+
   constructor(renderer, options = {}) {
     this.renderer = renderer;
 
@@ -225,6 +233,13 @@ export class RealtimeRaytracer {
     this._qEma = null;
     this._qLastT = null;
     this._qLastChange = 0;
+    /**
+     * App-owned canvas-scale setter, driven by the governor as its deepest
+     * lever once renderScale bottoms out. The app owns the canvas + CSS stretch,
+     * so it must apply the buffer resize itself; null disables this level.
+     */
+    this.canvasScaleHook = options.canvasScaleHook ?? null;
+    this._canvasLevelIdx = 0;
     /** Edge-aware à-trous denoise on the irradiance buffer. */
     this.denoise = options.denoise ?? true;
     /** À-trous iterations (steps 1, 2, 4, ...). */
@@ -406,6 +421,45 @@ export class RealtimeRaytracer {
 
     let s = this._renderScale * Math.pow(1 / ratio, 0.35);
     s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
+
+    // When we're fast, give back the deepest lever FIRST: restore canvas scale
+    // one step before touching renderScale, since canvas is the coarsest/most
+    // valuable resolution to recover and it's quadratic on every pass.
+    if (ratio < 0.8 && this.canvasScaleHook && this._canvasLevelIdx > 0) {
+      this._canvasLevelIdx--;
+      this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx]);
+      this._qLastChange = now;
+      this._qEma = null; // cost profile changed — measure fresh
+      console.info(
+        `three-realtime-rt: adaptive quality → ${Math.round(
+          RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx] * 100
+        )}% canvas`
+      );
+      return;
+    }
+
+    // When we're slow and renderScale has already bottomed out (clamped to its
+    // 0.2 floor while we're already near it), step DOWN the canvas ladder — the
+    // deepest, quadratic-on-every-pass lever — instead of a no-op renderScale.
+    if (
+      ratio > 1.12 &&
+      s <= 0.2 &&
+      this._renderScale <= 0.25 &&
+      this.canvasScaleHook &&
+      this._canvasLevelIdx < RealtimeRaytracer.CANVAS_LEVELS.length - 1
+    ) {
+      this._canvasLevelIdx++;
+      this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx]);
+      this._qLastChange = now;
+      this._qEma = null; // cost profile changed — measure fresh
+      console.info(
+        `three-realtime-rt: adaptive quality → ${Math.round(
+          RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx] * 100
+        )}% canvas`
+      );
+      return;
+    }
+
     if (Math.abs(s - this._renderScale) < 0.045) return;
 
     const q = RealtimeRaytracer._qualityFor(s);
