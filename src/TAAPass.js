@@ -171,12 +171,37 @@ export class TAAPass {
   }
 
   setSize(width, height) {
+    // No-op when the dimensions are unchanged (e.g. a renderScale-only step,
+    // which leaves the full-res TAA buffers alone): reallocating + resetting
+    // history here would drop a frame of resolved AA for nothing.
+    if (width === this._width && height === this._height) return;
     this._width = width;
     this._height = height;
     this.targetA.setSize(width, height);
     this.targetB.setSize(width, height);
     this.material.uniforms.uTexelSize.value.set(1 / width, 1 / height);
     this._reset = true;
+  }
+
+  /**
+   * Reallocate to a new size while carrying the resolved history forward (linear
+   * resample), so a canvas-ladder resize doesn't force a one-frame TAA reset and
+   * the shimmer that comes with it. The freshest resolved image is targetB (see
+   * the swap in render()); the neighbourhood clamp bounds any resample error
+   * within a frame, so no _reset is needed.
+   */
+  resizeCarry(renderer, copyPass, width, height) {
+    if (width === this._width && height === this._height) return;
+    this._width = width;
+    this._height = height;
+    const newA = this._makeTarget(width, height);
+    const newB = this._makeTarget(width, height);
+    copyPass.blit(renderer, this.targetB.texture, newB, -1);
+    this.targetA.dispose();
+    this.targetB.dispose();
+    this.targetA = newA;
+    this.targetB = newB;
+    this.material.uniforms.uTexelSize.value.set(1 / width, 1 / height);
   }
 
   /** Force the next frame to show the current sample with no history (scene changed). */

@@ -663,6 +663,29 @@ export class RTLightingPass {
     this.targetB.setSize(width, height);
   }
 
+  /**
+   * Reallocate the history targets to a new size while PRESERVING the
+   * accumulated irradiance. The plain setSize + clearHistory path dumps every
+   * temporal sample, which strobes the image back to 1-spp noise on every
+   * governor renderScale step — this carries the history over instead.
+   *
+   * The freshest history is targetB (last frame's output — see the swap in
+   * render()); it is resampled through copyPass into the new targetB, its
+   * per-pixel sample count (alpha) clamped to `carryFrames` so the EMA
+   * reconverges smoothly at the new resolution rather than freezing on stale
+   * values. targetA is overwritten on the next render, so it only needs the
+   * fresh allocation, not a copy.
+   */
+  resizeCarry(renderer, copyPass, width, height, carryFrames) {
+    const newA = this._makeTarget(width, height);
+    const newB = this._makeTarget(width, height);
+    copyPass.blit(renderer, this.targetB.texture, newB, carryFrames);
+    this.targetA.dispose();
+    this.targetB.dispose();
+    this.targetA = newA;
+    this.targetB = newB;
+  }
+
   setCompiledScene(compiled) {
     const u = this.material.uniforms;
     u.bvhStatic.value = compiled.staticBvhUniform;

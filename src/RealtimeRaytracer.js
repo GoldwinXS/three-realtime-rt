@@ -7,6 +7,7 @@ import { CompositePass } from "./CompositePass.js";
 import { TAAPass } from "./TAAPass.js";
 import { VolumetricPass } from "./VolumetricPass.js";
 import { RestirPass } from "./RestirPass.js";
+import { CopyPass } from "./CopyPass.js";
 
 // Van der Corput / Halton radical inverse — deterministic low-discrepancy
 // sub-pixel offsets for temporal jitter.
@@ -134,6 +135,13 @@ export class RealtimeRaytracer {
   // touching the renderer directly.
   static CANVAS_LEVELS = [1, 0.85, 0.75, 0.62, 0.5];
 
+  // Sample count the carried-over irradiance history is clamped to when the
+  // targets are reallocated (renderScale step / canvas resize). Small enough
+  // that the EMA visibly reconverges onto the new-resolution samples, large
+  // enough that the image doesn't flash back to raw 1-spp noise — "keep ~8
+  // frames of confidence". See RTLightingPass.resizeCarry.
+  static HISTORY_CARRY_FRAMES = 8;
+
   constructor(renderer, options = {}) {
     this.renderer = renderer;
 
@@ -175,6 +183,9 @@ export class RealtimeRaytracer {
     this.composite = new CompositePass();
     this.taaPass = new TAAPass(this._width, this._height);
     this._sceneColor = this._makeColorTarget(this._width, this._height);
+    // Fullscreen blit used to carry history buffers across target reallocation
+    // (renderScale steps / canvas resizes) instead of hard-clearing them.
+    this._copyPass = new CopyPass();
 
     this.compiled = null;
     this.frame = 0;
@@ -252,6 +263,12 @@ export class RealtimeRaytracer {
     this._qEma = null;
     this._qLastT = null;
     this._qLastChange = 0;
+    // Direction of the last committed quality change (+1 up / -1 down) and an
+    // oscillation flag: when two consecutive steps reverse direction the
+    // governor is hunting around the frame-time boundary, so it widens its
+    // deadband and lengthens its cooldown to settle down (see _adaptQuality).
+    this._qLastDir = 0;
+    this._qOscillating = false;
     /**
      * App-owned canvas-scale setter, driven by the governor as its deepest
      * lever once renderScale bottoms out. The app owns the canvas + CSS stretch,
@@ -467,18 +484,58 @@ export class RealtimeRaytracer {
     this.setSize(this._width, this._height);
   }
 
+  // Resize (or re-scale) the pipeline WITHOUT dumping temporal history. A
+  // renderScale step only resizes the lighting-resolution targets; a genuine
+  // canvas resize also resizes the full-res ones. Each history-bearing buffer
+  // is carried over (resampled) rather than cleared — a hard reset here is what
+  // strobed the image on every governor tick. Compares desired vs currently
+  // allocated size per pass, so it is correct no matter when _renderScale was
+  // updated (the renderScale setter changes it before calling us).
   setSize(width, height) {
     if (!this.supported) return;
     this._width = Math.floor(width);
     this._height = Math.floor(height);
-    this.gbuffer.setSize(this._width, this._height);
-    this.rtPass.setSize(this._scaledW, this._scaledH);
-    this.denoisePass.setSize(this._scaledW, this._scaledH);
-    this.volumetricPass.setSize(this._volW, this._volH);
-    this.restirPass.setSize(this._scaledW, this._scaledH);
-    this.taaPass.setSize(this._width, this._height);
-    this._sceneColor.setSize(this._width, this._height);
-    this.resetAccumulation();
+
+    const sw = this._scaledW;
+    const sh = this._scaledH;
+    const scaledChanged =
+      this.rtPass.targetA.width !== sw || this.rtPass.targetA.height !== sh;
+    const canvasChanged =
+      this.taaPass.targetA.width !== this._width ||
+      this.taaPass.targetA.height !== this._height;
+
+    // Lighting-resolution targets (change on both a renderScale step and a
+    // canvas resize). Carry the irradiance history — the buffer whose reset
+    // causes the flash — and reallocate the rest.
+    if (scaledChanged) {
+      this.rtPass.resizeCarry(
+        this.renderer,
+        this._copyPass,
+        sw,
+        sh,
+        RealtimeRaytracer.HISTORY_CARRY_FRAMES
+      );
+      this.denoisePass.setSize(sw, sh); // display-only, no temporal state
+      // ReSTIR reservoirs store packed id·64+M encodings — invalid to linearly
+      // resample — but they reconverge in a few frames, so just reallocate and
+      // clear them.
+      this.restirPass.setSize(sw, sh);
+      this.restirPass.clearHistory(this.renderer);
+    }
+
+    // Full-res / canvas-res targets: only touched on a real canvas resize (a
+    // renderScale step leaves them alone, so TAA keeps its resolved history).
+    if (canvasChanged) {
+      this.gbuffer.setSize(this._width, this._height);
+      // Quarter-canvas fog: low-frequency and reconverges instantly, so a plain
+      // reallocation + clear is fine.
+      this.volumetricPass.setSize(this._volW, this._volH);
+      this.volumetricPass.clearHistory(this.renderer);
+      // TAA history is full-canvas-res: carry it across the resize (linear
+      // resample) so the ladder step doesn't reset AA.
+      this.taaPass.resizeCarry(this.renderer, this._copyPass, this._width, this._height);
+      this._sceneColor.setSize(this._width, this._height);
+    }
   }
 
   // ---- adaptive quality governor: continuous dynamic resolution scaling ----
@@ -494,10 +551,17 @@ export class RealtimeRaytracer {
     this._qLastT = now;
     if (dt == null || dt > 100) return; // first frame or hidden-tab stall
     this._qEma = this._qEma == null ? dt : this._qEma * 0.9 + dt * 0.1;
-    if (now - this._qLastChange < 2000) return;
+    // Calmness: normally 2s between changes. When the last two steps reversed
+    // direction the governor is hunting the boundary, so hold for 5s AND widen
+    // the "comfortable" deadband — both push it to commit to a level instead of
+    // ping-ponging (each ping-pong is a target reallocation).
+    const cooldown = this._qOscillating ? 5000 : 2000;
+    if (now - this._qLastChange < cooldown) return;
 
     const ratio = this._qEma / (1000 / this.targetFps);
-    if (ratio < 1.12 && ratio > 0.8) return; // comfortable — leave it alone
+    const dbLo = this._qOscillating ? 0.6 : 0.8;
+    const dbHi = this._qOscillating ? 1.24 : 1.12;
+    if (ratio < dbHi && ratio > dbLo) return; // comfortable — leave it alone
 
     let s = this._renderScale * Math.pow(1 / ratio, 0.35);
     s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
@@ -505,10 +569,10 @@ export class RealtimeRaytracer {
     // When we're fast, give back the deepest lever FIRST: restore canvas scale
     // one step before touching renderScale, since canvas is the coarsest/most
     // valuable resolution to recover and it's quadratic on every pass.
-    if (ratio < 0.8 && this.canvasScaleHook && this._canvasLevelIdx > 0) {
+    if (ratio < dbLo && this.canvasScaleHook && this._canvasLevelIdx > 0) {
       this._canvasLevelIdx--;
       this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx]);
-      this._qLastChange = now;
+      this._recordChange(1, now); // restoring resolution = quality up
       this._qEma = null; // cost profile changed — measure fresh
       console.info(
         `three-realtime-rt: adaptive quality → ${Math.round(
@@ -522,7 +586,7 @@ export class RealtimeRaytracer {
     // 0.2 floor while we're already near it), step DOWN the canvas ladder — the
     // deepest, quadratic-on-every-pass lever — instead of a no-op renderScale.
     if (
-      ratio > 1.12 &&
+      ratio > dbHi &&
       s <= 0.2 &&
       this._renderScale <= 0.25 &&
       this.canvasScaleHook &&
@@ -530,7 +594,7 @@ export class RealtimeRaytracer {
     ) {
       this._canvasLevelIdx++;
       this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx]);
-      this._qLastChange = now;
+      this._recordChange(-1, now); // deeper downscale = quality down
       this._qEma = null; // cost profile changed — measure fresh
       console.info(
         `three-realtime-rt: adaptive quality → ${Math.round(
@@ -542,17 +606,27 @@ export class RealtimeRaytracer {
 
     if (Math.abs(s - this._renderScale) < 0.045) return;
 
+    const dir = Math.sign(s - this._renderScale);
     const q = RealtimeRaytracer._qualityFor(s);
     this.denoiseIterations = q.denoiseIterations;
     this.stochasticLights = q.stochasticLights;
-    this.renderScale = s; // reallocates targets + resets accumulation
-    this._qLastChange = now;
+    this.renderScale = s; // reallocates targets, carrying history over (no reset)
+    this._recordChange(dir, now);
     this._qEma = null; // cost profile changed — measure fresh
     console.info(
       `three-realtime-rt: adaptive quality → ${Math.round(s * 100)}% lighting, ` +
         `${q.denoiseIterations} denoise passes, ` +
         `${q.stochasticLights ? "stochastic" : "full"} direct light`
     );
+  }
+
+  // Record a committed quality step and update oscillation state: two
+  // consecutive steps in OPPOSITE directions mean the governor is hunting the
+  // frame-time boundary (drives the wider deadband + longer cooldown above).
+  _recordChange(dir, now) {
+    this._qOscillating = dir !== 0 && this._qLastDir !== 0 && dir !== this._qLastDir;
+    if (dir !== 0) this._qLastDir = dir;
+    this._qLastChange = now;
   }
 
   render(scene, camera) {
@@ -754,6 +828,7 @@ export class RealtimeRaytracer {
     this.volumetricPass.dispose();
     this.restirPass.dispose();
     this._sceneColor.dispose();
+    this._copyPass.dispose();
     if (this.compiled) this.compiled.dispose();
   }
 }
