@@ -56,10 +56,10 @@
       border: 1px solid #2c3a46; border-radius: 6px; padding: 3px 6px; cursor: pointer;
     }
   </style>
-  <script type="module" crossorigin src="./assets/gallery-BX-XnPyT.js"></script>
-  <link rel="modulepreload" crossorigin href="./assets/Duck-CiNw2Mg-.js">
-  <link rel="modulepreload" crossorigin href="./assets/OrbitControls-OIKOS60W.js">
-  <link rel="modulepreload" crossorigin href="./assets/DRACOLoader-CN0ennwt.js">
+  <script type="module" crossorigin src="./assets/gallery-Ba9Jzbho.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/Duck-prkR9BcE.js">
+  <link rel="modulepreload" crossorigin href="./assets/OrbitControls-CBQEHHka.js">
+  <link rel="modulepreload" crossorigin href="./assets/DRACOLoader-C3xqCFmP.js">
 </head>
 <body>
   <div id="app"></div>
@@ -73,8 +73,13 @@
       <option value="boombox">BoomBox (Khronos sample)</option>
       <option value="corset">Corset (Khronos sample)</option>
       <option value="waterbottle">Water Bottle (Khronos sample)</option>
+      <option value="toycar">Toy Car (Khronos sample)</option>
+      <option value="iridescence">Iridescence Lamp (Khronos sample)</option>
+      <option value="mosquito">Mosquito in Amber (Khronos sample)</option>
+      <option value="fox">Fox — bind pose (Khronos sample)</option>
     </select>
     <button id="rt-toggle" class="on">ray tracing: ON</button>
+    <button id="rt-hold">hold: raster</button>
     <div id="stats"></div>
     <details id="options">
       <summary>options</summary>
@@ -96,6 +101,15 @@
           <option value="0.5">50%</option>
           <option value="0.375">37%</option>
           <option value="0.25">25%</option>
+        </select>
+      </label>
+      <label class="opt-res-row">resolution
+        <select id="opt-canvas">
+          <option value="1">100%</option>
+          <option value="0.85">85%</option>
+          <option value="0.75">75%</option>
+          <option value="0.62">62%</option>
+          <option value="0.5">50%</option>
         </select>
       </label>
     </details>
