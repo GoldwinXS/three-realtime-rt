@@ -122,15 +122,22 @@ void main() {
   } else {
     color = albedoRough.rgb * irradiance + emissive;
     // Volumetric in-scatter (already radiance, not modulated by albedo). Fog
-    // is low-frequency, so a wide 5-tap blur costs nothing visually and eats
-    // most of the single-sample grain the accumulation hasn't averaged yet.
+    // is low-frequency, so a wide 9-tap blur costs nothing visually and eats
+    // the single-sample grain — crucial with MOVING lights, where the
+    // in-scatter field changes every frame and temporal accumulation alone
+    // can never converge it (grain carpeted dark scenes otherwise).
     if (uVolEnabled) {
-      vec2 o = uIrrTexelSize * 1.5;
-      vec3 vol = texture(uVolumetric, vUv).rgb * 0.4
-        + texture(uVolumetric, vUv + vec2( o.x,  o.y)).rgb * 0.15
-        + texture(uVolumetric, vUv + vec2(-o.x,  o.y)).rgb * 0.15
-        + texture(uVolumetric, vUv + vec2( o.x, -o.y)).rgb * 0.15
-        + texture(uVolumetric, vUv + vec2(-o.x, -o.y)).rgb * 0.15;
+      vec2 o1 = uIrrTexelSize * 1.5;
+      vec2 o2 = uIrrTexelSize * 3.5;
+      vec3 vol = texture(uVolumetric, vUv).rgb * 0.24
+        + texture(uVolumetric, vUv + vec2( o1.x,  o1.y)).rgb * 0.12
+        + texture(uVolumetric, vUv + vec2(-o1.x,  o1.y)).rgb * 0.12
+        + texture(uVolumetric, vUv + vec2( o1.x, -o1.y)).rgb * 0.12
+        + texture(uVolumetric, vUv + vec2(-o1.x, -o1.y)).rgb * 0.12
+        + texture(uVolumetric, vUv + vec2( o2.x,  0.0 )).rgb * 0.07
+        + texture(uVolumetric, vUv + vec2(-o2.x,  0.0 )).rgb * 0.07
+        + texture(uVolumetric, vUv + vec2( 0.0 ,  o2.y)).rgb * 0.07
+        + texture(uVolumetric, vUv + vec2( 0.0 , -o2.y)).rgb * 0.07;
       color += vol;
     }
     if (uFogEnabled) {
