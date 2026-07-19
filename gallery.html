@@ -38,6 +38,23 @@
     }
     #hud button.on { border-color: #38d0e0; color: #7fd8c8; }
     #stats { white-space: pre; color: #8fa3b3; }
+    #options { border-top: 1px solid #26323c; padding-top: 8px; }
+    #options summary {
+      cursor: pointer; color: #7fd8c8; list-style: none; user-select: none;
+    }
+    #options summary::-webkit-details-marker { display: none; }
+    #options summary::before { content: "\25B8 "; }
+    #options[open] summary::before { content: "\25BE "; }
+    #options .opt-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 2px 10px; margin-top: 8px;
+    }
+    #options label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    #options input[type="checkbox"] { accent-color: #38d0e0; cursor: pointer; }
+    #options .opt-res-row { margin-top: 8px; gap: 8px; }
+    #options select {
+      font: inherit; color: inherit; background: #16202b;
+      border: 1px solid #2c3a46; border-radius: 6px; padding: 3px 6px; cursor: pointer;
+    }
   </style>
 </head>
 <body>
@@ -48,9 +65,36 @@
       <option value="tokyo">Littlest Tokyo (DRACO glTF)</option>
       <option value="lantern">Lantern (Khronos sample)</option>
       <option value="helmet">Damaged Helmet + props</option>
+      <option value="camera">Antique Camera (Khronos sample)</option>
+      <option value="boombox">BoomBox (Khronos sample)</option>
+      <option value="corset">Corset (Khronos sample)</option>
+      <option value="waterbottle">Water Bottle (Khronos sample)</option>
     </select>
     <button id="rt-toggle" class="on">ray tracing: ON</button>
     <div id="stats"></div>
+    <details id="options">
+      <summary>options</summary>
+      <div class="opt-grid">
+        <label><input type="checkbox" data-flag="gi" /> GI</label>
+        <label><input type="checkbox" data-flag="emissiveNEE" /> emissive NEE</label>
+        <label><input type="checkbox" data-flag="reflections" /> reflections</label>
+        <label><input type="checkbox" data-flag="refraction" /> refraction</label>
+        <label><input type="checkbox" data-flag="restir" /> ReSTIR</label>
+        <label><input type="checkbox" data-flag="denoise" /> denoise</label>
+        <label><input type="checkbox" data-flag="taa" /> TAA</label>
+        <label><input type="checkbox" data-flag="volumetric" /> volumetric</label>
+        <label><input type="checkbox" data-flag="adaptiveQuality" id="opt-adaptive" /> auto quality</label>
+      </div>
+      <label class="opt-res-row">lighting res
+        <select id="opt-res">
+          <option value="1">100%</option>
+          <option value="0.75">75%</option>
+          <option value="0.5">50%</option>
+          <option value="0.375">37%</option>
+          <option value="0.25">25%</option>
+        </select>
+      </label>
+    </details>
   </div>
   <div id="boot">
     <div class="spin"></div>

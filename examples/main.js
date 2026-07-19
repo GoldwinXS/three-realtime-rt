@@ -251,11 +251,29 @@ async function main() {
         (rand() * 2 - 1) * 6    // z in ±6
       );
       light.userData.rtRadius = 0.2; // soft shadows
+      // A small glowing marker so the party light is visibly a source. It's a
+      // CHILD of the light so it tracks its position, and rtExclude keeps it out
+      // of the BVH — otherwise the marker would occlude its own light's shadow
+      // rays (same trick the Shadow Heist game uses). rtExclude also keeps its
+      // emissive off the RT light lists, so the glow is purely cosmetic via the
+      // G-buffer — intended.
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(0.12, 12, 8),
+        new THREE.MeshStandardMaterial({ color: 0x000000, emissive: light.color, emissiveIntensity: 3 })
+      );
+      marker.userData.rtExclude = true;
+      light.add(marker);
       scene.add(light);
       extraLights.push(light);
     }
     while (extraLights.length > n) {
       const light = extraLights.pop();
+      // Dispose the cosmetic marker's geometry/material before dropping the light.
+      const marker = light.children.find((c) => c.userData && c.userData.rtExclude);
+      if (marker) {
+        marker.geometry.dispose();
+        marker.material.dispose();
+      }
       scene.remove(light);
       light.dispose();
     }

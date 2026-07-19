@@ -24,6 +24,12 @@ const tokyoUrl =
   "https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/LittlestTokyo.glb";
 const lanternUrl =
   "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Lantern/glTF-Binary/Lantern.glb";
+const khronos = (name) =>
+  `https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/${name}/glTF-Binary/${name}.glb`;
+const cameraUrl = khronos("AntiqueCamera");
+const boomBoxUrl = khronos("BoomBox");
+const corsetUrl = khronos("Corset");
+const waterBottleUrl = khronos("WaterBottle");
 import helmetUrl from "./assets/DamagedHelmet.glb?url";
 import duckUrl from "./assets/Duck.glb?url";
 
@@ -132,6 +138,45 @@ const SCENES = {
     const sky = sunAndSky(scene, 2.8);
     return { scene, sky, cam: [6, 4, 8], target: [0, 2, 0] };
   },
+  async camera() {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1017);
+    const gltf = await loadGltf(cameraUrl);
+    normalize(gltf.scene, 7);
+    scene.add(gltf.scene, groundPlane(0x8d939b));
+    const sky = sunAndSky(scene, 2.6, [10, 15, 8]);
+    return { scene, sky, cam: [6, 5, 8], target: [0, 3, 0] };
+  },
+  async boombox() {
+    // BoomBox is authored a few centimetres tall — normalize large so it fills
+    // the view, then a tighter camera to read the metal + label textures.
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1017);
+    const gltf = await loadGltf(boomBoxUrl);
+    normalize(gltf.scene, 7);
+    scene.add(gltf.scene, groundPlane(0x777d85));
+    const sky = sunAndSky(scene, 2.8);
+    return { scene, sky, cam: [5, 4, 7], target: [0, 2.2, 0] };
+  },
+  async corset() {
+    // Another sub-centimetre asset — scaled up so the glossy fabric shows.
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1017);
+    const gltf = await loadGltf(corsetUrl);
+    normalize(gltf.scene, 7);
+    scene.add(gltf.scene, groundPlane(0x8d939b));
+    const sky = sunAndSky(scene, 2.6);
+    return { scene, sky, cam: [5, 5, 7], target: [0, 3.4, 0] };
+  },
+  async waterbottle() {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0c1017);
+    const gltf = await loadGltf(waterBottleUrl);
+    normalize(gltf.scene, 7);
+    scene.add(gltf.scene, groundPlane(0x8d939b));
+    const sky = sunAndSky(scene, 2.6);
+    return { scene, sky, cam: [5, 5, 7], target: [0, 3.2, 0] };
+  },
 };
 
 const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
@@ -142,6 +187,39 @@ let rt = null;
 let scene = null;
 let rtEnabled = true;
 let triCount = 0;
+
+// Single source of truth for the feature toggles. The gallery builds a fresh
+// RealtimeRaytracer on every scene switch, so `settings` outlives any one `rt`
+// and is re-applied after each switchScene() creates one. Controls write here
+// then call applySettings().
+const settings = {
+  gi: true,
+  emissiveNEE: true,
+  reflections: true,
+  refraction: true,
+  restir: true,
+  denoise: true,
+  taa: true,
+  volumetric: false,
+  renderScale: 0.5,
+  adaptiveQuality: false,
+};
+
+function applySettings() {
+  if (!rt) return;
+  rt.gi = settings.gi;
+  rt.emissiveNEE = settings.emissiveNEE;
+  rt.reflections = settings.reflections;
+  rt.refraction = settings.refraction;
+  rt.restir = settings.restir;
+  rt.denoise = settings.denoise;
+  rt.taa = settings.taa;
+  rt.volumetric.enabled = settings.volumetric;
+  rt.adaptiveQuality = settings.adaptiveQuality;
+  // renderScale reallocates targets, so only touch it when it actually changed.
+  if (rt.renderScale !== settings.renderScale) rt.renderScale = settings.renderScale;
+  rt.resetAccumulation();
+}
 
 async function switchScene(key) {
   setBoot("loading scene…");
@@ -160,6 +238,7 @@ async function switchScene(key) {
     envColor: def.env?.color ?? new THREE.Color(0x121821),
     envIntensity: def.env?.intensity ?? 1.0,
   });
+  applySettings();
   const t0 = performance.now();
   rt.compileScene(scene);
   triCount = rt.compiled.triangleCount;
@@ -177,6 +256,28 @@ rtBtn.addEventListener("click", () => {
   rtBtn.classList.toggle("on", rtEnabled);
   if (rt) rt.resetAccumulation();
 });
+
+// Options strip — each checkbox mirrors a boolean in `settings`; the lighting-res
+// select drives renderScale (and forces auto-quality off, matching the main
+// demo's manual override). Everything routes through applySettings().
+const resSelect = document.getElementById("opt-res");
+const autoBox = document.getElementById("opt-adaptive");
+document.querySelectorAll("#options input[data-flag]").forEach((box) => {
+  box.checked = settings[box.dataset.flag];
+  box.addEventListener("change", () => {
+    settings[box.dataset.flag] = box.checked;
+    applySettings();
+  });
+});
+if (resSelect) {
+  resSelect.value = String(settings.renderScale);
+  resSelect.addEventListener("change", () => {
+    settings.renderScale = parseFloat(resSelect.value);
+    settings.adaptiveQuality = false; // manual res selection overrides auto
+    if (autoBox) autoBox.checked = false;
+    applySettings();
+  });
+}
 
 window.addEventListener("resize", () => {
   camera.aspect = innerWidth / innerHeight;

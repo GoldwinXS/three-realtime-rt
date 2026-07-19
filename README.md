@@ -6,8 +6,9 @@ then swap one render call and get BVH-traced **soft shadows**, **one-bounce
 global illumination**, **emissive-mesh area lights**, **mirror/glossy
 reflections**, **glass refraction**, **volumetric god rays** (BVH-shadowed
 single scatter, not a screen-space trick), a **procedural sky** that lights
-the scene, and real-time **temporal denoising + anti-aliasing**. Runs on plain
-WebGL2, no build step required by consumers.
+the scene, **ReSTIR many-light sampling** (flat cost in light count),
+**blue-noise sampling**, and real-time **temporal denoising + anti-aliasing**.
+Runs on plain WebGL2, no build step required by consumers.
 
 ### ▶ [Live demo](https://goldwinxs.github.io/three-realtime-rt/) — drag to orbit, drop the pile, toggle every feature.
 
@@ -118,6 +119,7 @@ const rt = new RealtimeRaytracer(renderer, {
 | `emissiveNEE` | `true` | Sample static emissive meshes as area lights (next-event estimation). Off = emitters only light via lucky GI rays. |
 | `reflections` | `true` | Traced mirror/glossy reflections on metallic surfaces (sharpest at `renderScale: 1`). |
 | `refraction` | `true` | Traced two-interface refraction for `MeshPhysicalMaterial.transmission` surfaces. |
+| `restir` | `true` | ReSTIR direct lighting: per-pixel reservoirs with temporal + spatial reuse, one visibility ray regardless of light count. Flat cost in light count; cuts emissive area-light noise. |
 | `ior` | `1.5` | Index of refraction used by `refraction`. |
 | `volumetric` | *off* | Physically-based god rays: single-scatter fog, one BVH-shadowed light sample per lighting pixel per frame, temporally accumulated. `{ enabled, density, maxDist }`. |
 | `stochasticLights` | `false` | One direct shadow ray per pixel per frame (random source) instead of one per light. |
@@ -180,6 +182,20 @@ The demo ([`examples/`](examples/)) is an ordinary three.js app — see
 (scene → physics → compile → render loop). `npm run deploy` builds and publishes
 it to GitHub Pages.
 
+## Gallery & benchmarks
+
+[`gallery.html`](gallery.html) drops the raytracer into **stock glTF scenes it
+was never authored for** — LittlestTokyo, Lantern, Antique Camera, BoomBox,
+Corset, Water Bottle, and the Damaged Helmet — streamed straight from their
+public hosts (no assets committed). A one-button toggle A/Bs ray tracing against
+plain rasterized three.js with an fps + triangle readout, and a compact options
+strip exposes GI / emissive NEE / reflections / refraction / ReSTIR / denoise /
+TAA / volumetric plus lighting-resolution and auto-quality controls.
+
+[`bench.html?autorun=1`](bench.html) runs a matrix of feature configs with
+GPU-**fence-timed** frame costs and a temporal **ghosting metric**, writing each
+run's results to [`bench-results/`](bench-results/) for tracking regressions.
+
 ## Roadmap
 
 | Stage | Status | What |
@@ -192,6 +208,8 @@ it to GitHub Pages.
 | 5. Two-level BVH | ✅ | Static BVH uploaded once; movers in a small per-frame BVH → dynamic shadows at ~1 ms |
 | 5b. Area lights | ✅ | Emissive meshes sampled directly (NEE) — glowing panels cast soft light + shadows |
 | 6. Specular | ✅ | Mirror/glossy reflections on metals + two-interface glass refraction |
+| 6b. Sampling | ✅ | Blue-noise sampling + ReSTIR direct lighting (temporal + spatial reuse) |
+| 6c. Any-hit shadows | ✅ | Unordered early-out BVH traversal for occlusion rays — same image, up to ~2× cheaper shadows |
 | 7. Publish | — | npm publish; refractive water; per-material IOR |
 
 ## Credits
