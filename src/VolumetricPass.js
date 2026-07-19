@@ -3,6 +3,9 @@ import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS } from "./SceneCompiler.js";
 import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
 
+// Must match MAX_FOG_ZONES in the fragment shader.
+const MAX_FOG_ZONES = 8;
+
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
 void main() {
@@ -54,8 +57,29 @@ uniform int uEmissiveCount;
 uniform vec3 uCameraPos;
 uniform float uFrame;
 uniform float uEps;
-uniform float uDensity;   // scatter coefficient
+uniform float uDensity;   // scatter coefficient (global term)
 uniform float uMaxDist;   // cap for rays that hit nothing / far surfaces
+
+// Localized fog zones: up to 8 AABBs. Two vec4 per zone —
+//   [2*i]   = (min.xyz, density),  [2*i+1] = (max.xyz, unused).
+// Density at a point = uDensity + Σ density of every zone containing it.
+#define MAX_FOG_ZONES 8
+uniform vec4 uFogZones[MAX_FOG_ZONES * 2];
+uniform int uFogZoneCount;
+
+float fogDensityAt(vec3 p) {
+  float d = uDensity;
+  for (int i = 0; i < MAX_FOG_ZONES; i++) {
+    if (i >= uFogZoneCount) break;
+    vec4 lo = uFogZones[i * 2];
+    vec3 mn = lo.xyz;
+    vec3 mx = uFogZones[i * 2 + 1].xyz;
+    if (all(greaterThanEqual(p, mn)) && all(lessThanEqual(p, mx))) {
+      d += lo.w;
+    }
+  }
+  return d;
+}
 
 // ---------- RNG ----------
 // First four dims from the shared blue-noise tile (rows 2..65 of the
@@ -177,14 +201,27 @@ void main() {
   // the extra steps cost less than the old single-sample full-lighting-res
   // version — and MOVING lights, whose in-scatter field changes every frame
   // and can never converge temporally, get real per-frame averaging.
+  // Nothing to scatter: no global fog AND no localized zones → output zeros fast.
+  if (uDensity <= 0.0 && uFogZoneCount == 0) {
+    outScatter = vec4(0.0, 0.0, 0.0, 1.0);
+    return;
+  }
+
   #define VOL_STEPS 4
   vec3 sample_ = vec3(0.0);
   if (hit && segLen > 1e-3) {
     bool hasL = uLightCount > 0;
     bool hasE = uEmissiveCount > 0;
+    float segStep = segLen / float(VOL_STEPS);
+    // Piecewise integration: density can vary along the ray (zones), so the
+    // transmittance is built up step by step from the LOCAL density at each
+    // sample rather than a single closed-form exp(-uDensity * t).
+    float opticalDepth = 0.0;
     for (int k = 0; k < VOL_STEPS; k++) {
-      float t = (float(k) + rand()) * (segLen / float(VOL_STEPS));
+      float t = (float(k) + rand()) * segStep; // ascending strata
       vec3 S = uCameraPos + rd * t;
+      float local = fogDensityAt(S);
+      opticalDepth += local * segStep;
       vec3 Lin = vec3(0.0);
       // Stochastically pick analytic lights or the emissive set, weighted 1/p.
       if (hasL && hasE) {
@@ -200,7 +237,7 @@ void main() {
       } else if (hasE) {
         Lin = emissiveAt(S);
       }
-      vec3 c = Lin * uDensity * (segLen / float(VOL_STEPS)) * exp(-uDensity * t);
+      vec3 c = Lin * local * segStep * exp(-opticalDepth);
       // per-step spike clamp — outliers decay only as 1/count in the EMA
       float sl = dot(c, vec3(0.299, 0.587, 0.114));
       if (sl > 2.0) c *= 2.0 / sl;
@@ -262,10 +299,16 @@ export class VolumetricPass {
         uEps: { value: 1e-3 },
         uDensity: { value: 0.03 },
         uMaxDist: { value: 40 },
+        // Localized fog zones: flat vec4 array, two vec4 per zone (see shader).
+        uFogZones: { value: new Array(MAX_FOG_ZONES * 2).fill(0).map(() => new THREE.Vector4()) },
+        uFogZoneCount: { value: 0 },
       },
       depthTest: false,
       depthWrite: false,
     });
+
+    // Reused per-frame scratch so we don't allocate the zone vectors each call.
+    this._zoneVecs = this.material.uniforms.uFogZones.value;
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -316,7 +359,7 @@ export class VolumetricPass {
   }
 
   /** Renders into targetA (reading targetB as history), swaps, returns the texture. */
-  render(renderer, gbuffer, prevViewProj, cameraPos, frame, eps, density, maxDist) {
+  render(renderer, gbuffer, prevViewProj, cameraPos, frame, eps, density, maxDist, zones) {
     const u = this.material.uniforms;
     u.uGWorldPos.value = gbuffer.worldPos;
     u.uPrevAccum.value = this.targetB.texture;
@@ -326,6 +369,16 @@ export class VolumetricPass {
     u.uEps.value = eps;
     u.uDensity.value = density;
     u.uMaxDist.value = maxDist;
+
+    // Pack up to MAX_FOG_ZONES AABBs into the flat vec4 array, two vec4 per
+    // zone: [min.xyz, density] then [max.xyz, 0]. Reuses cached Vector4s.
+    const zn = zones && zones.length ? Math.min(zones.length, MAX_FOG_ZONES) : 0;
+    for (let i = 0; i < zn; i++) {
+      const z = zones[i];
+      this._zoneVecs[i * 2].set(z.min[0], z.min[1], z.min[2], z.density);
+      this._zoneVecs[i * 2 + 1].set(z.max[0], z.max[1], z.max[2], 0);
+    }
+    u.uFogZoneCount.value = zn;
 
     renderer.setRenderTarget(this.targetA);
     renderer.render(this.scene, this.camera);

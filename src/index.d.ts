@@ -36,14 +36,30 @@ export interface FogOptions {
   density?: number;
 }
 
+/** A localized fog zone: an AABB whose density adds to the global term inside it. */
+export interface FogZone {
+  /** Minimum corner of the AABB, world space [x, y, z]. */
+  min: [number, number, number];
+  /** Maximum corner of the AABB, world space [x, y, z]. */
+  max: [number, number, number];
+  /** Density added within this box (on top of the global `density`). */
+  density: number;
+}
+
 /** Volumetric single-scatter ("god rays") configuration. */
 export interface VolumetricOptions {
   /** Enable volumetric single-scatter lighting. */
   enabled?: boolean;
-  /** Scattering/fog density along the primary ray. */
+  /** Global scattering/fog density along the primary ray (may be 0 with zones set). */
   density?: number;
   /** Maximum distance the volumetric integration marches. */
   maxDist?: number;
+  /**
+   * Localized fog zones (up to 8 AABBs). Density at a world point is
+   * `density` plus the sum of every zone whose box contains the point.
+   * Empty/absent = global fog only.
+   */
+  zones?: FogZone[];
 }
 
 /** Constructor options for {@link RealtimeRaytracer}. All optional. */
@@ -154,6 +170,8 @@ export interface VolumetricState {
   enabled: boolean;
   density: number;
   maxDist: number;
+  /** Localized fog zones (up to 8 AABBs); mutate to add/remove fog volumes live. */
+  zones: FogZone[];
 }
 
 /** Options accepted by {@link RealtimeRaytracer.compileScene} and {@link compileScene}. */

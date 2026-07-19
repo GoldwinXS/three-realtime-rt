@@ -285,6 +285,9 @@ export class RealtimeRaytracer {
       enabled: options.volumetric?.enabled ?? false,
       density: options.volumetric?.density ?? 0.015,
       maxDist: options.volumetric?.maxDist ?? 40,
+      // Localized fog: up to 8 AABBs whose densities ADD to the global term at
+      // any point they contain. Empty = global-only (original behavior).
+      zones: options.volumetric?.zones ?? [],
     };
     // Quarter CANVAS resolution, independent of renderScale: fog is
     // low-frequency, so resolution buys nothing — the budget goes into
@@ -663,7 +666,14 @@ export class RealtimeRaytracer {
     // per lighting pixel along the camera ray, accumulated temporally. The
     // composite adds the result before fog and tonemap.
     let volumetricTex = null;
-    if (this.volumetric.enabled && this.outputMode === 0) {
+    // Runs when a global density is set OR when localized zones are present
+    // (a zone can add fog even where the global term is 0).
+    const hasZones = this.volumetric.zones && this.volumetric.zones.length > 0;
+    if (
+      this.volumetric.enabled &&
+      this.outputMode === 0 &&
+      (this.volumetric.density > 0 || hasZones)
+    ) {
       volumetricTex = this.volumetricPass.render(
         this.renderer,
         this.gbuffer,
@@ -672,7 +682,8 @@ export class RealtimeRaytracer {
         this.frame,
         this.eps,
         this.volumetric.density,
-        this.volumetric.maxDist
+        this.volumetric.maxDist,
+        this.volumetric.zones
       );
     }
 
