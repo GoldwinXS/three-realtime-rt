@@ -3,9 +3,11 @@
 **Turn-on ray traced lighting for three.js.** Build your scene with ordinary
 three.js — meshes, `MeshStandardMaterial`, `PointLight` / `DirectionalLight` —
 then swap one render call and get BVH-traced **soft shadows**, **one-bounce
-global illumination**, a **procedural sky** that lights the scene, and real-time
-**temporal denoising + anti-aliasing**. Runs on plain WebGL2, no build step
-required by consumers.
+global illumination**, **emissive-mesh area lights**, **mirror/glossy
+reflections**, **glass refraction**, **volumetric god rays** (BVH-shadowed
+single scatter, not a screen-space trick), a **procedural sky** that lights
+the scene, and real-time **temporal denoising + anti-aliasing**. Runs on plain
+WebGL2, no build step required by consumers.
 
 ### ▶ [Live demo](https://goldwinxs.github.io/three-realtime-rt/) — drag to orbit, drop the pile, toggle every feature.
 
@@ -38,8 +40,13 @@ in a fragment shader, against a GPU BVH ([three-mesh-bvh]):
 2. **RT lighting pass** — per pixel: soft shadow rays to each light (area
    sampled) + a 1-bounce cosine-weighted GI ray with next-event estimation. GI
    rays that escape sample the **procedural sky**, so the sky is a soft area
-   light. Output is *demodulated irradiance* (albedo divided out) so it denoises
-   cleanly while textures stay sharp.
+   light. **Emissive meshes are real area lights**: their triangles are sampled
+   directly (NEE with the area→solid-angle pdf), so a glowing panel casts soft
+   light and shadows instead of waiting for a lucky GI ray to hit it. Metallic
+   pixels trace a **mirror/glossy reflection ray**; transmissive pixels trace a
+   Fresnel-weighted **reflection + two-interface refraction**. Output is
+   *demodulated irradiance* (albedo divided out) so it denoises cleanly while
+   textures stay sharp.
 3. **Temporal reprojection** — motion-validated history keeps samples alive as
    the camera and objects move.
 4. **À-trous denoise** — an edge-avoiding (SVGF-lite) wavelet filter guided by
@@ -108,6 +115,12 @@ const rt = new RealtimeRaytracer(renderer, {
 | `taa` | `true` | Temporal anti-aliasing (jitter + neighbourhood clamp). |
 | `denoise` | `true` | Edge-aware à-trous denoiser. |
 | `gi` | `true` | 1-bounce global illumination (vs. direct-only). |
+| `emissiveNEE` | `true` | Sample static emissive meshes as area lights (next-event estimation). Off = emitters only light via lucky GI rays. |
+| `reflections` | `true` | Traced mirror/glossy reflections on metallic surfaces (sharpest at `renderScale: 1`). |
+| `refraction` | `true` | Traced two-interface refraction for `MeshPhysicalMaterial.transmission` surfaces. |
+| `ior` | `1.5` | Index of refraction used by `refraction`. |
+| `volumetric` | *off* | Physically-based god rays: single-scatter fog, one BVH-shadowed light sample per lighting pixel per frame, temporally accumulated. `{ enabled, density, maxDist }`. |
+| `stochasticLights` | `false` | One direct shadow ray per pixel per frame (random source) instead of one per light. |
 | `temporalReprojection` | `true` | Keep samples across camera/object motion. |
 | `maxHistory` | `128` | History cap — higher is smoother, slower to react. |
 | `fireflyClamp` | `4.0` | Clamp on indirect luminance to suppress fireflies. |
@@ -117,6 +130,43 @@ const rt = new RealtimeRaytracer(renderer, {
 Per-light: set `light.userData.rtRadius` for soft-shadow size. Set
 `mesh.userData.rtExclude = true` to keep a mesh out of the BVH (it still
 rasterizes and gets lit — useful for water / translucent surfaces).
+Transparent materials never act as occluders (a glass case shouldn't cast an
+opaque shadow); `alphaTest` cut-outs still do.
+
+## Running everywhere (capability tiers)
+
+Nothing adaptive is imposed — everything below is **opt-in**:
+
+- **No usable GPU** (missing WebGL2 float targets, or a software rasterizer
+  like SwiftShader): the library logs one console warning and `rt.render()`
+  silently falls back to plain `renderer.render()`. Your app runs everywhere
+  with zero capability checks; query `rt.supported` or the static
+  `RealtimeRaytracer.isSupported(renderer)` if you want to branch yourself.
+- **Tier presets**: `RealtimeRaytracer.detectTier(renderer)` returns
+  `"none" | "mid" | "high"`, and `recommendedOptions(tier)` gives matching
+  constructor options — spread them, then override what you like:
+
+  ```js
+  const tier = RealtimeRaytracer.detectTier(renderer);
+  const rt = new RealtimeRaytracer(renderer, {
+    ...RealtimeRaytracer.recommendedOptions(tier),
+    targetFps: 55,
+  });
+  ```
+
+- **Adaptive quality** (`adaptiveQuality: true`, default **false**): continuous
+  dynamic resolution scaling. Watches real frame time and steers the lighting
+  resolution smoothly toward `targetFps` (in 5% steps with a cooldown), pairing
+  low resolutions with MORE denoise passes (they run at lighting res, so
+  they're nearly free exactly where they're needed) and stochastic direct
+  light. While enabled it drives `renderScale` / `stochasticLights` /
+  `denoiseIterations`; turn it off for manual control.
+- **`stochasticLights: true`** (default false): one direct shadow ray per
+  pixel per frame instead of one per light — the biggest ray-count lever for
+  many-light scenes and mobile GPUs.
+
+WebGPU: not used as a backend (this is a WebGL2 library); a WGSL compute
+backend is on the roadmap.
 
 ## Running the demo
 
@@ -140,7 +190,9 @@ it to GitHub Pages.
 | 4. TAA | ✅ | Sub-pixel jitter + neighbourhood-clamped resolve → AA, no speckles |
 | 4b. Sky | ✅ | Procedural sky as background + GI ambient light source |
 | 5. Two-level BVH | ✅ | Static BVH uploaded once; movers in a small per-frame BVH → dynamic shadows at ~1 ms |
-| 6. Specular | — | Glossy reflections + refractive water; npm publish |
+| 5b. Area lights | ✅ | Emissive meshes sampled directly (NEE) — glowing panels cast soft light + shadows |
+| 6. Specular | ✅ | Mirror/glossy reflections on metals + two-interface glass refraction |
+| 7. Publish | — | npm publish; refractive water; per-material IOR |
 
 ## Credits
 

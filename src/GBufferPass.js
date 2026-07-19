@@ -31,6 +31,7 @@ in vec2 vUvCoord;
 uniform vec3 uColor;
 uniform float uRoughness;
 uniform float uMetalness;
+uniform float uTransmission;
 uniform vec3 uEmissive;
 uniform sampler2D uMap;
 uniform bool uHasMap;
@@ -48,8 +49,14 @@ void main() {
   }
   vec3 n = normalize(vWorldNormal) * (gl_FrontFacing ? 1.0 : -1.0);
   gAlbedoRough = vec4(albedo, uRoughness);
-  gNormalMetal = vec4(n, uMetalness);
-  gWorldPos = vec4(vWorldPos, 1.0); // w=1 marks "geometry here" (background stays 0)
+  // .w is a packed material word: >= 2 means transmissive glass (w - 2 =
+  // transmission amount), else it is plain metalness. Lets the lighting pass
+  // read specular/glass properties without an extra G-buffer sampler (it
+  // already sits at the WebGL2 16-sampler minimum).
+  gNormalMetal = vec4(n, uTransmission > 0.0 ? 2.0 + uTransmission : uMetalness);
+  // .w packs the valid flag AND roughness: 0 = background, 1 + roughness
+  // otherwise. Every consumer only tests w < 0.5, so this stays compatible.
+  gWorldPos = vec4(vWorldPos, 1.0 + uRoughness);
   gEmissive = vec4(emissive, 1.0);
 }
 `;
@@ -63,7 +70,11 @@ void main() {
  * material properties flow into the buffer without touching user materials.
  */
 export class GBufferPass {
-  constructor(width, height) {
+  constructor(width, height, { mixedPrecision = true } = {}) {
+    // Mixed fp16/fp32 attachments are legal WebGL2 but some implementations
+    // (notably Apple's Metal backend) may reject the framebuffer — the caller
+    // probes support and passes the verdict here.
+    this._mixedPrecision = mixedPrecision;
     // Two G-buffers, ping-ponged each frame: the previous frame's worldPos +
     // normals are needed to validate reprojected history (stage 2).
     this._targets = [
@@ -85,6 +96,14 @@ export class GBufferPass {
       depthBuffer: true,
     });
     for (const tex of t.texture) tex.generateMipmaps = false;
+    // Mixed precision: only world position (reprojection + plane-distance
+    // tests) needs fp32. Albedo/normal/emissive are fine in fp16, which halves
+    // G-buffer bandwidth on 3 of the 4 targets — a large win on mobile GPUs.
+    if (this._mixedPrecision) {
+      t.texture[0].type = THREE.HalfFloatType; // albedo + roughness
+      t.texture[1].type = THREE.HalfFloatType; // normal + packed material word
+      t.texture[3].type = THREE.HalfFloatType; // emissive
+    }
     return t;
   }
 
@@ -130,6 +149,7 @@ export class GBufferPass {
           uColor: { value: new THREE.Color(1, 1, 1) },
           uRoughness: { value: 1.0 },
           uMetalness: { value: 0.0 },
+          uTransmission: { value: 0.0 },
           uEmissive: { value: new THREE.Color(0, 0, 0) },
           uMap: { value: null },
           uHasMap: { value: false },
@@ -147,6 +167,8 @@ export class GBufferPass {
     if (src.color) u.uColor.value.copy(src.color);
     u.uRoughness.value = src.roughness ?? 1.0;
     u.uMetalness.value = src.metalness ?? 0.0;
+    u.uTransmission.value = src.transmission ?? 0.0; // MeshPhysicalMaterial
+
     if (src.emissive) {
       u.uEmissive.value
         .copy(src.emissive)
@@ -169,6 +191,15 @@ export class GBufferPass {
     this._swapped.length = 0;
     scene.traverse((obj) => {
       if (obj.isMesh && obj.geometry && obj.visible) {
+        // The G-buffer has no alpha blending — a nearly invisible surface
+        // (glass display case, ghost meshes) would write itself opaque over
+        // everything behind it. Hide it from the raster pass instead.
+        const m = Array.isArray(obj.material) ? obj.material[0] : obj.material;
+        if (m.transparent && (m.opacity ?? 1) < 0.5) {
+          obj.visible = false;
+          this._swapped.push([obj, null]); // restore visibility after render
+          return;
+        }
         this._swapped.push([obj, obj.material]);
         obj.material = this._gbufferMaterialFor(obj);
       }
@@ -184,7 +215,10 @@ export class GBufferPass {
     renderer.setRenderTarget(null);
 
     scene.background = prevBackground;
-    for (const [mesh, mat] of this._swapped) mesh.material = mat;
+    for (const [mesh, mat] of this._swapped) {
+      if (mat === null) mesh.visible = true; // was hidden, not material-swapped
+      else mesh.material = mat;
+    }
     this._swapped.length = 0;
   }
 

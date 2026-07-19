@@ -44,6 +44,9 @@ const enterSafeMode = (why) => {
   if (SAFE || safeModeTriggered) return;
   safeModeTriggered = true;
   console.warn("[three-realtime-rt demo] switching to compatibility mode:", why);
+  // Surface the reason after the reload — on iOS there's no console to check,
+  // so this is the only way to know WHY ray tracing bailed.
+  try { sessionStorage.setItem("rtSafeReason", String(why)); } catch {}
   const u = new URL(location.href);
   u.searchParams.set("safe", "1");
   location.replace(u);
@@ -51,7 +54,7 @@ const enterSafeMode = (why) => {
 
 async function main() {
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
-  const { scene, camera, bounds, lights, sky, ready } = buildScene();
+  const { scene, camera, bounds, lights, sky, ready, showcase } = buildScene();
 
   // A Rapier physics playground drops a pool of props onto the ground. Their
   // meshes are plain three.js meshes — we'll hand them to the raytracer as the
@@ -59,7 +62,8 @@ async function main() {
   setBoot("starting physics…");
   const physics = await Physics.create();
   physics.buildStaticColliders(bounds);
-  physics.spawnPool(scene, 40, new THREE.Vector3(2.4, 0, 2.2));
+  // The prop pile is opt-in (UI "Spawn pile" button) — the default scene stays
+  // clean so the hero pieces and lighting read clearly.
 
   setBoot("loading models…");
   await ready; // wait for glTF hero models before compiling the BVH
@@ -67,9 +71,24 @@ async function main() {
   // 2. Renderer + raytracer. The raytracer takes over lighting; three.js still
   //    rasterizes primary visibility (the G-buffer) for free.
   const renderer = new THREE.WebGLRenderer({ antialias: false });
-  renderer.setPixelRatio(1);
+  // Keep the CANVAS sharp (geometry/texture edges carry readability) and let
+  // the adaptive governor cut cost on the lighting side instead. Phones get up
+  // to 1.5× DPR — pixelRatio 1 on a 3× phone screen reads as mush.
+  const TIER = RealtimeRaytracer.detectTier(renderer);
+  // Sharpness within a PIXEL BUDGET: small phone screens can afford extra DPR
+  // (their CSS resolution is tiny), big tablets cannot — a 13" iPad at 1.5×
+  // is a ~2049×1536 buffer stack, enough for iOS to jetsam the tab.
+  const cssPixels = window.innerWidth * window.innerHeight;
+  const budgetPr = Math.sqrt(1.6e6 / cssPixels); // ~1600×1000 worst case
+  renderer.setPixelRatio(
+    TIER === "mid" ? Math.max(1, Math.min(window.devicePixelRatio || 1, 1.5, budgetPr)) : 1
+  );
   renderer.setSize(window.innerWidth, window.innerHeight);
   document.getElementById("app").appendChild(renderer.domElement);
+  const bufferSize = () => {
+    const pr = renderer.getPixelRatio();
+    return [Math.floor(window.innerWidth * pr), Math.floor(window.innerHeight * pr)];
+  };
 
   // If the GPU process dies (iOS Safari memory/watchdog kill), fall back
   // instead of taking the whole tab down with us.
@@ -88,6 +107,8 @@ async function main() {
     note.style.cssText =
       "position:fixed;top:12px;left:14px;z-index:30;color:#8fa3b3;font:11px ui-monospace,Consolas,monospace;" +
       "background:rgba(14,18,24,0.8);border:1px solid #26323c;border-radius:6px;padding:6px 10px;";
+    let reason = "";
+    try { reason = sessionStorage.getItem("rtSafeReason") || ""; } catch {}
     if (IOS && !PARAMS.has("safe")) {
       const u = new URL(location.href);
       u.searchParams.set("rt", "1");
@@ -95,7 +116,9 @@ async function main() {
         `compatibility mode — the RT pipeline is heavy for iOS Safari. ` +
         `<a href="${u.pathname + u.search}" style="color:#7fd8c8">try full ray tracing anyway</a>`;
     } else {
-      note.textContent = "compatibility mode — ray tracing off on this device (works on desktop)";
+      note.textContent =
+        "compatibility mode — ray tracing off on this device" +
+        (reason ? ` (reason: ${reason})` : " (works on desktop)");
     }
     document.body.append(note);
 
@@ -111,8 +134,22 @@ async function main() {
     return;
   }
 
+  // The demo starts at the user's tested MINIMAL config on every tier: a lean
+  // stochastic-light core with the heavy paths (GI, emissive NEE, reflections,
+  // refraction) off. Each is an opt-in add-on in the panel so its frame cost is
+  // visible on whatever hardware this actually is. Explicit — no tier presets —
+  // so the starting point is identical everywhere. targetFps stays set so the
+  // "auto quality" toggle has a target to walk quality toward.
   const rt = new RealtimeRaytracer(renderer, {
-    renderScale: 0.5,   // trace lighting at half res; upsample + TAA reconstruct
+    renderScale: 0.25,
+    denoiseIterations: 5,
+    stochasticLights: true,
+    adaptiveQuality: false,
+    gi: false,
+    emissiveNEE: false,
+    reflections: false,
+    refraction: false,
+    targetFps: 55,
     maxHistory: 48,     // shorter history so moving shadows keep up
     envColor: new THREE.Color(0x0a0f18), // low ambient for GI rays that escape the room
     sky,                // (disabled indoors) procedural sky as GI ambient + background
@@ -146,18 +183,60 @@ async function main() {
   // instead of us polling every frame.
   const refreshLights = () => rt.updateLights(scene);
   const state = { rtEnabled: true, physicsPaused: false };
-  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights });
+
+  // The orbiting ceiling light is animated in the loop (below) — find it once.
+  const orbitLight = lights.find((l) => l.label === "orbit light").light;
+
+  // Panel feature toggles route through here. Reflections/refraction also reveal
+  // their showcase sphere, which changes mesh visibility — the BVH skips
+  // invisible meshes, so those two must recompile. Every case ends by resetting
+  // accumulation so the change isn't smeared by stale history.
+  const recompile = () => rt.compileScene(scene, { dynamicMeshes: physics.meshes });
+  const setFeature = (name, on) => {
+    switch (name) {
+      case "gi":
+        rt.gi = on;
+        break;
+      case "emissive":
+        rt.emissiveNEE = on;
+        break;
+      case "reflections":
+        rt.reflections = on;
+        showcase.mirror.visible = on;
+        showcase.mirrorPed.visible = on;
+        recompile();
+        break;
+      case "refraction":
+        rt.refraction = on;
+        showcase.glass.visible = on;
+        showcase.glassPed.visible = on;
+        recompile();
+        break;
+    }
+    rt.resetAccumulation();
+  };
+
+  // Spawn the physics pile on demand and rebuild the BVH with the new
+  // dynamic set (a one-time hitch, same as the initial compile).
+  const spawnPile = () => {
+    if (physics.meshes.length > 0) return;
+    physics.spawnPool(scene, 40, new THREE.Vector3(2.4, 0, 2.2));
+    rt.compileScene(scene, { dynamicMeshes: physics.meshes });
+  };
+  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature });
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
-    rt.setSize(window.innerWidth, window.innerHeight);
+    rt.setSize(...bufferSize());
   });
 
   // 4. Render loop.
   let frames = 0, fps = 0, lastFps = performance.now(), lastT = performance.now();
   let booted = false;
+  let orbitAngle = 0;      // orbiting ceiling light phase (advanced only when lit)
+  let lastRtEnabled = null; // reconfigure the raster path only on RT on/off edges
 
   function animate() {
     if (document.visibilityState === "hidden") setTimeout(animate, 100);
@@ -167,8 +246,28 @@ async function main() {
     const dt = Math.min((now - lastT) / 1000, 0.05);
     lastT = now;
 
+    // Fair "ray tracing off" comparison: the raster fallback gets shadow maps +
+    // ACES tone mapping so it isn't a flat unlit strawman. Flip these only when
+    // the toggle changes — needsUpdate on every material is a rebuild.
+    if (state.rtEnabled !== lastRtEnabled) {
+      lastRtEnabled = state.rtEnabled;
+      renderer.shadowMap.enabled = !state.rtEnabled;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      renderer.toneMapping = state.rtEnabled ? THREE.NoToneMapping : THREE.ACESFilmicToneMapping;
+      scene.traverse((o) => { if (o.material) o.material.needsUpdate = true; });
+    }
+
     controls.update();
     if (!state.physicsPaused) physics.step();
+
+    // Sweep the orbiting light when it's on — moving ray traced shadows. Only
+    // the (cheap) light-list update is needed; temporal reprojection carries the
+    // lighting, so we deliberately do NOT reset accumulation each frame.
+    if (orbitLight.visible) {
+      orbitAngle += dt * 0.6;
+      orbitLight.position.set(Math.cos(orbitAngle) * 4.0, 5.4, Math.sin(orbitAngle) * 4.0);
+      refreshLights();
+    }
 
     if (state.rtEnabled) {
       // Only re-bake the BVH while something is actually moving — at rest this

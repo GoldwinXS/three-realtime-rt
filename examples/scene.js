@@ -73,7 +73,35 @@ export function buildScene() {
   knot.position.set(0.2, 1.7, -0.4);
   scene.add(knot);
 
-  // Emissive panel — an area light that lights the room purely through GI.
+  // Specular showcase: a mirror sphere and a glass sphere for the traced
+  // reflection / refraction paths.
+  const mirror = new THREE.Mesh(
+    new THREE.SphereGeometry(0.85, 48, 32),
+    new THREE.MeshStandardMaterial({ color: 0xf2f4f8, roughness: 0.05, metalness: 1.0 })
+  );
+  const mirrorPed = pedestal(-4.4, 1.2);
+  mirrorPed.visible = false;
+  mirror.position.set(-4.4, 1.85, 1.2);
+  mirror.visible = false; // appears (with its pedestal) when "reflections" is enabled
+  scene.add(mirror);
+
+  const glass = new THREE.Mesh(
+    new THREE.SphereGeometry(0.8, 48, 32),
+    new THREE.MeshPhysicalMaterial({
+      color: 0xffffff,
+      roughness: 0.02,
+      metalness: 0.0,
+      transmission: 1.0,
+      ior: 1.5,
+    })
+  );
+  const glassPed = pedestal(1.8, 2.6, 0.9);
+  glassPed.visible = false;
+  glass.position.set(1.8, 1.75, 2.6);
+  glass.visible = false; // appears (with its pedestal) when "refraction" is enabled
+  scene.add(glass);
+
+  // Emissive panel — an area light sampled directly by the raytracer (NEE).
   const panel = new THREE.Mesh(
     new THREE.BoxGeometry(2.6, 1.5, 0.1),
     new THREE.MeshStandardMaterial({
@@ -85,7 +113,8 @@ export function buildScene() {
   panel.position.set(-2.0, 2.4, -6.85);
   scene.add(panel);
 
-  // Two coloured point lights for soft shadows + warm/cool contrast.
+  // Coloured point lights. The demo starts MINIMAL (one light) — the second
+  // light and the orbiting one are add-ons so their frame cost is visible.
   const warm = new THREE.PointLight(0xffd9a0, 13);
   warm.position.set(-3.2, 4.6, 3.4);
   warm.userData.rtRadius = 0.35;
@@ -94,12 +123,32 @@ export function buildScene() {
   const cool = new THREE.PointLight(0x9fc4ff, 9);
   cool.position.set(4.4, 5.0, 2.2);
   cool.userData.rtRadius = 0.3;
+  cool.visible = false;
   scene.add(cool);
+
+  // Orbiting ceiling light — shows moving ray traced shadows sweeping the room.
+  const orbit = new THREE.PointLight(0xfff0dd, 11);
+  orbit.position.set(4.0, 5.4, 0);
+  orbit.userData.rtRadius = 0.28;
+  orbit.visible = false;
+  scene.add(orbit);
+
+  // Fair raster comparison: when ray tracing is toggled off, the demo enables
+  // shadow maps — flag everything now so that path just works.
+  for (const l of [warm, cool, orbit]) {
+    l.castShadow = true;
+    l.shadow.mapSize.set(1024, 1024);
+    l.shadow.bias = -0.004;
+  }
+  scene.traverse((o) => {
+    if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; }
+  });
 
   // Light descriptors for the UI (label + whether to show a colour swatch).
   const lights = [
     { label: "warm light", light: warm, color: true },
     { label: "cool light", light: cool, color: true },
+    { label: "orbit light", light: orbit, color: true },
   ];
 
   // No procedural sky indoors — a low ambient fills GI rays that escape the room.
@@ -123,5 +172,9 @@ export function buildScene() {
     scene.add(duck.scene);
   })();
 
-  return { scene, camera, bounds, lights, sky, ready };
+  return {
+    scene, camera, bounds, lights, sky, ready,
+    // Objects the demo shows/hides as their RT feature is toggled.
+    showcase: { mirror, mirrorPed, glass, glassPed, panel, orbit },
+  };
 }

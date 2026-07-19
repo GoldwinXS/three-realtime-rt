@@ -190,8 +190,10 @@ export class TAAPass {
    * @param prevViewProj the *jittered* view-projection used last frame
    * @param jitterUv     this frame's projection jitter in UV space
    * @param prevJitterUv last frame's projection jitter in UV space
+   * @param outputTarget where the resolved frame goes (null = screen); lets a
+   *                     post pass (god rays) run after the resolve
    */
-  render(renderer, currentColor, gbuffer, prevViewProj, jitterUv, prevJitterUv, blend) {
+  render(renderer, currentColor, gbuffer, prevViewProj, jitterUv, prevJitterUv, blend, outputTarget = null) {
     const u = this.material.uniforms;
     u.uCurrent.value = currentColor;
     u.uHistory.value = this.targetB.texture; // previous resolved
@@ -207,10 +209,10 @@ export class TAAPass {
     renderer.setRenderTarget(this.targetA);
     renderer.render(this.scene, this.camera);
 
-    // Copy the resolved frame to the screen.
+    // Copy the resolved frame out (screen, or a post-pass input target).
     this.quad.material = this.copyMaterial;
     this.copyMaterial.uniforms.uTex.value = this.targetA.texture;
-    renderer.setRenderTarget(null);
+    renderer.setRenderTarget(outputTarget);
     renderer.render(this.scene, this.camera);
 
     // Swap: this frame's resolve becomes next frame's history.

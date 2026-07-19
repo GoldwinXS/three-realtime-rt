@@ -147,7 +147,7 @@ function lightRow(name, light, hasColor, rt, scene) {
   return row;
 }
 
-export function buildUI({ rt, physics, lights, scene, state, refreshLights }) {
+export function buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature }) {
   document.head.append(el("style", null, CSS));
 
   const panel = el("div");
@@ -157,15 +157,19 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights }) {
     el("div", "hd", `${ICON.chip}<b>three-realtime-rt</b><span class="tag">RT on</span>`)
   );
 
-  // --- Renderer ---
+  // --- Renderer (core pipeline; watch the fps readout as you change these) ---
   const rSec = el("div", "sec");
   rSec.append(el("h3", null, `${ICON.layers} Renderer`));
   rSec.append(toggle("ray tracing", state.rtEnabled, (v) => (state.rtEnabled = v)).row);
-  rSec.append(toggle("global illumination", rt.gi, (v) => { rt.gi = v; rt.resetAccumulation(); }).row);
+  rSec.append(toggle("auto quality", rt.adaptiveQuality, (v) => { rt.adaptiveQuality = v; }).row);
   rSec.append(toggle("denoise", rt.denoise, (v) => (rt.denoise = v)).row);
   rSec.append(toggle("TAA (anti-alias)", rt.taa, (v) => { rt.taa = v; rt.resetAccumulation(); }).row);
+  // Include the mobile preset's scales — otherwise touching this dropdown on
+  // a phone locks you out of the value the page started with. Manual choice
+  // takes the wheel from the adaptive governor.
   rSec.append(
-    selectRow("lighting res", [["100%", 1], ["75%", 0.75], ["50%", 0.5]], rt.renderScale, (v) => {
+    selectRow("lighting res", [["100%", 1], ["75%", 0.75], ["50%", 0.5], ["37%", 0.375], ["25%", 0.25]], rt.renderScale, (v) => {
+      rt.adaptiveQuality = false;
       rt.renderScale = parseFloat(v);
     })
   );
@@ -176,6 +180,24 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights }) {
     ], rt.outputMode, (v) => (rt.outputMode = parseInt(v, 10)))
   );
   panel.append(rSec);
+
+  // --- RT features: additive effects, each with a visible frame-time cost.
+  // Tiered defaults leave the heavy ones off on phones — turning them on IS
+  // the demo ("what does this cost on MY hardware?").
+  const fSec = el("div", "sec");
+  fSec.append(el("h3", null, `${ICON.bulb} RT features`));
+  // Routed through setFeature — reflections/refraction also reveal a showcase
+  // sphere and recompile the BVH, which main() owns. Initial state reads the
+  // current rt values (all false at the minimal start).
+  fSec.append(toggle("global illumination", rt.gi, (v) => setFeature("gi", v)).row);
+  fSec.append(toggle("emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);
+  fSec.append(toggle("reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
+  fSec.append(toggle("refraction", rt.refraction, (v) => setFeature("refraction", v)).row);
+  fSec.append(toggle("fast lights (1 ray)", rt.stochasticLights, (v) => { rt.stochasticLights = v; rt.adaptiveQuality = false; rt.resetAccumulation(); }).row);
+  fSec.append(slider("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v)));
+  fSec.append(slider("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v)));
+  fSec.append(slider("denoise passes", 0, 5, 1, rt.denoiseIterations, (x) => Number(x).toFixed(0), (v) => (rt.denoiseIterations = v)));
+  panel.append(fSec);
 
   // --- Lights ---
   const lSec = el("div", "sec");
@@ -189,6 +211,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights }) {
   const aSec = el("div", "sec");
   aSec.append(el("h3", null, `${ICON.fog} Atmosphere`));
   aSec.append(toggle("fog / haze", rt.fog.enabled, (v) => { rt.fog.enabled = v; rt.resetAccumulation(); }).row);
+  aSec.append(toggle("volumetric light", rt.volumetric.enabled, (v) => { rt.volumetric.enabled = v; rt.resetAccumulation(); }).row);
   aSec.append(slider("density", 0.01, 0.12, 0.005, rt.fog.density, (x) => x.toFixed(2), (v) => (rt.fog.density = v)));
   panel.append(aSec);
 
@@ -204,6 +227,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights }) {
     return b;
   };
   btns.append(
+    mkBtn(ICON.cube, "Spawn pile", true, () => spawnPile && spawnPile()),
     mkBtn(ICON.down, "Drop", false, () => physics.dropWave()),
     mkBtn(ICON.burst, "Explode", false, () => physics.explode()),
     mkBtn(ICON.reset, "Reset pile", true, () => physics.reset())

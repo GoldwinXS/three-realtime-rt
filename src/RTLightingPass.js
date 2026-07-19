@@ -54,6 +54,11 @@ uniform float uFireflyClamp;
 uniform vec4 uLightPosType[MAX_LIGHTS];     // xyz pos|dir, w: 0 point, 1 directional
 uniform vec4 uLightColorRadius[MAX_LIGHTS]; // rgb color*intensity, w radius
 uniform int uLightCount;
+uniform int uEmissiveCount; // NEE area-light triangles in row 1 of uMaterialsTex
+uniform bool uReflEnabled;  // traced reflections on metallic surfaces
+uniform bool uRefrEnabled;  // traced refraction on transmissive surfaces
+uniform float uIor;         // index of refraction for transmissive materials
+uniform bool uLightStochastic; // 1 direct shadow ray/pixel/frame instead of 1/light
 
 uniform vec3 uEnvColor;
 uniform float uEnvIntensity;
@@ -83,17 +88,21 @@ float rand() {
 }
 vec2 rand2() { return vec2(rand(), rand()); }
 
-vec3 orthoBasisSample(vec3 n, vec2 u, out vec3 t, out vec3 b) {
-  t = normalize(abs(n.x) > 0.9 ? cross(n, vec3(0, 1, 0)) : cross(n, vec3(1, 0, 0)));
-  b = cross(n, t);
-  return vec3(0.0);
+// Branchless orthonormal basis (Duff et al. 2017) — cheaper and stable for
+// every n, including the poles the old cross-product picker handled branchily.
+void orthoBasis(vec3 n, out vec3 t, out vec3 b) {
+  float s = n.z >= 0.0 ? 1.0 : -1.0;
+  float a = -1.0 / (s + n.z);
+  float m = n.x * n.y * a;
+  t = vec3(1.0 + s * n.x * n.x * a, s * m, -s * n.x);
+  b = vec3(m, s + n.y * n.y * a, -n.y);
 }
 
 vec3 cosineSampleHemisphere(vec3 n, vec2 u) {
   float a = 2.0 * PI * u.x;
   float r = sqrt(u.y);
   vec3 t, b;
-  orthoBasisSample(n, u, t, b);
+  orthoBasis(n, t, b);
   return normalize(t * (r * cos(a)) + b * (r * sin(a)) + n * sqrt(max(0.0, 1.0 - u.y)));
 }
 
@@ -177,6 +186,139 @@ vec3 sampleOneLight(vec3 P, vec3 N) {
   return lightContribution(i, P, N) * float(uLightCount);
 }
 
+// Next-event estimation on emissive-mesh triangles (row 1 of uMaterialsTex):
+// pick one triangle, sample a point on it, cast one shadow ray, convert the
+// area pdf to solid angle. Turns emitters into proper soft area lights instead
+// of surfaces a GI ray has to hit by luck.
+vec3 sampleEmissiveTri(vec3 P, vec3 N) {
+  if (uEmissiveCount == 0) return vec3(0.0);
+  int i = min(int(rand() * float(uEmissiveCount)), uEmissiveCount - 1) * 4;
+  vec4 t0 = texelFetch(uMaterialsTex, ivec2(i, 1), 0);     // v0 | area
+  vec4 t1 = texelFetch(uMaterialsTex, ivec2(i + 1, 1), 0); // e1 | emit.r
+  vec4 t2 = texelFetch(uMaterialsTex, ivec2(i + 2, 1), 0); // e2 | emit.g
+  vec4 t3 = texelFetch(uMaterialsTex, ivec2(i + 3, 1), 0); // n  | emit.b
+
+  vec2 u = rand2();
+  if (u.x + u.y > 1.0) u = 1.0 - u; // uniform over the triangle
+  vec3 lp = t0.xyz + t1.xyz * u.x + t2.xyz * u.y;
+
+  vec3 d = lp - P;
+  float d2 = dot(d, d);
+  float dist = sqrt(d2);
+  if (dist < 1e-4) return vec3(0.0);
+  vec3 wi = d / dist;
+
+  float cosS = dot(N, wi);
+  // abs(): double-sided emission, matching what a GI ray hitting either face sees.
+  float cosL = abs(dot(t3.xyz, wi));
+  if (cosS <= 0.0 || cosL < 1e-4) return vec3(0.0);
+  if (occluded(P + N * uEps, wi, dist)) return vec3(0.0);
+
+  // Uniform pick of 1-of-count tris + uniform point: pdf_area = 1/(count·area).
+  // Solid-angle conversion gives irradiance Le · cosS · cosL / (d² · pdf_area).
+  vec3 e = vec3(t1.w, t2.w, t3.w) * (cosS * cosL * float(uEmissiveCount) * t0.w / max(d2, 1e-6));
+
+  // Uniform-area sampling has huge single-sample variance for receivers close
+  // to a big emitter (sampled point can land almost on top of P, d² → 0);
+  // those 100× spikes read as speckles because the EMA decays them only as
+  // 1/count. Clamp at 2× the indirect firefly limit — slight bias right next
+  // to the emitter, stable everywhere.
+  float eLum = dot(e, vec3(0.299, 0.587, 0.114));
+  float eCap = uFireflyClamp * 2.0;
+  if (eLum > eCap) e *= eCap / eLum;
+  return e;
+}
+
+// ONE light sample for secondary path vertices: stochastically pick either the
+// analytic lights or the emissive set (weighted 1/p). Costs a single shadow
+// ray — same ray budget the GI bounce had before emissive NEE existed —
+// instead of two; the estimator stays unbiased and temporal accumulation
+// averages out the extra variance.
+vec3 sampleOneAny(vec3 P, vec3 N) {
+  bool hasL = uLightCount > 0;
+  bool hasE = uEmissiveCount > 0;
+  if (hasL && hasE) {
+    return rand() < 0.5
+      ? sampleOneLight(P, N) * 2.0
+      : sampleEmissiveTri(P, N) * 2.0;
+  }
+  if (hasL) return sampleOneLight(P, N);
+  if (hasE) return sampleEmissiveTri(P, N);
+  return vec3(0.0);
+}
+
+// Incoming radiance along rd: trace, shade the hit with direct + NEE lighting,
+// sky/env on a miss. Specular rays keep emitter emission on hit (NEE at the ray
+// origin cannot cover a specular path); diffuse GI rays drop it for NEE-listed
+// (static) emitters so that light isn't counted twice.
+vec3 traceRadiance(vec3 ro, vec3 rd, bool specular) {
+  uvec4 fi; vec3 bary; float dist; bool isDyn;
+  if (!traceBoth(ro, rd, fi, bary, dist, isDyn)) {
+    return uSkyEnabled
+      ? skyColor(rd, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity)
+      : uEnvColor * uEnvIntensity;
+  }
+  vec4 attr = isDyn
+    ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
+    : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
+  vec3 hAlbedo; float hRough; vec3 hEmissive; float hMetal;
+  fetchMaterial(attr.w, hAlbedo, hRough, hEmissive, hMetal);
+  vec3 hN = normalize(attr.xyz);
+  if (dot(hN, rd) > 0.0) hN = -hN;
+  vec3 hP = ro + rd * dist;
+  vec3 Ld = sampleOneAny(hP + hN * uEps, hN);
+  vec3 hLe = (!specular && uEmissiveCount > 0 && !isDyn) ? vec3(0.0) : hEmissive;
+  return hLe + hAlbedo * Ld * (1.0 / PI);
+}
+
+float schlick(float cosT, float eta) {
+  float r0 = (1.0 - eta) / (1.0 + eta);
+  r0 *= r0;
+  return r0 + (1.0 - r0) * pow(1.0 - cosT, 5.0);
+}
+
+// Roughness-jittered mirror direction (glossy cone approximation).
+vec3 glossyReflect(vec3 V, vec3 N, float rough) {
+  vec3 refl = reflect(V, N);
+  if (rough > 0.0) {
+    refl = normalize(mix(refl, cosineSampleHemisphere(N, rand2()), rough * rough));
+  }
+  return refl;
+}
+
+// Glass: Fresnel-weighted blend of a surface reflection and a two-interface
+// refraction (enter at P, march to the exit surface, refract again).
+vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough) {
+  vec3 refl = glossyReflect(V, N, rough);
+  vec3 reflRad = dot(refl, N) > 0.0 ? traceRadiance(P + N * uEps, refl, true) : vec3(0.0);
+
+  float eta = 1.0 / uIor;
+  vec3 rd = refract(V, N, eta);
+  if (rd == vec3(0.0)) return reflRad; // total internal reflection at entry
+  float fres = schlick(clamp(-dot(V, N), 0.0, 1.0), eta);
+
+  vec3 ro = P - N * (2.0 * uEps);
+  vec3 refrRad;
+  uvec4 fi; vec3 bary; float dist; bool isDyn;
+  if (traceBoth(ro, rd, fi, bary, dist, isDyn)) {
+    // Exit interface: refract back out (or bounce once on internal reflection).
+    vec4 attr = isDyn
+      ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
+      : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
+    vec3 xN = normalize(attr.xyz);
+    if (dot(xN, rd) > 0.0) xN = -xN;
+    vec3 xP = ro + rd * dist;
+    vec3 rd2 = refract(rd, xN, uIor);
+    if (rd2 == vec3(0.0)) rd2 = reflect(rd, xN);
+    refrRad = traceRadiance(xP - xN * uEps, rd2, true);
+  } else {
+    refrRad = uSkyEnabled
+      ? skyColor(rd, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity)
+      : uEnvColor * uEnvIntensity;
+  }
+  return mix(refrRad, reflRad, fres);
+}
+
 void main() {
   vec4 wp = texture(uGWorldPos, vUv);
   if (wp.w < 0.5) {
@@ -189,41 +331,36 @@ void main() {
   gSeed = pcgHash(gSeed);
 
   vec3 P = wp.xyz;
-  vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
+  vec4 nmSample = texture(uGNormalMetal, vUv);
+  vec3 N = normalize(nmSample.xyz);
+  // Decode the packed material word (see GBufferPass): >= 2 → glass, else metal.
+  float transmission = nmSample.w >= 2.0 ? clamp(nmSample.w - 2.0, 0.0, 1.0) : 0.0;
+  float metal = nmSample.w >= 2.0 ? 0.0 : nmSample.w;
+  float rough = clamp(wp.w - 1.0, 0.0, 1.0);
 
-  // --- direct lighting: one shadow ray per light ---
+  // --- direct lighting ---
+  // Full quality: one shadow ray per light + one for the emissive set.
+  // Stochastic (mobile/fast): ONE shadow ray total, source picked at random and
+  // weighted by 1/p — temporal accumulation averages it out, the denoiser
+  // covers the extra variance. Biggest single lever on ray count.
   vec3 direct = vec3(0.0);
-  for (int i = 0; i < MAX_LIGHTS; i++) {
-    if (i >= uLightCount) break;
-    direct += lightContribution(i, P, N);
+  if (uLightStochastic) {
+    direct = sampleOneAny(P, N);
+  } else {
+    for (int i = 0; i < MAX_LIGHTS; i++) {
+      if (i >= uLightCount) break;
+      direct += lightContribution(i, P, N);
+    }
+    // Emissive meshes as area lights (next-event estimation, one shadow ray).
+    direct += sampleEmissiveTri(P, N);
   }
 
-  // --- 1-bounce indirect (cosine-weighted; pdf cancels the NdotL/PI) ---
+  // --- 1-bounce indirect (cosine-weighted; pdf cancels the NdotL/PI).
+  // traceRadiance shades the hit with direct + NEE light, or returns the
+  // sky/env colour when the ray escapes (the natural ambient bounce).
   vec3 indirect = vec3(0.0);
   if (uGIEnabled) {
-    vec3 dir = cosineSampleHemisphere(N, rand2());
-    uvec4 faceIndices; vec3 barycoord; float dist; bool isDyn;
-    if (traceBoth(P + N * uEps, dir, faceIndices, barycoord, dist, isDyn)) {
-      // One packed fetch: normal.xyz + materialIndex.w for the hit level.
-      vec4 attr = isDyn
-        ? textureSampleBarycoord(uAttrDynamic, barycoord, faceIndices.xyz)
-        : textureSampleBarycoord(uAttrStatic, barycoord, faceIndices.xyz);
-      vec3 hAlbedo; float hRough; vec3 hEmissive; float hMetal;
-      fetchMaterial(attr.w, hAlbedo, hRough, hEmissive, hMetal);
-
-      vec3 hN = normalize(attr.xyz);
-      if (dot(hN, dir) > 0.0) hN = -hN;
-
-      vec3 hP = P + dir * dist;
-      vec3 Ld = sampleOneLight(hP + hN * uEps, hN);
-      // Incoming radiance from the hit surface (its emission + reflected direct light)
-      indirect = hEmissive + hAlbedo * Ld * (1.0 / PI);
-    } else {
-      // GI ray escaped to the sky — this is the natural ambient bounce.
-      indirect = uSkyEnabled
-        ? skyColor(dir, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity)
-        : uEnvColor * uEnvIntensity;
-    }
+    indirect = traceRadiance(P + N * uEps, cosineSampleHemisphere(N, rand2()), false);
   }
 
   // Firefly clamp: suppress rare huge GI samples (big perceived-noise win,
@@ -232,6 +369,27 @@ void main() {
   if (lum > uFireflyClamp) indirect *= uFireflyClamp / lum;
 
   vec3 sampleIrr = direct + indirect;
+
+  // --- traced specular: mirror/glossy reflections on metals ---
+  if (uReflEnabled && metal > 0.001) {
+    vec3 V = normalize(P - uCameraPos);
+    vec3 refl = glossyReflect(V, N, rough);
+    if (dot(refl, N) > 0.0) {
+      // Metals have no diffuse term: replace by metalness. The composite's
+      // albedo multiply then tints the reflection (F0 = albedo for metals).
+      sampleIrr = mix(sampleIrr, traceRadiance(P + N * uEps, refl, true), metal);
+    }
+  }
+
+  // --- traced glass: Fresnel reflection + two-interface refraction ---
+  if (uRefrEnabled && transmission > 0.001) {
+    vec3 V = normalize(P - uCameraPos);
+    sampleIrr = mix(sampleIrr, glassRadiance(P, N, V, rough), transmission);
+  }
+
+  // A single NaN/Inf sample would poison the EMA history for good (mix() with
+  // NaN stays NaN until a disocclusion resets the pixel) — sanitize first.
+  if (any(isnan(sampleIrr)) || any(isinf(sampleIrr))) sampleIrr = vec3(0.0);
 
   // --- temporal reprojection: pull validated history from last frame ---
   float count = 1.0;
@@ -259,7 +417,13 @@ void main() {
           && dot(N, normalize(prevN)) > 0.9;
         if (valid) {
           vec4 h = texture(uPrevAccum, prevUv); // bilinear
-          count = clamp(h.a, 0.0, uMaxHistory) + 1.0;
+          // Mirror-like pixels keep a SHORT history: their reflected content
+          // moves differently from the surface, so long history smears the
+          // reflection under camera motion — and specular rays are nearly
+          // deterministic, so they don't need the accumulation anyway.
+          float specHist = max(metal, transmission) * (1.0 - rough);
+          float histCap = mix(uMaxHistory, min(uMaxHistory, 10.0), specHist);
+          count = clamp(h.a, 0.0, histCap) + 1.0;
           history = h.rgb;
         }
       }
@@ -308,6 +472,11 @@ export class RTLightingPass {
         uLightPosType: { value: [] },
         uLightColorRadius: { value: [] },
         uLightCount: { value: 0 },
+        uEmissiveCount: { value: 0 },
+        uReflEnabled: { value: true },
+        uRefrEnabled: { value: true },
+        uIor: { value: 1.5 },
+        uLightStochastic: { value: false },
         uEnvColor: { value: new THREE.Color(0.03, 0.04, 0.06) },
         uEnvIntensity: { value: 1.0 },
         uFrame: { value: 0 },
@@ -378,6 +547,7 @@ export class RTLightingPass {
     u.uLightPosType.value = compiled.lightPosType;
     u.uLightColorRadius.value = compiled.lightColorRadius;
     u.uLightCount.value = compiled.lightCount;
+    u.uEmissiveCount.value = compiled.emissiveTriCount;
   }
 
   /** Renders into targetA (reading targetB as history), then swaps. Returns the fresh accum texture. */

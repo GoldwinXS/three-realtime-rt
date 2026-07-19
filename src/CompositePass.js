@@ -23,6 +23,8 @@ uniform sampler2D uGAlbedoRough;
 uniform sampler2D uGNormalMetal;
 uniform sampler2D uGWorldPos;
 uniform sampler2D uGEmissive;
+uniform sampler2D uVolumetric; // in-scattered light (lighting res, smooth)
+uniform bool uVolEnabled;
 uniform vec3 uBackgroundColor;
 // 0 composite, 1 albedo, 2 normal, 3 irradiance (direct+GI), 4 worldPos, 5 emissive
 uniform int uOutputMode;
@@ -70,27 +72,36 @@ vec3 sampleIrradiance(vec2 uv, vec3 P, vec3 N) {
 
   vec3 sum = vec3(0.0);
   float wsum = 0.0;
-  vec3 fallback = vec3(0.0);
-  float fallbackW = -1.0;
+  vec3 bestGeo = vec3(0.0);
+  float bestGeoW = -1.0;
+  vec3 bestBil = vec3(0.0);
+  float bestBilW = -1.0;
   for (int dy = 0; dy <= 1; dy++) {
     for (int dx = 0; dx <= 1; dx++) {
       vec2 tuv = uv00 + vec2(float(dx), float(dy)) * uIrrTexelSize;
       vec3 irr = texture(uIrradiance, tuv).rgb;
       float bw = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
-      // Track best bilinear tap as a fallback if all weights die.
-      if (bw > fallbackW) { fallbackW = bw; fallback = irr; }
+      if (bw > bestBilW) { bestBilW = bw; bestBil = irr; }
 
       vec4 g = texture(uGWorldPos, tuv);
       if (g.w < 0.5) continue;
       vec3 Nt = normalize(texture(uGNormalMetal, tuv).xyz);
       float wPlane = exp(-abs(dot(g.xyz - P, N)) / planeTol);
       float wN = pow(max(dot(N, Nt), 0.0), 16.0);
-      float w = bw * wPlane * wN;
+      float gw = wPlane * wN;
+      // Track the geometrically most similar tap for the fallback below.
+      if (gw > bestGeoW) { bestGeoW = gw; bestGeo = irr; }
+      float w = bw * gw;
       sum += irr * w;
       wsum += w;
     }
   }
-  return wsum > 1e-4 ? sum / wsum : fallback;
+  if (wsum > 1e-4) return sum / wsum;
+  // All combined weights died (thin silhouette). Falling back to the closest
+  // *bilinear* tap would pull lighting from the far side of the edge — under
+  // TAA jitter the chosen tap flickers, which reads as bright "rain drop"
+  // speckles on dark objects. Prefer the geometrically closest tap instead.
+  return bestGeoW >= 0.0 ? bestGeo : bestBil;
 }
 
 void main() {
@@ -110,6 +121,18 @@ void main() {
     }
   } else {
     color = albedoRough.rgb * irradiance + emissive;
+    // Volumetric in-scatter (already radiance, not modulated by albedo). Fog
+    // is low-frequency, so a wide 5-tap blur costs nothing visually and eats
+    // most of the single-sample grain the accumulation hasn't averaged yet.
+    if (uVolEnabled) {
+      vec2 o = uIrrTexelSize * 1.5;
+      vec3 vol = texture(uVolumetric, vUv).rgb * 0.4
+        + texture(uVolumetric, vUv + vec2( o.x,  o.y)).rgb * 0.15
+        + texture(uVolumetric, vUv + vec2(-o.x,  o.y)).rgb * 0.15
+        + texture(uVolumetric, vUv + vec2( o.x, -o.y)).rgb * 0.15
+        + texture(uVolumetric, vUv + vec2(-o.x, -o.y)).rgb * 0.15;
+      color += vol;
+    }
     if (uFogEnabled) {
       float dist = distance(wp.xyz, uCameraPos);
       float f = 1.0 - exp(-uFogDensity * uFogDensity * dist * dist);
@@ -141,6 +164,8 @@ export class CompositePass {
         uGNormalMetal: { value: null },
         uGWorldPos: { value: null },
         uGEmissive: { value: null },
+        uVolumetric: { value: null },
+        uVolEnabled: { value: false },
         uBackgroundColor: { value: new THREE.Color(0.01, 0.012, 0.02) },
         uOutputMode: { value: 0 },
         uUpsample: { value: false },

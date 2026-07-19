@@ -4,14 +4,37 @@
     {
       "name": "rt-demo",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev"],
+      "runtimeArgs": [
+        "run",
+        "dev"
+      ],
       "port": 8115
     },
     {
       "name": "rt-preview",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "preview", "--", "--port", "4173", "--strictPort"],
+      "runtimeArgs": [
+        "run",
+        "preview",
+        "--",
+        "--port",
+        "4173",
+        "--strictPort"
+      ],
       "port": 4173
+    },
+    {
+      "name": "rt-demo-b",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--",
+        "--port",
+        "8119",
+        "--strictPort"
+      ],
+      "port": 8119
     }
   ]
 }

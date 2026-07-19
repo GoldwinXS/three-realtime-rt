@@ -5,6 +5,7 @@ import { RTLightingPass } from "./RTLightingPass.js";
 import { DenoisePass } from "./DenoisePass.js";
 import { CompositePass } from "./CompositePass.js";
 import { TAAPass } from "./TAAPass.js";
+import { VolumetricPass } from "./VolumetricPass.js";
 
 // Van der Corput / Halton radical inverse — deterministic low-discrepancy
 // sub-pixel offsets for temporal jitter.
@@ -31,8 +32,118 @@ function halton(index, base) {
  * shadow rays + 1-bounce GI for lighting, progressive temporal accumulation.
  */
 export class RealtimeRaytracer {
+  /**
+   * Can this renderer run the ray tracing pipeline at all? Requires WebGL2
+   * with float render targets on a hardware GPU (software rasterizers like
+   * SwiftShader technically work but are unusably slow — treated as no).
+   */
+  static isSupported(renderer) {
+    try {
+      const gl = renderer.getContext();
+      if (typeof WebGL2RenderingContext === "undefined" || !(gl instanceof WebGL2RenderingContext)) return false;
+      if (!gl.getExtension("EXT_color_buffer_float")) return false;
+      const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+      if (dbg) {
+        const r = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || "");
+        if (/swiftshader|llvmpipe|software/i.test(r)) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Rough capability tier for choosing defaults: "none" (can't trace — see
+   * isSupported), "mid" (phones/tablets), "high" (desktop-class). WebGPU
+   * presence is not used as a backend (this library is WebGL2), only as a
+   * modern-browser signal; a WGSL compute backend is roadmap.
+   */
+  static detectTier(renderer) {
+    if (renderer && !RealtimeRaytracer.isSupported(renderer)) return "none";
+    const nav = typeof navigator !== "undefined" ? navigator : {};
+    const mobile =
+      (nav.maxTouchPoints ?? 0) > 1 || /Android|iPhone|iPad|Mobile/i.test(nav.userAgent || "");
+    return mobile ? "mid" : "high";
+  }
+
+  /** Sensible constructor options for a tier (spread them, then override). */
+  static recommendedOptions(tier) {
+    if (tier === "none") return {};
+    if (tier === "mid") {
+      return {
+        renderScale: 0.375,
+        ...RealtimeRaytracer._qualityFor(0.375),
+        adaptiveQuality: true,
+      };
+    }
+    return { renderScale: 0.5, denoiseIterations: 3, adaptiveQuality: true };
+  }
+
+  /**
+   * Probe whether this context accepts a framebuffer with mixed fp16/fp32
+   * color attachments (legal WebGL2; some drivers reject it anyway). Runs raw
+   * GL before three renders anything, and restores null bindings after.
+   */
+  static _mixedMrtSupported(gl) {
+    try {
+      const fb = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      const mk = (ifmt) => {
+        const t = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, t);
+        gl.texStorage2D(gl.TEXTURE_2D, 1, ifmt, 4, 4);
+        return t;
+      };
+      const t0 = mk(gl.RGBA16F);
+      const t1 = mk(gl.RGBA32F);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t0, 0);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, t1, 0);
+      gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+      const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+      gl.deleteFramebuffer(fb);
+      gl.deleteTexture(t0);
+      gl.deleteTexture(t1);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Companion settings for a given lighting resolution. LOW resolution wants
+   * MORE denoise passes, not fewer — the filter runs at lighting res so extra
+   * iterations are nearly free there, and they're what makes 25% lighting look
+   * good. Stochastic lights kick in once the budget is clearly constrained.
+   */
+  static _qualityFor(scale) {
+    return {
+      denoiseIterations: scale <= 0.3 ? 5 : scale <= 0.45 ? 4 : 3,
+      stochasticLights: scale <= 0.55,
+    };
+  }
+
   constructor(renderer, options = {}) {
     this.renderer = renderer;
+
+    /**
+     * False when the platform can't run the tracer — render() then simply
+     * forwards to renderer.render (plain rasterized three.js), so apps work
+     * everywhere without their own capability checks.
+     */
+    this.supported = RealtimeRaytracer.isSupported(renderer);
+    if (!this.supported) {
+      console.warn(
+        "three-realtime-rt: ray tracing unavailable on this system " +
+          "(needs WebGL2 + EXT_color_buffer_float on a hardware GPU). " +
+          "Falling back to plain three.js rendering."
+      );
+      this.compiled = null;
+      this.frame = 0;
+      return;
+    }
 
     const size = renderer.getSize(new THREE.Vector2());
     const pr = renderer.getPixelRatio();
@@ -45,7 +156,11 @@ export class RealtimeRaytracer {
      */
     this._renderScale = options.renderScale ?? 0.5;
 
-    this.gbuffer = new GBufferPass(this._width, this._height);
+    const mixedPrecision = RealtimeRaytracer._mixedMrtSupported(renderer.getContext());
+    if (!mixedPrecision) {
+      console.info("three-realtime-rt: mixed fp16/fp32 G-buffer not supported here — using fp32 for all targets.");
+    }
+    this.gbuffer = new GBufferPass(this._width, this._height, { mixedPrecision });
     this.rtPass = new RTLightingPass(this._scaledW, this._scaledH);
     this.denoisePass = new DenoisePass(this._scaledW, this._scaledH);
     this.composite = new CompositePass();
@@ -60,8 +175,14 @@ export class RealtimeRaytracer {
     /** Environment (sky) color used for GI rays that miss + composite background. */
     this.envColor = options.envColor ?? new THREE.Color(0.03, 0.04, 0.06);
     this.envIntensity = options.envIntensity ?? 1.0;
-    /** Ray offset epsilon — raise for large scenes if you see acne. */
+    /**
+     * Ray offset epsilon. When not set explicitly it is auto-scaled from the
+     * scene's size at compile time (dense scenes need a larger offset or
+     * shadow rays self-intersect). Set it manually if you see acne (raise) or
+     * light leaking through thin walls (lower).
+     */
     this.eps = options.eps ?? 1e-3;
+    this._autoEps = options.eps == null;
     /** Reproject accumulated lighting through camera motion (stage 2). */
     this.temporalReprojection = options.temporalReprojection ?? true;
     /** History length cap: higher = smoother but slower to react. */
@@ -70,6 +191,39 @@ export class RealtimeRaytracer {
     this.fireflyClamp = options.fireflyClamp ?? 4.0;
     /** 1-bounce global illumination (traced indirect). Toggle for a direct-only look. */
     this.gi = options.gi ?? true;
+    /**
+     * Sample static emissive meshes as area lights (next-event estimation).
+     * Dramatically less noise than waiting for GI rays to hit the emitter, and
+     * emitters gain direct lighting + shadows. Off = legacy hit-only behaviour.
+     */
+    this.emissiveNEE = options.emissiveNEE ?? true;
+    /** Traced mirror/glossy reflections on metallic surfaces. */
+    this.reflections = options.reflections ?? true;
+    /** Traced refraction for transmissive (MeshPhysicalMaterial.transmission) surfaces. */
+    this.refraction = options.refraction ?? true;
+    /** Index of refraction used for transmissive surfaces. */
+    this.ior = options.ior ?? 1.5;
+    /**
+     * One stochastic direct shadow ray per pixel per frame (source picked at
+     * random) instead of one per light — the biggest ray-count lever for
+     * many-light scenes and mobile GPUs. Slightly noisier moving shadows;
+     * temporal accumulation + the denoiser absorb it.
+     */
+    this.stochasticLights = options.stochasticLights ?? false;
+    /**
+     * Adaptive quality governor: watches the app's real frame time and walks
+     * QUALITY_LADDER — degrading when frames run long, cautiously probing a
+     * better level when there is headroom (reverting if the probe fails). The
+     * portable way to "work well" on unknown hardware. Drives renderScale,
+     * denoiseIterations and stochasticLights; setting those manually while
+     * enabled will be overridden — turn this off for manual control.
+     */
+    this.adaptiveQuality = options.adaptiveQuality ?? false;
+    /** Frame-rate target for the adaptive governor. */
+    this.targetFps = options.targetFps ?? 55;
+    this._qEma = null;
+    this._qLastT = null;
+    this._qLastChange = 0;
     /** Edge-aware à-trous denoise on the irradiance buffer. */
     this.denoise = options.denoise ?? true;
     /** À-trous iterations (steps 1, 2, 4, ...). */
@@ -84,6 +238,20 @@ export class RealtimeRaytracer {
     this.taa = options.taa ?? true;
     /** Fresh-sample weight in the TAA blend (lower = smoother/more AA, more lag). */
     this.taaBlend = options.taaBlend ?? 0.1;
+
+    /**
+     * Volumetric lighting — real "god rays": single-scatter fog integrated
+     * along each primary ray with one jittered, BVH-shadowed light sample per
+     * pixel per frame, temporally accumulated like the surface lighting.
+     * Shafts are carved by actual occluders and work for off-screen sources.
+     * Off by default; costs roughly one extra shadow ray per lighting pixel.
+     */
+    this.volumetric = {
+      enabled: options.volumetric?.enabled ?? false,
+      density: options.volumetric?.density ?? 0.015,
+      maxDist: options.volumetric?.maxDist ?? 40,
+    };
+    this.volumetricPass = new VolumetricPass(this._scaledW, this._scaledH);
 
     /** Distance fog (composited in linear space before tonemap). */
     this.fog = {
@@ -136,9 +304,15 @@ export class RealtimeRaytracer {
    * whose transforms will change every frame (drive them with updateDynamic()).
    */
   compileScene(scene, options) {
+    if (!this.supported) return null;
     if (this.compiled) this.compiled.dispose();
     this.compiled = compileScene(scene, options);
+    if (this._autoEps) {
+      // ~1/1000 of the scene diagonal, floored at the classic 1e-3.
+      this.eps = Math.min(Math.max(1e-3, this.compiled.sceneDiagonal * 1.2e-3), 0.05);
+    }
     this.rtPass.setCompiledScene(this.compiled);
+    this.volumetricPass.setCompiledScene(this.compiled);
     this.resetAccumulation();
     return this.compiled;
   }
@@ -159,12 +333,14 @@ export class RealtimeRaytracer {
    * 0 (or invisible) are dropped so they can be switched off.
    */
   updateLights(scene) {
-    if (!this.compiled) return;
+    if (!this.supported || !this.compiled) return;
     syncLights(scene, this.compiled);
     this.rtPass.setCompiledScene(this.compiled);
+    this.volumetricPass.setCompiledScene(this.compiled);
   }
 
   resetAccumulation() {
+    if (!this.supported) return;
     this._needsClear = true;
     if (this.taaPass) this.taaPass.reset();
   }
@@ -185,17 +361,59 @@ export class RealtimeRaytracer {
   }
 
   setSize(width, height) {
+    if (!this.supported) return;
     this._width = Math.floor(width);
     this._height = Math.floor(height);
     this.gbuffer.setSize(this._width, this._height);
     this.rtPass.setSize(this._scaledW, this._scaledH);
     this.denoisePass.setSize(this._scaledW, this._scaledH);
+    this.volumetricPass.setSize(this._scaledW, this._scaledH);
     this.taaPass.setSize(this._width, this._height);
     this._sceneColor.setSize(this._width, this._height);
     this.resetAccumulation();
   }
 
+  // ---- adaptive quality governor: continuous dynamic resolution scaling ----
+  // Measures real call-to-call frame time (EMA) and steers renderScale
+  // proportionally toward targetFps, in 0.05 steps with a cooldown so target
+  // reallocation and accumulation resets stay rare. Lighting cost ≈ scale², so
+  // the correction uses a damped power of the error. Limitation: under a vsync
+  // cap the frame time can't reveal headroom, so upscaling only happens when
+  // frames are measurably faster than the target — it never thrashes.
+  _adaptQuality() {
+    const now = performance.now();
+    const dt = this._qLastT == null ? null : now - this._qLastT;
+    this._qLastT = now;
+    if (dt == null || dt > 100) return; // first frame or hidden-tab stall
+    this._qEma = this._qEma == null ? dt : this._qEma * 0.9 + dt * 0.1;
+    if (now - this._qLastChange < 2000) return;
+
+    const ratio = this._qEma / (1000 / this.targetFps);
+    if (ratio < 1.12 && ratio > 0.8) return; // comfortable — leave it alone
+
+    let s = this._renderScale * Math.pow(1 / ratio, 0.35);
+    s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
+    if (Math.abs(s - this._renderScale) < 0.045) return;
+
+    const q = RealtimeRaytracer._qualityFor(s);
+    this.denoiseIterations = q.denoiseIterations;
+    this.stochasticLights = q.stochasticLights;
+    this.renderScale = s; // reallocates targets + resets accumulation
+    this._qLastChange = now;
+    this._qEma = null; // cost profile changed — measure fresh
+    console.info(
+      `three-realtime-rt: adaptive quality → ${Math.round(s * 100)}% lighting, ` +
+        `${q.denoiseIterations} denoise passes, ` +
+        `${q.stochasticLights ? "stochastic" : "full"} direct light`
+    );
+  }
+
   render(scene, camera) {
+    if (!this.supported) {
+      this.renderer.render(scene, camera);
+      return;
+    }
+    if (this.adaptiveQuality) this._adaptQuality();
     if (!this.compiled) this.compileScene(scene);
 
     this.frame += 1;
@@ -208,7 +426,9 @@ export class RealtimeRaytracer {
     const proj = camera.projectionMatrix;
     const savedProj8 = proj.elements[8];
     const savedProj9 = proj.elements[9];
-    if (this.taa) {
+    // Debug views (outputMode != 0) bypass the TAA resolve, so skip the jitter
+    // too — otherwise the raw buffers visibly shake.
+    if (this.taa && this.outputMode === 0) {
       this._jitterIndex = (this._jitterIndex + 1) % 16;
       const jx = (halton(this._jitterIndex + 1, 2) - 0.5) * 2 / this._width;
       const jy = (halton(this._jitterIndex + 1, 3) - 0.5) * 2 / this._height;
@@ -231,6 +451,7 @@ export class RealtimeRaytracer {
 
     if (this._needsClear) {
       this.rtPass.clearHistory(this.renderer);
+      this.volumetricPass.clearHistory(this.renderer);
       this._needsClear = false;
     }
 
@@ -246,6 +467,11 @@ export class RealtimeRaytracer {
     rtU.uMaxHistory.value = this.maxHistory;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
     rtU.uGIEnabled.value = this.gi;
+    rtU.uEmissiveCount.value = this.emissiveNEE ? this.compiled.emissiveTriCount : 0;
+    rtU.uReflEnabled.value = this.reflections;
+    rtU.uRefrEnabled.value = this.refraction;
+    rtU.uIor.value = this.ior;
+    rtU.uLightStochastic.value = this.stochasticLights;
     rtU.uSkyEnabled.value = this.sky.enabled;
     rtU.uSunDir.value.copy(this.sky.sunDir);
     rtU.uSunColor.value.copy(this.sky.sunColor);
@@ -269,6 +495,23 @@ export class RealtimeRaytracer {
       );
     }
 
+    // 3b. volumetric single-scatter (optional): one BVH-shadowed light sample
+    // per lighting pixel along the camera ray, accumulated temporally. The
+    // composite adds the result before fog and tonemap.
+    let volumetricTex = null;
+    if (this.volumetric.enabled && this.outputMode === 0) {
+      volumetricTex = this.volumetricPass.render(
+        this.renderer,
+        this.gbuffer,
+        this._prevViewProj,
+        this._camWorldPos,
+        this.frame,
+        this.eps,
+        this.volumetric.density,
+        this.volumetric.maxDist
+      );
+    }
+
     // 4. composite (bilateral upsample if lighting is sub-res). With TAA on,
     // render to an offscreen colour target so the resolve can accumulate it;
     // otherwise straight to screen. Debug views bypass TAA (raw buffers).
@@ -288,6 +531,8 @@ export class RealtimeRaytracer {
     cU.uSkyZenith.value.copy(this.sky.zenith);
     cU.uSkyHorizon.value.copy(this.sky.horizon);
     cU.uSkyIntensity.value = this.sky.intensity;
+    cU.uVolumetric.value = volumetricTex;
+    cU.uVolEnabled.value = volumetricTex !== null;
     this.composite.render(
       this.renderer,
       irradiance,
@@ -324,11 +569,13 @@ export class RealtimeRaytracer {
   }
 
   dispose() {
+    if (!this.supported) return;
     this.gbuffer.dispose();
     this.rtPass.dispose();
     this.denoisePass.dispose();
     this.composite.dispose();
     this.taaPass.dispose();
+    this.volumetricPass.dispose();
     this._sceneColor.dispose();
     if (this.compiled) this.compiled.dispose();
   }

@@ -36,7 +36,15 @@ void main() {
     return;
   }
   vec3 P = wp.xyz;
-  vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
+  vec4 nm = texture(uGNormalMetal, vUv);
+  vec3 N = normalize(nm.xyz);
+  // Specular surfaces (mirror metals, glass) carry traced reflections whose
+  // detail is NOT in the G-buffer guides — filtering would smear them, and
+  // their signal is nearly deterministic anyway. Scale the filter down as the
+  // surface gets more mirror-like.
+  float matW = nm.w;
+  float specAmount = matW >= 2.0 ? clamp(matW - 2.0, 0.0, 1.0) : matW;
+  float specKeep = specAmount * (1.0 - clamp(wp.w - 1.0, 0.0, 1.0));
 
   // Fewer accumulated samples -> noisier pixel -> wider luminance tolerance.
   // A converged pixel (high count) is barely touched, preserving detail.
@@ -45,6 +53,31 @@ void main() {
 
   float distToCam = distance(P, uCameraPos);
   float planeTol = 0.01 * distToCam + 20.0 * uEps;
+
+  // Despeckle (first iteration, short history only): a freshly disoccluded
+  // pixel can carry one huge sample that the center-weighted filter would
+  // preserve as a bright "rain drop" at silhouettes. Such a pixel has no
+  // business being brighter than its entire neighbourhood — clamp its
+  // luminance to the brightest neighbour. Converged pixels are exempt, so
+  // real small highlights survive.
+  if (uStep < 1.5 && count < 8.0) {
+    float maxL = 0.0;
+    float found = 0.0;
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) continue;
+        vec2 tuv = vUv + vec2(float(dx), float(dy)) * uTexelSize;
+        if (tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0) continue;
+        if (texture(uGWorldPos, tuv).w < 0.5) continue;
+        maxL = max(maxL, luminance(texture(uIrradiance, tuv).rgb));
+        found = 1.0;
+      }
+    }
+    float cap = maxL * 1.25 + 1e-4;
+    float l = luminance(center.rgb);
+    if (found > 0.5 && l > cap) center.rgb *= cap / l;
+  }
+
   float lumC = luminance(center.rgb);
 
   // 3x3 B-spline-ish kernel, edge-avoiding weights.
@@ -65,7 +98,7 @@ void main() {
       float wN = pow(max(dot(N, Nt), 0.0), 32.0);
       float wZ = exp(-abs(dot(g.xyz - P, N)) / planeTol);
       float wL = exp(-abs(luminance(s.rgb) - lumC) / sigmaL);
-      float w = k * wN * wZ * wL;
+      float w = k * wN * wZ * wL * (1.0 - specKeep);
       sum += s.rgb * w;
       wsum += w;
     }
