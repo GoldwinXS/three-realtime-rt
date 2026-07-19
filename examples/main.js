@@ -223,7 +223,47 @@ async function main() {
     physics.spawnPool(scene, 40, new THREE.Vector3(2.4, 0, 2.2));
     rt.compileScene(scene, { dynamicMeshes: physics.meshes });
   };
-  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature });
+
+  // "Party lights" — spawn N extra point lights at deterministic pseudo-random
+  // positions/colours to stress the many-light path (ReSTIR). The scene already
+  // has 3 lights and the light table caps at 16, so N tops out at 13. Same slider
+  // value always yields the same lights (seeded per index), so it's reproducible.
+  const extraLights = [];
+  // mulberry32 — tiny deterministic PRNG; one stream per light index.
+  const mulberry32 = (a) => () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const setExtraLights = (n) => {
+    n = Math.max(0, Math.min(13, Math.round(n)));
+    if (n === extraLights.length) return;
+    while (extraLights.length < n) {
+      const i = extraLights.length;
+      const rand = mulberry32(i * 2654435761 + 1);
+      const light = new THREE.PointLight(
+        new THREE.Color().setHSL(rand(), 0.85, 0.6), 6, 0, 2
+      );
+      light.position.set(
+        (rand() * 2 - 1) * 6,   // x in ±6
+        2.5 + rand() * 3,       // y in 2.5..5.5
+        (rand() * 2 - 1) * 6    // z in ±6
+      );
+      light.userData.rtRadius = 0.2; // soft shadows
+      scene.add(light);
+      extraLights.push(light);
+    }
+    while (extraLights.length > n) {
+      const light = extraLights.pop();
+      scene.remove(light);
+      light.dispose();
+    }
+    refreshLights();
+    rt.resetAccumulation();
+  };
+
+  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights });
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;

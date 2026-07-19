@@ -500,6 +500,9 @@ export class RealtimeRaytracer {
     // each pixel's winner with a single visibility ray.
     let reservoirTex = null;
     if (this.restir) {
+      // Emissive candidates follow the emissiveNEE toggle — without this the
+      // reservoir keeps proposing panel samples the user has switched off.
+      this.restirPass.setEmissiveCount(this.emissiveNEE ? this.compiled.emissiveTriCount : 0);
       reservoirTex = this.restirPass.render(
         this.renderer,
         this.gbuffer,

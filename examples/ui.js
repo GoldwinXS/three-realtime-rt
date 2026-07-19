@@ -147,7 +147,7 @@ function lightRow(name, light, hasColor, rt, scene) {
   return row;
 }
 
-export function buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature }) {
+export function buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights }) {
   document.head.append(el("style", null, CSS));
 
   const panel = el("div");
@@ -206,6 +206,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   for (const { label, light, color } of lights) {
     lSec.append(lightRow(label, light, color, rt, scene));
   }
+  lSec.append(slider("party lights", 0, 13, 1, 0, (x) => Number(x).toFixed(0), (v) => setExtraLights(Math.round(v))));
   panel.append(lSec);
 
   // --- Atmosphere ---

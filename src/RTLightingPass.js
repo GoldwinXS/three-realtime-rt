@@ -264,10 +264,10 @@ vec3 sampleEmissiveTri(vec3 P, vec3 N) {
 // not the jitter). The estimator inherently tames near-emitter spikes: a huge
 // contribution comes with a proportionally huge p̂, and W divides it out.
 vec3 shadeReservoir(vec3 P, vec3 N) {
+  // Spatial-stage encoding: r = id, g,b = tri uv, a = precomputed W.
   vec4 res = texture(uReservoir, vUv);
-  float M = mod(res.r, 64.0);
-  if (M < 1.0 || res.a <= 0.0) return vec3(0.0);
-  float id = floor(res.r / 64.0);
+  if (res.a <= 0.0) return vec3(0.0);
+  float id = res.r;
 
   vec3 C;
   vec3 wi;
@@ -313,10 +313,8 @@ vec3 shadeReservoir(vec3 P, vec3 N) {
     C = vec3(t1.w, t2.w, t3.w) * (cosS * cosL * t0.w / max(d2, 1e-6));
   }
 
-  float phat = dot(C, vec3(0.299, 0.587, 0.114));
-  if (phat <= 0.0) return vec3(0.0);
   if (occluded(P + N * uEps, wi, maxDist)) return vec3(0.0);
-  vec3 e = C * (res.a / (M * phat));
+  vec3 e = C * res.a;
   // Safety clamp, same budget as the emissive direct clamp elsewhere.
   float l = dot(e, vec3(0.299, 0.587, 0.114));
   float cap = uFireflyClamp * 2.0;

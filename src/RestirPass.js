@@ -9,35 +9,16 @@ void main() {
 }
 `;
 
-// ReSTIR DI (temporal-only v1): per pixel, stream K light candidates through a
-// weighted reservoir (weights = UNSHADOWED contribution — no rays here), then
-// merge with the reprojected previous frame's reservoir. Over a few frames a
-// pixel converges onto the light that actually matters to it, and the lighting
-// pass spends its single shadow ray on that winner. Cost is ALU-only and flat
-// in light count — the key to "more lights without losing frames".
-//
-// Reservoir texel encoding (RGBA32F):
-//   r = candidateId * 64 + min(M, 63)   (id: light index, or MAX_LIGHTS + tri)
-//   g,b = barycentric sample uv on an emissive triangle (unused for lights)
-//   a = wSum
-const restirFrag = /* glsl */ `
-precision highp float;
-
+// GLSL shared by the temporal and spatial reservoir shaders: RNG (blue noise
+// first, PCG after) and the candidate contribution — which MUST stay in
+// agreement with RTLightingPass.shadeReservoir (minus visibility).
+const RESTIR_COMMON = /* glsl */ `
 #define MAX_LIGHTS ${MAX_LIGHTS}
 #define PI 3.14159265358979
-#define CANDIDATES 8
-
-layout(location = 0) out vec4 outReservoir;
-
-in vec2 vUv;
 
 uniform sampler2D uGWorldPos;
 uniform sampler2D uGNormalMetal;
 uniform sampler2D uMaterialsTex;  // row 1: emissive tris, rows 2..65: blue noise
-uniform sampler2D uPrevReservoir;
-uniform sampler2D uPrevGWorldPos;
-uniform mat4 uPrevViewProj;
-
 uniform vec4 uLightPosType[MAX_LIGHTS];
 uniform vec4 uLightColorRadius[MAX_LIGHTS];
 uniform int uLightCount;
@@ -46,7 +27,6 @@ uniform float uFrame;
 uniform vec3 uCameraPos;
 uniform float uEps;
 
-// ---------- RNG (blue noise for the first dims, PCG after) ----------
 uint gSeed;
 int gBnDim;
 vec4 gBlueNoise;
@@ -73,9 +53,7 @@ vec4 fetchBlueNoise() {
 
 float luminance(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
-// Unshadowed contribution of candidate (id, uv) at surface (P, N). MUST match
-// what RTLightingPass evaluates at shading time (minus visibility) — the
-// estimator's correctness rests on that agreement.
+// Unshadowed contribution of candidate (id, uv) at surface (P, N).
 vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
   if (id < float(MAX_LIGHTS)) {
     int i = int(id);
@@ -107,10 +85,30 @@ vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
   float cosS = dot(N, wi);
   float cosL = abs(dot(t3.xyz, wi));
   if (cosS <= 0.0 || cosL < 1e-4) return vec3(0.0);
-  // Uniform pick within the emissive set happens at CANDIDATE level, so the
+  // Uniform pick within the emissive set happens at candidate level, so the
   // per-triangle contribution uses area only (count folds into pick pdf).
   return vec3(t1.w, t2.w, t3.w) * (cosS * cosL * t0.w / max(d2, 1e-6));
 }
+`;
+
+// TEMPORAL stage. Streams K fresh candidates through a weighted reservoir,
+// merges with the reprojected previous frame's reservoir. Output encoding
+// (fed back as history next frame):
+//   r = candidateId * 64 + min(M, 63), g,b = tri uv, a = wSum
+const temporalFrag = /* glsl */ `
+precision highp float;
+
+${RESTIR_COMMON}
+
+#define CANDIDATES 8
+
+layout(location = 0) out vec4 outReservoir;
+
+in vec2 vUv;
+
+uniform sampler2D uPrevReservoir;
+uniform sampler2D uPrevGWorldPos;
+uniform mat4 uPrevViewProj;
 
 void main() {
   vec4 wp = texture(uGWorldPos, vUv);
@@ -133,7 +131,6 @@ void main() {
     return;
   }
 
-  // --- streaming RIS over K fresh candidates ---
   float rId = 0.0;
   vec2 rUv = vec2(0.0);
   float wSum = 0.0;
@@ -149,15 +146,14 @@ void main() {
       uv = vec2(rand(), rand());
       if (uv.x + uv.y > 1.0) uv = 1.0 - uv;
     }
-    // source pdf = 1/S (times uniform-area within a tri, already folded into
-    // the contribution's area factor) -> RIS weight = p̂ * S
+    // source pdf = 1/S -> RIS weight = p̂ * S
     float w = luminance(candidateContribution(id, uv, P, N)) * float(S);
     wSum += w;
     M += 1.0;
     if (w > 0.0 && rand() * wSum < w) { rId = id; rUv = uv; }
   }
 
-  // --- temporal reuse: prev reservoir re-weighted at THIS surface ---
+  // temporal reuse: previous reservoir as ONE candidate carrying its history
   vec4 clip = uPrevViewProj * vec4(P, 1.0);
   if (clip.w > 0.0) {
     vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
@@ -167,14 +163,12 @@ void main() {
       if (prevPos.w > 0.5 && abs(dot(P - prevPos.xyz, N)) < tol) {
         vec4 h = texture(uPrevReservoir, prevUv);
         // Staleness cap; ALSO keeps total M within the 6 bits the encoding
-        // stores (8 fresh + 40 history < 64) so shading's W uses the true M.
+        // stores (8 fresh + 40 history < 64).
         float hM = min(mod(h.r, 64.0), 40.0);
         float hId = floor(h.r / 64.0);
         if (hM > 0.0 && h.a > 0.0) {
-          // Treat the previous reservoir as ONE candidate carrying its history:
-          // RIS weight = p̂_now(sample) · W_prev · M_prev, where
-          // W_prev = wSum_prev / (M_prev · p̂_prev). p̂_prev ≈ p̂_now on a
-          // validated surface, so the p̂ terms cancel to wSum/M · M.
+          // RIS weight = p̂_now · W_prev · M_prev; with p̂_prev ≈ p̂_now on a
+          // validated surface this reduces to (wSum/M)·M.
           float hPhat = luminance(candidateContribution(hId, h.gb, P, N));
           float w = hPhat > 0.0 ? (h.a / max(mod(h.r, 64.0), 1.0)) * hM : 0.0;
           wSum += w;
@@ -189,34 +183,125 @@ void main() {
 }
 `;
 
-/** Temporal-reuse reservoir pass at lighting resolution (see shader comment). */
+// SPATIAL stage (the "v2" of ReSTIR): merge a few validated neighbor
+// reservoirs so pixels share each other's discoveries — the big win for
+// convergence speed and area-light (emissive) noise. Output is consumed by
+// the lighting pass THIS frame only (never fed back), so it trades the
+// history encoding for a precomputed weight:
+//   r = candidateId, g,b = tri uv, a = W = wSum / (M · p̂)
+const spatialFrag = /* glsl */ `
+precision highp float;
+
+${RESTIR_COMMON}
+
+#define NEIGHBORS 4
+
+layout(location = 0) out vec4 outReservoir;
+
+in vec2 vUv;
+
+uniform sampler2D uReservoirIn;
+uniform vec2 uTexelSize;
+
+void main() {
+  vec4 wp = texture(uGWorldPos, vUv);
+  if (wp.w < 0.5) {
+    outReservoir = vec4(0.0);
+    return;
+  }
+  vec3 P = wp.xyz;
+  vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
+
+  ivec2 px = ivec2(gl_FragCoord.xy);
+  gSeed = uint(px.x) * 5417u + uint(px.y) * 7907u + uint(uFrame) * 15731u;
+  gSeed = pcgHash(gSeed);
+  gBlueNoise = fetchBlueNoise();
+  gBnDim = 3; // decorrelate from the temporal stage's blue-noise dims
+
+  vec4 c = texture(uReservoirIn, vUv);
+  float rId = floor(c.r / 64.0);
+  vec2 rUv = c.gb;
+  float M = mod(c.r, 64.0);
+  float wSum = c.a;
+
+  float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
+  for (int k = 0; k < NEIGHBORS; k++) {
+    float a = (float(k) + rand()) * (2.0 * PI / float(NEIGHBORS));
+    float rad = 2.0 + rand() * 8.0; // taps within ~10 lighting-res texels
+    vec2 nUv = vUv + vec2(cos(a), sin(a)) * rad * uTexelSize;
+    if (nUv.x < 0.0 || nUv.x > 1.0 || nUv.y < 0.0 || nUv.y > 1.0) continue;
+
+    // geometric validation: same plane + similar orientation, or the
+    // neighbor's chosen light is meaningless here
+    vec4 nwp = texture(uGWorldPos, nUv);
+    if (nwp.w < 0.5) continue;
+    if (abs(dot(nwp.xyz - P, N)) > tol) continue;
+    vec3 nN = normalize(texture(uGNormalMetal, nUv).xyz);
+    if (dot(N, nN) < 0.9) continue;
+
+    vec4 h = texture(uReservoirIn, nUv);
+    float hM = mod(h.r, 64.0);
+    if (hM < 1.0 || h.a <= 0.0) continue;
+    float hId = floor(h.r / 64.0);
+    // neighbor reservoir as one candidate, re-weighted at THIS surface
+    float hPhat = luminance(candidateContribution(hId, h.gb, P, N));
+    float w = hPhat > 0.0 ? (h.a / hM) * min(hM, 40.0) : 0.0;
+    wSum += w;
+    M += min(hM, 40.0);
+    if (w > 0.0 && rand() * wSum < w) { rId = hId; rUv = h.gb; }
+  }
+
+  float phat = luminance(candidateContribution(rId, rUv, P, N));
+  float W = (M > 0.0 && phat > 0.0) ? wSum / (M * phat) : 0.0;
+  outReservoir = vec4(rId, rUv.x, rUv.y, W);
+}
+`;
+
+/**
+ * ReSTIR DI reservoirs at lighting resolution: temporal reuse (ping-ponged
+ * history) followed by one spatial-reuse iteration. render() returns the
+ * spatial output — {id, uv, W} per pixel — for the lighting pass to shade
+ * with a single visibility ray.
+ */
 export class RestirPass {
   constructor(width, height) {
     this.targetA = this._makeTarget(width, height);
     this.targetB = this._makeTarget(width, height);
+    this.spatialTarget = this._makeTarget(width, height);
 
-    this.material = new THREE.ShaderMaterial({
-      glslVersion: THREE.GLSL3,
-      vertexShader: fullscreenVert,
-      fragmentShader: restirFrag,
-      uniforms: {
-        uGWorldPos: { value: null },
-        uGNormalMetal: { value: null },
-        uMaterialsTex: { value: null },
-        uPrevReservoir: { value: null },
-        uPrevGWorldPos: { value: null },
-        uPrevViewProj: { value: new THREE.Matrix4() },
-        uLightPosType: { value: [] },
-        uLightColorRadius: { value: [] },
-        uLightCount: { value: 0 },
-        uEmissiveCount: { value: 0 },
-        uFrame: { value: 0 },
-        uCameraPos: { value: new THREE.Vector3() },
-        uEps: { value: 1e-3 },
-      },
-      depthTest: false,
-      depthWrite: false,
-    });
+    const mkMaterial = (frag) =>
+      new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: fullscreenVert,
+        fragmentShader: frag,
+        uniforms: {
+          uGWorldPos: { value: null },
+          uGNormalMetal: { value: null },
+          uMaterialsTex: { value: null },
+          uLightPosType: { value: [] },
+          uLightColorRadius: { value: [] },
+          uLightCount: { value: 0 },
+          uEmissiveCount: { value: 0 },
+          uFrame: { value: 0 },
+          uCameraPos: { value: new THREE.Vector3() },
+          uEps: { value: 1e-3 },
+          ...(frag === temporalFrag
+            ? {
+                uPrevReservoir: { value: null },
+                uPrevGWorldPos: { value: null },
+                uPrevViewProj: { value: new THREE.Matrix4() },
+              }
+            : {
+                uReservoirIn: { value: null },
+                uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) },
+              }),
+        },
+        depthTest: false,
+        depthWrite: false,
+      });
+
+    this.material = mkMaterial(temporalFrag);
+    this.spatialMaterial = mkMaterial(spatialFrag);
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -241,18 +326,26 @@ export class RestirPass {
   }
 
   setCompiledScene(compiled) {
-    const u = this.material.uniforms;
-    u.uMaterialsTex.value = compiled.materialsTex;
-    u.uLightPosType.value = compiled.lightPosType;
-    u.uLightColorRadius.value = compiled.lightColorRadius;
-    u.uLightCount.value = compiled.lightCount;
-    u.uEmissiveCount.value = compiled.emissiveTriCount;
+    for (const m of [this.material, this.spatialMaterial]) {
+      const u = m.uniforms;
+      u.uMaterialsTex.value = compiled.materialsTex;
+      u.uLightPosType.value = compiled.lightPosType;
+      u.uLightColorRadius.value = compiled.lightColorRadius;
+      u.uLightCount.value = compiled.lightCount;
+      u.uEmissiveCount.value = compiled.emissiveTriCount;
+    }
+  }
+
+  /** Emissive candidates follow the emissiveNEE toggle (set per frame). */
+  setEmissiveCount(count) {
+    this.material.uniforms.uEmissiveCount.value = count;
+    this.spatialMaterial.uniforms.uEmissiveCount.value = count;
   }
 
   clearHistory(renderer) {
     const prev = renderer.getRenderTarget();
     renderer.setClearColor(0x000000, 0);
-    for (const t of [this.targetA, this.targetB]) {
+    for (const t of [this.targetA, this.targetB, this.spatialTarget]) {
       renderer.setRenderTarget(t);
       renderer.clear(true, false, false);
     }
@@ -262,33 +355,45 @@ export class RestirPass {
   setSize(width, height) {
     this.targetA.setSize(width, height);
     this.targetB.setSize(width, height);
+    this.spatialTarget.setSize(width, height);
+    this.spatialMaterial.uniforms.uTexelSize.value.set(1 / width, 1 / height);
   }
 
-  /** Renders into targetA (reading targetB as history), swaps, returns texture. */
+  /** Temporal → spatial; history feeds back from the TEMPORAL stage only. */
   render(renderer, gbuffer, prevViewProj, cameraPos, frame, eps) {
-    const u = this.material.uniforms;
-    u.uGWorldPos.value = gbuffer.worldPos;
-    u.uGNormalMetal.value = gbuffer.normalMetal;
-    u.uPrevReservoir.value = this.targetB.texture;
-    u.uPrevGWorldPos.value = gbuffer.prevWorldPos;
-    u.uPrevViewProj.value.copy(prevViewProj);
-    u.uFrame.value = frame;
-    u.uCameraPos.value.copy(cameraPos);
-    u.uEps.value = eps;
+    for (const m of [this.material, this.spatialMaterial]) {
+      const u = m.uniforms;
+      u.uGWorldPos.value = gbuffer.worldPos;
+      u.uGNormalMetal.value = gbuffer.normalMetal;
+      u.uFrame.value = frame;
+      u.uCameraPos.value.copy(cameraPos);
+      u.uEps.value = eps;
+    }
+    const tu = this.material.uniforms;
+    tu.uPrevReservoir.value = this.targetB.texture;
+    tu.uPrevGWorldPos.value = gbuffer.prevWorldPos;
+    tu.uPrevViewProj.value.copy(prevViewProj);
 
+    this.quad.material = this.material;
     renderer.setRenderTarget(this.targetA);
+    renderer.render(this.scene, this.camera);
+
+    this.spatialMaterial.uniforms.uReservoirIn.value = this.targetA.texture;
+    this.quad.material = this.spatialMaterial;
+    renderer.setRenderTarget(this.spatialTarget);
     renderer.render(this.scene, this.camera);
     renderer.setRenderTarget(null);
 
-    const out = this.targetA;
     [this.targetA, this.targetB] = [this.targetB, this.targetA];
-    return out.texture;
+    return this.spatialTarget.texture;
   }
 
   dispose() {
     this.targetA.dispose();
     this.targetB.dispose();
+    this.spatialTarget.dispose();
     this.material.dispose();
+    this.spatialMaterial.dispose();
     this.quad.geometry.dispose();
   }
 }
