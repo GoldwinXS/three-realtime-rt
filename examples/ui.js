@@ -147,7 +147,7 @@ function lightRow(name, light, hasColor, rt, scene) {
   return row;
 }
 
-export function buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights }) {
+export function buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setCanvasScale, canvasScale }) {
   document.head.append(el("style", null, CSS));
 
   const panel = el("div");
@@ -167,6 +167,13 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // Include the mobile preset's scales — otherwise touching this dropdown on
   // a phone locks you out of the value the page started with. Manual choice
   // takes the wheel from the adaptive governor.
+  rSec.append(
+    // Whole-canvas buffer scale (the "browser zoom" trick as a control):
+    // barely visible on dense screens, quadratic savings on EVERY pass.
+    selectRow("resolution", [["100%", 1], ["85%", 0.85], ["75%", 0.75], ["62%", 0.62], ["50%", 0.5]], canvasScale, (v) => {
+      setCanvasScale(parseFloat(v));
+    })
+  );
   rSec.append(
     selectRow("lighting res", [["100%", 1], ["75%", 0.75], ["50%", 0.5], ["37%", 0.375], ["25%", 0.25]], rt.renderScale, (v) => {
       rt.adaptiveQuality = false;

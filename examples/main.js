@@ -80,12 +80,29 @@ async function main() {
   renderer.setPixelRatio(
     TIER === "mid" ? Math.max(1, Math.min(window.devicePixelRatio || 1, 1.5, budgetPr)) : 1
   );
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  document.getElementById("app").appendChild(renderer.domElement);
+  // Canvas resolution scale (user-discovered win: browser zoom shrinks the
+  // buffer with barely visible quality loss on dense screens — every full-res
+  // pass gets quadratically cheaper). The canvas CSS size stays fullscreen;
+  // the browser upscales the smaller drawing buffer.
+  let canvasScale = TIER === "mid" ? 0.85 : 1.0;
   const bufferSize = () => {
     const pr = renderer.getPixelRatio();
-    return [Math.floor(window.innerWidth * pr), Math.floor(window.innerHeight * pr)];
+    return [
+      Math.floor(window.innerWidth * canvasScale * pr),
+      Math.floor(window.innerHeight * canvasScale * pr),
+    ];
   };
+  const applyCanvasSize = () => {
+    renderer.setSize(
+      Math.floor(window.innerWidth * canvasScale),
+      Math.floor(window.innerHeight * canvasScale),
+      false
+    );
+    renderer.domElement.style.width = "100%";
+    renderer.domElement.style.height = "100%";
+  };
+  applyCanvasSize();
+  document.getElementById("app").appendChild(renderer.domElement);
 
   // If the GPU process dies (iOS Safari memory/watchdog kill), fall back
   // instead of taking the whole tab down with us.
@@ -270,12 +287,17 @@ async function main() {
     rt.resetAccumulation();
   };
 
-  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights });
+  const setCanvasScale = (s) => {
+    canvasScale = s;
+    applyCanvasSize();
+    rt.setSize(...bufferSize());
+  };
+  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setCanvasScale, canvasScale });
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    applyCanvasSize();
     rt.setSize(...bufferSize());
   });
 
