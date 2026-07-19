@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- **Adaptive quality no longer flashes**: renderScale steps carry the temporal
+  history across target reallocation (resampled, confidence clamped to ~8
+  frames) instead of hard-resetting accumulation — the visible "all samples
+  dumped" strobe on devices hovering near the fps target is gone. The governor
+  also detects boundary hunting (a step reversal) and responds by widening its
+  deadband and extending the cooldown.
+- **Light cap raised 16 → 32** (`MAX_LIGHTS`): scenes can now scan up to 32
+  point/spot/directional lights into the compiled light tables. ReSTIR keeps
+  direct lighting at one visibility ray per pixel regardless of the count, and
+  every affected program stays well under the WebGL2-guaranteed
+  fragment-uniform budget.
+
 ## 0.3.1 — 2026-07-19
 
 - **SpotLight support** across every estimator (lighting, ReSTIR, volumetric):

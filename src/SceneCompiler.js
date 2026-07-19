@@ -9,7 +9,7 @@ import {
 } from "three-mesh-bvh";
 import { decodeBlueNoise, BLUE_NOISE_SIZE } from "./blueNoise.js";
 
-const MAX_LIGHTS = 16; // stage-1 cap; a data-texture light list is future work
+const MAX_LIGHTS = 32; // stage-1 cap; a data-texture light list is future work
 
 // Emissive-mesh triangles sampled by next-event estimation. Beyond the cap the
 // largest-area triangles win (they carry the most light); the rest are dropped

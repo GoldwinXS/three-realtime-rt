@@ -300,7 +300,7 @@ export class RealtimeRaytracer {
   dispose(): void;
 }
 
-/** Stage-1 cap on the number of lights scanned into the compiled light tables. */
+/** Stage-1 cap (32) on the number of lights scanned into the compiled light tables. */
 export const MAX_LIGHTS: number;
 
 /** Build a {@link CompiledScene} (BVH + material/light tables) from a scene. */

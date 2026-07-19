@@ -73,7 +73,7 @@ floor.rotation.x = -Math.PI / 2;
 floor.position.y = -1;
 scene.add(floor);
 
-const light = new THREE.PointLight(0xffffff, 40);   // Point / Spot / Directional (up to 16)
+const light = new THREE.PointLight(0xffffff, 40);   // Point / Spot / Directional (up to 32)
 light.position.set(3, 5, 2);
 scene.add(light);
 
@@ -246,7 +246,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `RectAreaLight` | ❌ | Use an emissive mesh instead. |
 | `HemisphereLight` / `AmbientLight` | ❌ | Ignored — the procedural `sky` (or `envColor`) provides ambient. |
 
-- Up to **16** point/directional lights (`MAX_LIGHTS`); further lights are dropped.
+- Up to **32** point/directional lights (`MAX_LIGHTS`); further lights are dropped.
 - Moving, toggling, recolouring or dimming a light → `rt.updateLights(scene)` (cheap, no recompile).
 - Changing a mesh's **emissive** (it's an area light baked at compile time) → `rt.compileScene(...)` again.
 - Emissive area lights are capped at **256 triangles** (largest by area kept, with a console warning) — prefer low-poly emitter meshes.
