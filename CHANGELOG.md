@@ -1,7 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 — 2026-07-19
 
+- **Localized fog zones** (`volumetric.zones`): up to 8 world-space AABBs, each
+  adding its own density on top of (or instead of) the global fog — fog as a
+  level-design tool. Density integrates piecewise along the ray, so a bright
+  crossing over a pitch-black abyss "just works".
 - **Adaptive quality no longer flashes**: renderScale steps carry the temporal
   history across target reallocation (resampled, confidence clamped to ~8
   frames) instead of hard-resetting accumulation — the visible "all samples
