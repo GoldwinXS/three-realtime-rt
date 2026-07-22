@@ -131,7 +131,8 @@ function selectRow(labelText, options, value, onChange) {
   return row;
 }
 
-function lightRow(name, light, hasColor, rt, scene) {
+function lightRow(desc, rt, scene) {
+  const { label: name, light, color: hasColor, onToggle } = desc;
   const row = el("div", "row");
   const lab = el("label", null, name);
   const sw = el("label", "sw");
@@ -141,7 +142,11 @@ function lightRow(name, light, hasColor, rt, scene) {
   input.addEventListener("change", () => {
     light.visible = input.checked;
     rt.updateLights(scene);
-    rt.resetAccumulation();
+    // Some lights carry an emissive companion (e.g. the orbit light's orb) that
+    // must be shown/hidden and recompiled together — the descriptor's onToggle
+    // owns that. It runs after updateLights and does its own resetAccumulation.
+    if (onToggle) onToggle(input.checked);
+    else rt.resetAccumulation();
   });
   sw.append(input, el("span", "track"), el("span", "knob"));
   row.append(lab);
@@ -284,8 +289,8 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // --- Lights ---
   const lSec = el("div", "sec");
   lSec.append(el("h3", null, `${ICON.bulb} Lights`));
-  for (const { label, light, color } of lights) {
-    lSec.append(lightRow(label, light, color, rt, scene));
+  for (const desc of lights) {
+    lSec.append(lightRow(desc, rt, scene));
   }
   // Emissive clerestory windows — each is a true sampled area light; moving
   // this recompiles the light tables (deliberate, same hitch as pile spawn).

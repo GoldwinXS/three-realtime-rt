@@ -476,7 +476,8 @@ vec3 sampleOneAny(vec3 P, vec3 N) {
 // Incoming radiance along rd: trace, shade the hit with direct + NEE lighting,
 // sky/env on a miss. Specular rays keep emitter emission on hit (NEE at the ray
 // origin cannot cover a specular path); diffuse GI rays drop it for NEE-listed
-// (static) emitters so that light isn't counted twice.
+// emitters (static AND dynamic — dynamic emitters now join the NEE table, their
+// rows refreshed each frame) so that light isn't counted twice.
 vec3 traceRadiance(vec3 ro, vec3 rd, bool specular) {
   uvec4 fi; vec3 bary; float dist; bool isDyn;
   if (!traceBoth(ro, rd, fi, bary, dist, isDyn)) {
@@ -493,7 +494,7 @@ vec3 traceRadiance(vec3 ro, vec3 rd, bool specular) {
   if (dot(hN, rd) > 0.0) hN = -hN;
   vec3 hP = ro + rd * dist;
   vec3 Ld = sampleOneAny(hP + hN * uEps, hN);
-  vec3 hLe = (!specular && uEmissiveCount > 0 && !isDyn) ? vec3(0.0) : hEmissive;
+  vec3 hLe = (!specular && uEmissiveCount > 0) ? vec3(0.0) : hEmissive;
   return hLe + hAlbedo * Ld * (1.0 / PI);
 }
 

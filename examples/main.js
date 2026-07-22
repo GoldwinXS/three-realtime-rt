@@ -233,10 +233,13 @@ async function main() {
   }
 
   // The dynamic set = the (opt-in) physics pile PLUS the CPU-deformed water
-  // pool PLUS the animated fox. The water is flagged rtDeforming in scene.js, so
-  // the raytracer reads its live geometry each frame; the fox's SkinnedMesh is
-  // auto-detected and CPU-skinned each frame; the physics meshes are rigid movers.
-  const dynamicMeshes = () => [...physics.meshes, water.mesh, ...fox.meshes];
+  // pool PLUS the animated fox PLUS the orbit light's emissive orb. The water is
+  // flagged rtDeforming in scene.js, so the raytracer reads its live geometry
+  // each frame; the fox's SkinnedMesh is auto-detected and CPU-skinned each
+  // frame; the physics meshes are rigid movers; the orb is a rigid dynamic
+  // EMITTER (a moving NEE area light) — invisible until the orbit light is on, so
+  // compileScene skips it while hidden.
+  const dynamicMeshes = () => [...physics.meshes, water.mesh, ...fox.meshes, showcase.orbitOrb];
 
   // 3. Compile once. `dynamicMeshes` marks meshes that move every frame — they
   //    get re-baked into the BVH on updateDynamic() (see the loop below).
@@ -266,7 +269,19 @@ async function main() {
   const state = { rtEnabled: true, physicsPaused: false, waterEnabled: true, foxEnabled: true };
 
   // The orbiting ceiling light is animated in the loop (below) — find it once.
-  const orbitLight = lights.find((l) => l.label === "orbit light").light;
+  const orbitDesc = lights.find((l) => l.label === "orbit light");
+  const orbitLight = orbitDesc.light;
+  const orbitOrb = showcase.orbitOrb;
+  // Toggling the "orbit light" toggles BOTH the analytic point light and its
+  // emissive orb. The orb is an emissive mesh, so adding/removing it from the
+  // scene changes the NEE light table — a recompile, same deliberate hitch as
+  // the clerestory windows. lightRow (ui.js) sets light.visible + updateLights
+  // first, then calls this to sync the orb and rebuild.
+  orbitDesc.onToggle = (on) => {
+    orbitOrb.visible = on;
+    rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
+    rt.resetAccumulation();
+  };
 
   // Clerestory windows: emissive area lights are snapshotted at compile time,
   // so changing how many are open rebuilds the light tables (a deliberate,
@@ -386,8 +401,37 @@ async function main() {
   let frames = 0, fps = 0, lastFps = performance.now(), lastT = performance.now();
   let booted = false;
   let orbitAngle = 0;      // orbiting ceiling light phase (advanced only when lit)
+  let orbitManual = false; // when true the verification probe owns the orbit angle
   let lastRtEnabled = null; // reconfigure the raster path only on RT on/off edges
   let waterPerfLogged = false; // one-shot updateDynamic() cost probe (water active)
+
+  // Verification hooks (used by the headed-chromium emissive probe). Harmless in
+  // normal use: they just script the same operations the UI exposes, plus manual
+  // control of the orbit angle so a fixed floor point can be sampled per pose.
+  const positionOrbit = (a) => {
+    orbitLight.position.set(Math.cos(a) * 4.0, 5.4, Math.sin(a) * 4.0);
+    refreshLights();
+  };
+  window.__demoTest = {
+    rt, scene, state, orbitLight, orbitOrb, sign: showcase.sign,
+    // Enable/disable both the orbit point light and its emissive orb, with the
+    // recompile that adds/removes the orb from the NEE table.
+    setOrbit(on) {
+      orbitLight.visible = on;
+      orbitOrb.visible = on;
+      rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
+      rt.resetAccumulation();
+    },
+    // Isolate the orb's NEE: keep orbitLight VISIBLE (so updateDynamic keeps
+    // refreshing the orb) but zero its analytic intensity, so any floor light is
+    // the orb emitter's NEE cast alone. syncLights drops intensity<=0 lights.
+    setOrbitAnalytic(on) { orbitLight.intensity = on ? 13 : 0; refreshLights(); },
+    setOrbitManual(on) { orbitManual = on; },
+    setOrbitAngle(a) { orbitAngle = a; positionOrbit(a); },
+    setWater(on) { state.waterEnabled = on; },
+    setFox(on) { state.foxEnabled = on; },
+    resetAccum() { rt.resetAccumulation(); },
+  };
 
   function animate() {
     if (document.visibilityState === "hidden") setTimeout(animate, 100);
@@ -411,10 +455,13 @@ async function main() {
     controls.update();
     if (!state.physicsPaused) physics.step();
 
-    // Sweep the orbiting light when it's on — moving ray traced shadows. Only
-    // the (cheap) light-list update is needed; temporal reprojection carries the
-    // lighting, so we deliberately do NOT reset accumulation each frame.
-    if (orbitLight.visible) {
+    // Sweep the orbiting light + its emissive orb when on — moving ray traced
+    // shadows AND a moving NEE area light. Only the (cheap) light-list update is
+    // needed here; temporal reprojection carries the lighting, so we deliberately
+    // do NOT reset accumulation each frame. The orb (child of the light) tracks
+    // the position for free; updateDynamic() below refreshes its NEE triangles.
+    // orbitManual lets the verification probe own the angle (window.__demoTest).
+    if (orbitLight.visible && !orbitManual) {
       orbitAngle += dt * 0.6;
       orbitLight.position.set(Math.cos(orbitAngle) * 4.0, 5.4, Math.sin(orbitAngle) * 4.0);
       refreshLights();
@@ -436,7 +483,9 @@ async function main() {
       // frame.
       const physicsActive = !state.physicsPaused && physics.anyAwake();
       try {
-        if (state.waterEnabled || state.foxEnabled || physicsActive) {
+        // The orbit orb is a moving emitter, so its dynamic BVH + NEE rows must
+        // refresh every frame the orbit light is on, even at physics rest.
+        if (state.waterEnabled || state.foxEnabled || physicsActive || orbitLight.visible) {
           const tDyn = performance.now();
           rt.updateDynamic();
           // One-shot perf probe: what does re-baking the deforming water +

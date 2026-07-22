@@ -200,6 +200,47 @@ export function buildScene() {
   vitrine.position.set(-4.8, 1.55, 0.8);
   scene.add(vitrine);
 
+  // --- front-left: a textured EMISSIVE sign beside the vitrine ------------
+  // A small "OPEN" sign whose glow comes from an emissiveMap generated on a
+  // canvas (no binary asset). The map's per-pixel pattern shows in the G-buffer
+  // (the sign LOOKS like lettering), and its AVERAGE colour — greenish here —
+  // now also CASTS light: the raytracer approximates a textured emitter by
+  // avg(map) x emissive x emissiveIntensity, so the white floor in front of the
+  // sign picks up its green-cyan spill. (Emitters need a non-black `emissive`;
+  // white keeps the cast hue equal to the map average.)
+  const signCanvas = document.createElement("canvas");
+  signCanvas.width = 128;
+  signCanvas.height = 64;
+  {
+    const g = signCanvas.getContext("2d");
+    g.fillStyle = "#03130d"; // near-black green ground
+    g.fillRect(0, 0, 128, 64);
+    g.fillStyle = "#25e0ff"; // cyan rails top and bottom
+    g.fillRect(0, 3, 128, 5);
+    g.fillRect(0, 56, 128, 5);
+    g.fillStyle = "#28ff9a"; // bright green lettering
+    g.font = "bold 34px monospace";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText("OPEN", 64, 33);
+  }
+  const signTex = new THREE.CanvasTexture(signCanvas);
+  signTex.colorSpace = THREE.SRGBColorSpace;
+  const sign = new THREE.Mesh(
+    new THREE.PlaneGeometry(0.95, 0.48),
+    new THREE.MeshStandardMaterial({
+      color: 0x040404,
+      emissive: 0xffffff,
+      emissiveMap: signTex,
+      emissiveIntensity: 7,
+      roughness: 1,
+      side: THREE.DoubleSide,
+    })
+  );
+  sign.position.set(-3.2, 0.72, 1.95); // stands on the floor, front-right of the vitrine
+  sign.rotation.y = 0.55;              // angled toward the camera / open floor
+  scene.add(sign);
+
   // --- front-left: vertex-painted icosahedron sculpture -------------------
   // Its albedo comes entirely from a baked per-vertex `color` attribute (no
   // texture, no map): the hue sweeps with height so the whole form carries a
@@ -416,11 +457,33 @@ export function buildScene() {
   scene.add(spot.target);
 
   // Orbiting ceiling light — shows moving ray traced shadows sweeping the room.
+  // Its soft-shadow radius is kept small so the sampled light points stay clear
+  // of the emissive orb hung just above it (below).
   const orbit = new THREE.PointLight(0xfff0dd, 13);
   orbit.position.set(4.5, 6.2, 0);
-  orbit.userData.rtRadius = 0.28;
+  orbit.userData.rtRadius = 0.16;
   orbit.visible = false;
   scene.add(orbit);
+
+  // A small glowing orb bulb for the orbit light: a low-poly emissive mesh that
+  // IS a DYNAMIC area light (registered in dynamicMeshes, refreshed each frame by
+  // updateDynamic), so its glow sweeps the floor via NEE — not just GI luck. It's
+  // a CHILD of the orbit light (so it tracks the orbit animation for free) and is
+  // hung a touch ABOVE the light centre so shadow rays to the point light don't
+  // graze the orb and self-occlude it. Icosahedron(_, 0) = 20 tris: dynamic
+  // emitters are refreshed every frame, so keep them low-poly.
+  const orbitOrb = new THREE.Mesh(
+    new THREE.IcosahedronGeometry(0.16, 0),
+    new THREE.MeshStandardMaterial({
+      color: 0x000000,
+      emissive: 0xffe0b0,
+      emissiveIntensity: 22,
+      roughness: 1,
+    })
+  );
+  orbitOrb.position.set(0, 0.5, 0); // local offset above the light centre
+  orbitOrb.visible = false;         // tied to the orbit light (see main.js)
+  orbit.add(orbitOrb);
 
   // Fair raster comparison: when ray tracing is toggled off, the demo enables
   // shadow maps — flag everything now so that path just works.
@@ -520,6 +583,8 @@ export function buildScene() {
     // The clerestory windows (emissive panes) driven by the demo's slider.
     windows,
     // Feature-linked scene objects the demo may want handles to.
-    showcase: { orbit, paneBlue, paneAmber },
+    // orbitOrb is the orbit light's emissive bulb (a dynamic NEE area light);
+    // sign is the textured (emissiveMap) emitter beside the vitrine.
+    showcase: { orbit, orbitOrb, sign, paneBlue, paneAmber },
   };
 }
