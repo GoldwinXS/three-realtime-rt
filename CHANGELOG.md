@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **BVH traversal-cost heatmap debug view** (`outputMode: 7`, "bvh cost" in the
+  demo's view dropdown). The any-hit shadow-ray traversal now counts the BVH
+  nodes it visits into a per-pixel `gBvhVisits` accumulator; the lighting pass
+  maps that count through a cold→hot palette (blue = cheap, through green/yellow,
+  to red/white = expensive) and writes it into the irradiance buffer instead of
+  the accumulated lighting — bypassing temporal blending and the denoiser for a
+  raw per-frame snapshot. It teaches where scene geometry is expensive: hot means
+  many box tests per shadow ray (dense/overlapping geometry, long thin triangles,
+  or rays skimming surfaces). Scale it with the `costScale` option / live
+  property (default `1/96`) or the demo's "cost scale" slider. The counter is a
+  single integer add per popped node and does not change shading when the view is
+  off. No new samplers, and the strict 3-site `traceRadiance` Metal budget is
+  untouched (the heatmap only instruments the existing any-hit function).
+
 ## 0.4.2 — 2026-07-22
 
 - **Real fix for black lighting on iOS** (root-caused by live bisection on an

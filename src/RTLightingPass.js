@@ -76,6 +76,13 @@ uniform float uFrame;
 uniform float uEps;
 uniform bool uGIEnabled;
 
+// BVH traversal-cost heatmap (outputMode 7). When uCostView is on, main() writes
+// the per-pixel shadow-ray node-visit count (gBvhVisits, from bvhAnyHit.glsl.js)
+// through costPalette() into the irradiance attachment INSTEAD of the accumulated
+// lighting — bypassing temporal blending — so the debug view reads the raw cost.
+uniform bool uCostView;
+uniform float uCostScale; // multiplies the visit count before the palette (default 1/96)
+
 // Procedural sky (when enabled, replaces the flat env colour as the "miss" term
 // for GI rays — this is what gives natural outdoor bounce light).
 uniform bool uSkyEnabled;
@@ -574,6 +581,26 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough) {
   return mix(refrRad, reflRad, fres);
 }
 
+// Compact cold->hot ramp for the BVH-cost heatmap. Piecewise mix of five
+// anchors (deep blue -> green -> yellow -> red -> white) over four equal
+// segments — cheap, no textures, no extra samplers. t is the normalised cost
+// (visit count * uCostScale), clamped to [0,1]; saturating at white = the most
+// expensive pixels.
+vec3 costPalette(float t) {
+  t = clamp(t, 0.0, 1.0);
+  const vec3 c0 = vec3(0.02, 0.05, 0.45); // cold: cheap (few boxes)
+  const vec3 c1 = vec3(0.05, 0.55, 0.25); // green
+  const vec3 c2 = vec3(0.95, 0.85, 0.10); // yellow
+  const vec3 c3 = vec3(0.90, 0.10, 0.05); // red
+  const vec3 c4 = vec3(1.00, 1.00, 1.00); // hot: expensive (many boxes)
+  float s = t * 4.0;
+  vec3 col = mix(c0, c1, clamp(s, 0.0, 1.0));
+  col = mix(col, c2, clamp(s - 1.0, 0.0, 1.0));
+  col = mix(col, c3, clamp(s - 2.0, 0.0, 1.0));
+  col = mix(col, c4, clamp(s - 3.0, 0.0, 1.0));
+  return col;
+}
+
 void main() {
   vec4 wp = texture(uGWorldPos, vUv);
   if (wp.w < 0.5) {
@@ -607,6 +634,11 @@ void main() {
   gViewDir = normalize(uCameraPos - P);
   gSpecRough = rough;
   gWantSpec = true;
+
+  // Reset the shadow-ray traversal-cost counter for this pixel. It accumulates
+  // across every occluded() call below (direct, GI, reflection, glass) and is
+  // read once at the end when uCostView is on (see the cost-heatmap branch).
+  gBvhVisits = 0;
 
   // --- direct lighting ---
   // ReSTIR: shade the reservoir's winner with one visibility ray (flat cost in
@@ -772,6 +804,17 @@ void main() {
   // the fresh sample is used as-is.
   vec3 blended = mix(history, sampleIrr, 1.0 / count);
   outIrradiance = vec4(blended, count);
+
+  // BVH traversal-cost heatmap (outputMode 7). Overwrite the accumulated
+  // lighting with the palette-mapped shadow-ray node-visit count for this pixel.
+  // Alpha is forced to 1.0 so temporal history never builds on the cost image
+  // (each frame is a fresh snapshot), and the specular attachment is cleared so
+  // the composite's cost branch shows the palette alone. Uniform branch: when
+  // uCostView is off this is skipped and the writes above stand unchanged.
+  if (uCostView) {
+    outIrradiance = vec4(costPalette(float(gBvhVisits) * uCostScale), 1.0);
+    outSpecular = vec4(0.0);
+  }
 }
 `;
 
@@ -930,6 +973,8 @@ export class RTLightingPass {
         uFrame: { value: 0 },
         uEps: { value: 1e-3 },
         uGIEnabled: { value: true },
+        uCostView: { value: false },
+        uCostScale: { value: 1 / 96 },
         uSkyEnabled: { value: false },
         uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.45).normalize() },
         uSunColor: { value: new THREE.Color(1.0, 0.9, 0.75) },

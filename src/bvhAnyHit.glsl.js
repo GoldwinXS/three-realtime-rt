@@ -35,6 +35,17 @@
 
 export const BVH_ANY_HIT_GLSL = /* glsl */ `
 
+// Traversal-cost instrumentation. Counts how many BVH nodes the current pixel's
+// shadow rays visit this frame — the raw signal behind the "bvh cost" heatmap
+// debug view (outputMode 7). RTLightingPass main() zeroes it at the top of the
+// pixel and reads it after all shadow rays have run; it accumulates across every
+// bvhIntersectAnyHit call (both BVH levels, every light / GI / reflection ray).
+// When uCostView is off the count is written nowhere, so shading is unaffected —
+// the only cost is one integer add per popped node. Initialised to 0 so the
+// VolumetricPass program (which shares this GLSL but never reads the counter)
+// still compiles and runs unchanged.
+int gBvhVisits = 0;
+
 // Returns true if ANY triangle in the BVH is hit by the ray within (0, maxDist).
 // Unordered traversal with early-out; no closest-hit bookkeeping.
 bool bvhIntersectAnyHit( BVH bvh, vec3 rayOrigin, vec3 rayDirection, float maxDist ) {
@@ -53,6 +64,10 @@ bool bvhIntersectAnyHit( BVH bvh, vec3 rayOrigin, vec3 rayDirection, float maxDi
 
 		uint currNodeIndex = stack[ ptr ];
 		ptr --;
+
+		// One node visited (popped + tested). Counts pruned nodes too — that IS
+		// the traversal cost the heatmap visualises.
+		gBvhVisits ++;
 
 		// prune: skip nodes the ray misses or whose entry distance is already past maxDist
 		float boundsHitDistance;

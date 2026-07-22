@@ -182,6 +182,35 @@ Lighting is traced at half resolution by default and reconstructed by a joint
 bilateral upsample + the denoiser + TAA — the same "render few pixels, rebuild
 temporally" idea DLSS uses, done with hand-written math.
 
+### Debug views
+
+Set `rt.outputMode` (the demo's **view** dropdown) to inspect a single stage
+instead of the composited image:
+
+| Mode | View | Shows |
+|------|------|-------|
+| `0` | composite | Final tonemapped image (default). |
+| `1` | albedo | G-buffer base colour. |
+| `2` | normals | World-space normals, `×0.5 + 0.5`. |
+| `3` | irradiance | Demodulated diffuse lighting (direct + GI), pre-albedo. |
+| `4` | world pos | World position, `fract(p × 0.1)`. |
+| `5` | emissive | G-buffer emissive. |
+| `6` | specular | The dielectric specular buffer. |
+| `7` | **bvh cost** | Heatmap of how many BVH nodes this pixel's shadow rays visit. |
+
+**Reading the BVH-cost heatmap.** Mode 7 counts, per pixel, the total BVH nodes
+visited by every shadow ray the lighting pass casts that frame (the ReSTIR
+winner / stochastic / per-light rays, plus reflection and glass occlusion rays),
+and maps the count through a cold→hot palette: **blue is cheap** (few boxes),
+through green and yellow, to **red and white for the most expensive** pixels. Hot
+regions mean many box tests per shadow ray — dense or overlapping geometry, long
+thin triangles whose bounding boxes overlap wastefully, or rays skimming almost
+parallel to a surface (they thread a long corridor of the tree before they
+either hit or escape). It bypasses temporal blending and the denoiser, so it is a
+raw per-frame snapshot. `rt.costScale` sets the mapping (default `1/96`, so ~96
+visits saturate to white); the demo's **cost scale** slider drives it as
+"visits-to-saturate" so you can rescale the range to your scene.
+
 ## Moving objects (dynamic BVH)
 
 Mark meshes as dynamic and their motion casts **correct ray traced shadows** —
@@ -373,6 +402,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `temporalReprojection` | `true` | Keep samples across camera/object motion. |
 | `maxHistory` | `128` | History cap — higher is smoother, slower to react. |
 | `fireflyClamp` | `4.0` | Clamp on indirect luminance to suppress fireflies. |
+| `costScale` | `1/96` | BVH-cost heatmap scale for the `outputMode: 7` debug view (shadow-ray node-visit count × this, mapped through a cold→hot palette). See *Debug views*. |
 | `sky` | *off* | Procedural sky as background + GI ambient (see above). |
 | `fog` | *off* | Distance fog, composited before tonemap. |
 
