@@ -179,9 +179,12 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // Always-on fps readout, top-left: counts real presented frames via its own
   // rAF (rAF callbacks fire once per displayed frame, same cadence as the
   // render loop), refreshed twice a second.
+  // The badge doubles as a field diagnostic: build version + which fallbacks
+  // fired (device bug reports arrive as photos of this corner).
+  const diag = `v0.4.1${rt.specMRTSupported ? "" : " · no-mrt"}`;
   const fps = el("div");
   fps.id = "fps";
-  fps.textContent = "-- fps";
+  fps.textContent = `-- fps · ${diag}`;
   document.body.append(fps);
   let fpsFrames = 0;
   let fpsLast = performance.now();
@@ -190,7 +193,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
     fpsFrames++;
     const now = performance.now();
     if (now - fpsLast >= 500) {
-      fps.textContent = `${((fpsFrames * 1000) / (now - fpsLast)).toFixed(0)} fps`;
+      fps.textContent = `${((fpsFrames * 1000) / (now - fpsLast)).toFixed(0)} fps · ${diag}`;
       fpsFrames = 0;
       fpsLast = now;
     }
