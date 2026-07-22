@@ -37,6 +37,30 @@ uniform sampler2D uMap;
 uniform bool uHasMap;
 uniform sampler2D uEmissiveMap;
 uniform bool uHasEmissiveMap;
+// PBR texture maps (raster pass has ample sampler headroom, unlike the lighting
+// pass). All guarded by a uHas* flag so a material without a given map writes
+// exactly the same bytes it did before these were added.
+uniform sampler2D uNormalMap;
+uniform bool uHasNormalMap;
+uniform vec2 uNormalScale;
+uniform sampler2D uRoughnessMap;
+uniform bool uHasRoughnessMap;
+uniform sampler2D uMetalnessMap;
+uniform bool uHasMetalnessMap;
+
+// Screen-space cotangent frame (Mikkelsen 2010): reconstruct a tangent basis
+// from derivatives of world position and uv, so tangent-space normal maps work
+// without a per-vertex tangent attribute (none is uploaded to the BVH/G-buffer).
+vec3 perturbNormal(vec3 N, vec3 P, vec2 uv, vec3 mapN) {
+  vec3 dpdx = dFdx(P);
+  vec3 dpdy = dFdy(P);
+  vec2 duvdx = dFdx(uv);
+  vec2 duvdy = dFdy(uv);
+  vec3 t = normalize(dpdx * duvdy.y - dpdy * duvdx.y);
+  vec3 b = normalize(cross(N, t));
+  mat3 tbn = mat3(t, b, N);
+  return normalize(tbn * mapN);
+}
 
 void main() {
   vec3 albedo = uColor;
@@ -48,15 +72,27 @@ void main() {
     emissive *= texture(uEmissiveMap, vUvCoord).rgb;
   }
   vec3 n = normalize(vWorldNormal) * (gl_FrontFacing ? 1.0 : -1.0);
-  gAlbedoRough = vec4(albedo, uRoughness);
+  if (uHasNormalMap) {
+    // Tangent-space normal in [-1,1], scaled by material.normalScale (x,y).
+    vec3 mapN = texture(uNormalMap, vUvCoord).xyz * 2.0 - 1.0;
+    mapN.xy *= uNormalScale;
+    n = perturbNormal(n, vWorldPos, vUvCoord, mapN);
+  }
+  // three.js convention: green channel of roughnessMap x scalar roughness,
+  // blue channel of metalnessMap x scalar metalness (an ORM texture packs both).
+  float roughness = uRoughness;
+  if (uHasRoughnessMap) roughness *= texture(uRoughnessMap, vUvCoord).g;
+  float metalness = uMetalness;
+  if (uHasMetalnessMap) metalness *= texture(uMetalnessMap, vUvCoord).b;
+  gAlbedoRough = vec4(albedo, roughness);
   // .w is a packed material word: >= 2 means transmissive glass (w - 2 =
   // transmission amount), else it is plain metalness. Lets the lighting pass
   // read specular/glass properties without an extra G-buffer sampler (it
   // already sits at the WebGL2 16-sampler minimum).
-  gNormalMetal = vec4(n, uTransmission > 0.0 ? 2.0 + uTransmission : uMetalness);
+  gNormalMetal = vec4(n, uTransmission > 0.0 ? 2.0 + uTransmission : metalness);
   // .w packs the valid flag AND roughness: 0 = background, 1 + roughness
   // otherwise. Every consumer only tests w < 0.5, so this stays compatible.
-  gWorldPos = vec4(vWorldPos, 1.0 + uRoughness);
+  gWorldPos = vec4(vWorldPos, 1.0 + roughness);
   gEmissive = vec4(emissive, 1.0);
 }
 `;
@@ -155,6 +191,13 @@ export class GBufferPass {
           uHasMap: { value: false },
           uEmissiveMap: { value: null },
           uHasEmissiveMap: { value: false },
+          uNormalMap: { value: null },
+          uHasNormalMap: { value: false },
+          uNormalScale: { value: new THREE.Vector2(1, 1) },
+          uRoughnessMap: { value: null },
+          uHasRoughnessMap: { value: false },
+          uMetalnessMap: { value: null },
+          uHasMetalnessMap: { value: false },
         },
         side: THREE.FrontSide,
       });
@@ -178,6 +221,14 @@ export class GBufferPass {
     u.uHasMap.value = !!src.map;
     u.uEmissiveMap.value = src.emissiveMap ?? null;
     u.uHasEmissiveMap.value = !!src.emissiveMap;
+    u.uNormalMap.value = src.normalMap ?? null;
+    u.uHasNormalMap.value = !!src.normalMap;
+    if (src.normalScale) u.uNormalScale.value.copy(src.normalScale);
+    else u.uNormalScale.value.set(1, 1);
+    u.uRoughnessMap.value = src.roughnessMap ?? null;
+    u.uHasRoughnessMap.value = !!src.roughnessMap;
+    u.uMetalnessMap.value = src.metalnessMap ?? null;
+    u.uHasMetalnessMap.value = !!src.metalnessMap;
     u.uNormalMatrixWorld.value.getNormalMatrix(mesh.matrixWorld);
     material.side = src.side ?? THREE.FrontSide;
     return material;

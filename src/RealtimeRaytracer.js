@@ -180,6 +180,9 @@ export class RealtimeRaytracer {
     this.gbuffer = new GBufferPass(this._width, this._height, { mixedPrecision });
     this.rtPass = new RTLightingPass(this._scaledW, this._scaledH);
     this.denoisePass = new DenoisePass(this._scaledW, this._scaledH);
+    // Separate à-trous instance for the specular buffer (its own ping-pong
+    // targets, so the specular denoise cannot clobber the irradiance result).
+    this.specDenoisePass = new DenoisePass(this._scaledW, this._scaledH);
     this.composite = new CompositePass();
     this.taaPass = new TAAPass(this._width, this._height);
     this._sceneColor = this._makeColorTarget(this._width, this._height);
@@ -224,6 +227,12 @@ export class RealtimeRaytracer {
      * emitters gain direct lighting + shadows. Off = legacy hit-only behaviour.
      */
     this.emissiveNEE = options.emissiveNEE ?? true;
+    /**
+     * PBR direct specular: Cook-Torrance GGX highlights for all surfaces, in a
+     * separate specular buffer added without the albedo multiply (dielectric
+     * highlights are white, F0 ~= 0.04). Off = the old Lambert-only look.
+     */
+    this.specular = options.specular ?? true;
     /** Traced mirror/glossy reflections on metallic surfaces. */
     this.reflections = options.reflections ?? true;
     /** Traced refraction for transmissive (MeshPhysicalMaterial.transmission) surfaces. */
@@ -516,6 +525,7 @@ export class RealtimeRaytracer {
         RealtimeRaytracer.HISTORY_CARRY_FRAMES
       );
       this.denoisePass.setSize(sw, sh); // display-only, no temporal state
+      this.specDenoisePass.setSize(sw, sh); // ditto; spec history lives in rtPass
       // ReSTIR reservoirs store packed id·64+M encodings — invalid to linearly
       // resample — but they reconverge in a few frames, so just reallocate and
       // clear them.
@@ -722,7 +732,7 @@ export class RealtimeRaytracer {
         this.eps
       );
     }
-    let irradiance = this.rtPass.render(this.renderer, this.gbuffer, this.frame, reservoirTex);
+    let { irradiance, specular } = this.rtPass.render(this.renderer, this.gbuffer, this.frame, reservoirTex);
 
     // 3. denoise (display-only: history keeps accumulating raw samples)
     if (this.denoise && this.denoiseIterations > 0) {
@@ -733,6 +743,21 @@ export class RealtimeRaytracer {
         this._camWorldPos,
         this.eps,
         this.denoiseIterations
+      );
+    }
+
+    // 3a. light denoise on the specular buffer. specKeep (DenoisePass) already
+    // spares near-mirror pixels, so reflections stay crisp; capped at 2 passes
+    // to avoid washing out sharp dielectric highlights.
+    let specularTex = this.specular ? specular : null;
+    if (specularTex && this.denoise && this.denoiseIterations > 0) {
+      specularTex = this.specDenoisePass.render(
+        this.renderer,
+        specularTex,
+        this.gbuffer,
+        this._camWorldPos,
+        this.eps,
+        Math.min(this.denoiseIterations, 2)
       );
     }
 
@@ -788,7 +813,8 @@ export class RealtimeRaytracer {
       irradiance,
       this.gbuffer,
       scene.background,
-      useTaa ? this._sceneColor : null
+      useTaa ? this._sceneColor : null,
+      specularTex
     );
 
     // 5. temporal anti-aliasing resolve (jitter + neighbourhood-clamped history).
@@ -823,6 +849,7 @@ export class RealtimeRaytracer {
     this.gbuffer.dispose();
     this.rtPass.dispose();
     this.denoisePass.dispose();
+    this.specDenoisePass.dispose();
     this.composite.dispose();
     this.taaPass.dispose();
     this.volumetricPass.dispose();

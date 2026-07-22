@@ -54,6 +54,21 @@ vec4 fetchBlueNoise() {
 
 float luminance(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
+// Primary-surface roughness, set per pixel in main(). Drives the cheap specular
+// lobe below so reservoirs favour lights that land on a highlight.
+float gRestirRough;
+
+// Cheap Blinn-Phong specular lobe for the target pdf ONLY (never shaded with
+// this). Deliberately approximate — no Fresnel or geometry term, one pow() per
+// candidate — since it just biases which light each reservoir keeps. wi points
+// from the surface toward the light. Returns a multiplier boost in [0, ~0.8].
+float restirSpecBoost(vec3 N, vec3 wi, vec3 P) {
+  vec3 V = normalize(uCameraPos - P);
+  vec3 H = normalize(wi + V);
+  float shin = mix(4.0, 256.0, 1.0 - gRestirRough);
+  return 0.8 * pow(max(dot(N, H), 0.0), shin);
+}
+
 // Unshadowed contribution of candidate (id, uv) at surface (P, N).
 vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
   if (id < float(MAX_LIGHTS)) {
@@ -73,11 +88,11 @@ vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
         cone = smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, -d / dl));
         if (cone <= 0.0) return vec3(0.0);
       }
-      return colRad.rgb * (cone * NdotL / (dl * dl));
+      return colRad.rgb * (cone * NdotL / (dl * dl)) * (1.0 + restirSpecBoost(N, d / dl, P));
     }
     float NdotL = dot(N, -posType.xyz);
     if (NdotL <= 0.0) return vec3(0.0);
-    return colRad.rgb * NdotL;
+    return colRad.rgb * NdotL * (1.0 + restirSpecBoost(N, -posType.xyz, P));
   }
   int t = (int(id) - MAX_LIGHTS) * 4;
   vec4 t0 = texelFetch(uMaterialsTex, ivec2(t, 1), 0);
@@ -95,7 +110,7 @@ vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
   if (cosS <= 0.0 || cosL < 1e-4) return vec3(0.0);
   // Uniform pick within the emissive set happens at candidate level, so the
   // per-triangle contribution uses area only (count folds into pick pdf).
-  return vec3(t1.w, t2.w, t3.w) * (cosS * cosL * t0.w / max(d2, 1e-6));
+  return vec3(t1.w, t2.w, t3.w) * (cosS * cosL * t0.w / max(d2, 1e-6)) * (1.0 + restirSpecBoost(N, wi, P));
 }
 
 // v3: reservoirs select TRIANGLES, not points. The selection target is the
@@ -137,6 +152,7 @@ void main() {
   }
   vec3 P = wp.xyz;
   vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
+  gRestirRough = clamp(wp.w - 1.0, 0.0, 1.0);
 
   ivec2 px = ivec2(gl_FragCoord.xy);
   gSeed = uint(px.x) * 3079u + uint(px.y) * 9277u + uint(uFrame) * 26699u;
@@ -223,6 +239,7 @@ void main() {
   }
   vec3 P = wp.xyz;
   vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
+  gRestirRough = clamp(wp.w - 1.0, 0.0, 1.0);
 
   ivec2 px = ivec2(gl_FragCoord.xy);
   gSeed = uint(px.x) * 5417u + uint(px.y) * 7907u + uint(uFrame) * 15731u;

@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+- **PBR materials — real specular.** The renderer was Lambert-only for every
+  dielectric; roughness/metalness maps and normal maps were ignored. This round:
+  - **Cook-Torrance GGX direct specular** (GGX distribution + height-correlated
+    Smith visibility + Schlick Fresnel) for *every* surface, evaluated in the
+    direct-lighting path (analytic lights, emissive NEE, and the ReSTIR winner).
+    Dielectric highlights (`F0 ≈ 0.04`, white) go into a **separate specular
+    buffer** the composite adds *without* the albedo multiply — they cannot ride
+    the albedo-demodulated irradiance buffer. Metals' albedo-tinted specular
+    stays in the reflection path (`F0 = mix(0.04, albedo, metalness)` is realised
+    across the two buffers, so the lighting pass never needs an albedo sampler).
+    New `specular` option / toggle (default on); new debug view `6`.
+  - The specular buffer is a second **MRT attachment** on the lighting pass,
+    temporally accumulated with a short (near-mirror) history, lightly denoised
+    with the à-trous filter (mirror pixels spared via `specKeep`), and carried
+    across renderScale/canvas resizes like the irradiance history.
+  - **Analytic-light glints on metals/glass:** the traced reflection ray can't
+    see point/spot/directional lights (they aren't geometry), so each is now
+    evaluated as a small area source along the reflection direction and shadowed
+    — a metal sphere under a spotlight finally glints.
+  - **G-buffer material maps:** `normalMap` (screen-space cotangent frame, honours
+    `normalScale`), `roughnessMap` (`.g`) and `metalnessMap` (`.b`), all guarded
+    so a material without a given map renders byte-identically to before.
+  - **ReSTIR** target pdf gains a cheap Blinn-Phong specular lobe so reservoirs
+    favour lights that land on a highlight.
+  - Fixed: history carry across a resize wrote a single-output copy into the new
+    2-attachment MRT, which ANGLE/D3D11 rejects (`INVALID_OPERATION`); it now
+    uses a matching 2-output carry.
+
 ## 0.3.2 — 2026-07-19
 
 - **Localized fog zones** (`volumetric.zones`): up to 8 world-space AABBs, each

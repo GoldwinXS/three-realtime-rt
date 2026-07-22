@@ -105,6 +105,14 @@ export interface RealtimeRaytracerOptions {
    * Dramatically less noise than waiting for GI rays to hit the emitter.
    */
   emissiveNEE?: boolean;
+  /**
+   * PBR direct specular: Cook-Torrance GGX highlights for every surface, kept in
+   * a separate specular buffer the composite adds WITHOUT the albedo multiply
+   * (dielectric highlights are white, F0 ~= 0.04). Metals' albedo-tinted specular
+   * rides the reflection path instead. Default true; false restores the old
+   * Lambert-only diffuse look.
+   */
+  specular?: boolean;
   /** Traced mirror/glossy reflections on metallic surfaces. */
   reflections?: boolean;
   /** Traced refraction for transmissive (MeshPhysicalMaterial.transmission) surfaces. */
@@ -225,7 +233,7 @@ export class RealtimeRaytracer {
   compiled: CompiledScene | null;
   /** Accumulated frame counter. */
   frame: number;
-  /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive. */
+  /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular. */
   outputMode: number;
 
   /** Resolution scale for the ray traced lighting; assigning reallocates targets. */
@@ -248,6 +256,8 @@ export class RealtimeRaytracer {
   gi: boolean;
   /** Sample static emissive meshes as area lights (NEE). */
   emissiveNEE: boolean;
+  /** PBR direct specular (Cook-Torrance GGX) into a separate additive buffer. */
+  specular: boolean;
   /** Traced mirror/glossy reflections on metallic surfaces. */
   reflections: boolean;
   /** Traced refraction for transmissive surfaces. */

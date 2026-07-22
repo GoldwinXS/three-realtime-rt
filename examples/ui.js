@@ -183,7 +183,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   rSec.append(
     selectRow("view", [
       ["composite", 0], ["albedo", 1], ["normals", 2],
-      ["irradiance", 3], ["world pos", 4], ["emissive", 5],
+      ["irradiance", 3], ["world pos", 4], ["emissive", 5], ["specular", 6],
     ], rt.outputMode, (v) => (rt.outputMode = parseInt(v, 10)))
   );
   panel.append(rSec);
@@ -196,6 +196,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // Routed through setFeature — reflections/refraction also reveal a showcase
   // sphere and recompile the BVH, which main() owns. Initial state reads the
   // current rt values (all false at the minimal start).
+  fSec.append(toggle("PBR specular", rt.specular, (v) => { rt.specular = v; rt.resetAccumulation(); }).row);
   fSec.append(toggle("global illumination", rt.gi, (v) => setFeature("gi", v)).row);
   fSec.append(toggle("half-rate GI (fast)", rt.giHalfRate, (v) => { rt.giHalfRate = v; rt.resetAccumulation(); }).row);
   fSec.append(toggle("emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);

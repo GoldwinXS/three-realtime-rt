@@ -19,6 +19,8 @@ in vec2 vUv;
 ${SKY_GLSL}
 
 uniform sampler2D uIrradiance;
+uniform sampler2D uSpecular;   // dielectric direct specular (added WITHOUT albedo)
+uniform bool uSpecEnabled;
 uniform sampler2D uGAlbedoRough;
 uniform sampler2D uGNormalMetal;
 uniform sampler2D uGWorldPos;
@@ -27,7 +29,8 @@ uniform sampler2D uVolumetric; // in-scattered light (quarter canvas res, smooth
 uniform vec2 uVolTexelSize;
 uniform bool uVolEnabled;
 uniform vec3 uBackgroundColor;
-// 0 composite, 1 albedo, 2 normal, 3 irradiance (direct+GI), 4 worldPos, 5 emissive
+// 0 composite, 1 albedo, 2 normal, 3 irradiance (direct+GI), 4 worldPos,
+// 5 emissive, 6 specular
 uniform int uOutputMode;
 
 // joint bilateral upsample (lighting may be rendered below full resolution)
@@ -63,8 +66,8 @@ vec3 acesFilm(vec3 x) {
 // Upsample low-res irradiance to this full-res pixel: 4 nearest low-res taps,
 // bilinear weights modulated by geometric similarity (plane distance + normal)
 // so lighting never bleeds across depth or orientation discontinuities.
-vec3 sampleIrradiance(vec2 uv, vec3 P, vec3 N) {
-  if (!uUpsample) return texture(uIrradiance, uv).rgb;
+vec3 upsampleGuided(sampler2D tex, vec2 uv, vec3 P, vec3 N) {
+  if (!uUpsample) return texture(tex, uv).rgb;
 
   float planeTol = 0.01 * distance(P, uCameraPos) + 1e-3;
   vec2 base = uv / uIrrTexelSize - 0.5;
@@ -80,7 +83,7 @@ vec3 sampleIrradiance(vec2 uv, vec3 P, vec3 N) {
   for (int dy = 0; dy <= 1; dy++) {
     for (int dx = 0; dx <= 1; dx++) {
       vec2 tuv = uv00 + vec2(float(dx), float(dy)) * uIrrTexelSize;
-      vec3 irr = texture(uIrradiance, tuv).rgb;
+      vec3 irr = texture(tex, tuv).rgb;
       float bw = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
       if (bw > bestBilW) { bestBilW = bw; bestBil = irr; }
 
@@ -109,7 +112,8 @@ void main() {
   vec4 wp = texture(uGWorldPos, vUv);
   vec4 albedoRough = texture(uGAlbedoRough, vUv);
   vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
-  vec3 irradiance = sampleIrradiance(vUv, wp.xyz, N);
+  vec3 irradiance = upsampleGuided(uIrradiance, vUv, wp.xyz, N);
+  vec3 specular = uSpecEnabled ? upsampleGuided(uSpecular, vUv, wp.xyz, N) : vec3(0.0);
   vec3 emissive = texture(uGEmissive, vUv).rgb;
 
   vec3 color;
@@ -121,7 +125,9 @@ void main() {
       color = uFogEnabled ? uFogColor : uBackgroundColor;
     }
   } else {
-    color = albedoRough.rgb * irradiance + emissive;
+    // Diffuse is demodulated (albedo re-applied here); the dielectric specular
+    // highlight is white (F0 ~= 0.04) and is added WITHOUT the albedo multiply.
+    color = albedoRough.rgb * irradiance + specular + emissive;
     // Volumetric in-scatter (already radiance, not modulated by albedo). Fog
     // is low-frequency, so a wide 9-tap blur costs nothing visually and eats
     // the single-sample grain — crucial with MOVING lights, where the
@@ -153,6 +159,7 @@ void main() {
   else if (uOutputMode == 3) color = irradiance;
   else if (uOutputMode == 4) color = fract(wp.xyz * 0.1);
   else if (uOutputMode == 5) color = emissive;
+  else if (uOutputMode == 6) color = specular;
   else color = acesFilm(color);
 
   outColor = vec4(pow(color, vec3(1.0 / 2.2)), 1.0);
@@ -168,6 +175,8 @@ export class CompositePass {
       fragmentShader: compositeFrag,
       uniforms: {
         uIrradiance: { value: null },
+        uSpecular: { value: null },
+        uSpecEnabled: { value: false },
         uGAlbedoRough: { value: null },
         uGNormalMetal: { value: null },
         uGWorldPos: { value: null },
@@ -202,9 +211,11 @@ export class CompositePass {
     this.scene.add(this.quad);
   }
 
-  render(renderer, irradianceTexture, gbuffer, background, target = null) {
+  render(renderer, irradianceTexture, gbuffer, background, target = null, specularTexture = null) {
     const u = this.material.uniforms;
     u.uIrradiance.value = irradianceTexture;
+    u.uSpecular.value = specularTexture;
+    u.uSpecEnabled.value = specularTexture !== null;
     u.uGAlbedoRough.value = gbuffer.albedoRough;
     u.uGNormalMetal.value = gbuffer.normalMetal;
     u.uGWorldPos.value = gbuffer.worldPos;

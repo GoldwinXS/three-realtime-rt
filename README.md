@@ -223,13 +223,15 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | Property | Feeds lighting? | Notes |
 |----------|-----------------|-------|
 | `color` + `map` | ✅ | Albedo = `color × map.rgb`. Textures stay sharp (irradiance is demodulated, then re-multiplied). |
-| `roughness` | ✅ | **Scalar only.** Drives shadow / GI softness and reflection sharpness. |
-| `metalness` | ✅ | **Scalar only.** Metallic pixels trace a reflection ray. |
-| `emissive` | ✅ | A *static* emissive mesh becomes a real **area light** (NEE) — casts soft light + shadows. |
+| `roughness` | ✅ | Drives shadow / GI softness, reflection sharpness **and the GGX specular lobe width** (see *dielectric specular* below). |
+| `metalness` | ✅ | Metallic pixels trace a reflection ray whose analytic-light glints are shadowed; `F0 = mix(0.04, albedo, metalness)`. |
+| `emissive` | ✅ | A *static* emissive mesh becomes a real **area light** (NEE) — casts soft light + shadows, including a GGX highlight. |
 | `emissiveMap` | ⚠️ visible only | A map-masked emissive **glows on screen** but the map **zeroes its area-light table** — it lights nothing. Use a flat `emissive` colour (no map) for an emitter that should illuminate. |
-| `transmission` (Physical) | ✅ | Glass: Fresnel reflection + two-interface refraction. |
-| `roughnessMap` / `metalnessMap` | ❌ | Only the scalar `roughness` / `metalness` are used; these maps are ignored by lighting. |
-| `normalMap` | ❌ | Lighting uses geometric normals; normal maps don't perturb shading. |
+| `transmission` (Physical) | ✅ | Glass: Fresnel reflection (with analytic-light glints) + two-interface refraction. |
+| **dielectric specular** | ✅ | Cook-Torrance **GGX** direct highlights for *every* surface, in a separate white (`F0 ≈ 0.04`) specular buffer the composite adds without the albedo multiply. Toggle with `specular` (default on). |
+| `roughnessMap` | ✅ | `roughness × roughnessMap.g` (three.js convention) — sampled in the G-buffer. |
+| `metalnessMap` | ✅ | `metalness × metalnessMap.b` (a packed ORM texture works — G = roughness, B = metalness). |
+| `normalMap` | ✅ | Perturbs the shading normal via a screen-space cotangent frame (no tangent attribute needed); respects `material.normalScale`. |
 | `clearcoat`, `sheen`, `iridescence` | ❌ | Not modelled. |
 | vertex colors | ❌ | Not read into albedo. |
 | per-material `ior` | ❌ | Refraction uses the single **global** `rt.ior` (default 1.5), never `material.ior`. |

@@ -73,6 +73,26 @@ export function buildScene() {
   knot.position.set(0.2, 1.7, -0.4);
   scene.add(knot);
 
+  // PBR roughness ramp: five dielectric spheres (metalness 0) from near-mirror
+  // to nearly matte. With GGX direct specular they show a tight, bright highlight
+  // on the left that broadens and dims to the right — the clearest read on the
+  // new specular buffer. Lambert-only, all five look identically flat.
+  const rampRoughness = [0.05, 0.2, 0.4, 0.65, 0.9];
+  for (let i = 0; i < rampRoughness.length; i++) {
+    const s = new THREE.Mesh(
+      new THREE.SphereGeometry(0.5, 40, 28),
+      new THREE.MeshStandardMaterial({
+        color: 0xdfe3ea,
+        roughness: rampRoughness[i],
+        metalness: 0.0,
+      })
+    );
+    s.position.set(-4.0 + i * 2.0, 0.5, 4.6);
+    s.castShadow = true;
+    s.receiveShadow = true;
+    scene.add(s);
+  }
+
   // Specular showcase: a mirror sphere and a glass sphere for the traced
   // reflection / refraction paths.
   const mirror = new THREE.Mesh(
