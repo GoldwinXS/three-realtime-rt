@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.1 — 2026-07-22
+
+- **Fix: black lighting on iOS (iPhone/iPad, all browsers).** WebKit reports
+  the 0.4.0 two-attachment half-float lighting MRT as framebuffer-complete and
+  then silently renders it black, which blanked the entire ray traced image
+  (only emissive surfaces survived the composite). The renderer now runs a
+  FUNCTIONAL probe at construction — draw one 2-output quad into a tiny fp16
+  MRT and read the pixel back — and on failure rebuilds the lighting pass
+  single-attachment (the 0.3.x layout): `specular` is disabled and
+  `specMRTSupported` is exposed on the instance; alpha-blend surfaces render
+  opaque there (their behind-image rides the specular buffer by design).
+  Everything else — GGX in reflections, GI, ReSTIR, water, overscan — keeps
+  working. The demo accepts `?nospecmrt=1` to force this fallback on any
+  machine for testing.
+
 ## 0.4.0 — 2026-07-22
 
 - **Demo:** the room is now a designed gallery (water pool with kerbs under the

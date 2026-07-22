@@ -140,6 +140,13 @@ async function main() {
     return;
   }
 
+  // Debug hook: ?nospecmrt=1 forces the WebKit/iOS single-attachment lighting
+  // fallback on ANY machine, so the iOS code path can be exercised (and eye-
+  // balled) without an Apple device in hand.
+  if (new URLSearchParams(location.search).has("nospecmrt")) {
+    RealtimeRaytracer._specMrtSupported = () => false;
+  }
+
   // The demo starts at the user's tested MINIMAL config on every tier: a lean
   // stochastic-light core with the heavy paths (GI, emissive NEE, reflections,
   // refraction) off. Each is an opt-in add-on in the panel so its frame cost is

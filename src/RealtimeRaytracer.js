@@ -243,6 +243,72 @@ export class RealtimeRaytracer {
   }
 
   /**
+   * FUNCTIONAL probe: can this context actually DRAW into a 2-attachment
+   * half-float MRT? A checkFramebufferStatus probe is not enough — WebKit
+   * (every iOS browser) reports the framebuffer complete and then renders
+   * black, which killed the whole lighting pass on iPhone/iPad in 0.4.0.
+   * So: render one 2-output quad into a tiny fp16 MRT, resolve attachment 0
+   * into an RGBA8 target through a sampler, and read the pixel back. Only a
+   * round-trip that returns the written value counts as support.
+   */
+  static _specMrtSupported(renderer) {
+    let mrt, out, mat, copy, quad, scene2, cam;
+    const prevTarget = renderer.getRenderTarget();
+    try {
+      mrt = new THREE.WebGLMultipleRenderTargets(2, 2, 2, {
+        format: THREE.RGBAFormat,
+        type: THREE.HalfFloatType,
+        depthBuffer: false,
+        stencilBuffer: false,
+      });
+      for (const tex of mrt.texture) tex.generateMipmaps = false;
+      out = new THREE.WebGLRenderTarget(2, 2, { depthBuffer: false, stencilBuffer: false });
+      const vert = `out vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+      mat = new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: vert,
+        fragmentShader: `precision highp float;
+layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1;
+void main(){ o0 = vec4(0.5, 0.25, 0.75, 1.0); o1 = vec4(0.125); }`,
+        depthTest: false,
+        depthWrite: false,
+      });
+      copy = new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: vert,
+        fragmentShader: `precision highp float; in vec2 vUv; out vec4 outColor;
+uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
+        uniforms: { uTex: { value: mrt.texture[0] } },
+        depthTest: false,
+        depthWrite: false,
+      });
+      scene2 = new THREE.Scene();
+      cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+      quad.frustumCulled = false;
+      scene2.add(quad);
+      renderer.setRenderTarget(mrt);
+      renderer.render(scene2, cam);
+      quad.material = copy;
+      renderer.setRenderTarget(out);
+      renderer.render(scene2, cam);
+      const px = new Uint8Array(4);
+      renderer.readRenderTargetPixels(out, 0, 0, 1, 1, px);
+      // 0.5 -> ~128; accept a generous tolerance (fp16 + dithering).
+      return Math.abs(px[0] - 128) < 24 && Math.abs(px[1] - 64) < 24;
+    } catch {
+      return false;
+    } finally {
+      renderer.setRenderTarget(prevTarget);
+      if (quad) quad.geometry.dispose();
+      if (mat) mat.dispose();
+      if (copy) copy.dispose();
+      if (mrt) mrt.dispose();
+      if (out) out.dispose();
+    }
+  }
+
+  /**
    * Companion settings for a given lighting resolution. LOW resolution wants
    * MORE denoise passes, not fewer — the filter runs at lighting res so extra
    * iterations are nearly free there, and they're what makes 25% lighting look
@@ -325,8 +391,22 @@ export class RealtimeRaytracer {
     if (!mixedPrecision) {
       console.info("three-realtime-rt: mixed fp16/fp32 G-buffer not supported here — using fp32 for all targets.");
     }
+    // Functional probe, not just a status check: WebKit (all iOS browsers)
+    // reports the 2-attachment fp16 MRT complete but silently renders black,
+    // which blanks the whole lighting pass. On such devices the lighting pass
+    // runs single-attachment (0.3.x layout): the specular buffer is disabled
+    // and blend surfaces degrade to opaque — everything else keeps working.
+    this.specMRTSupported = RealtimeRaytracer._specMrtSupported(renderer);
+    if (!this.specMRTSupported) {
+      console.info(
+        "three-realtime-rt: multi-attachment lighting buffer failed the draw probe here " +
+          "(WebKit/iOS) — specular buffer disabled, alpha-blend surfaces render opaque."
+      );
+    }
     this.gbuffer = new GBufferPass(this._width, this._height, { mixedPrecision });
-    this.rtPass = new RTLightingPass(this._scaledW, this._scaledH);
+    this.rtPass = new RTLightingPass(this._scaledW, this._scaledH, {
+      specMRT: this.specMRTSupported,
+    });
     this.denoisePass = new DenoisePass(this._scaledW, this._scaledH);
     // Separate à-trous instance for the specular buffer (its own ping-pong
     // targets, so the specular denoise cannot clobber the irradiance result).

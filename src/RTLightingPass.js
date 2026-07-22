@@ -854,18 +854,31 @@ void main() {
  * into a second ping-pong pair, specA/specB).
  */
 export class RTLightingPass {
-  constructor(width, height) {
+  // `specMRT: false` is the WebKit fallback: iOS Safari (every iOS browser)
+  // silently fails the 2-attachment half-float MRT draw — the whole lighting
+  // pass renders black. RealtimeRaytracer probes this functionally at
+  // construction; in fallback mode this pass allocates a single-attachment
+  // target exactly like 0.3.x, the shader's second output collapses to a dead
+  // local variable, and render() returns { specular: null } (the caller then
+  // runs with specular off; blend surfaces degrade to opaque as documented).
+  constructor(width, height, { specMRT = true } = {}) {
+    this.specMRT = specMRT;
     this.targetA = this._makeTarget(width, height);
     this.targetB = this._makeTarget(width, height);
     // Accumulated specular history (ping-pong), fed by the fresh specular in
     // targetA/B attachment 1.
-    this.specA = this._makeSpecTarget(width, height);
-    this.specB = this._makeSpecTarget(width, height);
+    this.specA = specMRT ? this._makeSpecTarget(width, height) : null;
+    this.specB = specMRT ? this._makeSpecTarget(width, height) : null;
 
     this.material = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
-      fragmentShader: rtLightingFrag,
+      fragmentShader: specMRT
+        ? rtLightingFrag
+        : rtLightingFrag.replace(
+            "layout(location = 1) out vec4 outSpecular;",
+            "vec4 outSpecular; // single-target fallback: dead store"
+          ),
       uniforms: {
         bvhStatic: { value: null },
         bvhDynamic: { value: null },
@@ -936,11 +949,18 @@ export class RTLightingPass {
       depthWrite: false,
     });
 
-    // 2-output history carry (see mrtCarryFrag) — matches the MRT's draw buffers.
+    // 2-output history carry (see mrtCarryFrag) — matches the MRT's draw
+    // buffers. In single-target fallback the second output collapses the same
+    // way as the lighting shader's.
     this.carryMaterial = new THREE.ShaderMaterial({
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
-      fragmentShader: mrtCarryFrag,
+      fragmentShader: specMRT
+        ? mrtCarryFrag
+        : mrtCarryFrag.replace(
+            "layout(location = 1) out vec4 o1;",
+            "vec4 o1; // single-target fallback: dead store"
+          ),
       uniforms: { uTex: { value: null }, uCountClamp: { value: -1 } },
       depthTest: false,
       depthWrite: false,
@@ -957,17 +977,29 @@ export class RTLightingPass {
     // Half-float + linear: history is sampled bilinearly at reprojected UVs,
     // and fp16 halves the bandwidth (EMA blending never accumulates a raw sum,
     // so fp16 precision is sufficient). Two attachments: [0] irradiance,
-    // [1] fresh dielectric specular.
-    const t = new THREE.WebGLMultipleRenderTargets(width, height, 2, {
+    // [1] fresh dielectric specular — or a single attachment in the WebKit
+    // fallback (see the constructor note).
+    const opts = {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
       type: THREE.HalfFloatType,
       depthBuffer: false,
       stencilBuffer: false,
-    });
+    };
+    if (!this.specMRT) {
+      const t = new THREE.WebGLRenderTarget(width, height, opts);
+      t.texture.generateMipmaps = false;
+      return t;
+    }
+    const t = new THREE.WebGLMultipleRenderTargets(width, height, 2, opts);
     for (const tex of t.texture) tex.generateMipmaps = false;
     return t;
+  }
+
+  // The accumulated-irradiance texture of a history target, either layout.
+  _irrTex(target) {
+    return this.specMRT ? target.texture[0] : target.texture;
   }
 
   _makeSpecTarget(width, height) {
@@ -991,6 +1023,7 @@ export class RTLightingPass {
     const prevAlpha = renderer.getClearAlpha();
     renderer.setClearColor(0x000000, 0);
     for (const t of [this.targetA, this.targetB, this.specA, this.specB]) {
+      if (!t) continue; // spec pair is absent in the single-target fallback
       renderer.setRenderTarget(t);
       renderer.clear(true, false, false);
     }
@@ -1001,8 +1034,8 @@ export class RTLightingPass {
   setSize(width, height) {
     this.targetA.setSize(width, height);
     this.targetB.setSize(width, height);
-    this.specA.setSize(width, height);
-    this.specB.setSize(width, height);
+    if (this.specA) this.specA.setSize(width, height);
+    if (this.specB) this.specB.setSize(width, height);
   }
 
   /**
@@ -1025,7 +1058,7 @@ export class RTLightingPass {
     // material so the draw matches the MRT's draw buffers (a 1-output CopyPass
     // blit here is INVALID_OPERATION on ANGLE/D3D11). Attachment 1 is fresh-
     // written every frame, so it needs no carry.
-    this.carryMaterial.uniforms.uTex.value = this.targetB.texture[0];
+    this.carryMaterial.uniforms.uTex.value = this._irrTex(this.targetB);
     this.carryMaterial.uniforms.uCountClamp.value = carryFrames;
     this.quad.material = this.carryMaterial;
     const prev = renderer.getRenderTarget();
@@ -1039,13 +1072,15 @@ export class RTLightingPass {
     this.targetB = newB;
 
     // Specular history carries the same way (freshest is specB — see render()).
-    const newSpecA = this._makeSpecTarget(width, height);
-    const newSpecB = this._makeSpecTarget(width, height);
-    copyPass.blit(renderer, this.specB.texture, newSpecB, carryFrames);
-    this.specA.dispose();
-    this.specB.dispose();
-    this.specA = newSpecA;
-    this.specB = newSpecB;
+    if (this.specMRT) {
+      const newSpecA = this._makeSpecTarget(width, height);
+      const newSpecB = this._makeSpecTarget(width, height);
+      copyPass.blit(renderer, this.specB.texture, newSpecB, carryFrames);
+      this.specA.dispose();
+      this.specB.dispose();
+      this.specA = newSpecA;
+      this.specB = newSpecB;
+    }
   }
 
   setCompiledScene(compiled) {
@@ -1074,7 +1109,7 @@ export class RTLightingPass {
     u.uGWorldPos.value = gbuffer.worldPos;
     u.uGNormalMetal.value = gbuffer.normalMetal;
     u.uPrevGWorldPos.value = gbuffer.prevWorldPos;
-    u.uPrevAccum.value = this.targetB.texture[0];
+    u.uPrevAccum.value = this._irrTex(this.targetB);
     u.uReservoir.value = reservoirTexture;
     u.uRestirEnabled.value = reservoirTexture !== null;
     u.uFrame.value = frame;
@@ -1085,37 +1120,42 @@ export class RTLightingPass {
     renderer.render(this.scene, this.camera);
 
     // 2. specular temporal accumulation: fresh (targetA[1]) + history (specB).
-    const su = this.specMaterial.uniforms;
-    su.uFreshSpec.value = this.targetA.texture[1];
-    su.uPrevSpec.value = this.specB.texture;
-    su.uGWorldPos.value = gbuffer.worldPos;
-    su.uGNormalMetal.value = gbuffer.normalMetal;
-    su.uPrevGWorldPos.value = gbuffer.prevWorldPos;
-    su.uPrevViewProj.value.copy(u.uPrevViewProj.value);
-    su.uViewProj.value.copy(u.uViewProj.value);
-    su.uCameraPos.value.copy(u.uCameraPos.value);
-    su.uEps.value = u.uEps.value;
-    su.uMaxHistory.value = u.uMaxHistory.value;
-    su.uTemporalReprojection.value = u.uTemporalReprojection.value;
-    this.quad.material = this.specMaterial;
-    renderer.setRenderTarget(this.specA);
-    renderer.render(this.scene, this.camera);
+    // Skipped entirely in the single-target fallback — there is no fresh
+    // specular attachment to accumulate.
+    let outSpec = null;
+    if (this.specMRT) {
+      const su = this.specMaterial.uniforms;
+      su.uFreshSpec.value = this.targetA.texture[1];
+      su.uPrevSpec.value = this.specB.texture;
+      su.uGWorldPos.value = gbuffer.worldPos;
+      su.uGNormalMetal.value = gbuffer.normalMetal;
+      su.uPrevGWorldPos.value = gbuffer.prevWorldPos;
+      su.uPrevViewProj.value.copy(u.uPrevViewProj.value);
+      su.uViewProj.value.copy(u.uViewProj.value);
+      su.uCameraPos.value.copy(u.uCameraPos.value);
+      su.uEps.value = u.uEps.value;
+      su.uMaxHistory.value = u.uMaxHistory.value;
+      su.uTemporalReprojection.value = u.uTemporalReprojection.value;
+      this.quad.material = this.specMaterial;
+      renderer.setRenderTarget(this.specA);
+      renderer.render(this.scene, this.camera);
+      outSpec = this.specA.texture;
+    }
 
     this.quad.material = this.material; // restore for the next caller
     renderer.setRenderTarget(null);
 
-    const outIrr = this.targetA.texture[0];
-    const outSpec = this.specA.texture;
+    const outIrr = this._irrTex(this.targetA);
     [this.targetA, this.targetB] = [this.targetB, this.targetA];
-    [this.specA, this.specB] = [this.specB, this.specA];
+    if (this.specMRT) [this.specA, this.specB] = [this.specB, this.specA];
     return { irradiance: outIrr, specular: outSpec };
   }
 
   dispose() {
     this.targetA.dispose();
     this.targetB.dispose();
-    this.specA.dispose();
-    this.specB.dispose();
+    if (this.specA) this.specA.dispose();
+    if (this.specB) this.specB.dispose();
     this.material.dispose();
     this.specMaterial.dispose();
     this.carryMaterial.dispose();

@@ -288,6 +288,12 @@ export class RealtimeRaytracer {
   renderer: WebGLRenderer;
   /** False when the platform can't run the tracer; render() then forwards to renderer.render. */
   supported: boolean;
+  /**
+   * False when the 2-attachment lighting buffer fails the construction-time
+   * draw probe (WebKit/iOS): the specular buffer is disabled there and
+   * alpha-blend surfaces render opaque; everything else keeps working.
+   */
+  specMRTSupported: boolean;
   /** The current compiled scene, or null before the first compile / when unsupported. */
   compiled: CompiledScene | null;
   /** Accumulated frame counter. */
