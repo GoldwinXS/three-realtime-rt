@@ -343,7 +343,7 @@ export class RealtimeRaytracer {
     this.compiled = null;
     this.frame = 0;
 
-    /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive */
+    /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular */
     this.outputMode = 0;
     /** Environment (sky) color used for GI rays that miss + composite background. */
     this.envColor = options.envColor ?? new THREE.Color(0.03, 0.04, 0.06);
