@@ -141,11 +141,17 @@ vec3 octDecode12(uint ox, uint oy) {
   if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * signNotZero(v.xy);
   return normalize(v);
 }
-// Pack M (clamped to [0,255]) + hit normal into a single fp32 word.
+// Pack M (clamped to [0,126]) + hit normal into a single fp32 word.
+// M's ceiling is 126, NOT 255: bits 30..23 of the packed word are the float's
+// exponent field, and if they are ever all-ones (M lower bits all 1 AND
+// octX >= 2048) the word is a NaN/Inf bit pattern — some GPUs CANONICALIZE
+// NaNs on texture write, silently destroying the payload. M <= 126 keeps at
+// least one exponent bit zero, so the pattern is unrepresentable by
+// construction. (126 is far above any practical restirGIMCap.)
 float packMN(float M, vec3 n) {
   uint ox, oy;
   octEncode12(n, ox, oy);
-  uint mi = uint(clamp(M, 0.0, 255.0)) & 0xFFu;
+  uint mi = uint(clamp(M, 0.0, 126.0)) & 0xFFu;
   return uintBitsToFloat((mi << 24) | (ox << 12) | oy);
 }
 void unpackMN(float w, out float M, out vec3 n) {
