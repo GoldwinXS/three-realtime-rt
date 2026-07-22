@@ -2,6 +2,10 @@
 // icons only. Mutates the raytracer / physics / scene directly and flips fields
 // on the shared `state` object that the render loop reads.
 
+// Vite resolves JSON named imports in dev and build alike, so the fps badge
+// always shows the version being served rather than a hand-copied string.
+import { version } from "../package.json";
+
 const CSS = `
 :root { --panel-bg: rgba(14,18,24,0.82); --panel-br: #26323c; --ink: #d7e0e6;
   --ink-dim: #8298a6; --accent: #38d0e0; --accent-2: #7ee787; }
@@ -186,7 +190,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // render loop), refreshed twice a second.
   // The badge doubles as a field diagnostic: build version + which fallbacks
   // fired (device bug reports arrive as photos of this corner).
-  const diag = `v0.4.1${rt.specMRTSupported ? "" : " · no-mrt"}`;
+  const diag = `v${version}${rt.specMRTSupported ? "" : " · no-mrt"}`;
   const fps = el("div");
   fps.id = "fps";
   fps.textContent = `-- fps · ${diag}`;
