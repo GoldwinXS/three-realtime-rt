@@ -367,6 +367,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `refraction` | `true` | Traced two-interface refraction for `MeshPhysicalMaterial.transmission` surfaces. |
 | `transparency` | `true` | Alpha-blended transparency: composite `transparent` meshes over the geometry behind them (single-layer, weighted by `opacity`, tinted by albedo). Needs the specular buffer (`specular: true`). Off = they render fully opaque. |
 | `restir` | `true` | ReSTIR direct lighting: per-pixel reservoirs with temporal + spatial reuse, one visibility ray regardless of light count. Flat cost in light count; cuts emissive area-light noise. |
+| `restirGI` | `false` | **Experimental.** ReSTIR GI (v1, temporal-only): per-pixel reservoirs reuse the 1-bounce indirect sample across frames at the reprojected same-surface point (no spatial reuse). Runs in a standalone pass with its own sampler budget; the lighting pass then skips its inline GI trace and the resolved GI is added at the à-trous denoise stage — so it only takes effect when `gi` **and** `denoise` are also on. Its mean matches the inline GI path; convergence character differs. `restirGIMCap` (default `20`) tunes the temporal M-cap. |
 | `ior` | `1.5` | Index of refraction used by `refraction`. |
 | `volumetric` | *off* | Physically-based god rays: single-scatter fog, one BVH-shadowed light sample per lighting pixel per frame, temporally accumulated. `{ enabled, density, maxDist, zones }`, where `zones` is an optional array of up to 8 AABBs `{ min:[x,y,z], max:[x,y,z], density }` that add localized fog on top of (or instead of) the global `density`. |
 | `stochasticLights` | `true` | One direct shadow ray per pixel per frame (random source) instead of one per light. The governor turns it off once it has scaled resolution up on strong hardware. |
@@ -543,7 +544,8 @@ is **feature-detected** — it appears only when the loaded build exposes an
 | 6b. Sampling | ✅ | Blue-noise sampling + ReSTIR direct lighting (temporal + spatial reuse) |
 | 6c. Any-hit shadows | ✅ | Unordered early-out BVH traversal for occlusion rays — same image, up to ~2× cheaper shadows |
 | 6d. PBR materials | ✅ | Cook-Torrance GGX dielectric specular + normal/roughness/metalness maps, alpha-blended transparency, deforming (water) meshes, overscan |
-| 7. Next | — | Skinned-mesh (animated) shadows; DDGI irradiance probes; ReSTIR GI (indirect reservoir reuse); WGSL / WebGPU backend; per-material IOR |
+| 6e. ReSTIR GI | 🧪 | **Experimental** (`restirGI`, off by default): temporal-only reservoir reuse of the 1-bounce indirect sample (v1 — no spatial reuse yet) |
+| 7. Next | — | Skinned-mesh (animated) shadows; DDGI irradiance probes; ReSTIR GI **spatial** reuse; WGSL / WebGPU backend; per-material IOR |
 
 ## Credits
 

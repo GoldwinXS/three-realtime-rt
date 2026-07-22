@@ -161,6 +161,18 @@ export interface RealtimeRaytracerOptions {
    * matters most to each pixel. Cost is flat in light count.
    */
   restir?: boolean;
+  /**
+   * EXPERIMENTAL — ReSTIR GI (v1, temporal-only): per-pixel reservoirs reuse the
+   * 1-bounce global-illumination sample across frames (at the reprojected
+   * same-surface point; no spatial reuse). When on, the lighting pass skips its
+   * inline GI trace and the reservoir's resolved GI is added at the denoise
+   * stage — so it only takes effect when `gi` and `denoise` are also on. Its
+   * mean matches the inline GI path; convergence character differs. Default
+   * `false`. Live-toggleable.
+   */
+  restirGI?: boolean;
+  /** EXPERIMENTAL — temporal M-cap for the ReSTIR GI reservoir (default 20). */
+  restirGIMCap?: number;
   /** Index of refraction used for transmissive surfaces. */
   ior?: number;
   /** History length cap: higher = smoother but slower to react. */
@@ -354,6 +366,13 @@ export class RealtimeRaytracer {
   taaBlend: number;
   /** ReSTIR direct lighting toggle. */
   restir: boolean;
+  /**
+   * EXPERIMENTAL — ReSTIR GI (temporal-only) toggle. Only takes effect when
+   * `gi` and `denoise` are also on (injected at the à-trous stage). Default false.
+   */
+  restirGI: boolean;
+  /** EXPERIMENTAL — temporal M-cap for the ReSTIR GI reservoir. */
+  restirGIMCap: number;
   /** Procedural-sky state. */
   sky: SkyState;
   /** Distance-fog state. */

@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- **EXPERIMENTAL — ReSTIR GI (v1, temporal-only)** (`restirGI`, default **off**).
+  Per-pixel reservoirs reuse the 1-bounce global-illumination sample across
+  frames at the reprojected same-surface point (validated like the irradiance
+  history). No spatial reuse in v1 — spatial needs the solid-angle→area Jacobian
+  and is where implementations go subtly wrong; temporal reuse at the same
+  surface point needs none.
+  - Runs in a **new standalone pass** (`GIReservoirPass`) at lighting resolution
+    with its **own** 16-sampler budget (8 BVH + 2 vertex-attribute + scene-data +
+    gWorldPos + gNormalMetal + prevGWorldPos + 2 reservoir-history textures), so
+    the lighting pass — already at the WebGL2 16-sampler minimum — is untouched.
+  - GI-bounce hits are shaded **identically** to `RTLightingPass.traceRadiance`
+    (direct + emissive NEE at the hit, sky/env on a miss), and the RIS estimator
+    is derived so the **mean equals the inline GI path** (forcing the M-cap to 1
+    with no history is statistically identical to the legacy path). Reservoir
+    stores the candidate hit position + M and its radiance estimate + W.
+  - When on, the lighting pass **skips its inline GI trace** (new `uExternalGI`
+    uniform — not a sampler) and the resolved GI is **added at the à-trous
+    denoise stage** (`DenoisePass` gained an optional additive input, guarded so
+    it is byte-identical when unused). It is therefore only in effect when `gi`
+    and `denoise` are both on. The GI is added downstream of the lighting pass's
+    temporal history, so it never double-counts through it; the reservoir is the
+    GI temporal integrator (expect a somewhat different convergence character).
+  - New `restirGI` option/property (default false, live-toggleable) and demo
+    toggle "ReSTIR GI (exp)"; `restirGIMCap` tunes the temporal M-cap (default 20).
+
 ## 0.4.0 — 2026-07-22
 
 - **Demo:** the room is now a designed gallery (water pool with kerbs under the

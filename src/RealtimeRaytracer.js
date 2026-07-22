@@ -7,6 +7,7 @@ import { CompositePass } from "./CompositePass.js";
 import { TAAPass } from "./TAAPass.js";
 import { VolumetricPass } from "./VolumetricPass.js";
 import { RestirPass } from "./RestirPass.js";
+import { GIReservoirPass } from "./GIReservoirPass.js";
 import { CopyPass } from "./CopyPass.js";
 
 // Van der Corput / Halton radical inverse — deterministic low-discrepancy
@@ -502,6 +503,22 @@ export class RealtimeRaytracer {
     this.restir = options.restir ?? true;
     this.restirPass = new RestirPass(this._scaledW, this._scaledH);
 
+    /**
+     * EXPERIMENTAL — ReSTIR GI (v1, temporal-only): per-pixel reservoirs reuse
+     * the 1-bounce global-illumination sample across frames (at the reprojected
+     * same-surface point, no spatial reuse / no Jacobian). Runs in a standalone
+     * pass with its own sampler budget; when on, the lighting pass skips its
+     * inline GI trace and this pass's resolved GI is added at the denoise stage.
+     * Only meaningful when `gi` is on, and injected via the à-trous denoise, so
+     * it requires `denoise` (denoiseIterations >= 1). Default OFF. Its mean
+     * matches the inline GI path — see GIReservoirPass. Live-toggleable.
+     */
+    this.restirGI = options.restirGI ?? false;
+    /** Temporal M-cap for the ReSTIR GI reservoir (staleness limit). */
+    this.restirGIMCap = options.restirGIMCap ?? 20;
+    this.giReservoirPass = new GIReservoirPass(this._scaledW, this._scaledH);
+    this._giMissWarned = false;
+
     /** Distance fog (composited in linear space before tonemap). */
     this.fog = {
       enabled: options.fog?.enabled ?? false,
@@ -623,6 +640,7 @@ export class RealtimeRaytracer {
     this.rtPass.setCompiledScene(this.compiled);
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
+    this.giReservoirPass.setCompiledScene(this.compiled);
     this.resetAccumulation();
     return this.compiled;
   }
@@ -648,6 +666,7 @@ export class RealtimeRaytracer {
     this.rtPass.setCompiledScene(this.compiled);
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
+    this.giReservoirPass.setCompiledScene(this.compiled);
   }
 
   resetAccumulation() {
@@ -751,6 +770,11 @@ export class RealtimeRaytracer {
       // clear them.
       this.restirPass.setSize(sw, sh);
       this.restirPass.clearHistory(this.renderer);
+      // Reservoir GI history is packed (hit position + M + radiance + W) —
+      // invalid to linearly resample — but reconverges in a few frames, so
+      // reallocate and clear like the DI reservoirs.
+      this.giReservoirPass.setSize(sw, sh);
+      this.giReservoirPass.clearHistory(this.renderer);
     }
 
     // Full-res / canvas-res targets: only touched on a real canvas resize (a
@@ -919,6 +943,7 @@ export class RealtimeRaytracer {
       this.rtPass.clearHistory(this.renderer);
       this.volumetricPass.clearHistory(this.renderer);
       this.restirPass.clearHistory(this.renderer);
+      this.giReservoirPass.clearHistory(this.renderer);
       this._needsClear = false;
     }
 
@@ -935,6 +960,21 @@ export class RealtimeRaytracer {
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
     rtU.uGIEnabled.value = this.gi;
     rtU.uGIHalfRate.value = this.giHalfRate;
+    // ReSTIR GI (experimental) supplies the 1-bounce indirect externally when
+    // on; the lighting pass then skips its inline GI trace so it isn't double
+    // counted. It's injected at the denoise stage, so it needs denoise on.
+    const giExternal =
+      this.restirGI && this.gi && this.denoise && this.denoiseIterations > 0;
+    rtU.uExternalGI.value = giExternal;
+    if (this.restirGI && this.gi && !giExternal && !this._giMissWarned) {
+      console.info(
+        "[three-realtime-rt] restirGI is on but denoise is off — ReSTIR GI is " +
+          "injected during the à-trous denoise, so enable denoise " +
+          "(denoiseIterations >= 1) to see its contribution."
+      );
+      this._giMissWarned = true;
+    }
+    if (giExternal) this._giMissWarned = false;
     rtU.uEmissiveCount.value = this.emissiveNEE ? this.compiled.emissiveTriCount : 0;
     rtU.uEmissiveCDF.value = this.emissiveImportance;
     rtU.uReflEnabled.value = this.reflections;
@@ -968,9 +1008,42 @@ export class RealtimeRaytracer {
         this.eps
       );
     }
+    // 2b. ReSTIR GI reservoirs (experimental). Runs after the lighting pass's
+    // inline GI is skipped (uExternalGI); the resolved GI is added at denoise.
+    let giTex = null;
+    if (giExternal) {
+      this.giReservoirPass.setEmissiveCount(
+        this.emissiveNEE ? this.compiled.emissiveTriCount : 0
+      );
+      giTex = this.giReservoirPass.render(
+        this.renderer,
+        this.gbuffer,
+        this._prevViewProj,
+        this._camWorldPos,
+        this.frame,
+        this.eps,
+        {
+          fireflyClamp: this.fireflyClamp > 0 ? this.fireflyClamp : 1e6,
+          mCap: this.restirGIMCap,
+          emissiveCDF: this.emissiveImportance,
+          envColor: this.envColor,
+          envIntensity: this.envIntensity,
+          skyEnabled: this.sky.enabled,
+          sunDir: this.sky.sunDir,
+          sunColor: this.sky.sunColor,
+          skyZenith: this.sky.zenith,
+          skyHorizon: this.sky.horizon,
+          skyIntensity: this.sky.intensity,
+        }
+      );
+    }
+
     let { irradiance, specular } = this.rtPass.render(this.renderer, this.gbuffer, this.frame, reservoirTex);
 
-    // 3. denoise (display-only: history keeps accumulating raw samples)
+    // 3. denoise (display-only: history keeps accumulating raw samples). The
+    // experimental ReSTIR GI (giTex) is added on the first à-trous iteration —
+    // downstream of the lighting pass's temporal history, so it never
+    // double-counts through it.
     if (this.denoise && this.denoiseIterations > 0) {
       irradiance = this.denoisePass.render(
         this.renderer,
@@ -978,7 +1051,8 @@ export class RealtimeRaytracer {
         this.gbuffer,
         this._camWorldPos,
         this.eps,
-        this.denoiseIterations
+        this.denoiseIterations,
+        giTex
       );
     }
 
@@ -1099,6 +1173,7 @@ export class RealtimeRaytracer {
     this.taaPass.dispose();
     this.volumetricPass.dispose();
     this.restirPass.dispose();
+    this.giReservoirPass.dispose();
     this._sceneColor.dispose();
     this._copyPass.dispose();
     if (this.compiled) this.compiled.dispose();
