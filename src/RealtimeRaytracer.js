@@ -330,7 +330,9 @@ export class RealtimeRaytracer {
     this.denoisePass = new DenoisePass(this._scaledW, this._scaledH);
     // Separate à-trous instance for the specular buffer (its own ping-pong
     // targets, so the specular denoise cannot clobber the irradiance result).
-    this.specDenoisePass = new DenoisePass(this._scaledW, this._scaledH);
+    this.specDenoisePass = new DenoisePass(this._scaledW, this._scaledH, {
+      blendIsSpec: true, // blend pixels here hold the behind-the-pane image
+    });
     this.composite = new CompositePass();
     this.taaPass = new TAAPass(this._width, this._height);
     this._sceneColor = this._makeColorTarget(this._width, this._height);

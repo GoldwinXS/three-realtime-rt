@@ -182,10 +182,9 @@ async function main() {
       `(${physics.meshes.length} dynamic), ${rt.compiled.lightCount} lights`
   );
 
-  // Expose for debugging / automated verification.
-  Object.assign(window, { RT: rt, SCENE: scene, CAMERA: camera, PHYSICS: physics });
-
   const controls = new OrbitControls(camera, renderer.domElement);
+  // Expose for debugging / automated verification.
+  Object.assign(window, { RT: rt, SCENE: scene, CAMERA: camera, PHYSICS: physics, CONTROLS: controls });
   controls.target.set(0, 1.2, 0);
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;

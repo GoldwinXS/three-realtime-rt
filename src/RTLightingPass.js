@@ -638,14 +638,20 @@ void main() {
   // the BVH, so a ray along the view direction passes THROUGH it to whatever is
   // behind. Trace that continuation and shade it like a glass/GI hit (emitters
   // keep their emission — this is direct visibility through the pane — sky/env on
-  // a miss), then blend by opacity. sampleIrr already holds the pane's own
-  // direct + GI, demodulated; the behind-radiance is written demodulated too and
-  // re-tinted by the pane's albedo at composite — the intended look for a
-  // coloured pane. The pane's lit term keeps its opacity weight.
+  // a miss). The two quantities live at DIFFERENT scales: sampleIrr is the
+  // pane's own demodulated surface light (composite re-applies albedo), while
+  // the behind trace is final outgoing radiance — mixing them in one slot makes
+  // the pane term drown out what shows through. So the behind image rides the
+  // SPECULAR attachment instead (composite adds that buffer without the albedo
+  // multiply, and its short-history accumulation suits behind-content that
+  // parallaxes against the pane), and CompositePass performs the opacity blend
+  // where the pane's albedo is actually available. sampleIrr keeps only the
+  // pane's own surface lighting, which is static on the surface and accumulates
+  // with normal full-length history.
+  vec3 blendBehind = vec3(0.0);
   if (uBlendEnabled && blend) {
     vec3 V = normalize(P - uCameraPos);
-    vec3 behind = traceRadiance(P + V * uEps, V, true);
-    sampleIrr = mix(behind, sampleIrr, opacity);
+    blendBehind = traceRadiance(P + V * uEps, V, true);
   }
 
   // A single NaN/Inf sample would poison the EMA history for good (mix() with
@@ -657,11 +663,16 @@ void main() {
   // out of the white buffer — the effective F0 is mix(0.04, albedo, metal),
   // split across the two buffers. The separate SpecularAccumPass reprojects and
   // temporally accumulates this with a short (near-mirror) history.
-  vec3 spec = gSpec * ((1.0 - metal) * (1.0 - transmission));
+  // Blend pixels repurpose this attachment for the straight-through behind
+  // radiance (see above) — their dielectric highlight is dropped, a fair trade
+  // for a correct-scale see-through image.
+  vec3 spec = blend ? blendBehind : gSpec * ((1.0 - metal) * (1.0 - transmission));
   if (any(isnan(spec)) || any(isinf(spec))) spec = vec3(0.0);
-  float specLum = dot(spec, vec3(0.299, 0.587, 0.114));
-  float specCap = uFireflyClamp * 4.0; // narrow lobes spike; keep the EMA stable
-  if (specLum > specCap) spec *= specCap / specLum;
+  if (!blend) {
+    float specLum = dot(spec, vec3(0.299, 0.587, 0.114));
+    float specCap = uFireflyClamp * 4.0; // narrow lobes spike; keep the EMA stable
+    if (specLum > specCap) spec *= specCap / specLum;
+  }
   outSpecular = vec4(spec, 1.0);
 
   // --- temporal reprojection: pull validated history from last frame ---
@@ -693,12 +704,10 @@ void main() {
           // reflection under camera motion — and specular rays are nearly
           // deterministic, so they don't need the accumulation anyway.
           float specHist = max(metal, transmission) * (1.0 - rough);
-          // Blend pixels see straight-through content from a different depth,
-          // which parallaxes against the pane as the camera moves; long history
-          // smears it. The more see-through the pane (lower opacity), the shorter
-          // the history it should keep. (The behind ray is not roughness-jittered,
-          // so pane roughness does not enter here.)
-          if (blend) specHist = max(specHist, 1.0 - opacity);
+          // (Blend pixels need no shortening here: this slot holds only the
+          // pane's own surface light, which is static on the surface. The
+          // parallaxing behind-image rides the specular attachment, whose
+          // accumulation is short-history by design.)
           float histCap = mix(uMaxHistory, min(uMaxHistory, 10.0), specHist);
           count = clamp(h.a, 0.0, histCap) + 1.0;
           history = h.rgb;

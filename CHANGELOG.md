@@ -34,10 +34,14 @@
   `opacity >= 0.5` rendered fully opaque and `opacity < 0.5` vanished entirely. A
   transparent surface is primary-visible in the G-buffer (kept out of the BVH, so
   it still casts no shadow) and the lighting pass traces one straight-through ray
-  to composite the fully lit (direct + 1-bounce GI) geometry behind it, weighted
-  by `opacity` and tinted by the pane's albedo — coloured panes tint what shows
-  through. Single-layer: the nearest transparent surface wins and overlapping
-  panes do not inter-sort. Costs a ray only on blend pixels. Set
+  to what is behind it. The behind image rides the specular attachment (its
+  radiance scale and short-history accumulation both fit; the pane's dielectric
+  highlight is dropped in trade) and CompositePass performs the opacity blend
+  where the pane's albedo lives, so the see-through content reads at true
+  brightness instead of being crushed by the demodulation scale mismatch.
+  Single-layer: the nearest transparent surface wins and overlapping panes do
+  not inter-sort; needs the specular buffer (`specular: false` degrades blend
+  surfaces to opaque). Costs a ray only on blend pixels. Set
   `transparency: false` to render blend surfaces fully opaque.
 - **Deforming dynamic meshes** (`mesh.userData.rtDeforming`): a dynamic mesh can
   now be CPU-deformed (water, cloth, morph targets) and have its *traced* rays —

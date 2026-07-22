@@ -23,6 +23,7 @@ uniform float uStep;             // à-trous step: 1, 2, 4, ...
 uniform vec3 uCameraPos;
 uniform float uEps;
 uniform float uLumSigma;
+uniform bool uBlendIsSpec;       // this instance filters the specular buffer
 
 float luminance(vec3 c) {
   return dot(c, vec3(0.299, 0.587, 0.114));
@@ -43,11 +44,13 @@ void main() {
   // their signal is nearly deterministic anyway. Scale the filter down as the
   // surface gets more mirror-like.
   // Packed word ranges (see GBufferPass): [4,5] alpha blend, [2,4) glass,
-  // [0,1] metal. A blend surface carries diffuse-lit direct + GI that DOES need
-  // filtering, so it is explicitly not specular (specAmount 0) — only true
-  // mirror/glass content is protected from the blur.
+  // [0,1] metal. In the IRRADIANCE buffer a blend surface carries diffuse-lit
+  // direct + GI that DOES need filtering (specAmount 0); in the SPECULAR buffer
+  // (uBlendIsSpec) it carries the traced behind-the-pane image, which must be
+  // spared like a mirror — the pane is flat, so the G-buffer guides would let
+  // the filter smear the see-through content into mush.
   float matW = nm.w;
-  float specAmount = matW >= 4.0 ? 0.0
+  float specAmount = matW >= 4.0 ? (uBlendIsSpec ? 1.0 : 0.0)
     : (matW >= 2.0 ? clamp(matW - 2.0, 0.0, 1.0) : matW);
   float specKeep = specAmount * (1.0 - clamp(wp.w - 1.0, 0.0, 1.0));
 
@@ -128,7 +131,12 @@ void main() {
  * pixels get blurred hard, converged pixels stay crisp.
  */
 export class DenoisePass {
-  constructor(width, height) {
+  // `blendIsSpec`: the SPECULAR-buffer instance passes true — for blend pixels
+  // that buffer holds the traced behind-the-pane image, whose detail is not in
+  // the G-buffer guides (the pane itself is flat), so filtering would smear it
+  // into mush. The irradiance instance keeps false: there a blend pixel holds
+  // the pane's own diffuse-lit surface, which does want filtering.
+  constructor(width, height, { blendIsSpec = false } = {}) {
     this.targetA = this._makeTarget(width, height);
     this.targetB = this._makeTarget(width, height);
 
@@ -145,6 +153,7 @@ export class DenoisePass {
         uCameraPos: { value: new THREE.Vector3() },
         uEps: { value: 1e-3 },
         uLumSigma: { value: 0.25 },
+        uBlendIsSpec: { value: blendIsSpec },
       },
       depthTest: false,
       depthWrite: false,

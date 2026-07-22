@@ -119,7 +119,8 @@ void main() {
   vec2 uv = vUv * uCrop.xy + uCrop.zw;
   vec4 wp = texture(uGWorldPos, uv);
   vec4 albedoRough = texture(uGAlbedoRough, uv);
-  vec3 N = normalize(texture(uGNormalMetal, uv).xyz);
+  vec4 nmFull = texture(uGNormalMetal, uv);
+  vec3 N = normalize(nmFull.xyz);
   vec3 irradiance = upsampleGuided(uIrradiance, uv, wp.xyz, N);
   vec3 specular = uSpecEnabled ? upsampleGuided(uSpecular, uv, wp.xyz, N) : vec3(0.0);
   vec3 emissive = texture(uGEmissive, uv).rgb;
@@ -135,7 +136,19 @@ void main() {
   } else {
     // Diffuse is demodulated (albedo re-applied here); the dielectric specular
     // highlight is white (F0 ~= 0.04) and is added WITHOUT the albedo multiply.
-    color = albedoRough.rgb * irradiance + specular + emissive;
+    if (nmFull.w >= 4.0) {
+      // Alpha blend (packed word >= 4, opacity = w - 4): the irradiance slot
+      // holds the pane's own demodulated surface light and the SPECULAR slot
+      // carries the traced radiance from BEHIND the pane (see RTLightingPass) —
+      // the only place both quantities exist at final-pixel scale alongside the
+      // pane's albedo, so the opacity blend happens here. With the specular
+      // buffer disabled there is no behind-image; degrade to an opaque pane.
+      float opacity = clamp(nmFull.w - 4.0, 0.0, 1.0);
+      vec3 paneCol = albedoRough.rgb * irradiance + emissive;
+      color = uSpecEnabled ? mix(specular, paneCol, opacity) : paneCol;
+    } else {
+      color = albedoRough.rgb * irradiance + specular + emissive;
+    }
     // Volumetric in-scatter (already radiance, not modulated by albedo). Fog
     // is low-frequency, so a wide 9-tap blur costs nothing visually and eats
     // the single-sample grain — crucial with MOVING lights, where the
