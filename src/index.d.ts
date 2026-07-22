@@ -190,7 +190,19 @@ export interface VolumetricState {
 
 /** Options accepted by {@link RealtimeRaytracer.compileScene} and {@link compileScene}. */
 export interface CompileSceneOptions {
-  /** Meshes whose transforms change every frame; drive them with updateDynamic(). */
+  /**
+   * Meshes whose transforms change every frame; drive them with updateDynamic().
+   *
+   * By default a dynamic mesh is treated as **rigid** — its compile-time vertices
+   * are snapshotted and only re-transformed by `mesh.matrixWorld` each frame.
+   * To trace a mesh whose *vertices* move on the CPU (water, cloth, morph
+   * targets), also set `mesh.userData.rtDeforming = true`. Such a mesh has its
+   * live `position` (and `normal`) attributes re-read every frame, so the traced
+   * shadows/reflections follow the actual deformed shape. The app must keep the
+   * normal attribute current (e.g. call `geometry.computeVertexNormals()` after
+   * deforming). The live vertex count is fixed at compile time — changing it
+   * throws; call `compileScene()` again after a topology change.
+   */
   dynamicMeshes?: Object3D[];
 }
 

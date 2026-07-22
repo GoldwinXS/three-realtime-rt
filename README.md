@@ -179,6 +179,46 @@ that is re-baked and refit per frame. `updateDynamic()` therefore costs
 ~1 ms for dozens of moving objects *regardless of how big the static world is* —
 skip it entirely on frames where nothing moved.
 
+### Deforming meshes (water, cloth)
+
+By default a dynamic mesh is **rigid**: its vertices are snapshotted at compile
+time and only re-transformed by `mesh.matrixWorld` each frame — so CPU edits to
+its `position` attribute show in the rasterized image but the *traced* rays
+(shadows, GI, reflections) still hit the original shape. For a mesh whose
+vertices actually move on the CPU (a water surface, cloth, a morph target), set
+`userData.rtDeforming` so the raytracer re-reads its live geometry every frame:
+
+```js
+water.userData.rtDeforming = true;           // opt in
+rt.compileScene(scene, { dynamicMeshes: [water, ...crates] });
+
+// each frame:
+deformWaterVertices(water.geometry, t);       // your CPU wave/cloth solver
+water.geometry.attributes.position.needsUpdate = true;
+water.geometry.computeVertexNormals();        // REQUIRED — see below
+rt.updateDynamic();                            // re-reads the live vertices
+rt.render(scene, camera);
+```
+
+Two requirements:
+
+- **You own the normals.** The tracer reads the mesh's live `normal` attribute
+  for deforming segments — it does not recompute them. Call
+  `geometry.computeVertexNormals()` (or update the attribute yourself) after
+  moving the vertices, or the shading/reflections will track the old silhouette.
+- **The vertex count is fixed at compile time.** Deforming an existing surface is
+  free; changing its topology (adding/removing vertices) is not — `updateDynamic()`
+  throws with a clear message telling you to `compileScene()` again.
+
+**Cost model.** A deforming segment is re-baked from its live vertices every
+frame and its normals are re-uploaded every frame (rigid movers amortize the
+normal upload over 8 frames). Both are O(dynamic triangles), and the cheap
+per-frame BVH `refit()` (kept for surfaces that stay roughly in place, like a
+water plane) is O(dynamic tris) too — so **keep deforming meshes low-poly**. A
+`48×48` plane is ≈ 4.6k triangles, which refits in well under a millisecond; a
+`256×256` plane (~131k tris) will dominate the frame. The demo's mirror-water
+pool is a `48×48` plane.
+
 ## Live lighting & sky
 
 Lights can be toggled, moved, and recoloured every frame without recompiling:

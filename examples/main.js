@@ -51,7 +51,7 @@ const enterSafeMode = (why) => {
 
 async function main() {
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
-  const { scene, camera, bounds, lights, sky, ready, showcase } = buildScene();
+  const { scene, camera, bounds, lights, sky, ready, showcase, water } = buildScene();
 
   // A Rapier physics playground drops a pool of props onto the ground. Their
   // meshes are plain three.js meshes — we'll hand them to the raytracer as the
@@ -166,11 +166,16 @@ async function main() {
     fog: { enabled: false, color: new THREE.Color(0.5, 0.55, 0.62), density: 0.04 },
   });
 
+  // The dynamic set = the (opt-in) physics pile PLUS the CPU-deformed water
+  // pool. The water is flagged rtDeforming in scene.js, so the raytracer reads
+  // its live geometry each frame; the physics meshes are rigid movers.
+  const dynamicMeshes = () => [...physics.meshes, water.mesh];
+
   // 3. Compile once. `dynamicMeshes` marks meshes that move every frame — they
   //    get re-baked into the BVH on updateDynamic() (see the loop below).
   setBoot("building BVH…");
   const t0 = performance.now();
-  rt.compileScene(scene, { dynamicMeshes: physics.meshes });
+  rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
   console.log(
     `[three-realtime-rt] compiled in ${Math.round(performance.now() - t0)}ms: ` +
       `${rt.compiled.triangleCount.toLocaleString()} tris ` +
@@ -192,7 +197,7 @@ async function main() {
   // Lights only need re-reading when they actually change, so the UI calls this
   // instead of us polling every frame.
   const refreshLights = () => rt.updateLights(scene);
-  const state = { rtEnabled: true, physicsPaused: false };
+  const state = { rtEnabled: true, physicsPaused: false, waterEnabled: true };
 
   // The orbiting ceiling light is animated in the loop (below) — find it once.
   const orbitLight = lights.find((l) => l.label === "orbit light").light;
@@ -201,7 +206,7 @@ async function main() {
   // their showcase sphere, which changes mesh visibility — the BVH skips
   // invisible meshes, so those two must recompile. Every case ends by resetting
   // accumulation so the change isn't smeared by stale history.
-  const recompile = () => rt.compileScene(scene, { dynamicMeshes: physics.meshes });
+  const recompile = () => rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
   const setFeature = (name, on) => {
     switch (name) {
       case "gi":
@@ -231,7 +236,7 @@ async function main() {
   const spawnPile = () => {
     if (physics.meshes.length > 0) return;
     physics.spawnPool(scene, 40, new THREE.Vector3(2.4, 0, 2.2));
-    rt.compileScene(scene, { dynamicMeshes: physics.meshes });
+    rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
   };
 
   // "Party lights" — spawn N extra point lights at deterministic pseudo-random
@@ -310,6 +315,7 @@ async function main() {
   let booted = false;
   let orbitAngle = 0;      // orbiting ceiling light phase (advanced only when lit)
   let lastRtEnabled = null; // reconfigure the raster path only on RT on/off edges
+  let waterPerfLogged = false; // one-shot updateDynamic() cost probe (water active)
 
   function animate() {
     if (document.visibilityState === "hidden") setTimeout(animate, 100);
@@ -342,11 +348,31 @@ async function main() {
       refreshLights();
     }
 
+    // The water deforms continuously, so its geometry must be advanced (and the
+    // dynamic BVH refit) every frame — INDEPENDENTLY of whether the physics pile
+    // is awake. Advance it before updateDynamic() so the fresh vertices/normals
+    // are what gets baked in.
+    if (state.waterEnabled) water.update(now / 1000);
+
     if (state.rtEnabled) {
-      // Only re-bake the BVH while something is actually moving — at rest this
-      // whole step (and its BVH upload) is skipped, which is most of the frame.
+      // Re-bake the dynamic BVH when anything moved: the water (if enabled) or an
+      // awake physics body. At full rest with water off, the whole step (and its
+      // BVH upload) is skipped, which is most of the frame.
+      const physicsActive = !state.physicsPaused && physics.anyAwake();
       try {
-        if (!state.physicsPaused && physics.anyAwake()) rt.updateDynamic();
+        if (state.waterEnabled || physicsActive) {
+          const tDyn = performance.now();
+          rt.updateDynamic();
+          // One-shot perf probe: what does re-baking the deforming water cost?
+          if (!waterPerfLogged && state.waterEnabled) {
+            waterPerfLogged = true;
+            console.log(
+              `[three-realtime-rt demo] updateDynamic() with water active: ` +
+                `${(performance.now() - tDyn).toFixed(2)} ms ` +
+                `(${rt.compiled.triangleCount.toLocaleString()} dynamic+static tris)`
+            );
+          }
+        }
         rt.render(scene, camera); // <- the one call that replaces renderer.render
       } catch (err) {
         enterSafeMode(err && err.message ? err.message : String(err));
