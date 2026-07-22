@@ -262,6 +262,14 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   fSec.append(toggle("emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);
   fSec.append(toggle("reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
   fSec.append(toggle("refraction", rt.refraction, (v) => setFeature("refraction", v)).row);
+  // Chromatic dispersion on the refracted term — the diamond-ior glass sphere on
+  // the materials bench splits white light into a rainbow. Default 0 (off): the
+  // stochastic spectral sampling estimates one colour channel per glass pixel
+  // per frame, which triples the transmitted term's variance and adds visible
+  // grain on the sphere at the demo's reduced render scale before it fully
+  // converges. Drag it up to see the effect; it shimmers slightly while
+  // converging, so reset the accumulator on each change.
+  fSec.append(slider("dispersion", 0, 0.3, 0.01, rt.dispersion, (x) => Number(x).toFixed(2), (v) => { rt.dispersion = v; rt.resetAccumulation(); }));
   // Grab the fast-lights toggle first so the ReSTIR handler can uncheck it.
   const fastLights = toggle("fast lights (1 ray)", rt.stochasticLights, (v) => { rt.stochasticLights = v; rt.adaptiveQuality = false; rt.resetAccumulation(); });
   // Turning ReSTIR OFF must drop us onto the per-light-rays baseline, NOT the

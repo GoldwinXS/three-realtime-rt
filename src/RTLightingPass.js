@@ -66,6 +66,7 @@ uniform bool uReflEnabled;  // traced reflections on metallic surfaces
 uniform bool uRefrEnabled;  // traced refraction on transmissive surfaces
 uniform bool uBlendEnabled; // straight-through view continuation on blend surfaces
 uniform float uIor;         // index of refraction for transmissive materials
+uniform float uDispersion;  // chromatic dispersion strength for glass (0 = off)
 uniform bool uLightStochastic; // 1 direct shadow ray/pixel/frame instead of 1/light
 uniform bool uRestirEnabled;   // shade the reservoir winner instead of sampling
 uniform bool uGIHalfRate;      // GI ray on alternating checkerboard, doubled
@@ -553,16 +554,64 @@ vec3 analyticGlint(vec3 P, vec3 refl) {
 
 // Glass: Fresnel-weighted blend of a surface reflection and a two-interface
 // refraction (enter at P, march to the exit surface, refract again).
+//
+// CHROMATIC DISPERSION (stochastic spectral sampling). Real glass has a
+// wavelength-dependent ior, so white light splits into a spectrum (a diamond
+// throws a rainbow). Tracing one refraction path per colour would cost three
+// traceRadiance calls, but the Metal call-site budget (see the note at the
+// unified secondary-ray site) forbids a fourth traceRadiance anywhere in this
+// shader. Instead, when uDispersion > 0 each frame this pixel picks ONE colour
+// channel c in R,G,B uniformly and traces the SAME single refraction path with
+// a channel-shifted ior. The refracted radiance is then isolated to channel c
+// and multiplied by 3 (to compensate the 1-of-3 pick); the temporal EMA
+// averages the three per-channel estimates into a full-spectrum, dispersed
+// refraction — zero extra rays, zero new call sites, unbiased in the mean. It
+// therefore shimmers slightly while converging.
+//
+// THE MIX SPLIT. The return is mix(refrRad, reflRad, fres) = refrRad*(1-fres)
+// + reflRad*fres. Only the TRANSMITTED half (refrRad) carries the channel
+// mask; the reflection half (reflRad) is NOT dispersed and stays full colour
+// EVERY frame. To keep the reflection deterministic frame-to-frame, the
+// Fresnel weight is taken from the BASE ior (constant), not the channel-shifted
+// ior — only the refracted ray DIRECTION disperses, so the reflection term
+// reflRad*fres is identical every frame while refrRad*mask*3 is the spectral
+// estimator.
+//
+// OFF-PATH IDENTITY. uDispersion == 0 skips the channel pick entirely: it
+// consumes NO rand() (so the RNG stream does not shift), leaves iorC == ior and
+// chanMask == vec3(1), and the whole function reduces byte-for-byte to the
+// pre-dispersion path.
 vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
   vec3 refl = glossyReflect(V, N, rough);
   vec3 reflRad = dot(refl, N) > 0.0
     ? traceRadiance(P + N * uEps, refl, true) + analyticGlint(P, refl)
     : vec3(0.0);
 
-  float eta = 1.0 / ior;
+  // Per-frame spectral channel pick for the transmitted term (guarded so the
+  // off path consumes no rand()).
+  vec3 chanMask = vec3(1.0); // full colour (un-masked) when dispersion is off
+  float iorC = ior;
+  if (uDispersion > 0.0) {
+    int c = min(int(rand() * 3.0), 2); // uniform channel: 0 = R, 1 = G, 2 = B
+    // shift = (+1.0, 0.0, -1.0) * 0.5, indexed by channel: R = +0.5, G = 0,
+    // B = -0.5. uDispersion (0..0.5) scales the ior spread.
+    float shift = c == 0 ? 0.5 : (c == 2 ? -0.5 : 0.0);
+    iorC = ior * (1.0 + uDispersion * shift);
+    // Isolate channel c and weight x3: vec3(3,0,0) / (0,3,0) / (0,0,3). The
+    // mean over the three equally-likely picks is (1/3)(3,0,0)+... = (1,1,1),
+    // so E[masked refrRad] == refrRad. The OTHER channels are zero this frame.
+    chanMask = c == 0 ? vec3(3.0, 0.0, 0.0)
+             : c == 1 ? vec3(0.0, 3.0, 0.0)
+                      : vec3(0.0, 0.0, 3.0);
+  }
+
+  float eta = 1.0 / iorC;                 // channel-shifted: drives the refraction bend
   vec3 rd = refract(V, N, eta);
-  if (rd == vec3(0.0)) return reflRad; // total internal reflection at entry
-  float fres = schlick(clamp(-dot(V, N), 0.0, 1.0), eta);
+  if (rd == vec3(0.0)) return reflRad;    // total internal reflection at entry
+  // Fresnel from the BASE ior so the reflection/refraction split is the same
+  // every frame (reflection stays full colour and un-dispersed). Equal to the
+  // original schlick(..., eta) when uDispersion == 0 (iorC == ior).
+  float fres = schlick(clamp(-dot(V, N), 0.0, 1.0), 1.0 / ior);
 
   vec3 ro = P - N * (2.0 * uEps);
   vec3 refrRad;
@@ -575,7 +624,7 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
     vec3 xN = normalize(attr.xyz);
     if (dot(xN, rd) > 0.0) xN = -xN;
     vec3 xP = ro + rd * dist;
-    vec3 rd2 = refract(rd, xN, ior);
+    vec3 rd2 = refract(rd, xN, iorC);     // same channel-shifted ior on exit
     if (rd2 == vec3(0.0)) rd2 = reflect(rd, xN);
     refrRad = traceRadiance(xP - xN * uEps, rd2, true);
   } else {
@@ -583,7 +632,9 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
       ? skyColor(rd, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity)
       : uEnvColor * uEnvIntensity;
   }
-  return mix(refrRad, reflRad, fres);
+  // Mask ONLY the transmitted term to the chosen channel (full colour when
+  // dispersion is off); the reflection term is never masked.
+  return mix(refrRad * chanMask, reflRad, fres);
 }
 
 // Compact cold->hot ramp for the BVH-cost heatmap. Piecewise mix of five
@@ -978,6 +1029,7 @@ export class RTLightingPass {
         uRefrEnabled: { value: true },
         uBlendEnabled: { value: true },
         uIor: { value: 1.5 },
+        uDispersion: { value: 0 },
         uLightStochastic: { value: false },
         uGIHalfRate: { value: false },
         uEnvColor: { value: new THREE.Color(0.03, 0.04, 0.06) },

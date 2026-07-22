@@ -493,6 +493,17 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     /** Index of refraction used for transmissive surfaces. */
     this.ior = options.ior ?? 1.5;
     /**
+     * Chromatic dispersion strength for glass (0..0.5, clamped on upload,
+     * default 0 = off). Splits refracted white light into a spectrum: each
+     * frame every glass pixel estimates ONE colour channel through a
+     * channel-shifted ior and the temporal accumulator blends the three into a
+     * rainbow (stochastic spectral sampling — no extra rays). It shimmers
+     * slightly while converging, so it needs temporal accumulation to settle.
+     * Global control only for now (there is no free G-buffer channel for a
+     * per-material MeshPhysicalMaterial.dispersion).
+     */
+    this.dispersion = options.dispersion ?? 0;
+    /**
      * One stochastic direct shadow ray per pixel per frame (source picked at
      * random) instead of one per light — the biggest ray-count lever for
      * many-light scenes and mobile GPUs. Slightly noisier moving shadows;
@@ -1091,6 +1102,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     rtU.uRefrEnabled.value = this.refraction;
     rtU.uBlendEnabled.value = this.transparency;
     rtU.uIor.value = this.ior;
+    rtU.uDispersion.value = Math.min(0.5, Math.max(0, this.dispersion));
     rtU.uLightStochastic.value = this.stochasticLights;
     rtU.uSkyEnabled.value = this.sky.enabled;
     rtU.uSunDir.value.copy(this.sky.sunDir);

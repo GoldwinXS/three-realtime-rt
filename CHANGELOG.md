@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Chromatic dispersion for glass (`dispersion`).** A new lib option / live
+  property (`0..0.5`, clamped, default `0` = off) splits refracted white light
+  into a spectrum — a diamond throws a rainbow. It uses **stochastic spectral
+  sampling** to fit the shader's hard three-`traceRadiance` Metal call-site
+  budget: each frame every glass pixel picks ONE colour channel `c` in R/G/B
+  uniformly, traces the *same single* refraction path with a channel-shifted ior
+  (`iorC = ior * (1 + dispersion * shift[c])`, `shift = (+1,0,-1)*0.5`), and
+  returns the refracted radiance masked to `c` and weighted `x3`. The temporal
+  accumulator blends the three per-channel estimates into a converged rainbow —
+  **zero extra rays, zero new call sites, unbiased in the mean**. Only the
+  transmitted term is channel-estimated; the Fresnel reflection stays full colour
+  every frame (its weight uses the base ior). `dispersion == 0` consumes no extra
+  `rand()` and is byte-identical to the pre-dispersion image. Because it relies on
+  accumulation it shimmers slightly in motion. Global control only for now (no
+  free G-buffer channel for a per-material `MeshPhysicalMaterial.dispersion`).
+  Exposed in the demo as a **dispersion** slider in the RT-features panel.
+
 - **ReSTIR GI spatial reuse (v2, experimental).** The `restirGI` pass, shipped in
   0.5.0 as temporal-only, now takes `restirGISpatialTaps` spatial taps (default
   `2`, clamp `0..4`; `0` reproduces the exact v1 temporal-only image) of the

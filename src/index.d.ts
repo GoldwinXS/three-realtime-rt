@@ -188,6 +188,15 @@ export interface RealtimeRaytracerOptions {
    * the default when no per-material ior is carried.
    */
   ior?: number;
+  /**
+   * Chromatic dispersion strength for glass, `0..0.5` (clamped), default `0`
+   * (off). Splits refracted white light into a spectrum via stochastic spectral
+   * sampling — each frame every glass pixel estimates one colour channel through
+   * a channel-shifted ior, and temporal accumulation blends the three into a
+   * rainbow (no extra rays). Needs accumulation to converge, so it shimmers
+   * slightly in motion. Global control only (no per-material dispersion).
+   */
+  dispersion?: number;
   /** History length cap: higher = smoother but slower to react. */
   maxHistory?: number;
   /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
@@ -395,6 +404,12 @@ export class RealtimeRaytracer {
    * per material for fully-transmissive glass (range [1.0, 1.98]).
    */
   ior: number;
+  /**
+   * Chromatic dispersion strength for glass, `0..0.5` (clamped on upload),
+   * default `0`. Stochastic spectral sampling: splits refracted white light into
+   * a rainbow via temporal accumulation, no extra rays. Global control only.
+   */
+  dispersion: number;
   /** One stochastic direct shadow ray per pixel per frame instead of one per light. */
   stochasticLights: boolean;
   /** Adaptive quality governor toggle. */
