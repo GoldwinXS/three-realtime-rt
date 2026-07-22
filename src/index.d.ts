@@ -110,6 +110,12 @@ export interface RealtimeRaytracerOptions {
   /** Traced refraction for transmissive (MeshPhysicalMaterial.transmission) surfaces. */
   refraction?: boolean;
   /**
+   * Alpha-blended transparency: `transparent: true` meshes are primary-visible
+   * and composited against the geometry behind them (weighted by `opacity`).
+   * Default true. Off = blend surfaces render fully opaque.
+   */
+  transparency?: boolean;
+  /**
    * ReSTIR direct lighting: per-pixel reservoirs converge onto the light that
    * matters most to each pixel. Cost is flat in light count.
    */
@@ -252,6 +258,8 @@ export class RealtimeRaytracer {
   reflections: boolean;
   /** Traced refraction for transmissive surfaces. */
   refraction: boolean;
+  /** Alpha-blended transparency: composite `transparent` meshes over the geometry behind them. */
+  transparency: boolean;
   /** Index of refraction used for transmissive surfaces. */
   ior: number;
   /** One stochastic direct shadow ray per pixel per frame instead of one per light. */

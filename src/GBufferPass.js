@@ -37,6 +37,8 @@ uniform sampler2D uMap;
 uniform bool uHasMap;
 uniform sampler2D uEmissiveMap;
 uniform bool uHasEmissiveMap;
+uniform bool uBlend;
+uniform float uOpacity;
 
 void main() {
   vec3 albedo = uColor;
@@ -49,15 +51,24 @@ void main() {
   }
   vec3 n = normalize(vWorldNormal) * (gl_FrontFacing ? 1.0 : -1.0);
   gAlbedoRough = vec4(albedo, uRoughness);
-  // .w is a packed material word: >= 2 means transmissive glass (w - 2 =
-  // transmission amount), else it is plain metalness. Lets the lighting pass
-  // read specular/glass properties without an extra G-buffer sampler (it
-  // already sits at the WebGL2 16-sampler minimum).
-  gNormalMetal = vec4(n, uTransmission > 0.0 ? 2.0 + uTransmission : uMetalness);
+  // .w is a packed material word in three disjoint ranges, so the lighting pass
+  // reads specular/glass/blend properties without an extra G-buffer sampler (it
+  // already sits at the WebGL2 16-sampler minimum):
+  //   [0,1] plain metalness   [2,3] transmissive glass (w - 2 = transmission)
+  //   [4,5] alpha blend (w - 4 = opacity). Blend wins: a transparent surface is
+  // kept out of the BVH and composited by the lighting pass, so it must never be
+  // read as glass even if the material also carries a transmission value.
+  float matWord = uBlend
+    ? 4.0 + uOpacity
+    : (uTransmission > 0.0 ? 2.0 + uTransmission : uMetalness);
+  gNormalMetal = vec4(n, matWord);
   // .w packs the valid flag AND roughness: 0 = background, 1 + roughness
   // otherwise. Every consumer only tests w < 0.5, so this stays compatible.
   gWorldPos = vec4(vWorldPos, 1.0 + uRoughness);
-  gEmissive = vec4(emissive, 1.0);
+  // .a is normally the constant 1.0 (CompositePass reads only .rgb). A blend
+  // surface carries its opacity here; the packed word above also encodes it, so
+  // the sampler-bound lighting pass reads opacity without a gEmissive fetch.
+  gEmissive = vec4(emissive, uBlend ? uOpacity : 1.0);
 }
 `;
 
@@ -155,6 +166,8 @@ export class GBufferPass {
           uHasMap: { value: false },
           uEmissiveMap: { value: null },
           uHasEmissiveMap: { value: false },
+          uBlend: { value: false },
+          uOpacity: { value: 1.0 },
         },
         side: THREE.FrontSide,
       });
@@ -178,6 +191,11 @@ export class GBufferPass {
     u.uHasMap.value = !!src.map;
     u.uEmissiveMap.value = src.emissiveMap ?? null;
     u.uHasEmissiveMap.value = !!src.emissiveMap;
+    // Alpha-blended transparency: primary-visible here (opacity packed into the
+    // material word + gEmissive.a), composited against the geometry behind by the
+    // lighting pass. opacity 1 renders opaque, matching the old force-opaque path.
+    u.uBlend.value = !!src.transparent;
+    u.uOpacity.value = src.opacity ?? 1.0;
     u.uNormalMatrixWorld.value.getNormalMatrix(mesh.matrixWorld);
     material.side = src.side ?? THREE.FrontSide;
     return material;
@@ -187,19 +205,15 @@ export class GBufferPass {
     // Ping-pong: what was "current" becomes "previous".
     this._current = 1 - this._current;
 
-    // Swap in G-buffer materials.
+    // Swap in G-buffer materials. Transparent meshes are written too — as the
+    // nearest single layer, depth-tested/written like any surface (overlapping
+    // transparent surfaces do not inter-sort). Their opacity rides in the packed
+    // material word + gEmissive.a, and the lighting pass blends them against the
+    // geometry behind. opacity 1 writes fully opaque, so alpha-textured cases
+    // (LittlestTokyo's glass) look exactly as before.
     this._swapped.length = 0;
     scene.traverse((obj) => {
       if (obj.isMesh && obj.geometry && obj.visible) {
-        // The G-buffer has no alpha blending — a nearly invisible surface
-        // (glass display case, ghost meshes) would write itself opaque over
-        // everything behind it. Hide it from the raster pass instead.
-        const m = Array.isArray(obj.material) ? obj.material[0] : obj.material;
-        if (m.transparent && (m.opacity ?? 1) < 0.5) {
-          obj.visible = false;
-          this._swapped.push([obj, null]); // restore visibility after render
-          return;
-        }
         this._swapped.push([obj, obj.material]);
         obj.material = this._gbufferMaterialFor(obj);
       }
@@ -215,10 +229,7 @@ export class GBufferPass {
     renderer.setRenderTarget(null);
 
     scene.background = prevBackground;
-    for (const [mesh, mat] of this._swapped) {
-      if (mat === null) mesh.visible = true; // was hidden, not material-swapped
-      else mesh.material = mat;
-    }
+    for (const [mesh, mat] of this._swapped) mesh.material = mat;
     this._swapped.length = 0;
   }
 

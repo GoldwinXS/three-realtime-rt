@@ -42,8 +42,13 @@ void main() {
   // detail is NOT in the G-buffer guides — filtering would smear them, and
   // their signal is nearly deterministic anyway. Scale the filter down as the
   // surface gets more mirror-like.
+  // Packed word ranges (see GBufferPass): [4,5] alpha blend, [2,4) glass,
+  // [0,1] metal. A blend surface carries diffuse-lit direct + GI that DOES need
+  // filtering, so it is explicitly not specular (specAmount 0) — only true
+  // mirror/glass content is protected from the blur.
   float matW = nm.w;
-  float specAmount = matW >= 2.0 ? clamp(matW - 2.0, 0.0, 1.0) : matW;
+  float specAmount = matW >= 4.0 ? 0.0
+    : (matW >= 2.0 ? clamp(matW - 2.0, 0.0, 1.0) : matW);
   float specKeep = specAmount * (1.0 - clamp(wp.w - 1.0, 0.0, 1.0));
 
   // Fewer accumulated samples -> noisier pixel -> wider luminance tolerance.

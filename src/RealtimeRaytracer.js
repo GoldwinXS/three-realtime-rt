@@ -228,6 +228,14 @@ export class RealtimeRaytracer {
     this.reflections = options.reflections ?? true;
     /** Traced refraction for transmissive (MeshPhysicalMaterial.transmission) surfaces. */
     this.refraction = options.refraction ?? true;
+    /**
+     * Alpha-blended transparency: a `transparent: true` mesh is primary-visible
+     * but kept out of the BVH, and the lighting pass traces a straight-through
+     * ray to composite the geometry behind it (weighted by `opacity`, tinted by
+     * the pane's albedo). Default ON — it fixes silently-wrong behaviour and
+     * costs only on blend pixels. Off = blend surfaces render fully opaque.
+     */
+    this.transparency = options.transparency ?? true;
     /** Index of refraction used for transmissive surfaces. */
     this.ior = options.ior ?? 1.5;
     /**
@@ -694,6 +702,7 @@ export class RealtimeRaytracer {
     rtU.uEmissiveCount.value = this.emissiveNEE ? this.compiled.emissiveTriCount : 0;
     rtU.uReflEnabled.value = this.reflections;
     rtU.uRefrEnabled.value = this.refraction;
+    rtU.uBlendEnabled.value = this.transparency;
     rtU.uIor.value = this.ior;
     rtU.uLightStochastic.value = this.stochasticLights;
     rtU.uSkyEnabled.value = this.sky.enabled;

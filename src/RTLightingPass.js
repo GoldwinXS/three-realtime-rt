@@ -62,6 +62,7 @@ uniform int uLightCount;
 uniform int uEmissiveCount; // NEE area-light triangles in row 1 of uMaterialsTex
 uniform bool uReflEnabled;  // traced reflections on metallic surfaces
 uniform bool uRefrEnabled;  // traced refraction on transmissive surfaces
+uniform bool uBlendEnabled; // straight-through view continuation on blend surfaces
 uniform float uIor;         // index of refraction for transmissive materials
 uniform bool uLightStochastic; // 1 direct shadow ray/pixel/frame instead of 1/light
 uniform bool uRestirEnabled;   // shade the reservoir winner instead of sampling
@@ -450,9 +451,13 @@ void main() {
   vec3 P = wp.xyz;
   vec4 nmSample = texture(uGNormalMetal, vUv);
   vec3 N = normalize(nmSample.xyz);
-  // Decode the packed material word (see GBufferPass): >= 2 → glass, else metal.
-  float transmission = nmSample.w >= 2.0 ? clamp(nmSample.w - 2.0, 0.0, 1.0) : 0.0;
-  float metal = nmSample.w >= 2.0 ? 0.0 : nmSample.w;
+  // Decode the packed material word (see GBufferPass): [4,5] → alpha blend
+  // (w - 4 = opacity), [2,4) → glass (w - 2 = transmission), else metalness.
+  float matW = nmSample.w;
+  bool blend = matW >= 4.0;
+  float opacity = blend ? clamp(matW - 4.0, 0.0, 1.0) : 1.0;
+  float transmission = (matW >= 2.0 && matW < 4.0) ? clamp(matW - 2.0, 0.0, 1.0) : 0.0;
+  float metal = matW < 2.0 ? matW : 0.0;
   float rough = clamp(wp.w - 1.0, 0.0, 1.0);
 
   // --- direct lighting ---
@@ -513,6 +518,21 @@ void main() {
     sampleIrr = mix(sampleIrr, glassRadiance(P, N, V, rough), transmission);
   }
 
+  // --- alpha blend: straight-through view continuation ---
+  // A transparent surface is primary-visible in the G-buffer but was kept out of
+  // the BVH, so a ray along the view direction passes THROUGH it to whatever is
+  // behind. Trace that continuation and shade it like a glass/GI hit (emitters
+  // keep their emission — this is direct visibility through the pane — sky/env on
+  // a miss), then blend by opacity. sampleIrr already holds the pane's own
+  // direct + GI, demodulated; the behind-radiance is written demodulated too and
+  // re-tinted by the pane's albedo at composite — the intended look for a
+  // coloured pane. The pane's lit term keeps its opacity weight.
+  if (uBlendEnabled && blend) {
+    vec3 V = normalize(P - uCameraPos);
+    vec3 behind = traceRadiance(P + V * uEps, V, true);
+    sampleIrr = mix(behind, sampleIrr, opacity);
+  }
+
   // A single NaN/Inf sample would poison the EMA history for good (mix() with
   // NaN stays NaN until a disocclusion resets the pixel) — sanitize first.
   if (any(isnan(sampleIrr)) || any(isinf(sampleIrr))) sampleIrr = vec3(0.0);
@@ -546,6 +566,12 @@ void main() {
           // reflection under camera motion — and specular rays are nearly
           // deterministic, so they don't need the accumulation anyway.
           float specHist = max(metal, transmission) * (1.0 - rough);
+          // Blend pixels see straight-through content from a different depth,
+          // which parallaxes against the pane as the camera moves; long history
+          // smears it. The more see-through the pane (lower opacity), the shorter
+          // the history it should keep. (The behind ray is not roughness-jittered,
+          // so pane roughness does not enter here.)
+          if (blend) specHist = max(specHist, 1.0 - opacity);
           float histCap = mix(uMaxHistory, min(uMaxHistory, 10.0), specHist);
           count = clamp(h.a, 0.0, histCap) + 1.0;
           history = h.rgb;
@@ -601,6 +627,7 @@ export class RTLightingPass {
         uEmissiveCount: { value: 0 },
         uReflEnabled: { value: true },
         uRefrEnabled: { value: true },
+        uBlendEnabled: { value: true },
         uIor: { value: 1.5 },
         uLightStochastic: { value: false },
         uGIHalfRate: { value: false },
