@@ -610,6 +610,13 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.restirGI = options.restirGI ?? false;
     /** Temporal M-cap for the ReSTIR GI reservoir (staleness limit). */
     this.restirGIMCap = options.restirGIMCap ?? 20;
+    /**
+     * ReSTIR GI (v2) spatial-reuse taps per frame, taken after the temporal
+     * merge from the previous frame's reservoirs (reconnection-Jacobian
+     * reweighted, with a final visibility ray). Clamped to 0..4; `0` reproduces
+     * the v1 temporal-only behaviour. Default 2.
+     */
+    this.restirGISpatialTaps = options.restirGISpatialTaps ?? 2;
     this.giReservoirPass = new GIReservoirPass(this._scaledW, this._scaledH);
     this._giMissWarned = false;
 
@@ -1128,6 +1135,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
         {
           fireflyClamp: this.fireflyClamp > 0 ? this.fireflyClamp : 1e6,
           mCap: this.restirGIMCap,
+          spatialTaps: Math.max(0, Math.min(4, this.restirGISpatialTaps | 0)),
           emissiveCDF: this.emissiveImportance,
           envColor: this.envColor,
           envIntensity: this.envIntensity,

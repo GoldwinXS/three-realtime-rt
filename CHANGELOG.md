@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **ReSTIR GI spatial reuse (v2, experimental).** The `restirGI` pass, shipped in
+  0.5.0 as temporal-only, now takes `restirGISpatialTaps` spatial taps (default
+  `2`, clamp `0..4`; `0` reproduces the exact v1 temporal-only image) of the
+  previous frame's reservoirs after the temporal merge, in a single fused
+  spatiotemporal pass — no new passes or ping-pongs. Each adopted neighbour
+  sample is reweighted by the reconnection solid-angle→area Jacobian
+  `|J| = (cosPhi_q/cosPhi_r)·(d_r²/d_q²)` (clamped to `[0.1, 10]`), gated by uv
+  bounds + the temporal plane-distance validation + a non-empty reservoir, and
+  finalized with one any-hit visibility ray at the reconnection point so reused
+  samples cannot leak light through walls. The reconnection hit normal the
+  Jacobian needs is bit-packed into the reservoir-position `.w` alongside `M`
+  (8-bit `M` + 12+12-bit octahedral normal), keeping the pass at its 16-sampler
+  ceiling. Mean matches taps-`0`; per-frame variance is lower. Wired as the
+  `restirGISpatialTaps` lib option / live property.
+
 ## 0.5.0 — 2026-07-22
 
 - **Fix: TAA wobble at reduced canvas scale** (`taaJitterScale`). The sub-pixel

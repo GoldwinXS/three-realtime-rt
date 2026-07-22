@@ -174,6 +174,13 @@ export interface RealtimeRaytracerOptions {
   /** EXPERIMENTAL — temporal M-cap for the ReSTIR GI reservoir (default 20). */
   restirGIMCap?: number;
   /**
+   * EXPERIMENTAL — ReSTIR GI (v2) spatial-reuse taps per frame, taken after the
+   * temporal merge from the previous frame's reservoirs (reconnection-Jacobian
+   * reweighted, with a final visibility ray to prevent leaks). Clamped to 0..4;
+   * `0` reproduces v1 temporal-only behaviour. Default 2.
+   */
+  restirGISpatialTaps?: number;
+  /**
    * Global fallback index of refraction for transmissive surfaces. A
    * `MeshPhysicalMaterial.ior` overrides this per material for fully-transmissive
    * glass (encoded in the G-buffer, supported range [1.0, 1.98]); `material.ior`
@@ -415,6 +422,8 @@ export class RealtimeRaytracer {
   restirGI: boolean;
   /** EXPERIMENTAL — temporal M-cap for the ReSTIR GI reservoir. */
   restirGIMCap: number;
+  /** EXPERIMENTAL — ReSTIR GI (v2) spatial-reuse taps per frame (0..4, 0 = v1). */
+  restirGISpatialTaps: number;
   /** Procedural-sky state. */
   sky: SkyState;
   /** Distance-fog state. */

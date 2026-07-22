@@ -39,7 +39,8 @@ ${SKY_GLSL}
 #define MAX_LIGHTS ${MAX_LIGHTS}
 #define PI 3.14159265358979
 
-// MRT: [0] reservoir hit position + M (fp32), [1] reservoir radiance + W,
+// MRT: [0] reservoir hit position + packed(M, oct-normal) (fp32),
+//      [1] reservoir radiance + W,
 //      [2] resolved demodulated GI irradiance (consumed by the denoise add).
 layout(location = 0) out vec4 outResPos;
 layout(location = 1) out vec4 outResRad;
@@ -78,6 +79,7 @@ uniform float uFrame;
 uniform float uEps;
 uniform float uFireflyClamp;
 uniform float uMCap;        // temporal M-cap (staleness limit)
+uniform int uSpatialTaps;   // spatial reuse taps after the temporal merge (0 = v1)
 
 uniform vec3 uEnvColor;
 uniform float uEnvIntensity;
@@ -116,6 +118,41 @@ vec4 fetchBlueNoise() {
 }
 
 float luminance(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// ---------- reservoir .w bit-packing: M (8 bit) + oct-normal (12+12 bit) ------
+// The RGBA32F reservoir-position attachment is at the pass's hard 16-sampler
+// ceiling, so the reconnection normal n_s (needed by the spatial Jacobian) is
+// bit-packed into the SAME .w channel that holds M. fp32 + NEAREST round-trips
+// the bits exactly. Layout: (uint(M)&0xFF)<<24 | octX12<<12 | octY12. M caps at
+// 255 (clamped on write). 12 bits/axis is ample for a cosine-weighted normal.
+vec2 signNotZero(vec2 v) {
+  return vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+}
+void octEncode12(vec3 n, out uint ox, out uint oy) {
+  n /= (abs(n.x) + abs(n.y) + abs(n.z));
+  vec2 e = n.z >= 0.0 ? n.xy : (1.0 - abs(n.yx)) * signNotZero(n.xy);
+  vec2 u = clamp(e * 0.5 + 0.5, 0.0, 1.0);
+  ox = uint(u.x * 4095.0 + 0.5) & 0xFFFu;
+  oy = uint(u.y * 4095.0 + 0.5) & 0xFFFu;
+}
+vec3 octDecode12(uint ox, uint oy) {
+  vec2 e = vec2(float(ox), float(oy)) / 4095.0 * 2.0 - 1.0;
+  vec3 v = vec3(e.xy, 1.0 - abs(e.x) - abs(e.y));
+  if (v.z < 0.0) v.xy = (1.0 - abs(v.yx)) * signNotZero(v.xy);
+  return normalize(v);
+}
+// Pack M (clamped to [0,255]) + hit normal into a single fp32 word.
+float packMN(float M, vec3 n) {
+  uint ox, oy;
+  octEncode12(n, ox, oy);
+  uint mi = uint(clamp(M, 0.0, 255.0)) & 0xFFu;
+  return uintBitsToFloat((mi << 24) | (ox << 12) | oy);
+}
+void unpackMN(float w, out float M, out vec3 n) {
+  uint packed = floatBitsToUint(w);
+  M = float((packed >> 24) & 0xFFu);
+  n = octDecode12((packed >> 12) & 0xFFFu, packed & 0xFFFu);
+}
 
 void orthoBasis(vec3 n, out vec3 t, out vec3 b) {
   float s = n.z >= 0.0 ? 1.0 : -1.0;
@@ -268,10 +305,13 @@ vec3 sampleOneAny(vec3 P, vec3 N) {
 // inline path), plus the world-space hit position so temporal reuse can
 // recompute the geometry term at the reprojected (same) surface. On a miss the
 // "hit" is a far point along the ray, so the reused direction is recoverable.
-vec3 traceRadianceGI(vec3 ro, vec3 rd, out vec3 hitPos) {
+vec3 traceRadianceGI(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 hitNormal) {
   uvec4 fi; vec3 bary; float dist; bool isDyn;
   if (!traceBoth(ro, rd, fi, bary, dist, isDyn)) {
     hitPos = ro + rd * 1.0e4;
+    // Sky "hit" has no surface; face the normal back along the ray so a
+    // neighbour reconnecting to this point sees a sane, positive cosPhi.
+    hitNormal = -rd;
     return uSkyEnabled
       ? skyColor(rd, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity)
       : uEnvColor * uEnvIntensity;
@@ -285,6 +325,7 @@ vec3 traceRadianceGI(vec3 ro, vec3 rd, out vec3 hitPos) {
   if (dot(hN, rd) > 0.0) hN = -hN;
   vec3 hP = ro + rd * dist;
   hitPos = hP;
+  hitNormal = hN;
   vec3 Ld = sampleOneAny(hP + hN * uEps, hN);
   // Diffuse GI drops NEE-listed (static) emitter emission so it isn't double
   // counted (same rule as RTLightingPass.traceRadiance with specular=false).
@@ -339,7 +380,8 @@ void main() {
   // --- fresh candidate: one cosine-hemisphere GI bounce, shaded like inline ---
   vec3 wi = cosineSampleHemisphere(N, rand2());
   vec3 hitPos;
-  vec3 rad = traceRadianceGI(P + N * uEps, wi, hitPos);
+  vec3 hitNormal;
+  vec3 rad = traceRadianceGI(P + N * uEps, wi, hitPos, hitNormal);
   // Match the inline firefly clamp, which is applied to indirect (= L_i) so
   // the biased mean of the two paths agrees.
   float rl = luminance(rad);
@@ -354,72 +396,191 @@ void main() {
   float M = 1.0;
   vec3 selRad = rad;
   vec3 selPos = hitPos;
+  vec3 selNormal = hitNormal;   // n_s of the selected sample (packed into .w)
+
+  // Reprojected UV of this pixel's primary point into the previous frame; shared
+  // by the temporal merge and the spatial taps below.
+  vec4 clip = uPrevViewProj * vec4(P, 1.0);
+  vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
+  bool haveReproj = clip.w > 0.0 &&
+    prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0;
+  // Same plane-distance tolerance the temporal validation uses (reused by taps).
+  float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
 
   // --- temporal reuse: reproject P, validate the SAME surface, merge history ---
-  vec4 clip = uPrevViewProj * vec4(P, 1.0);
-  if (clip.w > 0.0) {
-    vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
-    if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
-      vec4 pPos = texture(uPrevGWorldPos, prevUv);
-      float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
-      if (pPos.w > 0.5 && abs(dot(P - pPos.xyz, N)) < tol) {
-        vec4 hp = texture(uPrevResPos, prevUv);  // hitPos.xyz + M
-        vec4 hr = texture(uPrevResRad, prevUv);  // radiance.rgb + W
-        float Mprev = hp.w;
-        float Wprev = hr.w;
-        if (Mprev > 0.0 && Wprev > 0.0) {
-          vec3 radPrev = hr.rgb;
-          vec3 hitPrev = hp.xyz;
-          // Re-evaluate the target at the CURRENT surface (reconnect at the
-          // stored hit point). Same world point P (validated), so no Jacobian.
-          vec3 dp = hitPrev - P;
-          float dl = length(dp);
-          float cosPrev = dl > 1e-5 ? max(dot(N, dp / dl), 0.0) : 0.0;
-          float pHatPrev = luminance(radPrev) * cosPrev;
-          float Mc = min(Mprev, uMCap);
-          // Combine reservoirs: w = p_hat_current(sample) * W_prev * M_prev.
-          float w = pHatPrev * Wprev * Mc;
-          wSum += w;
-          M += Mc;
-          if (w > 0.0 && rand() * wSum < w) {
-            selRad = radPrev;
-            selPos = hitPrev;
-          }
+  if (haveReproj) {
+    vec4 pPos = texture(uPrevGWorldPos, prevUv);
+    if (pPos.w > 0.5 && abs(dot(P - pPos.xyz, N)) < tol) {
+      vec4 hp = texture(uPrevResPos, prevUv);  // hitPos.xyz + packed(M, n_s)
+      vec4 hr = texture(uPrevResRad, prevUv);  // radiance.rgb + W
+      float Mprev; vec3 nPrev;
+      unpackMN(hp.w, Mprev, nPrev);
+      float Wprev = hr.w;
+      if (Mprev > 0.0 && Wprev > 0.0) {
+        vec3 radPrev = hr.rgb;
+        vec3 hitPrev = hp.xyz;
+        // Re-evaluate the target at the CURRENT surface (reconnect at the
+        // stored hit point). Same world point P (validated), so no Jacobian.
+        vec3 dp = hitPrev - P;
+        float dl = length(dp);
+        float cosPrev = dl > 1e-5 ? max(dot(N, dp / dl), 0.0) : 0.0;
+        float pHatPrev = luminance(radPrev) * cosPrev;
+        float Mc = min(Mprev, uMCap);
+        // Combine reservoirs: w = p_hat_current(sample) * W_prev * M_prev.
+        float w = pHatPrev * Wprev * Mc;
+        wSum += w;
+        M += Mc;
+        if (w > 0.0 && rand() * wSum < w) {
+          selRad = radPrev;
+          selPos = hitPrev;
+          selNormal = nPrev;
         }
       }
     }
   }
 
-  // --- finalize: recompute p_hat(selected) at this surface, form W, resolve ---
+  // Snapshot the TEMPORAL-only reservoir. This — not the spatially-merged one — is
+  // what gets STORED as history, exactly as v1 did. Spatial reuse below is terminal
+  // (it only sharpens THIS frame's resolved GI output); it is deliberately NOT fed
+  // back into the stored reservoir. The reconnection shift carries a small target
+  // -function bias, and the high default M-cap's temporal feedback would amplify it
+  // by ~1/(1-M/(M+1)) ≈ (M+1)x, so storing the merged reservoir makes the GI drift
+  // frame-over-frame (dark in grazing views, blown out in steep ones). Keeping the
+  // history temporal-only — the pattern the shipped direct-light ReSTIR uses, where
+  // "history feeds back from the TEMPORAL stage only" — keeps it stable and
+  // unbiased while still delivering the per-frame spatial variance reduction into
+  // the denoiser. taps==0 leaves selRad/M/wSum untouched, so this is a no-op there.
+  vec3 selRadT = selRad; vec3 selPosT = selPos; vec3 selNormalT = selNormal;
+  float wSumT = wSum; float MT = M;
+
+  // --- spatial reuse (v2): fused spatiotemporal, streamed RIS over K taps of the
+  // PREVIOUS frame's reservoir textures around the reprojected UV. Each adopted
+  // neighbour sample S = (hit x_s, hit normal n_s, radiance L_s) is reweighted by
+  // the reconnection Jacobian |J| = (cosPhi_q/cosPhi_r)*(d_r^2/d_q^2). x_q is this
+  // pixel's primary point; x_r is the NEIGHBOUR's primary point read from the
+  // previous frame's gWorldPos. A final visibility ray (below) prevents leaks. ---
+  if (haveReproj && uSpatialTaps > 0) {
+    vec2 texel = 1.0 / vec2(textureSize(uPrevResPos, 0));
+    for (int k = 0; k < 4; k++) {
+      if (k >= uSpatialTaps) break;
+      // Offset: radius uniform in [4, 20] lighting-res pixels, angle from RNG,
+      // decorrelated per frame (gSeed carries uFrame; blue noise is frame-shifted).
+      float ang = rand() * 2.0 * PI;
+      float rad_px = mix(4.0, 20.0, rand());
+      vec2 nUv = prevUv + vec2(cos(ang), sin(ang)) * rad_px * texel;
+      // (a) neighbour uv in [0,1].
+      if (nUv.x < 0.0 || nUv.x > 1.0 || nUv.y < 0.0 || nUv.y > 1.0) continue;
+      // (b) plane-distance validation of the neighbour's PREVIOUS primary point
+      // against q's plane (same tolerance as the temporal validation).
+      vec4 nPrimary = texture(uPrevGWorldPos, nUv);   // x_r + validFlag
+      if (nPrimary.w < 0.5 || abs(dot(P - nPrimary.xyz, N)) >= tol) continue;
+      vec4 nhp = texture(uPrevResPos, nUv);   // x_s + packed(M_r, n_s)
+      vec4 nhr = texture(uPrevResRad, nUv);   // L_s + W_r
+      float Mr; vec3 nS;
+      unpackMN(nhp.w, Mr, nS);
+      float Wr = nhr.w;
+      // (c) skip reservoirs with M == 0 or W <= 0.
+      if (Mr <= 0.0 || Wr <= 0.0) continue;
+      vec3 xS = nhp.xyz;
+      vec3 Ls = nhr.rgb;
+      vec3 xR = nPrimary.xyz;
+
+      // Reconnection Jacobian for q adopting the neighbour's sample.
+      float dq = length(xS - P);
+      float dr = length(xS - xR);
+      if (dq < 1e-5 || dr < 1e-5) continue;
+      float cosPhiQ = max(dot(nS, normalize(P - xS)), 1e-4);
+      float cosPhiR = max(dot(nS, normalize(xR - xS)), 1e-4);
+      float J = (cosPhiQ / cosPhiR) * (dr * dr) / (dq * dq);
+      J = clamp(J, 0.1, 10.0);   // grazing-angle firefly guard
+
+      // Target function at q (same shape the pass already uses).
+      float cosQ = max(dot(N, normalize(xS - P)), 0.0);
+      float pHatQ = luminance(Ls) * cosQ;
+      // Invalid-shift reject: if the neighbour's hit x_s lies below q's shading
+      // hemisphere (cosQ == 0) or carries no radiance, the reconnected target is
+      // zero — the shift could never have produced this sample at q, so it must
+      // NOT add confidence weight. Skipping the whole tap (not just its w) keeps
+      // the M normalization honest; adding Mc here while w == 0 would inflate M
+      // without wSum and systematically darken the GI. (The temporal path never
+      // trips this — same surface point, always a valid, non-zero target.)
+      if (pHatQ <= 0.0) continue;
+      float Mc = min(Mr, uMCap);
+      float w = pHatQ * J * Wr * Mc;
+      wSum += w;
+      M += Mc;
+      if (w > 0.0 && rand() * wSum < w) {
+        selRad = Ls;
+        selPos = xS;
+        selNormal = nS;
+      }
+    }
+  }
+
+  // --- finalize OUTPUT: recompute p_hat(selected) at this surface from the
+  // SPATIALLY-merged reservoir, form W, resolve the GI for this frame. ---
   vec3 sd = selPos - P;
   float sl = length(sd);
   float selCos = sl > 1e-5 ? max(dot(N, sd / sl), 0.0) : 0.0;
   float pHatSel = luminance(selRad) * selCos;
   float W = (M > 0.0 && pHatSel > 0.0) ? wSum / (M * pHatSel) : 0.0;
 
-  vec3 gi = selRad * (selCos / PI) * W;   // demodulated indirect irradiance
+  // --- final visibility (mandatory): ONE any-hit occlusion ray from x_q toward
+  // x_s. If the reconnection point is blocked, drop THIS FRAME's OUTPUT estimate
+  // (Wout=0) — this is what stops reused samples leaking light through walls.
+  // occluded() already trims 2*eps off maxDist to avoid self-intersecting the far
+  // surface. The STORED reservoir keeps the un-occluded W: the sample is real and
+  // may be visible to a neighbour, so each pixel re-tests visibility from its own
+  // position. Storing the zeroed W instead would bleed energy out of the reservoir
+  // over frames (spatial samples fail visibility more often than temporal ones,
+  // and the zero would propagate to neighbours), darkening the GI. ---
+  // Gated on uSpatialTaps > 0: the temporal-only path reuses at the SAME surface
+  // point, whose sample is visible by construction, so v1 (taps==0) needs no
+  // occlusion ray and stays byte-identical. Spatial reconnections to a neighbour's
+  // hit point are the ones that can pierce a wall, so they get the visibility test.
+  float Wout = W;
+  if (uSpatialTaps > 0 && Wout > 0.0 && sl > 1e-5) {
+    if (occluded(P + N * uEps, sd / sl, sl)) Wout = 0.0;
+  }
+
+  vec3 gi = selRad * (selCos / PI) * Wout;   // demodulated indirect irradiance
   float gil = luminance(gi);
   if (gil > uFireflyClamp) gi *= uFireflyClamp / gil;  // matches inline safety net
   if (any(isnan(gi)) || any(isinf(gi))) gi = vec3(0.0);
-  if (any(isnan(selRad)) || any(isinf(selRad))) { selRad = vec3(0.0); W = 0.0; }
 
-  outResPos = vec4(selPos, M);
-  outResRad = vec4(selRad, W);
+  // --- STORE the TEMPORAL-only reservoir as history (see snapshot note above).
+  // Resolve its own W from the temporal-merged wSum/M so the stored W is valid for
+  // next frame's temporal AND spatial reuse. For taps==0 this is exactly the v1
+  // reservoir. A NaN sample is scrubbed so it can't poison the history. ---
+  vec3 sdT = selPosT - P;
+  float slT = length(sdT);
+  float selCosT = slT > 1e-5 ? max(dot(N, sdT / slT), 0.0) : 0.0;
+  float pHatSelT = luminance(selRadT) * selCosT;
+  float WT = (MT > 0.0 && pHatSelT > 0.0) ? wSumT / (MT * pHatSelT) : 0.0;
+  if (any(isnan(selRadT)) || any(isinf(selRadT))) { selRadT = vec3(0.0); WT = 0.0; }
+
+  outResPos = vec4(selPosT, packMN(MT, selNormalT));
+  outResRad = vec4(selRadT, WT);
   outGI = vec4(gi, 1.0);
 }
 `;
 
 /**
- * EXPERIMENTAL ReSTIR GI (v1, temporal-only). Per-pixel reservoirs reuse the
- * 1-bounce GI sample across frames at the reprojected same-surface point. Runs
- * at lighting resolution with its OWN sampler budget (16: 8 BVH + 2 attr + 1
- * scene-data + gWorldPos + gNormalMetal + prevGWorldPos + 2 reservoir history),
+ * EXPERIMENTAL ReSTIR GI (v2, fused spatiotemporal). Per-pixel reservoirs reuse
+ * the 1-bounce GI sample across frames at the reprojected same-surface point,
+ * then take K spatial taps (`restirGISpatialTaps`, default 2; 0 = exact v1
+ * temporal-only behaviour) of the previous frame's reservoirs around that UV.
+ * Runs at lighting resolution with its OWN sampler budget (16: 8 BVH + 2 attr +
+ * 1 scene-data + gWorldPos + gNormalMetal + prevGWorldPos + 2 reservoir history),
  * independent of the lighting pass. render() returns a resolved, demodulated GI
  * irradiance texture whose mean matches the inline GI path (see main()).
  *
- * NO spatial reuse in v1: spatial reuse needs the solid-angle->area Jacobian and
- * is where implementations go subtly wrong. Temporal reuse at the same surface
- * point does not.
+ * Spatial reuse applies the reconnection solid-angle->area Jacobian per adopted
+ * neighbour and a final visibility ray at the reconnection point (anti-leak); the
+ * hit normal n_s it needs is bit-packed into the reservoir-position .w alongside
+ * M (the pass is at the 16-sampler ceiling and can add none). Taps are gated by
+ * uv bounds, a plane-distance check of the neighbour's previous primary point,
+ * and a non-empty reservoir, so it stays unbiased and does not leak.
  */
 export class GIReservoirPass {
   constructor(width, height) {
@@ -454,6 +615,7 @@ export class GIReservoirPass {
         uEps: { value: 1e-3 },
         uFireflyClamp: { value: 4.0 },
         uMCap: { value: 20 },
+        uSpatialTaps: { value: 2 },
         uEnvColor: { value: new THREE.Color(0.03, 0.04, 0.06) },
         uEnvIntensity: { value: 1.0 },
         uSkyEnabled: { value: false },
@@ -544,6 +706,7 @@ export class GIReservoirPass {
     u.uEps.value = eps;
     u.uFireflyClamp.value = params.fireflyClamp;
     u.uMCap.value = params.mCap;
+    u.uSpatialTaps.value = params.spatialTaps;
     u.uEmissiveCDF.value = params.emissiveCDF;
     u.uEnvColor.value.copy(params.envColor);
     u.uEnvIntensity.value = params.envIntensity;
