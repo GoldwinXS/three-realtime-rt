@@ -424,8 +424,15 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.compiled = null;
     this.frame = 0;
 
-    /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular */
+    /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular, 7 bvh cost */
     this.outputMode = 0;
+    /**
+     * BVH-cost heatmap scale (outputMode 7): the per-pixel shadow-ray node-visit
+     * count is multiplied by this before the palette, so 1/costScale visits map
+     * to the hot (white) end. Default 1/96 — ~96 visits saturate. Live-tunable
+     * (the demo's "cost scale" slider drives it).
+     */
+    this.costScale = options.costScale ?? 1 / 96;
     /** Environment (sky) color used for GI rays that miss + composite background. */
     this.envColor = options.envColor ?? new THREE.Color(0.03, 0.04, 0.06);
     this.envIntensity = options.envIntensity ?? 1.0;
@@ -1035,6 +1042,8 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     rtU.uEnvColor.value.copy(this.envColor);
     rtU.uEnvIntensity.value = this.envIntensity;
     rtU.uEps.value = this.eps;
+    rtU.uCostView.value = this.outputMode === 7;
+    rtU.uCostScale.value = this.costScale;
     rtU.uTemporalReprojection.value = this.temporalReprojection;
     rtU.uMaxHistory.value = this.maxHistory;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
@@ -1123,8 +1132,10 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // 3. denoise (display-only: history keeps accumulating raw samples). The
     // experimental ReSTIR GI (giTex) is added on the first à-trous iteration —
     // downstream of the lighting pass's temporal history, so it never
-    // double-counts through it.
-    if (this.denoise && this.denoiseIterations > 0) {
+    // double-counts through it. The bvh-cost heatmap (mode 7) is a per-pixel
+    // debug signal, not lighting — the edge-aware blur would smear its bands,
+    // so it bypasses the denoiser (which also keeps the GI add out of mode 7).
+    if (this.denoise && this.denoiseIterations > 0 && this.outputMode !== 7) {
       irradiance = this.denoisePass.render(
         this.renderer,
         irradiance,

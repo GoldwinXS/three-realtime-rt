@@ -234,7 +234,14 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
     selectRow("view", [
       ["composite", 0], ["albedo", 1], ["normals", 2],
       ["irradiance", 3], ["world pos", 4], ["emissive", 5], ["specular", 6],
+      ["bvh cost", 7],
     ], rt.outputMode, (v) => (rt.outputMode = parseInt(v, 10)))
+  );
+  // BVH-cost heatmap scale: the slider is "visits to saturate" (hot/white end),
+  // 32..512; rt.costScale is its reciprocal. Only affects the mode-7 view.
+  rSec.append(
+    slider("cost scale", 32, 512, 16, Math.round(1 / rt.costScale),
+      (x) => `${Number(x).toFixed(0)} hits`, (v) => (rt.costScale = 1 / v))
   );
   panel.append(rSec);
 

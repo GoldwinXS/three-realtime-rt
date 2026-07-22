@@ -30,7 +30,9 @@ uniform vec2 uVolTexelSize;
 uniform bool uVolEnabled;
 uniform vec3 uBackgroundColor;
 // 0 composite, 1 albedo, 2 normal, 3 irradiance (direct+GI), 4 worldPos,
-// 5 emissive, 6 specular
+// 5 emissive, 6 specular, 7 bvh cost (heatmap of shadow-ray node visits — the
+// lighting pass wrote the palette into the irradiance buffer, so it shares the
+// mode-3 display path)
 uniform int uOutputMode;
 
 // joint bilateral upsample (lighting may be rendered below full resolution)
@@ -177,7 +179,9 @@ void main() {
 
   if (uOutputMode == 1) color = albedoRough.rgb;
   else if (uOutputMode == 2) color = N * 0.5 + 0.5;
-  else if (uOutputMode == 3) color = irradiance;
+  // 3 = irradiance, 7 = bvh cost heatmap: both live in the irradiance buffer
+  // (the lighting pass wrote the cost palette there when uCostView was on).
+  else if (uOutputMode == 3 || uOutputMode == 7) color = irradiance;
   else if (uOutputMode == 4) color = fract(wp.xyz * 0.1);
   else if (uOutputMode == 5) color = emissive;
   else if (uOutputMode == 6) color = specular;

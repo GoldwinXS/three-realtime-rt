@@ -185,6 +185,11 @@ export interface RealtimeRaytracerOptions {
   maxHistory?: number;
   /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
   fireflyClamp?: number;
+  /**
+   * BVH-cost heatmap scale for the mode-7 debug view: shadow-ray node-visit
+   * count is multiplied by this before the palette (default 1/96).
+   */
+  costScale?: number;
   /** Reproject accumulated lighting through camera motion. */
   temporalReprojection?: boolean;
   /**
@@ -326,8 +331,14 @@ export class RealtimeRaytracer {
   compiled: CompiledScene | null;
   /** Accumulated frame counter. */
   frame: number;
-  /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular. */
+  /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular, 7 bvh cost. */
   outputMode: number;
+  /**
+   * BVH-cost heatmap scale (outputMode 7): the per-pixel shadow-ray node-visit
+   * count is multiplied by this before the palette (default 1/96 — ~96 visits
+   * saturate to white). Live-tunable.
+   */
+  costScale: number;
 
   /** Resolution scale for the ray traced lighting; assigning reallocates targets. */
   get renderScale(): number;
