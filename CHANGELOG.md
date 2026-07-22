@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **Overscan** (`overscan`, default `0`): render internally at a padded
+  resolution with a proportionally widened field of view, then crop the centre
+  to the canvas on the final on-screen draw. Newly-disoccluded pixels at the
+  leading screen edge during camera motion — which have no temporal history and
+  take several frames to converge — are then born off-screen, hiding the
+  shimmering edge band. Padding fraction per edge (clamped 0–0.25); both axes
+  pad equally so aspect ratio is preserved. Cost is `1 + 2·overscan` per axis
+  (`0.1` → 1.44× the pixels); 0.05–0.1 recommended. Live-assignable like
+  `renderScale` (reallocates targets, resets accumulation). The user's camera is
+  never mutated — the widened projection is applied/restored per frame like the
+  TAA jitter. Every pass runs in the shared padded space; the only crop point is
+  the final draw (the TAA resolve's out-copy, or the composite when TAA is off).
+
 ## 0.3.2 — 2026-07-19
 
 - **Localized fog zones** (`volumetric.zones`): up to 8 world-space AABBs, each

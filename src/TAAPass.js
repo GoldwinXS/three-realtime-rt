@@ -101,12 +101,17 @@ void main() {
 }
 `;
 
+// Copies the resolved frame out. When overscan is active the resolve target is
+// PADDED (larger than the canvas); uCrop (scale.xy, offset.zw) samples its central
+// canvas-sized region so the padded edges — where disocclusion noise is born —
+// stay off-screen. Identity (1,1,0,0) when overscan is 0.
 const copyFrag = /* glsl */ `
 precision highp float;
 layout(location = 0) out vec4 outColor;
 in vec2 vUv;
 uniform sampler2D uTex;
-void main() { outColor = vec4(texture(uTex, vUv).rgb, 1.0); }
+uniform vec4 uCrop;
+void main() { outColor = vec4(texture(uTex, vUv * uCrop.xy + uCrop.zw).rgb, 1.0); }
 `;
 
 /**
@@ -145,7 +150,10 @@ export class TAAPass {
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: copyFrag,
-      uniforms: { uTex: { value: null } },
+      uniforms: {
+        uTex: { value: null },
+        uCrop: { value: new THREE.Vector4(1, 1, 0, 0) },
+      },
       depthTest: false,
       depthWrite: false,
     });
@@ -217,8 +225,12 @@ export class TAAPass {
    * @param prevJitterUv last frame's projection jitter in UV space
    * @param outputTarget where the resolved frame goes (null = screen); lets a
    *                     post pass (god rays) run after the resolve
+   * @param crop         overscan central-crop transform (THREE.Vector4 scale.xy /
+   *                     offset.zw) applied by the out-copy; null = identity. The
+   *                     resolve itself runs in full padded space; only the copy
+   *                     to `outputTarget` crops to the canvas.
    */
-  render(renderer, currentColor, gbuffer, prevViewProj, jitterUv, prevJitterUv, blend, outputTarget = null) {
+  render(renderer, currentColor, gbuffer, prevViewProj, jitterUv, prevJitterUv, blend, outputTarget = null, crop = null) {
     const u = this.material.uniforms;
     u.uCurrent.value = currentColor;
     u.uHistory.value = this.targetB.texture; // previous resolved
@@ -234,9 +246,13 @@ export class TAAPass {
     renderer.setRenderTarget(this.targetA);
     renderer.render(this.scene, this.camera);
 
-    // Copy the resolved frame out (screen, or a post-pass input target).
+    // Copy the resolved frame out (screen, or a post-pass input target). The
+    // overscan crop lives here — the resolve above stays in full padded space so
+    // history reprojection and the neighbourhood clamp see the whole padded image.
     this.quad.material = this.copyMaterial;
     this.copyMaterial.uniforms.uTex.value = this.targetA.texture;
+    if (crop) this.copyMaterial.uniforms.uCrop.value.copy(crop);
+    else this.copyMaterial.uniforms.uCrop.value.set(1, 1, 0, 0);
     renderer.setRenderTarget(outputTarget);
     renderer.render(this.scene, this.camera);
 

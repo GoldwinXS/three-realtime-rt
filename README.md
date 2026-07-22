@@ -278,6 +278,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | Option | Default | What |
 |--------|---------|------|
 | `renderScale` | `0.5` | Lighting resolution vs. the G-buffer. `1.0` = max quality. |
+| `overscan` | `0` | Render past the canvas edges and crop the centre back, so leading-edge disocclusion noise during camera motion is born off-screen. Padding fraction per edge (0–0.25); `0.1` costs 1.44× the pixels. See *Edge convergence and overscan*. |
 | `taa` | `true` | Temporal anti-aliasing (jitter + neighbourhood clamp). |
 | `denoise` | `true` | Edge-aware à-trous denoiser. |
 | `gi` | `true` | 1-bounce global illumination (vs. direct-only). |
@@ -299,6 +300,36 @@ Per-light: set `light.userData.rtRadius` for soft-shadow size. Set
 rasterizes and gets lit — useful for water / translucent surfaces).
 Transparent materials never act as occluders (a glass case shouldn't cast an
 opaque shadow); `alphaTest` cut-outs still do.
+
+## Edge convergence and overscan
+
+Lighting is accumulated over time (temporal reprojection). When the camera
+moves, pixels newly revealed at the **leading screen edge** have no history to
+reproject from, so they start from a single noisy sample and take several frames
+to converge — a shimmering band that rides the edge you are turning toward.
+
+`overscan` hides it by rendering *bigger than the screen*. Every internal pass
+(G-buffer, lighting, denoise, volumetric, composite, TAA history) runs at a
+padded resolution with a proportionally **widened field of view**, and only the
+final on-screen draw crops the central canvas-sized region out. Disoccluded
+pixels are then born in the padding — off-screen — and have already converged by
+the time the camera turns far enough to bring them into view.
+
+```js
+const rt = new RealtimeRaytracer(renderer, { overscan: 0.1 });
+// or live: rt.overscan = 0.05;  (reallocates targets; resets accumulation)
+```
+
+`overscan` is the padding fraction **per edge**. `0.1` on a 1000×600 canvas
+renders 1200×720 internally and crops the central 1000×600 — both axes pad by
+the same fraction, so aspect ratio is preserved and the widened frustum stays
+centred on your camera's. The cost is purely the extra pixels: `1 + 2·overscan`
+per axis, so **0.1 → 1.44×** the work of every pass. **0.05–0.1** is the useful
+range; more just spends pixels on padding you will rarely turn fast enough to
+need. Changing it live reallocates the targets and resets accumulation, so treat
+it as a settings-time knob rather than a per-frame one. The camera you pass to
+`render()` is never mutated — the widened projection is applied and restored
+internally each frame, exactly like the TAA jitter.
 
 ## Running everywhere (capability tiers)
 

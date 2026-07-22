@@ -35,6 +35,11 @@ uniform bool uUpsample;
 uniform vec2 uIrrTexelSize;
 uniform vec3 uCameraPos;
 
+// Overscan crop: maps this on-screen pixel's UV into the central region of the
+// padded internal image (scale.xy, offset.zw). Identity (1,1,0,0) when overscan
+// is 0 or when compositing into the offscreen target that TAA later crops.
+uniform vec4 uCrop;
+
 // distance fog (applied in linear space, before tonemap)
 uniform bool uFogEnabled;
 uniform vec3 uFogColor;
@@ -106,17 +111,20 @@ vec3 sampleIrradiance(vec2 uv, vec3 P, vec3 N) {
 }
 
 void main() {
-  vec4 wp = texture(uGWorldPos, vUv);
-  vec4 albedoRough = texture(uGAlbedoRough, vUv);
-  vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
-  vec3 irradiance = sampleIrradiance(vUv, wp.xyz, N);
-  vec3 emissive = texture(uGEmissive, vUv).rgb;
+  // Sample the padded internal image at the cropped UV (identity when no crop).
+  // Everything below lives in padded space, so one remap here covers all taps.
+  vec2 uv = vUv * uCrop.xy + uCrop.zw;
+  vec4 wp = texture(uGWorldPos, uv);
+  vec4 albedoRough = texture(uGAlbedoRough, uv);
+  vec3 N = normalize(texture(uGNormalMetal, uv).xyz);
+  vec3 irradiance = sampleIrradiance(uv, wp.xyz, N);
+  vec3 emissive = texture(uGEmissive, uv).rgb;
 
   vec3 color;
   if (wp.w < 0.5) {
     // Background: the procedural sky (with sun), else fog colour, else flat.
     if (uSkyEnabled) {
-      color = skyColor(viewRay(vUv), uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity);
+      color = skyColor(viewRay(uv), uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity);
     } else {
       color = uFogEnabled ? uFogColor : uBackgroundColor;
     }
@@ -130,15 +138,15 @@ void main() {
     if (uVolEnabled) {
       vec2 o1 = uVolTexelSize * 1.5;
       vec2 o2 = uVolTexelSize * 3.5;
-      vec3 vol = texture(uVolumetric, vUv).rgb * 0.24
-        + texture(uVolumetric, vUv + vec2( o1.x,  o1.y)).rgb * 0.12
-        + texture(uVolumetric, vUv + vec2(-o1.x,  o1.y)).rgb * 0.12
-        + texture(uVolumetric, vUv + vec2( o1.x, -o1.y)).rgb * 0.12
-        + texture(uVolumetric, vUv + vec2(-o1.x, -o1.y)).rgb * 0.12
-        + texture(uVolumetric, vUv + vec2( o2.x,  0.0 )).rgb * 0.07
-        + texture(uVolumetric, vUv + vec2(-o2.x,  0.0 )).rgb * 0.07
-        + texture(uVolumetric, vUv + vec2( 0.0 ,  o2.y)).rgb * 0.07
-        + texture(uVolumetric, vUv + vec2( 0.0 , -o2.y)).rgb * 0.07;
+      vec3 vol = texture(uVolumetric, uv).rgb * 0.24
+        + texture(uVolumetric, uv + vec2( o1.x,  o1.y)).rgb * 0.12
+        + texture(uVolumetric, uv + vec2(-o1.x,  o1.y)).rgb * 0.12
+        + texture(uVolumetric, uv + vec2( o1.x, -o1.y)).rgb * 0.12
+        + texture(uVolumetric, uv + vec2(-o1.x, -o1.y)).rgb * 0.12
+        + texture(uVolumetric, uv + vec2( o2.x,  0.0 )).rgb * 0.07
+        + texture(uVolumetric, uv + vec2(-o2.x,  0.0 )).rgb * 0.07
+        + texture(uVolumetric, uv + vec2( 0.0 ,  o2.y)).rgb * 0.07
+        + texture(uVolumetric, uv + vec2( 0.0 , -o2.y)).rgb * 0.07;
       color += vol;
     }
     if (uFogEnabled) {
@@ -180,6 +188,7 @@ export class CompositePass {
         uUpsample: { value: false },
         uIrrTexelSize: { value: new THREE.Vector2() },
         uCameraPos: { value: new THREE.Vector3() },
+        uCrop: { value: new THREE.Vector4(1, 1, 0, 0) },
         uFogEnabled: { value: false },
         uFogColor: { value: new THREE.Color(0.5, 0.6, 0.7) },
         uFogDensity: { value: 0.05 },
@@ -202,13 +211,18 @@ export class CompositePass {
     this.scene.add(this.quad);
   }
 
-  render(renderer, irradianceTexture, gbuffer, background, target = null) {
+  // `crop` is the overscan central-crop transform (THREE.Vector4 scale.xy /
+  // offset.zw); pass null for no crop (identity) — used when compositing into the
+  // padded offscreen target that TAA crops later.
+  render(renderer, irradianceTexture, gbuffer, background, target = null, crop = null) {
     const u = this.material.uniforms;
     u.uIrradiance.value = irradianceTexture;
     u.uGAlbedoRough.value = gbuffer.albedoRough;
     u.uGNormalMetal.value = gbuffer.normalMetal;
     u.uGWorldPos.value = gbuffer.worldPos;
     u.uGEmissive.value = gbuffer.emissive;
+    if (crop) u.uCrop.value.copy(crop);
+    else u.uCrop.value.set(1, 1, 0, 0);
     if (background && background.isColor) {
       u.uBackgroundColor.value.copy(background);
     }
