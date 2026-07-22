@@ -617,6 +617,19 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * the v1 temporal-only behaviour. Default 2.
      */
     this.restirGISpatialTaps = options.restirGISpatialTaps ?? 2;
+    /**
+     * EXPERIMENTAL — ReSTIR GI reservoir-sample validation period. Every frame a
+     * rotating 1-in-N subset of pixels (decorrelated by a per-pixel hash) re-aims
+     * its ONE candidate ray at the reservoir's STORED hit instead of a fresh
+     * cosine bounce and re-shades it; the reservoir is killed (so fresh candidates
+     * rebuild) when the geometry moved or the re-shaded target collapsed to
+     * near-black (a light switched off), and left untouched otherwise. This reuses
+     * the existing candidate trace (no extra bounce rays) and is the fix for stale
+     * bounce light: a switched-off light stops haunting the reservoir instead of
+     * fading slowly, while a static scene does not drift. `0` disables it
+     * (byte-identical to before the feature); default 8.
+     */
+    this.restirGIValidate = options.restirGIValidate ?? 8;
     this.giReservoirPass = new GIReservoirPass(this._scaledW, this._scaledH);
     this._giMissWarned = false;
 
@@ -1136,6 +1149,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
           fireflyClamp: this.fireflyClamp > 0 ? this.fireflyClamp : 1e6,
           mCap: this.restirGIMCap,
           spatialTaps: Math.max(0, Math.min(4, this.restirGISpatialTaps | 0)),
+          validateInterval: Math.max(0, this.restirGIValidate | 0),
           emissiveCDF: this.emissiveImportance,
           envColor: this.envColor,
           envIntensity: this.envIntensity,

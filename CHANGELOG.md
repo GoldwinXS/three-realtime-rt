@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **ReSTIR GI reservoir-sample validation (experimental).** Fixes stale bounce
+  light: switch a light off and the reservoirs used to keep bouncing its ghost,
+  fading slowly instead of going dark. Every frame a rotating 1-in-N subset of
+  pixels (`restirGIValidate`, default `8`, `0` = off) re-aims its single GI
+  candidate ray AT the reservoir's stored hit instead of a fresh cosine bounce
+  (`dir = normalize(storedHit - P)`) and re-shades it. If the hit distance no
+  longer matches the stored one (geometry moved / occluder / miss) OR the re-shaded
+  target has collapsed to near-black (the light went off), the reservoir is KILLED
+  — the stale temporal term is dropped so the pixel's fresh candidates rebuild from
+  the current scene; otherwise it is left untouched. The kill is deferred to the
+  STORE (the displayed frame still uses the merged history, so a valid pixel never
+  drops out), which keeps a static scene from drifting. The re-shade averages a few
+  NEE samples so the kill fires on a real collapse, not on single-sample shadow
+  noise. Reuses the single existing candidate trace (no extra bounce rays) and adds
+  no samplers; the only added cost is a few shadow rays on the ~1/N validating
+  pixels. `restirGIValidate=0` is byte-identical to before the feature. Wired as the
+  `restirGIValidate` lib option / live property. (The originally-drafted "refresh
+  the stored radiance + rescale W by clamp(pHat_old/pHat_new)" path was implemented
+  and measured to darken static GI ~25% — the single-sample re-shade is heavy-
+  tailed and the reservoir's radiance is RIS-bright-biased — so the kill-only path
+  above is used instead.)
 - **ReSTIR GI spatial reuse (v2, experimental).** The `restirGI` pass, shipped in
   0.5.0 as temporal-only, now takes `restirGISpatialTaps` spatial taps (default
   `2`, clamp `0..4`; `0` reproduces the exact v1 temporal-only image) of the

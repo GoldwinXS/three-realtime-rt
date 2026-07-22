@@ -181,6 +181,17 @@ export interface RealtimeRaytracerOptions {
    */
   restirGISpatialTaps?: number;
   /**
+   * EXPERIMENTAL — ReSTIR GI reservoir-sample validation period. Every frame a
+   * rotating 1-in-N subset of pixels re-aims its single candidate ray at the
+   * reservoir's stored hit (instead of a fresh cosine bounce) and re-shades it;
+   * the reservoir is killed when the geometry moved or the re-shaded target
+   * collapsed to near-black (a light switched off), and left untouched otherwise.
+   * Reuses the existing candidate trace (no extra bounce rays); fixes stale bounce
+   * light (a switched-off light stops haunting the reservoir) without drifting a
+   * static scene. `0` disables it (byte-identical to before the feature). Default 8.
+   */
+  restirGIValidate?: number;
+  /**
    * Global fallback index of refraction for transmissive surfaces. A
    * `MeshPhysicalMaterial.ior` overrides this per material for fully-transmissive
    * glass (encoded in the G-buffer, supported range [1.0, 1.98]); `material.ior`
@@ -424,6 +435,8 @@ export class RealtimeRaytracer {
   restirGIMCap: number;
   /** EXPERIMENTAL — ReSTIR GI (v2) spatial-reuse taps per frame (0..4, 0 = v1). */
   restirGISpatialTaps: number;
+  /** EXPERIMENTAL — ReSTIR GI reservoir-sample validation period (0 = off, default 8). */
+  restirGIValidate: number;
   /** Procedural-sky state. */
   sky: SkyState;
   /** Distance-fog state. */

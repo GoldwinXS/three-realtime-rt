@@ -73,7 +73,7 @@ async function main() {
 
   // 2. Renderer + raytracer. The raytracer takes over lighting; three.js still
   //    rasterizes primary visibility (the G-buffer) for free.
-  const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: SELFTEST });
+  const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: SELFTEST || PARAMS.has("pdb") });
   // Keep the CANVAS sharp (geometry/texture edges carry readability) and let
   // the adaptive governor cut cost on the lighting side instead. Phones get up
   // to 1.5× DPR — pixelRatio 1 on a 3× phone screen reads as mush.
@@ -374,6 +374,13 @@ async function main() {
     rt.taaJitterScale = s;
   };
   const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setWindows, setCanvasScale, canvasScale });
+
+  // Test/automation surface (also read by scripts/selftest.mjs). The raytracer
+  // instance carries all live properties (gi, restirGI, restirGIValidate, …);
+  // the hooks drive the demo-owned actions (window count, feature toggles) that
+  // are not raytracer properties.
+  window.RT = rt;
+  window.RTDEMO = { rt, renderer, setWindows, setFeature, setExtraLights, refreshLights, scene, lights, canvas: renderer.domElement };
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;
