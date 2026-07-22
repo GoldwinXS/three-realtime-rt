@@ -281,9 +281,11 @@ the honest map of what actually feeds the traced lighting.
 
 ### Materials
 
-Lighting reads the **first material only** on a multi-material mesh, pulling the
-scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lambert
-/ Phong contribute whatever of those fields they have).
+Lighting reads the scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial`
+(Basic / Lambert / Phong contribute whatever of those fields they have). A
+**multi-material mesh** (`mesh.material` is an array + `geometry.groups`) now feeds
+**every group's** material into both the G-buffer and the BVH (see the *2nd+
+material of a group* row).
 
 | Property | Feeds lighting? | Notes |
 |----------|-----------------|-------|
@@ -299,10 +301,10 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `roughnessMap` | ✅ | `roughness × roughnessMap.g` (three.js convention) — sampled in the G-buffer. |
 | `metalnessMap` | ✅ | `metalness × metalnessMap.b` (a packed ORM texture works — G = roughness, B = metalness). |
 | `normalMap` | ✅ | Perturbs the shading normal via a screen-space cotangent frame (no tangent attribute needed); respects `material.normalScale`. |
-| `clearcoat`, `sheen`, `iridescence` | ❌ | Not modelled. |
-| vertex colors | ❌ | Not read into albedo. |
-| per-material `ior` | ❌ | Refraction uses the single **global** `rt.ior` (default 1.5), never `material.ior`. |
-| 2nd+ material of a group | ❌ | Only `material[0]` of a multi-material mesh reaches the G-buffer and BVH. |
+| `clearcoat`, `sheen`, `iridescence` | ❌ | Per-pixel lobe parameters have **no remaining G-buffer channel** — the 4-MRT WebGL2 guarantee is fully packed (see the `GBufferPass` layout comment), so these stay unmodelled rather than risk corrupting the packing; revisit if a WebGPU backend lands. |
+| vertex colors | ✅ | Geometry `color` attribute (3- or 4-component; `.rgb` used) multiplies into G-buffer albedo, gated so meshes without one render byte-identically. **Caveat:** secondary GI/reflection rays see the flat `material.color` (same as texture maps). |
+| per-material `ior` | ✅ | `MeshPhysicalMaterial.ior` refracts per material, encoded in the packed material word for fully-transmissive glass. Supported range **[1.0, 1.98]** (values clamp; the tight ceiling keeps the packed word clear of the alpha-blend boundary). `rt.ior` is the global fallback (partial-transmission glass + the default); **`material.ior` wins when present**. |
+| 2nd+ material of a group | ✅ | Each group material of a multi-material mesh (`mesh.material` array + `geometry.groups`) is registered separately in the G-buffer **and** the BVH, with per-vertex material indices; emissive group materials also join the NEE area-light list. **Limits:** opaque groups only (a transparent group throws — split it out); not supported on CPU-deforming (`rtDeforming`) meshes (throws). |
 
 ### Lights
 
@@ -339,7 +341,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 
 - **1-bounce GI + direct light.** No multi-bounce diffuse, no caustics, no specular-chain paths.
 - **Reflections** are a single traced bounce into a **diffuse-shaded** view of the world — no recursive mirror-in-mirror; a metal shows its surroundings, not a second full render.
-- **Refraction** is two-interface (front + back) with a single global IOR — convincing glass, not a spectral / dispersive renderer.
+- **Refraction** is two-interface (front + back). IOR is **per material** (`MeshPhysicalMaterial.ior`, encoded in the G-buffer for fully-transmissive glass, range [1.0, 1.98]); `rt.ior` is the global fallback. Convincing glass, not a spectral / dispersive renderer.
 - **Volumetric** is **single-scatter** god rays, not multiple-scattering fog.
 - **Transparency** is a **single-layer deferred blend**: a `transparent` surface writes as the nearest layer of the G-buffer and the lighting pass composites it over the geometry behind by tracing one straight-through ray. The behind-radiance is fully lit (direct + 1-bounce GI) and tinted by the pane's albedo. Overlapping transparent surfaces do **not** inter-sort (only the nearest is kept), and there is no per-pixel back-to-front over-blend of many layers as in raster three.js. Turn it off with `transparency: false` (blend surfaces then render fully opaque).
 
@@ -367,7 +369,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `refraction` | `true` | Traced two-interface refraction for `MeshPhysicalMaterial.transmission` surfaces. |
 | `transparency` | `true` | Alpha-blended transparency: composite `transparent` meshes over the geometry behind them (single-layer, weighted by `opacity`, tinted by albedo). Needs the specular buffer (`specular: true`). Off = they render fully opaque. |
 | `restir` | `true` | ReSTIR direct lighting: per-pixel reservoirs with temporal + spatial reuse, one visibility ray regardless of light count. Flat cost in light count; cuts emissive area-light noise. |
-| `ior` | `1.5` | Index of refraction used by `refraction`. |
+| `ior` | `1.5` | **Global fallback** index of refraction for `refraction`. A `MeshPhysicalMaterial.ior` overrides it per material (fully-transmissive glass, range [1.0, 1.98]); this value applies to partial-transmission glass and as the default. |
 | `volumetric` | *off* | Physically-based god rays: single-scatter fog, one BVH-shadowed light sample per lighting pixel per frame, temporally accumulated. `{ enabled, density, maxDist, zones }`, where `zones` is an optional array of up to 8 AABBs `{ min:[x,y,z], max:[x,y,z], density }` that add localized fog on top of (or instead of) the global `density`. |
 | `stochasticLights` | `true` | One direct shadow ray per pixel per frame (random source) instead of one per light. The governor turns it off once it has scaled resolution up on strong hardware. |
 | `temporalReprojection` | `true` | Keep samples across camera/object motion. |
@@ -543,7 +545,7 @@ is **feature-detected** — it appears only when the loaded build exposes an
 | 6b. Sampling | ✅ | Blue-noise sampling + ReSTIR direct lighting (temporal + spatial reuse) |
 | 6c. Any-hit shadows | ✅ | Unordered early-out BVH traversal for occlusion rays — same image, up to ~2× cheaper shadows |
 | 6d. PBR materials | ✅ | Cook-Torrance GGX dielectric specular + normal/roughness/metalness maps, alpha-blended transparency, deforming (water) meshes, overscan |
-| 7. Next | — | Skinned-mesh (animated) shadows; DDGI irradiance probes; ReSTIR GI (indirect reservoir reuse); WGSL / WebGPU backend; per-material IOR |
+| 7. Next | — | Skinned-mesh (animated) shadows; DDGI irradiance probes; ReSTIR GI (indirect reservoir reuse); WGSL / WebGPU backend |
 
 ## Credits
 

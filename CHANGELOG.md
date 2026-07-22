@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+- **Material-completeness pass** — three gaps in the material-support matrix closed
+  with no new lighting-pass samplers (it sits at the WebGL2-guaranteed 16):
+  - **Vertex colors.** A geometry `color` attribute (3- or 4-component; `.rgb`
+    used) now multiplies into G-buffer albedo. Gated per mesh via three's
+    `USE_COLOR` define — a mesh without a color attribute writes byte-identical
+    albedo. Secondary GI/reflection rays keep the flat `material.color` (same
+    documented caveat as texture maps).
+  - **Per-material IOR.** `MeshPhysicalMaterial.ior` now refracts per material
+    instead of only the global `rt.ior`. Audit finding: primary roughness is
+    stored twice (`gAlbedoRough.w` **and** `gWorldPos.w`), so `gAlbedoRough.w` is
+    dead — but the lighting pass samples only `gWorldPos`/`gNormalMetal` (exactly
+    16 samplers), so reading a third G-buffer texture would exceed the guaranteed
+    limit. Instead the IOR rides the previously-unused **[3,4) sub-band of the
+    packed material word** in `gNormalMetal.w` (which the lighting pass already
+    reads): every existing consumer decodes that band as transmission = 1.0 (full
+    glass) unchanged, and the lighting pass additionally recovers `ior = 1 +
+    (w - 3)`. Range [1.0, 1.98] (the ceiling keeps the word clear of the 4.0
+    alpha-blend boundary under fp16 rounding). `rt.ior` stays the global
+    fallback; `material.ior` wins when present.
+  - **Multi-material groups.** A mesh with `mesh.material` as an array +
+    `geometry.groups` now registers **each group's** material separately in the
+    G-buffer (an array of gbuffer materials, rendered natively by three) and in
+    the BVH (per-vertex material indices de-indexed through `toNonIndexed`
+    order); emissive group materials also join the NEE area-light list. Opaque
+    groups only (a transparent group throws — split it into its own mesh); not
+    supported on CPU-deforming (`rtDeforming`) meshes (throws).
+- **Deliberate omission documented:** `clearcoat` / `sheen` / `iridescence` stay
+  unmodelled because their per-pixel lobe parameters have no remaining G-buffer
+  channel (the 4-MRT WebGL2 guarantee is fully packed) — revisit with a WebGPU
+  backend. The README matrix row now says so instead of a bare "Not modelled".
+- **Demo:** a vertex-painted low-icosahedron sculpture (baked hue-by-height
+  gradient) on a pedestal front-left; the materials-bench glass sphere set to
+  diamond IOR (2.42) to show per-material refraction.
+
 ## 0.4.0 — 2026-07-22
 
 - **Demo:** the room is now a designed gallery (water pool with kerbs under the

@@ -161,7 +161,13 @@ export interface RealtimeRaytracerOptions {
    * matters most to each pixel. Cost is flat in light count.
    */
   restir?: boolean;
-  /** Index of refraction used for transmissive surfaces. */
+  /**
+   * Global fallback index of refraction for transmissive surfaces. A
+   * `MeshPhysicalMaterial.ior` overrides this per material for fully-transmissive
+   * glass (encoded in the G-buffer, supported range [1.0, 1.98]); `material.ior`
+   * wins when present. This value applies to partial-transmission glass and as
+   * the default when no per-material ior is carried.
+   */
   ior?: number;
   /** History length cap: higher = smoother but slower to react. */
   maxHistory?: number;
@@ -332,7 +338,10 @@ export class RealtimeRaytracer {
   refraction: boolean;
   /** Alpha-blended transparency: composite `transparent` meshes over the geometry behind them. */
   transparency: boolean;
-  /** Index of refraction used for transmissive surfaces. */
+  /**
+   * Global fallback index of refraction. `MeshPhysicalMaterial.ior` overrides it
+   * per material for fully-transmissive glass (range [1.0, 1.98]).
+   */
   ior: number;
   /** One stochastic direct shadow ray per pixel per frame instead of one per light. */
   stochasticLights: boolean;

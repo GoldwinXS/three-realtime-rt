@@ -4,6 +4,7 @@ const gbufferVert = /* glsl */ `
 out vec3 vWorldPos;
 out vec3 vWorldNormal;
 out vec2 vUvCoord;
+out vec3 vColor;
 
 uniform mat3 uNormalMatrixWorld;
 
@@ -12,6 +13,19 @@ void main() {
   vWorldPos = wp.xyz;
   vWorldNormal = normalize(uNormalMatrixWorld * normal);
   vUvCoord = uv;
+  // Geometry vertex colours. three's shader prefix declares the built-in
+  // \`color\` attribute (vec3 or vec4) and sets USE_COLOR / USE_COLOR_ALPHA only
+  // when material.vertexColors is on — which we enable ONLY for meshes whose
+  // geometry actually carries a color attribute (see GBufferPass swap). A mesh
+  // without one compiles the else branch (white), so its albedo is byte-identical
+  // to before this varying existed. 4-component colours use .rgb.
+  #if defined( USE_COLOR_ALPHA )
+    vColor = color.rgb;
+  #elif defined( USE_COLOR )
+    vColor = color;
+  #else
+    vColor = vec3(1.0);
+  #endif
   gl_Position = projectionMatrix * viewMatrix * wp;
 }
 `;
@@ -27,11 +41,13 @@ layout(location = 3) out vec4 gEmissive;
 in vec3 vWorldPos;
 in vec3 vWorldNormal;
 in vec2 vUvCoord;
+in vec3 vColor;
 
 uniform vec3 uColor;
 uniform float uRoughness;
 uniform float uMetalness;
 uniform float uTransmission;
+uniform float uIor;
 uniform vec3 uEmissive;
 uniform sampler2D uMap;
 uniform bool uHasMap;
@@ -69,6 +85,7 @@ void main() {
   if (uHasMap) {
     albedo *= texture(uMap, vUvCoord).rgb;
   }
+  albedo *= vColor; // vertex colours (white when the mesh has no color attribute)
   vec3 emissive = uEmissive;
   if (uHasEmissiveMap) {
     emissive *= texture(uEmissiveMap, vUvCoord).rgb;
@@ -87,16 +104,34 @@ void main() {
   float metalness = uMetalness;
   if (uHasMetalnessMap) metalness *= texture(uMetalnessMap, vUvCoord).b;
   gAlbedoRough = vec4(albedo, roughness);
-  // .w is a packed material word in three disjoint ranges, so the lighting pass
-  // reads specular/glass/blend properties without an extra G-buffer sampler (it
-  // already sits at the WebGL2 16-sampler minimum):
-  //   [0,1] plain metalness   [2,3] transmissive glass (w - 2 = transmission)
-  //   [4,5] alpha blend (w - 4 = opacity). Blend wins: a transparent surface is
-  // kept out of the BVH and composited by the lighting pass, so it must never be
-  // read as glass even if the material also carries a transmission value.
-  float matWord = uBlend
-    ? 4.0 + uOpacity
-    : (uTransmission > 0.0 ? 2.0 + uTransmission : metalness);
+  // .w is a packed material word in disjoint ranges, so the lighting pass reads
+  // specular/glass/blend properties without an extra G-buffer sampler (it already
+  // sits at the WebGL2 16-sampler minimum — the reason per-material IOR rides
+  // here rather than in a third G-buffer texture the lighting pass would have to
+  // sample):
+  //   [0,1] plain metalness
+  //   (2,3] transmissive glass, PARTIAL: w - 2 = transmission (global rt.ior)
+  //   [3,4) transmissive glass, FULL (transmission >= ~1): w - 3 = ior - 1
+  //   [4,5] alpha blend: w - 4 = opacity
+  // Blend wins: a transparent surface is kept out of the BVH and composited by
+  // the lighting pass, so it must never be read as glass. Every EXISTING consumer
+  // decodes clamp(w - 2, 0, 1) as transmission, which saturates to 1.0 across the
+  // whole [3,4) band — so full glass keeps reading as fully transmissive there and
+  // only the lighting pass additionally recovers the per-material IOR (Task 2).
+  float matWord;
+  if (uBlend) {
+    matWord = 4.0 + uOpacity;
+  } else if (uTransmission > 0.0) {
+    if (uTransmission >= 0.99) {
+      // clamp (ior - 1) to [0, 0.98] so the word stays clear of the 4.0 blend
+      // boundary even after fp16 rounding of this channel; covers ior 1.0-1.98.
+      matWord = 3.0 + clamp(uIor - 1.0, 0.0, 0.98);
+    } else {
+      matWord = 2.0 + uTransmission; // partial glass: keep transmission, global ior
+    }
+  } else {
+    matWord = metalness;
+  }
   gNormalMetal = vec4(n, matWord);
   // .w packs the valid flag AND roughness: 0 = background, 1 + roughness
   // otherwise. Every consumer only tests w < 0.5, so this stays compatible.
@@ -184,46 +219,54 @@ export class GBufferPass {
     for (const t of this._targets) t.setSize(width, height);
   }
 
-  _gbufferMaterialFor(mesh) {
-    let material = this._materialCache.get(mesh);
-    if (!material) {
-      material = new THREE.ShaderMaterial({
-        glslVersion: THREE.GLSL3,
-        vertexShader: gbufferVert,
-        fragmentShader: gbufferFrag,
-        uniforms: {
-          uNormalMatrixWorld: { value: new THREE.Matrix3() },
-          uColor: { value: new THREE.Color(1, 1, 1) },
-          uRoughness: { value: 1.0 },
-          uMetalness: { value: 0.0 },
-          uTransmission: { value: 0.0 },
-          uEmissive: { value: new THREE.Color(0, 0, 0) },
-          uMap: { value: null },
-          uHasMap: { value: false },
-          uEmissiveMap: { value: null },
-          uHasEmissiveMap: { value: false },
-          uNormalMap: { value: null },
-          uHasNormalMap: { value: false },
-          uNormalScale: { value: new THREE.Vector2(1, 1) },
-          uRoughnessMap: { value: null },
-          uHasRoughnessMap: { value: false },
-          uMetalnessMap: { value: null },
-          uHasMetalnessMap: { value: false },
-          uBlend: { value: false },
-          uOpacity: { value: 1.0 },
-        },
-        side: THREE.FrontSide,
-      });
-      this._materialCache.set(mesh, material);
-    }
+  _makeGbufferMaterial(mesh) {
+    const material = new THREE.ShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      vertexShader: gbufferVert,
+      fragmentShader: gbufferFrag,
+      uniforms: {
+        uNormalMatrixWorld: { value: new THREE.Matrix3() },
+        uColor: { value: new THREE.Color(1, 1, 1) },
+        uRoughness: { value: 1.0 },
+        uMetalness: { value: 0.0 },
+        uTransmission: { value: 0.0 },
+        uIor: { value: 1.5 },
+        uEmissive: { value: new THREE.Color(0, 0, 0) },
+        uMap: { value: null },
+        uHasMap: { value: false },
+        uEmissiveMap: { value: null },
+        uHasEmissiveMap: { value: false },
+        uNormalMap: { value: null },
+        uHasNormalMap: { value: false },
+        uNormalScale: { value: new THREE.Vector2(1, 1) },
+        uRoughnessMap: { value: null },
+        uHasRoughnessMap: { value: false },
+        uMetalnessMap: { value: null },
+        uHasMetalnessMap: { value: false },
+        uBlend: { value: false },
+        uOpacity: { value: 1.0 },
+      },
+      side: THREE.FrontSide,
+    });
+    // Enable the vertex-colour path ONLY when this mesh's geometry carries a
+    // color attribute. This drives three's USE_COLOR define (see gbufferVert), so
+    // a mesh without one writes byte-identical albedo. The material cache is
+    // per-mesh, so this per-mesh define variant is safe.
+    material.vertexColors = !!(mesh.geometry && mesh.geometry.getAttribute("color"));
+    return material;
+  }
 
-    // Sync properties from the user's material every frame (cheap).
-    const src = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
+  // Sync properties from one user material into one gbuffer material (cheap; run
+  // every frame). `mesh` supplies the shared world normal matrix + side.
+  _syncGbufferMaterial(material, src, mesh) {
     const u = material.uniforms;
     if (src.color) u.uColor.value.copy(src.color);
     u.uRoughness.value = src.roughness ?? 1.0;
     u.uMetalness.value = src.metalness ?? 0.0;
     u.uTransmission.value = src.transmission ?? 0.0; // MeshPhysicalMaterial
+    // Per-material IOR (MeshPhysicalMaterial.ior; default 1.5). Encoded into the
+    // packed material word for fully-transmissive glass (see gbufferFrag).
+    u.uIor.value = src.ior ?? 1.5;
 
     if (src.emissive) {
       u.uEmissive.value
@@ -249,6 +292,30 @@ export class GBufferPass {
     u.uOpacity.value = src.opacity ?? 1.0;
     u.uNormalMatrixWorld.value.getNormalMatrix(mesh.matrixWorld);
     material.side = src.side ?? THREE.FrontSide;
+  }
+
+  // Returns the gbuffer material(s) for a mesh: a single ShaderMaterial, or — for
+  // a multi-material mesh (mesh.material is an array + geometry.groups) — an ARRAY
+  // of them, one per source material, index-aligned so three renders each group
+  // with its own gbuffer material natively.
+  _gbufferMaterialFor(mesh) {
+    if (Array.isArray(mesh.material)) {
+      let cached = this._materialCache.get(mesh);
+      if (!Array.isArray(cached) || cached.length !== mesh.material.length) {
+        cached = mesh.material.map(() => this._makeGbufferMaterial(mesh));
+        this._materialCache.set(mesh, cached);
+      }
+      for (let i = 0; i < mesh.material.length; i++) {
+        this._syncGbufferMaterial(cached[i], mesh.material[i], mesh);
+      }
+      return cached;
+    }
+    let material = this._materialCache.get(mesh);
+    if (!material || Array.isArray(material)) {
+      material = this._makeGbufferMaterial(mesh);
+      this._materialCache.set(mesh, material);
+    }
+    this._syncGbufferMaterial(material, mesh.material, mesh);
     return material;
   }
 

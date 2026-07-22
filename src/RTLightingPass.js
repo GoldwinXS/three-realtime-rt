@@ -541,13 +541,13 @@ vec3 analyticGlint(vec3 P, vec3 refl) {
 
 // Glass: Fresnel-weighted blend of a surface reflection and a two-interface
 // refraction (enter at P, march to the exit surface, refract again).
-vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough) {
+vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
   vec3 refl = glossyReflect(V, N, rough);
   vec3 reflRad = dot(refl, N) > 0.0
     ? traceRadiance(P + N * uEps, refl, true) + analyticGlint(P, refl)
     : vec3(0.0);
 
-  float eta = 1.0 / uIor;
+  float eta = 1.0 / ior;
   vec3 rd = refract(V, N, eta);
   if (rd == vec3(0.0)) return reflRad; // total internal reflection at entry
   float fres = schlick(clamp(-dot(V, N), 0.0, 1.0), eta);
@@ -563,7 +563,7 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough) {
     vec3 xN = normalize(attr.xyz);
     if (dot(xN, rd) > 0.0) xN = -xN;
     vec3 xP = ro + rd * dist;
-    vec3 rd2 = refract(rd, xN, uIor);
+    vec3 rd2 = refract(rd, xN, ior);
     if (rd2 == vec3(0.0)) rd2 = reflect(rd, xN);
     refrRad = traceRadiance(xP - xN * uEps, rd2, true);
   } else {
@@ -599,6 +599,10 @@ void main() {
   float transmission = (matW >= 2.0 && matW < 4.0) ? clamp(matW - 2.0, 0.0, 1.0) : 0.0;
   float metal = matW < 2.0 ? matW : 0.0;
   float rough = clamp(wp.w - 1.0, 0.0, 1.0);
+  // Per-material IOR rides the [3,4) glass sub-band (full-transmission glass, see
+  // GBufferPass). Below 3 (partial glass) or non-glass, fall back to the global
+  // rt.ior uniform. material.ior wins whenever it was encoded. (Task 2)
+  float ior = (matW >= 3.0 && matW < 4.0) ? (1.0 + (matW - 3.0)) : uIor;
 
   // Cook-Torrance specular state for this primary surface. gWantSpec gates the
   // GGX term to PRIMARY direct lighting only (GI-bounce direct light, below,
@@ -667,7 +671,7 @@ void main() {
   // --- traced glass: Fresnel reflection + two-interface refraction ---
   if (uRefrEnabled && transmission > 0.001) {
     vec3 V = normalize(P - uCameraPos);
-    sampleIrr = mix(sampleIrr, glassRadiance(P, N, V, rough), transmission);
+    sampleIrr = mix(sampleIrr, glassRadiance(P, N, V, rough, ior), transmission);
   }
 
   // --- alpha blend: straight-through view continuation ---
