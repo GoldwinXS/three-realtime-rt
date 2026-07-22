@@ -249,6 +249,9 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   fSec.append(toggle("PBR specular", rt.specular, (v) => { rt.specular = v; rt.resetAccumulation(); }).row);
   fSec.append(toggle("global illumination", rt.gi, (v) => setFeature("gi", v)).row);
   fSec.append(toggle("half-rate GI (fast)", rt.giHalfRate, (v) => { rt.giHalfRate = v; rt.resetAccumulation(); }).row);
+  // Experimental: reservoir reuse of the 1-bounce GI sample (temporal-only).
+  // Only meaningful when global illumination is on; injected at the denoise stage.
+  fSec.append(toggle("ReSTIR GI (exp)", rt.restirGI, (v) => { rt.restirGI = v; rt.resetAccumulation(); }).row);
   fSec.append(toggle("emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);
   fSec.append(toggle("reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
   fSec.append(toggle("refraction", rt.refraction, (v) => setFeature("refraction", v)).row);

@@ -25,12 +25,29 @@ uniform float uEps;
 uniform float uLumSigma;
 uniform bool uBlendIsSpec;       // this instance filters the specular buffer
 
+// Optional additive input (EXPERIMENTAL ReSTIR GI): when uHasAdd is set, this
+// texture's rgb is ADDED to every irradiance tap so the à-trous filter smooths
+// the sum (the GI is injected here, downstream of the lighting pass's own
+// temporal history, so it never double-counts through that history). The add is
+// gated to the FIRST iteration by the caller (uStep == 1) — later iterations
+// read the already-summed result. When uHasAdd is false this is byte-identical
+// to the original filter (the alpha/history-count channel is never touched).
+uniform sampler2D uAddTex;
+uniform bool uHasAdd;
+
 float luminance(vec3 c) {
   return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
+// Irradiance tap with the optional GI add folded into rgb (alpha untouched).
+vec4 sampleIrr(vec2 uv) {
+  vec4 c = texture(uIrradiance, uv);
+  if (uHasAdd) c.rgb += texture(uAddTex, uv).rgb;
+  return c;
+}
+
 void main() {
-  vec4 center = texture(uIrradiance, vUv);
+  vec4 center = sampleIrr(vUv);
   vec4 wp = texture(uGWorldPos, vUv);
   if (wp.w < 0.5) {
     outColor = center;
@@ -82,7 +99,7 @@ void main() {
         vec2 tuv = vUv + vec2(float(dx), float(dy)) * uTexelSize;
         if (tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0) continue;
         if (texture(uGWorldPos, tuv).w < 0.5) continue;
-        maxL = max(maxL, luminance(texture(uIrradiance, tuv).rgb));
+        maxL = max(maxL, luminance(sampleIrr(tuv).rgb));
         found = 1.0;
       }
     }
@@ -104,7 +121,7 @@ void main() {
 
       vec4 g = texture(uGWorldPos, tuv);
       if (g.w < 0.5) continue;
-      vec4 s = texture(uIrradiance, tuv);
+      vec4 s = sampleIrr(tuv);
       vec3 Nt = normalize(texture(uGNormalMetal, tuv).xyz);
 
       float k = (dx == 0 || dy == 0) ? 2.0 : 1.0;
@@ -154,6 +171,8 @@ export class DenoisePass {
         uEps: { value: 1e-3 },
         uLumSigma: { value: 0.25 },
         uBlendIsSpec: { value: blendIsSpec },
+        uAddTex: { value: null },
+        uHasAdd: { value: false },
       },
       depthTest: false,
       depthWrite: false,
@@ -189,20 +208,29 @@ export class DenoisePass {
     this.targetB.setSize(width, height);
   }
 
-  /** Runs `iterations` à-trous passes; returns the final filtered texture. */
-  render(renderer, inputTexture, gbuffer, cameraPos, eps, iterations = 3) {
+  /**
+   * Runs `iterations` à-trous passes; returns the final filtered texture.
+   * `addTexture` (EXPERIMENTAL ReSTIR GI) is added to the input on the FIRST
+   * iteration only, so the filter smooths input + GI together; pass null to
+   * leave the filter byte-identical to before.
+   */
+  render(renderer, inputTexture, gbuffer, cameraPos, eps, iterations = 3, addTexture = null) {
     const u = this.material.uniforms;
     u.uGWorldPos.value = gbuffer.worldPos;
     u.uGNormalMetal.value = gbuffer.normalMetal;
     u.uTexelSize.value.set(1 / this._width, 1 / this._height);
     u.uCameraPos.value.copy(cameraPos);
     u.uEps.value = eps;
+    u.uAddTex.value = addTexture;
 
     let read = inputTexture;
     let write = this.targetA;
     for (let i = 0; i < iterations; i++) {
       u.uIrradiance.value = read;
       u.uStep.value = 1 << i;
+      // The GI add is applied once, on iteration 0 — later iterations read the
+      // already-summed intermediate, so adding again would double it.
+      u.uHasAdd.value = addTexture !== null && i === 0;
       renderer.setRenderTarget(write);
       renderer.render(this.scene, this.camera);
       read = write.texture;

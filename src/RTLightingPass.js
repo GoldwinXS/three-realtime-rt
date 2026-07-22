@@ -75,6 +75,11 @@ uniform float uEnvIntensity;
 uniform float uFrame;
 uniform float uEps;
 uniform bool uGIEnabled;
+// EXPERIMENTAL: when an external ReSTIR GI pass supplies the 1-bounce indirect
+// (added downstream at the denoise stage), skip the inline GI trace so it isn't
+// counted twice. A uniform, NOT a sampler — the lighting pass is already at the
+// WebGL2 16-sampler minimum and cannot take another.
+uniform bool uExternalGI;
 
 // Procedural sky (when enabled, replaces the flat env colour as the "miss" term
 // for GI rays — this is what gives natural outdoor bounce light).
@@ -650,7 +655,10 @@ void main() {
   vec3 indirect = vec3(0.0);
   vec3 blendBehind = vec3(0.0);
   bool wantBehind = uBlendEnabled && blend;
-  bool wantGI = uGIEnabled && !wantBehind
+  // uExternalGI (experimental ReSTIR GI): the GIReservoirPass supplies the
+  // bounce, so the inline GI ray is skipped — but the blend continuation is
+  // NOT GI and must keep tracing regardless.
+  bool wantGI = uGIEnabled && !uExternalGI && !wantBehind
     && (!uGIHalfRate || (((px.x + px.y + int(uFrame)) & 1) == 0));
   if (wantBehind || wantGI) {
     vec3 Vv = normalize(P - uCameraPos);
@@ -934,6 +942,7 @@ export class RTLightingPass {
         uFrame: { value: 0 },
         uEps: { value: 1e-3 },
         uGIEnabled: { value: true },
+        uExternalGI: { value: false },
         uSkyEnabled: { value: false },
         uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.45).normalize() },
         uSunColor: { value: new THREE.Color(1.0, 0.9, 0.75) },
