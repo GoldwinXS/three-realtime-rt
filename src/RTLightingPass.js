@@ -593,9 +593,11 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
   float iorC = ior;
   if (uDispersion > 0.0) {
     int c = min(int(rand() * 3.0), 2); // uniform channel: 0 = R, 1 = G, 2 = B
-    // shift = (+1.0, 0.0, -1.0) * 0.5, indexed by channel: R = +0.5, G = 0,
-    // B = -0.5. uDispersion (0..0.5) scales the ior spread.
-    float shift = c == 0 ? 0.5 : (c == 2 ? -0.5 : 0.0);
+    // Normal dispersion: BLUE has the higher refractive index and bends most,
+    // red least. shift = (-1.0, 0.0, +1.0) * 0.5, indexed by channel:
+    // R = -0.5, G = 0, B = +0.5. uDispersion (0..0.5) scales the ior spread.
+    // (The original spec vector had the R/B signs reversed — audit-corrected.)
+    float shift = c == 0 ? -0.5 : (c == 2 ? 0.5 : 0.0);
     iorC = ior * (1.0 + uDispersion * shift);
     // Isolate channel c and weight x3: vec3(3,0,0) / (0,3,0) / (0,0,3). The
     // mean over the three equally-likely picks is (1/3)(3,0,0)+... = (1,1,1),
