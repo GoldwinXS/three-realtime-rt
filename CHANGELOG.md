@@ -29,6 +29,16 @@
   - Fixed: history carry across a resize wrote a single-output copy into the new
     2-attachment MRT, which ANGLE/D3D11 rejects (`INVALID_OPERATION`); it now
     uses a matching 2-output carry.
+- **Alpha-blended transparency** (`transparency`, default on): `transparent: true`
+  meshes are now composited correctly instead of the old broken behaviour, where
+  `opacity >= 0.5` rendered fully opaque and `opacity < 0.5` vanished entirely. A
+  transparent surface is primary-visible in the G-buffer (kept out of the BVH, so
+  it still casts no shadow) and the lighting pass traces one straight-through ray
+  to composite the fully lit (direct + 1-bounce GI) geometry behind it, weighted
+  by `opacity` and tinted by the pane's albedo — coloured panes tint what shows
+  through. Single-layer: the nearest transparent surface wins and overlapping
+  panes do not inter-sort. Costs a ray only on blend pixels. Set
+  `transparency: false` to render blend surfaces fully opaque.
 
 ## 0.3.2 — 2026-07-19
 

@@ -121,6 +121,37 @@ export function buildScene() {
   glass.visible = false; // appears (with its pedestal) when "refraction" is enabled
   scene.add(glass);
 
+  // Alpha-blended transparency showcase: two coloured panes standing between the
+  // camera and the lit room. Transparent surfaces are primary-visible but kept
+  // out of the BVH, so the lighting pass traces a straight-through ray and
+  // composites the room behind them, tinted by each pane's colour. Lower opacity
+  // = more see-through. They stay visible by default (transparency defaults on).
+  const paneBlue = new THREE.Mesh(
+    new THREE.BoxGeometry(2.6, 3.2, 0.08),
+    new THREE.MeshStandardMaterial({
+      color: 0x4fa3ff,
+      roughness: 0.35,
+      transparent: true,
+      opacity: 0.35,
+    })
+  );
+  paneBlue.position.set(1.3, 1.9, 3.7);
+  paneBlue.rotation.y = -0.35;
+  scene.add(paneBlue);
+
+  const paneAmber = new THREE.Mesh(
+    new THREE.BoxGeometry(2.2, 2.6, 0.08),
+    new THREE.MeshStandardMaterial({
+      color: 0xff9a5c,
+      roughness: 0.35,
+      transparent: true,
+      opacity: 0.7,
+    })
+  );
+  paneAmber.position.set(4.2, 1.6, 4.8);
+  paneAmber.rotation.y = -0.55;
+  scene.add(paneAmber);
+
   // Emissive panel — an area light sampled directly by the raytracer (NEE).
   const panel = new THREE.Mesh(
     new THREE.BoxGeometry(2.6, 1.5, 0.1),
@@ -195,6 +226,6 @@ export function buildScene() {
   return {
     scene, camera, bounds, lights, sky, ready,
     // Objects the demo shows/hides as their RT feature is toggled.
-    showcase: { mirror, mirrorPed, glass, glassPed, panel, orbit },
+    showcase: { mirror, mirrorPed, glass, glassPed, panel, orbit, paneBlue, paneAmber },
   };
 }
