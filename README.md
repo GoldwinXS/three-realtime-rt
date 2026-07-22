@@ -364,7 +364,7 @@ material of a group* row).
 | `roughness` | ✅ | Drives shadow / GI softness, reflection sharpness **and the GGX specular lobe width** (see *dielectric specular* below). |
 | `metalness` | ✅ | Metallic pixels trace a reflection ray whose analytic-light glints are shadowed; `F0 = mix(0.04, albedo, metalness)`. |
 | `emissive` | ✅ | A *static* emissive mesh becomes a real **area light** (NEE) — casts soft light + shadows, including a GGX highlight. |
-| `emissiveMap` | ⚠️ visible only | A map-masked emissive **glows on screen** but the map **zeroes its area-light table** — it lights nothing. Use a flat `emissive` colour (no map) for an emitter that should illuminate. |
+| `emissiveMap` | ✅ average-colour approximation | A map-masked emissive **glows on screen** with its full per-pixel pattern (G-buffer, untouched) **and now also casts light**: the CPU averages the map (`avg(map) × emissive × emissiveIntensity`) and feeds that single colour into the NEE area-light table. Needs a non-black `emissive` (white keeps the cast hue equal to the map average) and a readable image (a CORS-tainted / not-yet-decoded map falls back to visible-only, with a one-time `console.info`). A map that averages to **near-black** (e.g. a model's mostly-dark emissiveMap with a few tiny glowing texels) casts nothing — treated as visible-only so it doesn't flood the NEE list with a whole high-poly mesh. Texel-accurate (spatially-varying) emission is future work. |
 | `transmission` (Physical) | ✅ | Glass: Fresnel reflection (with analytic-light glints) + two-interface refraction. |
 | `transparent` + `opacity` | ✅ | Alpha blend: the surface is composited over the geometry behind it (a straight-through traced ray), weighted by scalar `opacity` and **tinted by `color`/`map`**. The behind-radiance rides the **specular buffer** and the opacity blend happens at **composite** (where the pane's albedo lives), so **needs `specular: true`** — with the specular buffer off, blend surfaces degrade to opaque. Single layer — nearest transparent surface wins, overlapping panes don't inter-sort. Kept out of the BVH, so it casts no shadow. Toggle with `transparency`. |
 | `opacity` on an opaque material | ❌ | Only read when `transparent: true`; an opaque material always writes at full coverage. |
@@ -383,7 +383,7 @@ material of a group* row).
 |-------|-----------|-------|
 | `PointLight` | ✅ | `light.userData.rtRadius` (default `0.15`) sets soft-shadow size. |
 | `DirectionalLight` | ✅ | `light.userData.rtRadius` (default `0.02`) sets sun softness; keep its direction in sync with `sky.sunDir`. |
-| Emissive meshes | ✅ static | Sampled directly as area lights. **Dynamic** emitters are *not* in the NEE list — they light only via GI-ray hits. |
+| Emissive meshes | ✅ static + dynamic | Sampled directly as area lights (NEE). **Dynamic** emitters (a mesh in `dynamicMeshes`) are refreshed every `updateDynamic()`: their world-space triangles are re-derived from the freshly baked/skinned/deformed positions and their NEE rows + power CDF rewritten — a moving glowing orb sweeps real light across the floor. Keep them **low-poly** (refreshed per frame) and note the 256-tri cap is shared with static emitters. |
 | `SpotLight` | ✅ | Cone + penumbra respected; soft shadows via `rtRadius`; visible light cones in volumetric fog. |
 | `RectAreaLight` | ❌ | Use an emissive mesh instead. |
 | `HemisphereLight` / `AmbientLight` | ❌ | Ignored — the procedural `sky` (or `envColor`) provides ambient. |
@@ -397,8 +397,9 @@ material of a group* row).
   bright ones, and let `fireflyClamp` do its job.
 - Up to **32** point/directional lights (`MAX_LIGHTS`); further lights are dropped.
 - Moving, toggling, recolouring or dimming a light → `rt.updateLights(scene)` (cheap, no recompile).
-- Changing a mesh's **emissive** (it's an area light baked at compile time) → `rt.compileScene(...)` again.
-- Emissive area lights are capped at **256 triangles** (largest by area kept, with a console warning) — prefer low-poly emitter meshes.
+- **Textured emitters** (`emissiveMap`) cast their **average** colour (`avg(map) × emissive × emissiveIntensity`), not per-texel — the sign still *looks* patterned in the G-buffer but lights with one averaged hue. Texel-accurate emission is future work.
+- **Moving** a dynamic emitter → `rt.updateDynamic()` refreshes its area-light rows + CDF from the new geometry. But an emitter's **emission itself** (its `emissive` colour / `emissiveIntensity`, or the map's average) is frozen at compile time: **changing what it emits — static or dynamic — needs `rt.compileScene(...)` again** (`updateDynamic`/`updateLights` do not rescan emissive meshes). A dynamic emitter that never moves also needs a recompile to reflect an emission change.
+- Emissive area lights are capped at **256 triangles** (shared across static + dynamic; largest by compile-time area kept, with a console warning) — prefer low-poly emitter meshes, especially dynamic ones.
 
 ### Geometry & occlusion
 

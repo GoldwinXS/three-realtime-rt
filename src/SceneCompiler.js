@@ -58,6 +58,15 @@ export class CompiledScene {
     this.emissiveTriCount = 0;
     this.triangleCount = 0;
 
+    // Dynamic emissive area lights: the final (post-cap) emissive triangle list
+    // and the subset that belongs to dynamic emitters (row + merged-position
+    // offset), refreshed in place each updateDynamic(). lastEmissiveRefreshMs is
+    // the CPU cost of the most recent refresh (0 when there are none).
+    this.emissiveTris = [];
+    this._dynamicEmissive = [];
+    this.hasDynamicEmissive = false;
+    this.lastEmissiveRefreshMs = 0;
+
     this._m3 = new THREE.Matrix3();
     this._normalFrame = 0;
     this._dynBuildVolume = null; // world-volume of the dynamic set at build time
@@ -251,6 +260,64 @@ export class CompiledScene {
     if (this.hasDeforming || this.hasSkinned || this._normalFrame++ % 8 === 0) {
       this.dynamicAttrTex.updateFrom(this.dynamicPackedAttr);
     }
+
+    // Refresh dynamic emissive area lights from the freshly baked world-space
+    // merged positions (rows in the scene-data texture + the power CDF).
+    if (this.hasDynamicEmissive) this._refreshDynamicEmissive();
+  }
+
+  /**
+   * Re-derive dynamic emitters' world-space NEE triangles from the merged
+   * dynamic positions this frame, rewrite their rows in the scene-data texture
+   * (row 1) and rebuild the power CDF (row 66), then flag the texture for
+   * re-upload. The whole (small) texture goes back up — measured in
+   * lastEmissiveRefreshMs. Called from updateDynamic (i.e. only when the dynamic
+   * set actually updated); an emissive change on an emitter that did NOT move —
+   * e.g. recolouring material.emissive — is frozen at compile time and needs a
+   * compileScene() (updateLights only rescans analytic THREE lights).
+   */
+  _refreshDynamicEmissive() {
+    const list = this._dynamicEmissive;
+    if (list.length === 0) return;
+    const now = typeof performance !== "undefined" ? performance : Date;
+    const t0 = now.now();
+    const tex = this.materialsTex;
+    const data = tex.image.data;
+    const row = tex.image.width * 4; // texture width in floats
+    const pos = this.dynamicMerged.getAttribute("position").array;
+    const tris = this.emissiveTris;
+    for (let k = 0; k < list.length; k++) {
+      const de = list[k];
+      const off = de.off;
+      const ax = pos[off], ay = pos[off + 1], az = pos[off + 2];
+      const e1x = pos[off + 3] - ax, e1y = pos[off + 4] - ay, e1z = pos[off + 5] - az;
+      const e2x = pos[off + 6] - ax, e2y = pos[off + 7] - ay, e2z = pos[off + 8] - az;
+      let nx = e1y * e2z - e1z * e2y;
+      let ny = e1z * e2x - e1x * e2z;
+      let nz = e1x * e2y - e1y * e2x;
+      const len = Math.hypot(nx, ny, nz);
+      const area = len * 0.5;
+      const il = len > 1e-10 ? 1 / len : 0; // keep a degenerate frame from NaN-ing
+      nx *= il; ny *= il; nz *= il;
+      const emit = de.emit;
+      // Keep the JS-side tri object current so writeEmissiveCdf sees fresh areas.
+      const t = tris[de.row];
+      t.v0[0] = ax; t.v0[1] = ay; t.v0[2] = az;
+      t.e1[0] = e1x; t.e1[1] = e1y; t.e1[2] = e1z;
+      t.e2[0] = e2x; t.e2[1] = e2y; t.e2[2] = e2z;
+      t.n[0] = nx; t.n[1] = ny; t.n[2] = nz;
+      t.area = area;
+      // Row 1 texel (16 floats) — layout must match buildSceneDataTexture.
+      const o = row + de.row * 16;
+      data[o + 0] = ax; data[o + 1] = ay; data[o + 2] = az; data[o + 3] = area;
+      data[o + 4] = e1x; data[o + 5] = e1y; data[o + 6] = e1z; data[o + 7] = emit[0];
+      data[o + 8] = e2x; data[o + 9] = e2y; data[o + 10] = e2z; data[o + 11] = emit[1];
+      data[o + 12] = nx; data[o + 13] = ny; data[o + 14] = nz; data[o + 15] = emit[2];
+    }
+    // Areas (and therefore pick probabilities) may have changed — rebuild the CDF.
+    writeEmissiveCdf(data, row, tris);
+    tex.needsUpdate = true;
+    this.lastEmissiveRefreshMs = now.now() - t0;
   }
 
   dispose() {
@@ -333,12 +400,91 @@ function resolveMeshMaterials(mesh, count, registerMaterial) {
   return { matIdx, ranges };
 }
 
+// Average-colour cache for emissive maps: texture -> [r,g,b] linear, or null when
+// the image is unreadable (CORS-tainted / not yet decoded). Keyed by the THREE
+// texture so the two collect sites (material row + NEE tris) share one solve.
+const _emissiveMapAvgCache = new Map();
+let _emissiveMapWarned = false;
+
+// sRGB -> linear for one 0..1 channel (three decodes SRGBColorSpace maps this way
+// before lighting; average in linear so the cast colour matches the lit look).
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+// CPU average of an emissiveMap: draw the texture image into a small (16x16)
+// offscreen canvas and mean the texels. Returns linear [r,g,b] in 0..1, or null
+// if the image can't be read (CORS-tainted, or no decoded image yet) — the
+// caller then falls back to the map-zeroes-the-light behaviour, once, with a
+// console.info explaining why. Result is cached per texture.
+function averageEmissiveMap(map) {
+  if (_emissiveMapAvgCache.has(map)) return _emissiveMapAvgCache.get(map);
+  let result = null;
+  try {
+    const img = map.image;
+    const w = img && (img.width || img.videoWidth || 0);
+    const h = img && (img.height || img.videoHeight || 0);
+    if (img && w > 0 && h > 0 && typeof document !== "undefined") {
+      const N = 16;
+      const canvas = document.createElement("canvas");
+      canvas.width = N;
+      canvas.height = N;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0, N, N); // downsample
+      const d = ctx.getImageData(0, 0, N, N).data; // throws if the image is tainted
+      const toLinear = map.colorSpace !== THREE.NoColorSpace && map.colorSpace !== THREE.LinearSRGBColorSpace;
+      let r = 0, g = 0, b = 0;
+      const n = d.length / 4;
+      for (let i = 0; i < d.length; i += 4) {
+        if (toLinear) {
+          r += srgbToLinear(d[i] / 255);
+          g += srgbToLinear(d[i + 1] / 255);
+          b += srgbToLinear(d[i + 2] / 255);
+        } else {
+          r += d[i] / 255; g += d[i + 1] / 255; b += d[i + 2] / 255;
+        }
+      }
+      result = [r / n, g / n, b / n];
+    }
+  } catch (e) {
+    result = null; // CORS-tainted (SecurityError) or unreadable
+  }
+  if (result === null && !_emissiveMapWarned) {
+    _emissiveMapWarned = true;
+    console.info(
+      "three-realtime-rt: an emissiveMap could not be read on the CPU (CORS-tainted " +
+      "or not yet decoded), so its mesh casts no area light — it is still drawn " +
+      "per-pixel in the G-buffer. Serve the texture same-origin (or set " +
+      "image.crossOrigin) to enable the average-colour approximation."
+    );
+  }
+  _emissiveMapAvgCache.set(map, result);
+  return result;
+}
+
 // Effective emissive colour (already scaled by intensity), or null if the
-// material doesn't emit. Matches the shading table's emissiveMap exclusion.
+// material doesn't emit. A plain emissive colour is used directly; an
+// emissiveMap is approximated by its AVERAGE colour (avg(map) x emissive x
+// emissiveIntensity) so a textured emitter casts (approximately) correct light —
+// the G-buffer still renders it per-pixel, so it LOOKS patterned. An unreadable
+// map falls back to null (visible only), matching the old exclusion.
 function emissiveColor(mat) {
-  if (mat.emissiveMap != null || !mat.emissive) return null;
+  if (!mat.emissive) return null;
   const i = mat.emissiveIntensity ?? 1;
   if (i <= 0 || mat.emissive.r + mat.emissive.g + mat.emissive.b <= 0) return null;
+  if (mat.emissiveMap != null) {
+    const avg = averageEmissiveMap(mat.emissiveMap);
+    if (avg == null) return null; // unreadable -> current behaviour (visible only)
+    const emit = [mat.emissive.r * i * avg[0], mat.emissive.g * i * avg[1], mat.emissive.b * i * avg[2]];
+    // A map that averages to (near) black casts no meaningful light — treat it
+    // as visible-only, like a black emissive colour. This keeps an incidental
+    // textured emissive (a high-poly model whose emissiveMap is mostly dark with
+    // a few tiny glowing texels — e.g. DamagedHelmet) out of the NEE list rather
+    // than flooding it with the whole mesh; a real neon sign clears this easily.
+    const lum = 0.2126 * emit[0] + 0.7152 * emit[1] + 0.0722 * emit[2];
+    if (lum < 1e-3) return null;
+    return emit;
+  }
   return [mat.emissive.r * i, mat.emissive.g * i, mat.emissive.b * i];
 }
 
@@ -387,22 +533,9 @@ function buildSceneDataTexture(materials, emissiveTris) {
       data[o + i] = (bn[src + i] + 0.5) / 256.0;
     }
   }
-  // Emissive power CDF (see the layout comment above). Weight = area x
-  // emitted luminance; degenerate totals fall back to the uniform pick.
-  if (emissiveTris.length > 0) {
-    const w = emissiveTris.map(
-      (t) => t.area * (0.2126 * t.emit[0] + 0.7152 * t.emit[1] + 0.0722 * t.emit[2])
-    );
-    const total = w.reduce((a, b) => a + b, 0);
-    const cdfRow = (2 + BLUE_NOISE_SIZE) * row;
-    let cum = 0;
-    for (let i = 0; i < emissiveTris.length; i++) {
-      const p = total > 0 ? w[i] / total : 1 / emissiveTris.length;
-      cum += p;
-      data[cdfRow + i * 4 + 0] = i === emissiveTris.length - 1 ? 1.0 : cum;
-      data[cdfRow + i * 4 + 1] = p;
-    }
-  }
+  // Emissive power CDF (row 66). Factored out so updateDynamic can rebuild it
+  // in place when a dynamic emitter's area/position changed this frame.
+  writeEmissiveCdf(data, row, emissiveTris);
   const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
   tex.minFilter = THREE.NearestFilter;
   tex.magFilter = THREE.NearestFilter;
@@ -410,11 +543,40 @@ function buildSceneDataTexture(materials, emissiveTris) {
   return tex;
 }
 
+// Write the emissive power CDF (row 66 of the scene-data texture). Weight =
+// area x emitted luminance; degenerate totals fall back to the uniform pick.
+// The layout matches the row-66 comment in buildSceneDataTexture. `row` is the
+// texture width in floats (width * 4). Reused by updateDynamic's in-place refresh.
+function writeEmissiveCdf(data, row, emissiveTris) {
+  if (emissiveTris.length === 0) return;
+  const cdfRow = (2 + BLUE_NOISE_SIZE) * row;
+  let total = 0;
+  const w = new Array(emissiveTris.length);
+  for (let i = 0; i < emissiveTris.length; i++) {
+    const t = emissiveTris[i];
+    w[i] = t.area * (0.2126 * t.emit[0] + 0.7152 * t.emit[1] + 0.0722 * t.emit[2]);
+    total += w[i];
+  }
+  let cum = 0;
+  for (let i = 0; i < emissiveTris.length; i++) {
+    const p = total > 0 ? w[i] / total : 1 / emissiveTris.length;
+    cum += p;
+    data[cdfRow + i * 4 + 0] = i === emissiveTris.length - 1 ? 1.0 : cum;
+    data[cdfRow + i * 4 + 1] = p;
+  }
+}
+
 // Collect world-space triangles of an emissive mesh for the NEE light list.
 // `geo` is already non-indexed and world-baked by extractMeshGeometry. An
 // optional [vStart, vCount) vertex range restricts collection to one material
 // group (ranges are triangle-aligned, so this stays whole-triangle).
-function collectEmissiveTriangles(geo, emit, out, vStart = 0, vCount = -1) {
+//
+// `dynBase` >= 0 tags each triangle as belonging to a DYNAMIC emitter: dynBase is
+// the float offset of this mesh's segment in the merged dynamic position array
+// (segStart * 3), so `dynOff` records where the triangle's v0/e1/e2 live there.
+// updateDynamic re-derives the world-space triangle from those merged positions
+// each frame (the merged array already holds the freshly transformed vertices).
+function collectEmissiveTriangles(geo, emit, out, vStart = 0, vCount = -1, dynBase = -1) {
   const pos = geo.getAttribute("position").array;
   const begin = vStart * 3;
   const end = vCount < 0 ? pos.length : Math.min(pos.length, (vStart + vCount) * 3);
@@ -426,14 +588,19 @@ function collectEmissiveTriangles(geo, emit, out, vStart = 0, vCount = -1) {
     const cz = e1[0] * e2[1] - e1[1] * e2[0];
     const len = Math.hypot(cx, cy, cz);
     if (len < 1e-10) continue; // degenerate
-    out.push({
+    const tri = {
       v0: [pos[i], pos[i + 1], pos[i + 2]],
       e1,
       e2,
       n: [cx / len, cy / len, cz / len],
       area: len * 0.5,
       emit,
-    });
+    };
+    if (dynBase >= 0) {
+      tri.dyn = true;
+      tri.dynOff = dynBase + i; // float offset of v0 in the merged dynamic positions
+    }
+    out.push(tri);
   }
 }
 
@@ -523,19 +690,20 @@ export function compileScene(scene, options = {}) {
     // the shared table) and get the ranges for per-group emissive collection.
     const { matIdx, ranges } = resolveMeshMaterials(obj, extracted.count, registerMaterial);
     extracted.geo.setAttribute("materialIndex", new THREE.BufferAttribute(matIdx, 1));
-    // Static emissive meshes become NEE area lights (sampled directly with
-    // shadow rays instead of waiting for a GI ray to stumble into them).
-    // Dynamic emitters are left out — their world-space triangles would go
-    // stale — so they keep lighting the old way, via GI-ray hits. Each emissive
-    // GROUP contributes its own range.
-    if (!isDynamic) {
+    // Emissive meshes become NEE area lights (sampled directly with shadow rays
+    // instead of waiting for a GI ray to stumble into them). Each emissive GROUP
+    // contributes its own range. STATIC emitters are collected in world space
+    // once; DYNAMIC emitters are ALSO collected now but tagged with their merged
+    // segment offset (segStart * 3) so updateDynamic() can re-derive their
+    // world-space triangles each frame from the freshly baked merged positions.
+    if (isDynamic) {
+      const segStart = dynVertexOffset; // this segment's vertex base in the merged array
+      dynamicGeoms.push(extracted.geo);
       for (const r of ranges) {
         const emit = emissiveColor(r.material);
-        if (emit) collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount);
+        if (emit)
+          collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount, segStart * 3);
       }
-    }
-    if (isDynamic) {
-      dynamicGeoms.push(extracted.geo);
       // A SkinnedMesh is auto-detected (no userData flag): it is CPU-skinned from
       // its live skeleton pose every frame. Opt-in CPU deformation (water/cloth)
       // instead requires userData.rtDeforming and reads live geometry. The two are
@@ -564,6 +732,10 @@ export function compileScene(scene, options = {}) {
       dynVertexOffset += extracted.count;
     } else {
       staticGeoms.push(extracted.geo);
+      for (const r of ranges) {
+        const emit = emissiveColor(r.material);
+        if (emit) collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount);
+      }
     }
   });
 
@@ -602,13 +774,27 @@ export function compileScene(scene, options = {}) {
   if (emissiveTris.length > MAX_EMISSIVE_TRIS) {
     console.warn(
       `three-realtime-rt: ${emissiveTris.length} emissive triangles exceed the ` +
-      `NEE cap of ${MAX_EMISSIVE_TRIS}; keeping the largest by area. Dropped ` +
-      `triangles no longer act as lights — prefer low-poly emitter meshes.`
+      `NEE cap of ${MAX_EMISSIVE_TRIS} (shared across static + dynamic emitters); ` +
+      `keeping the largest by area (measured at compile time). Dropped triangles ` +
+      `no longer act as lights — prefer low-poly emitter meshes, especially for ` +
+      `dynamic ones (their tris are refreshed every frame).`
     );
     emissiveTris.sort((a, b) => b.area - a.area);
     emissiveTris.length = MAX_EMISSIVE_TRIS;
   }
   compiled.emissiveTriCount = emissiveTris.length;
+  // Keep the final (post-cap) emissive list so updateDynamic can rebuild the
+  // power CDF, and record which surviving rows belong to dynamic emitters (with
+  // their merged-position offset) so their world-space triangles can be
+  // refreshed per frame. Rows stay index-stable after this point, so the
+  // reservoir passes' triangle ids remain valid across refreshes.
+  compiled.emissiveTris = emissiveTris;
+  compiled._dynamicEmissive = [];
+  for (let r = 0; r < emissiveTris.length; r++) {
+    const t = emissiveTris[r];
+    if (t.dyn) compiled._dynamicEmissive.push({ row: r, off: t.dynOff, emit: t.emit });
+  }
+  compiled.hasDynamicEmissive = compiled._dynamicEmissive.length > 0;
   compiled.materialsTex = buildSceneDataTexture(materials, emissiveTris);
   syncLights(scene, compiled);
 

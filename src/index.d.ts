@@ -303,11 +303,19 @@ export class CompiledScene {
   triangleCount: number;
   /** Number of lights scanned into the compiled light tables. */
   lightCount: number;
-  /** Number of emissive triangles registered as NEE area lights. */
+  /** Number of emissive triangles registered as NEE area lights (static + dynamic). */
   emissiveTriCount: number;
   /** World-space diagonal of the static level (used to auto-scale ray epsilon). */
   sceneDiagonal: number;
-  /** Re-bake moving meshes' current world transforms and refit the dynamic BVH. */
+  /** True when any dynamic emitter contributes NEE rows refreshed each frame. */
+  hasDynamicEmissive: boolean;
+  /** CPU cost (ms) of the most recent dynamic-emissive refresh (0 if none). */
+  lastEmissiveRefreshMs: number;
+  /**
+   * Re-bake moving meshes' current world transforms and refit the dynamic BVH.
+   * Also refreshes any dynamic emitters' NEE area-light rows + power CDF from the
+   * freshly baked world positions.
+   */
   updateDynamic(): void;
   /** Release GPU resources held by this compiled scene. */
   dispose(): void;
