@@ -242,6 +242,48 @@ water plane) is O(dynamic tris) too — so **keep deforming meshes low-poly**. A
 `256×256` plane (~131k tris) will dominate the frame. The demo's mirror-water
 pool is a `48×48` plane.
 
+### Skinned meshes (animated characters)
+
+A `SkinnedMesh` is **auto-detected** — just list it in `dynamicMeshes` (no
+`userData` flag) and it is CPU-skinned into the dynamic BVH every frame, so an
+animated character casts a **traced shadow that moves with its gait** and
+rasterizes in its animated pose (not bind pose) in the G-buffer:
+
+```js
+rt.compileScene(scene, { dynamicMeshes: [...crates, foxMesh] }); // foxMesh.isSkinnedMesh
+
+// each frame:
+mixer.update(dt);                 // advance the AnimationMixer
+foxRoot.updateMatrixWorld(true);  // pose the skeleton (bones -> world matrices) NOW
+rt.updateDynamic();               // CPU-skins the live pose into the BVH
+rt.render(scene, camera);
+```
+
+- **Skin the pose before `updateDynamic()`.** The CPU skinning reads each bone's
+  `matrixWorld` (via three's `SkinnedMesh.applyBoneTransform` / `getVertexPosition`,
+  which apply the bind matrix, bone weights and bone matrices), so the skeleton
+  must be posed for this frame first. `mixer.update(dt)` then a forced
+  `updateMatrixWorld` on the character root does that — otherwise the traced
+  shadow lags the raster by a frame. (three r160's `applyBoneTransform` returns
+  the vertex in the mesh's **local/bind-relative** space; the tracer applies
+  `matrixWorld` itself, exactly like a rigid mover.)
+- **Two sampler-friendly shortcuts.** Skinning is done for the mesh's *unique*
+  source vertices once per frame (shared triangle-soup slots reuse the result),
+  and secondary-ray **normals are per-face** — recomputed from the skinned
+  triangle positions rather than CPU-skinning the normal attribute. Flat-shaded
+  secondary rays are indistinguishable for shadows/GI, and **primary visibility
+  still gets smooth normals from the raster path** (the G-buffer skins the normal
+  properly via three's own `skinnormal_vertex` chunk). If your character's
+  geometry ships without a `normal` attribute (some glTF do — e.g. the Khronos
+  Fox), call `geometry.computeVertexNormals()` once after load so the raster path
+  has bind-pose normals to skin.
+
+**Cost model.** CPU skinning is O(source verts × 4 bones) with zero per-vertex
+allocation, plus the usual O(dynamic tris) BVH refit and normal upload. Budget
+~**10–20k total skinned source vertices to stay sub-2 ms**; the demo's Fox is
+≈ 1.7k source verts and skins in ≈ 0.3 ms. As with any dynamic mesh, keep the
+skinned tris low and there is no static-world cost.
+
 ## Live lighting & sky
 
 Lights can be toggled, moved, and recoloured every frame without recompiling:

@@ -295,6 +295,9 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // The CPU-deformed water pool (rtDeforming) — its motion is independent of the
   // rigid-body sim, so it gets its own switch.
   pSec.append(toggle("water waves", state.waterEnabled, (v) => { state.waterEnabled = v; rt.resetAccumulation(); }).row);
+  // The skinned fox — CPU-skinned into the dynamic BVH so its traced shadow
+  // moves with the gait. Off freezes the animation (and lets updateDynamic skip).
+  pSec.append(toggle("fox walk", state.foxEnabled, (v) => { state.foxEnabled = v; rt.resetAccumulation(); }).row);
   pSec.append(slider("gravity", 0, 20, 0.5, 9.81, (x) => "-" + x.toFixed(0), (v) => physics.setGravity(-v)));
   const btns = el("div", "btns");
   const mkBtn = (icon, text, wide, fn) => {
