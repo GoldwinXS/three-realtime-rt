@@ -10,6 +10,24 @@ import type {
 /** Capability tier used to pick sensible defaults. */
 export type Tier = "none" | "mid" | "high";
 
+/** Result of {@link RealtimeRaytracer.probeGPUTier}. */
+export interface GPUTierProbe {
+  /** Chosen capability tier. */
+  tier: Tier;
+  /**
+   * Where the tier came from: `"webgpu"` (real adapter limits inspected),
+   * `"webgl"` (WebGL `detectTier` heuristic on the supplied renderer), or
+   * `"fallback"` (pure user-agent guess — no WebGPU and no renderer given).
+   */
+  source: "webgpu" | "webgl" | "fallback";
+  /**
+   * Diagnostics behind the decision: the adapter limits read, any masked
+   * `adapter.info` fields, the computed `screenPixels` demand factor, and a
+   * human-readable `reason`. Shape varies by `source`; treat as informational.
+   */
+  details: Record<string, unknown>;
+}
+
 /** Procedural-sky configuration (background + ambient light for escaping GI rays). */
 export interface SkyOptions {
   /** Enable the procedural sky as background and ambient GI source. */
@@ -210,8 +228,16 @@ export class RealtimeRaytracer {
 
   /** Can this renderer run the ray tracing pipeline at all (WebGL2 + float RTs on hardware GPU)? */
   static isSupported(renderer: WebGLRenderer): boolean;
-  /** Rough capability tier for choosing defaults. */
+  /** Rough capability tier for choosing defaults (synchronous WebGL heuristic). */
   static detectTier(renderer?: WebGLRenderer): Tier;
+  /**
+   * Optional async GPU tier probe: inspects real WebGPU adapter limits when
+   * available (honest heuristic — WebGPU does NOT expose VRAM, so it uses
+   * `maxBufferSize`/texture limits as a proxy and factors screen resolution),
+   * else falls back to {@link detectTier}. The constructor stays synchronous;
+   * feed the result to {@link recommendedOptions}.
+   */
+  static probeGPUTier(renderer?: WebGLRenderer): Promise<GPUTierProbe>;
   /** Sensible constructor options for a tier (spread them, then override). */
   static recommendedOptions(tier: Tier): RealtimeRaytracerOptions;
 

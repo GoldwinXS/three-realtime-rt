@@ -101,6 +101,17 @@ loop();
 On hardware that can't trace, `rt.render` transparently falls back to
 `renderer.render` — no capability branch needed (see [Running everywhere](#running-everywhere-capability-tiers)).
 
+> **Defaults are conservative.** Zero-config construction
+> (`new RealtimeRaytracer(renderer)`) starts *low but still ray traced* — half
+> lighting resolution, stochastic direct light, a lean denoise — so it runs
+> acceptably on weak discrete and integrated GPUs out of the box. The adaptive
+> governor is **on by default** and scales quality **up** toward `targetFps`
+> when it measures headroom (a strong desktop climbs to full-resolution
+> lighting within a couple of seconds). Want to start higher, or pin a level?
+> Pass `RealtimeRaytracer.recommendedOptions(RealtimeRaytracer.detectTier(renderer))`
+> (or `probeGPUTier()` — see [Running everywhere](#running-everywhere-capability-tiers)),
+> or explicit options.
+
 ### Integrating into an existing app
 
 A checklist for dropping the tracer into a scene you already have:
@@ -278,6 +289,8 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | Option | Default | What |
 |--------|---------|------|
 | `renderScale` | `0.5` | Lighting resolution vs. the G-buffer. `1.0` = max quality. |
+| `adaptiveQuality` | `true` | Governor that steers `renderScale` / `denoiseIterations` / `stochasticLights` toward `targetFps` — scales **up** on strong hardware, **down** on weak. Turn off for manual control. |
+| `denoiseIterations` | `2` | À-trous denoise passes; the governor raises this as it lowers resolution. |
 | `taa` | `true` | Temporal anti-aliasing (jitter + neighbourhood clamp). |
 | `denoise` | `true` | Edge-aware à-trous denoiser. |
 | `gi` | `true` | 1-bounce global illumination (vs. direct-only). |
@@ -287,7 +300,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `restir` | `true` | ReSTIR direct lighting: per-pixel reservoirs with temporal + spatial reuse, one visibility ray regardless of light count. Flat cost in light count; cuts emissive area-light noise. |
 | `ior` | `1.5` | Index of refraction used by `refraction`. |
 | `volumetric` | *off* | Physically-based god rays: single-scatter fog, one BVH-shadowed light sample per lighting pixel per frame, temporally accumulated. `{ enabled, density, maxDist, zones }`, where `zones` is an optional array of up to 8 AABBs `{ min:[x,y,z], max:[x,y,z], density }` that add localized fog on top of (or instead of) the global `density`. |
-| `stochasticLights` | `false` | One direct shadow ray per pixel per frame (random source) instead of one per light. |
+| `stochasticLights` | `true` | One direct shadow ray per pixel per frame (random source) instead of one per light. The governor turns it off once it has scaled resolution up on strong hardware. |
 | `temporalReprojection` | `true` | Keep samples across camera/object motion. |
 | `maxHistory` | `128` | History cap — higher is smoother, slower to react. |
 | `fireflyClamp` | `4.0` | Clamp on indirect luminance to suppress fireflies. |
@@ -302,7 +315,10 @@ opaque shadow); `alphaTest` cut-outs still do.
 
 ## Running everywhere (capability tiers)
 
-Nothing adaptive is imposed — everything below is **opt-in**:
+The zero-config defaults are **conservative and self-scaling**: construction
+starts low-but-ray-traced and the adaptive governor (on by default) walks
+quality up or down toward `targetFps`. The knobs below let you set a smarter
+starting point or take manual control:
 
 - **No usable GPU** (missing WebGL2 float targets, or a software rasterizer
   like SwiftShader): the library logs one console warning and `rt.render()`
@@ -321,7 +337,30 @@ Nothing adaptive is imposed — everything below is **opt-in**:
   });
   ```
 
-- **Adaptive quality** (`adaptiveQuality: true`, default **false**): continuous
+- **GPU probe** (`await RealtimeRaytracer.probeGPUTier(renderer?)`): an optional,
+  async, more-informed alternative to `detectTier`. When the browser exposes
+  **WebGPU** it inspects the real adapter limits; otherwise it falls back to the
+  WebGL heuristic. Returns `{ tier, source: "webgpu"|"webgl"|"fallback", details }`.
+
+  ```js
+  const probe = await RealtimeRaytracer.probeGPUTier(renderer);
+  const rt = new RealtimeRaytracer(renderer, RealtimeRaytracer.recommendedOptions(probe.tier));
+  ```
+
+  **Honest heuristic — WebGPU does NOT expose VRAM.** There is no API for actual
+  video memory, so the probe uses `adapter.limits` (`maxBufferSize`,
+  `maxTextureDimension2D`, …) as a *proxy* for GPU class — two cards with wildly
+  different VRAM can report the same limits. `adapter.info`
+  (vendor/architecture/description) is masked on many browsers, so it is a hint
+  only. Screen resolution is factored in: `screenPixels = screen.width *
+  screen.height * min(devicePixelRatio, 2)`; a 4K-class panel (`>= 6e6`) has to
+  fill ~4× the pixels of 1080p, so a GPU is only rated `"high"` on such a screen
+  when `maxBufferSize >= 4GiB` (otherwise it is demoted to `"mid"`). Software
+  renderers (SwiftShader / llvmpipe) rate `"none"`. Every threshold and the raw
+  values are echoed back in `details`. The constructor stays synchronous — this
+  is a pre-construction, opt-in call.
+
+- **Adaptive quality** (`adaptiveQuality: true`, default **true**): continuous
   dynamic resolution scaling. Watches real frame time and steers the lighting
   resolution smoothly toward `targetFps` (in 5% steps with a cooldown), pairing
   low resolutions with MORE denoise passes (they run at lighting res, so
@@ -360,6 +399,22 @@ TAA / volumetric plus lighting-resolution and auto-quality controls.
 [`bench.html?autorun=1`](bench.html) runs a matrix of feature configs with
 GPU-**fence-timed** frame costs and a temporal **ghosting metric**, writing each
 run's results to [`bench-results/`](bench-results/) for tracking regressions.
+
+### Movement-artifact harness
+
+[`harness.html`](harness.html) makes the **edge-of-screen convergence noise seen
+while the camera moves** measurable and eyeball-able. It drives the demo scene
+along a deterministic path (`strafe` — sinusoidal side-to-side — or `orbit`;
+pose is a pure function of sim-time) and, every couple of frames, reads three
+vertical bands off the drawing buffer — the outer 10% at each edge and the
+central 10% — tracking **per-pixel temporal luminance variance** over a sliding
+window. The HUD reports the three mean-variance numbers; the headline is the
+**edge-vs-center ratio** (>1 = edges noisier than the middle — the artifact the
+overscan feature targets). A magnified side-by-side inset shows a left-edge strip
+next to a center strip for human comparison, and the metric triple is logged as a
+JSON line to the console every 2s for automated scraping. The overscan control
+is **feature-detected** — it appears only when the loaded build exposes an
+`overscan` property.
 
 ## Roadmap
 
