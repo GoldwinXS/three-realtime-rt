@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.2 — 2026-07-22
+
+- **Real fix for black lighting on iOS** (root-caused by live bisection on an
+  iPad): WebKit's GLSL-to-Metal translation silently emits a broken program
+  when `traceRadiance` (BVH traversal + full hit shading) is inlined at a
+  FOURTH call site — clean compile, black output, no console error. 0.4.0's
+  alpha-blend straight-through trace was that fourth site. The blend
+  continuation now reuses the GI bounce's call site (a blend pixel's secondary
+  ray becomes the view continuation instead of a GI bounce — it forgoes the
+  pane's own GI bounce, visually negligible, and saves a ray). The shader
+  carries a hard call-site budget comment; iOS gets the FULL pipeline again,
+  spec buffer and real transparency included. 0.4.1's functional MRT probe and
+  single-attachment fallback remain as protection for genuinely MRT-broken
+  devices.
+
 ## 0.4.1 — 2026-07-22
 
 - **Fix: black lighting on iOS (iPhone/iPad, all browsers).** WebKit reports

@@ -634,11 +634,29 @@ void main() {
   // (unbiased) while GI's ray cost halves; accumulation + denoise absorb
   // the alternation.
   gWantSpec = false; // secondary bounces contribute to diffuse GI only
+  // BLEND pixels reuse THIS call site as their straight-through view
+  // continuation instead of a GI bounce (their behind-image rides the specular
+  // attachment; the pane forgoes its own GI bounce — visually negligible, and
+  // it saves a ray). CRITICAL CALL-SITE BUDGET: traceRadiance may appear at
+  // most THREE times in this shader (glass refraction exit, this unified
+  // secondary site, the metal-reflection path). WebKit's GLSL->Metal
+  // translation silently emits a broken program at a FOURTH inlined call site
+  // (clean compile, black output on every iOS browser) — bisected live on an
+  // iPad, 2026-07-22. Never add a call site; extend this one.
   vec3 indirect = vec3(0.0);
-  if (uGIEnabled) {
-    bool trace = !uGIHalfRate || (((px.x + px.y + int(uFrame)) & 1) == 0);
-    if (trace) {
-      indirect = traceRadiance(P + N * uEps, cosineSampleHemisphere(N, rand2()), false);
+  vec3 blendBehind = vec3(0.0);
+  bool wantBehind = uBlendEnabled && blend;
+  bool wantGI = uGIEnabled && !wantBehind
+    && (!uGIHalfRate || (((px.x + px.y + int(uFrame)) & 1) == 0));
+  if (wantBehind || wantGI) {
+    vec3 Vv = normalize(P - uCameraPos);
+    vec3 dir = wantBehind ? Vv : cosineSampleHemisphere(N, rand2());
+    vec3 org = wantBehind ? P + Vv * uEps : P + N * uEps;
+    vec3 r = traceRadiance(org, dir, wantBehind);
+    if (wantBehind) {
+      blendBehind = r;
+    } else {
+      indirect = r;
       if (uGIHalfRate) indirect *= 2.0;
     }
   }
@@ -685,11 +703,8 @@ void main() {
   // where the pane's albedo is actually available. sampleIrr keeps only the
   // pane's own surface lighting, which is static on the surface and accumulates
   // with normal full-length history.
-  vec3 blendBehind = vec3(0.0);
-  if (uBlendEnabled && blend) {
-    vec3 V = normalize(P - uCameraPos);
-    blendBehind = traceRadiance(P + V * uEps, V, true);
-  }
+  // (The straight-through trace itself happens at the unified secondary-ray
+  // call site above — see the Metal call-site-count note there.)
 
   // A single NaN/Inf sample would poison the EMA history for good (mix() with
   // NaN stays NaN until a disocclusion resets the pixel) — sanitize first.
