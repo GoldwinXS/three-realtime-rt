@@ -414,6 +414,15 @@ void main() {
   float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
 
   // --- temporal reuse: reproject P, validate the SAME surface, merge history ---
+  // emaPrevGi: last frame's resolved GI, RECONSTRUCTED from the previous
+  // reservoir (all inputs already bound — no extra sampler). Reservoirs persist
+  // WHICH sample matters, not a variance average: near emitters many samples
+  // are legitimately bright and the per-frame selection churn reads as
+  // flickering fireflies (the inline GI path hid the same variance inside the
+  // lighting pass's deep EMA). The resolve below blends against this
+  // reconstruction to restore that smoothing.
+  vec3 emaPrevGi = vec3(0.0);
+  bool emaPrevOk = false;
   if (haveReproj) {
     vec4 pPos = texture(uPrevGWorldPos, prevUv);
     if (pPos.w > 0.5 && abs(dot(P - pPos.xyz, N)) < tol) {
@@ -440,6 +449,15 @@ void main() {
           selRad = radPrev;
           selPos = hitPrev;
           selNormal = nPrev;
+        }
+        // Reconstruct last frame's resolve from this same sample (same W cap
+        // and clamp as the live resolve, for a like-for-like EMA partner).
+        vec3 pg = radPrev * (cosPrev / PI) * min(Wprev, 32.0);
+        float pgl = luminance(pg);
+        if (pgl > uFireflyClamp) pg *= uFireflyClamp / pgl;
+        if (!any(isnan(pg)) && !any(isinf(pg))) {
+          emaPrevGi = pg;
+          emaPrevOk = true;
         }
       }
     }
@@ -548,11 +566,31 @@ void main() {
   if (uSpatialTaps > 0 && Wout > 0.0 && sl > 1e-5) {
     if (occluded(P + N * uEps, sd / sl, sl)) Wout = 0.0;
   }
+  // W cap: W ~ pi/cos for the cosine source pdf, so values beyond ~32 mean the
+  // recomputed p_hat(selected) collapsed this frame (grazing cos after a camera
+  // or normal change) while wSum still carries past-frame magnitudes — the
+  // classic reservoir firefly. The inline GI path hid the same spikes inside
+  // its deep temporal EMA; this resolve has no EMA downstream, so the spike
+  // would live on screen for a whole frame (visibly on Metal/iOS). Capping W
+  // trusts reconnection angles down to cos ~ 0.1 and slightly darkens grazing
+  // GI beyond that — the standard ReSTIR trade.
+  Wout = min(Wout, 32.0);
 
   vec3 gi = selRad * (selCos / PI) * Wout;   // demodulated indirect irradiance
+  // Confidence-weighted firefly clamp: a young reservoir (M small — fresh
+  // pixels under camera motion, where the resolve EMA has no partner yet) is
+  // one raw sample, and at the full clamp it reads as motion sparkle. Tighten
+  // the cap for low-M pixels and relax it to the inline-path clamp as
+  // confidence grows; converged pixels are untouched. Trades a few frames of
+  // slightly dim GI on freshly revealed surfaces for a steady image in motion.
+  float conf = clamp(M / uMCap, 0.0, 1.0);
+  float cap = uFireflyClamp * mix(0.3, 1.0, conf);
   float gil = luminance(gi);
-  if (gil > uFireflyClamp) gi *= uFireflyClamp / gil;  // matches inline safety net
+  if (gil > cap) gi *= cap / gil;
   if (any(isnan(gi)) || any(isinf(gi))) gi = vec3(0.0);
+  // Resolve EMA (see the emaPrevGi note above): ~5-frame effective average.
+  // Cuts selection-churn flicker near emitters ~5x for ~5 frames of lag.
+  if (emaPrevOk) gi = mix(emaPrevGi, gi, 0.2);
 
   // --- STORE the TEMPORAL-only reservoir as history (see snapshot note above).
   // Resolve its own W from the temporal-merged wSum/M so the stored W is valid for

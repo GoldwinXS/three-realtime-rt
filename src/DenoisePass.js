@@ -90,7 +90,12 @@ void main() {
   // business being brighter than its entire neighbourhood — clamp its
   // luminance to the brightest neighbour. Converged pixels are exempt, so
   // real small highlights survive.
-  if (uStep < 1.5 && count < 8.0) {
+  // With an additive GI input (uHasAdd) the despeckle must ALWAYS run on the
+  // first iteration: count is the LIGHTING buffer's history depth and says
+  // nothing about the GI term, which is re-resolved fresh every frame — a GI
+  // firefly at a "converged" pixel would otherwise skip this clamp entirely
+  // and survive to the screen (observed as white speckles on iOS).
+  if (uStep < 1.5 && (count < 8.0 || uHasAdd)) {
     float maxL = 0.0;
     float found = 0.0;
     for (int dy = -1; dy <= 1; dy++) {

@@ -153,6 +153,10 @@ async function main() {
   if (urlFlags.has("nospecmrt")) {
     RealtimeRaytracer._specMrtSupported = () => false;
   }
+  // ?gitaps=N: override ReSTIR GI spatial tap count (0 = v1 temporal-only) —
+  // lets a devtools-less device bisect spatial-vs-temporal artifacts.
+  const giTapsOverride = urlFlags.has("gitaps") ? parseInt(urlFlags.get("gitaps"), 10) : null;
+
   // ?diag=1: on-page console capture for devices with no reachable devtools
   // (iPads in the field). Shader compile/link failures land in console.error —
   // this surfaces the ERROR lines right on the screen so a photo of the device
@@ -208,6 +212,9 @@ async function main() {
     sky,                // (disabled indoors) procedural sky as GI ambient + background
     fog: { enabled: false, color: new THREE.Color(0.5, 0.55, 0.62), density: 0.04 },
   });
+  if (giTapsOverride !== null && Number.isFinite(giTapsOverride)) {
+    rt.restirGISpatialTaps = giTapsOverride;
+  }
 
   // Self-test mode turns the full lighting stack on (GI + emissive NEE +
   // reflections + refraction) at 50% lighting resolution, matching the config
