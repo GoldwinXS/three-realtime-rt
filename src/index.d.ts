@@ -70,6 +70,14 @@ export interface RealtimeRaytracerOptions {
    * denoiser reconstruct the difference. Set 1.0 for maximum quality.
    */
   renderScale?: number;
+  /**
+   * Overscan: render internally at a padded resolution with a proportionally
+   * widened field of view, then crop the centre to the canvas on the final draw.
+   * Fraction of padding PER EDGE (clamped 0–0.25). Pushes the disocclusion
+   * convergence noise at the leading screen edge off-screen during camera
+   * motion. `0.1` renders 1.44× the pixels; 0.05–0.1 recommended. Default `0`.
+   */
+  overscan?: number;
   /** À-trous denoise iterations (steps 1, 2, 4, ...). */
   denoiseIterations?: number;
   /**
@@ -258,6 +266,13 @@ export class RealtimeRaytracer {
   get renderScale(): number;
   set renderScale(v: number);
 
+  /**
+   * Overscan padding fraction per edge (0–0.25). Assigning reallocates every
+   * pass at the new padded size and hard-resets accumulation (settings-time).
+   */
+  get overscan(): number;
+  set overscan(v: number);
+
   /** Environment (sky) color for GI rays that miss + composite background. */
   envColor: Color;
   /** Environment intensity multiplier. */
@@ -322,7 +337,10 @@ export class RealtimeRaytracer {
   updateLights(scene: Scene): void;
   /** Discard temporal history and restart accumulation. */
   resetAccumulation(): void;
-  /** Resize all internal render targets. */
+  /**
+   * Resize all internal render targets. Pass the CANVAS (drawing-buffer) size;
+   * the internal targets are the overscan-padded size derived from it.
+   */
   setSize(width: number, height: number): void;
   /** Render one frame (call instead of renderer.render). */
   render(scene: Scene, camera: Camera): void;

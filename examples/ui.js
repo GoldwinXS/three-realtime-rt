@@ -181,6 +181,14 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
     })
   );
   rSec.append(
+    // Overscan: render past the canvas edges and crop back, so the leading-edge
+    // disocclusion noise during camera motion is born off-screen. Costs pixels
+    // (0.1 → 1.44×), so it lives next to the resolution controls.
+    selectRow("overscan", [["off", 0], ["5%", 0.05], ["10%", 0.1]], rt.overscan, (v) => {
+      rt.overscan = parseFloat(v);
+    })
+  );
+  rSec.append(
     selectRow("view", [
       ["composite", 0], ["albedo", 1], ["normals", 2],
       ["irradiance", 3], ["world pos", 4], ["emissive", 5], ["specular", 6],

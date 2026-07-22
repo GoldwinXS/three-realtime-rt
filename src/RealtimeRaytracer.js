@@ -164,14 +164,34 @@ export class RealtimeRaytracer {
 
     const size = renderer.getSize(new THREE.Vector2());
     const pr = renderer.getPixelRatio();
-    this._width = Math.floor(size.x * pr);
-    this._height = Math.floor(size.y * pr);
+    // Canvas (on-screen) drawing-buffer size. Everything internal renders at the
+    // OVERSCAN-padded size derived from this; the final on-screen draw crops the
+    // centre back to it.
+    this._canvasW = Math.floor(size.x * pr);
+    this._canvasH = Math.floor(size.y * pr);
+    /**
+     * Overscan: render internally at a padded resolution with a proportionally
+     * widened field of view, then crop the centre to the canvas on the final
+     * draw. Disocclusion pixels at the leading screen edge during camera motion
+     * are then born OFF-screen, hiding their several-frame temporal-convergence
+     * noise. Fraction of padding PER EDGE (clamped 0–0.25); 0.1 on a 1000×600
+     * canvas renders 1200×720 internally (1.44× the pixels). 0 disables it.
+     */
+    this._overscan = Math.min(0.25, Math.max(0, options.overscan ?? 0));
     /**
      * Resolution scale for the ray traced lighting (G-buffer and final image
      * stay full res). 0.5 traces 4x fewer rays; the bilateral upsample +
      * denoiser reconstruct the difference. Set 1.0 for maximum quality.
      */
     this._renderScale = options.renderScale ?? 0.5;
+    // Padded internal render size (canvas × the overscan factor). All passes
+    // work here; _crop maps it back to the canvas on the final draw.
+    this._width = Math.round(this._canvasW * this._padFactor);
+    this._height = Math.round(this._canvasH * this._padFactor);
+    // Central-crop UV transform (scale.xy, offset.zw): padded → canvas. Identity
+    // when overscan is 0. Recomputed by _updateCrop() on every size/overscan change.
+    this._crop = new THREE.Vector4(1, 1, 0, 0);
+    this._updateCrop();
 
     const mixedPrecision = RealtimeRaytracer._mixedMrtSupported(renderer.getContext());
     if (!mixedPrecision) {
@@ -480,6 +500,23 @@ export class RealtimeRaytracer {
     if (this.taaPass) this.taaPass.reset();
   }
 
+  // Padded/canvas size ratio per axis: 1 + 2×overscan (padding is per edge).
+  get _padFactor() {
+    return 1 + 2 * this._overscan;
+  }
+
+  // Recompute the central-crop transform that maps the padded internal image
+  // back to the canvas on the final draw. UV: canvas_uv × scale + offset →
+  // padded_uv, sampling the central canvas-sized region. Identity at overscan 0.
+  _updateCrop() {
+    this._crop.set(
+      this._canvasW / this._width,
+      this._canvasH / this._height,
+      (this._width - this._canvasW) * 0.5 / this._width,
+      (this._height - this._canvasH) * 0.5 / this._height
+    );
+  }
+
   get _scaledW() {
     return Math.max(1, Math.floor(this._width * this._renderScale));
   }
@@ -498,7 +535,20 @@ export class RealtimeRaytracer {
   }
   set renderScale(v) {
     this._renderScale = v;
-    this.setSize(this._width, this._height);
+    this.setSize(this._canvasW, this._canvasH);
+  }
+
+  get overscan() {
+    return this._overscan;
+  }
+  // Live-assignable like renderScale. Changing the padded size reallocates every
+  // pass, so this hard-resets accumulation (a settings-time knob, not per-frame).
+  set overscan(v) {
+    const c = Math.min(0.25, Math.max(0, v || 0));
+    if (c === this._overscan) return;
+    this._overscan = c;
+    this.setSize(this._canvasW, this._canvasH);
+    this.resetAccumulation();
   }
 
   // Resize (or re-scale) the pipeline WITHOUT dumping temporal history. A
@@ -510,8 +560,14 @@ export class RealtimeRaytracer {
   // updated (the renderScale setter changes it before calling us).
   setSize(width, height) {
     if (!this.supported) return;
-    this._width = Math.floor(width);
-    this._height = Math.floor(height);
+    // Arguments are the CANVAS (on-screen) size; the internal targets are the
+    // overscan-padded size derived from it. The only place the two diverge is
+    // the final on-screen crop (see _crop / _updateCrop).
+    this._canvasW = Math.floor(width);
+    this._canvasH = Math.floor(height);
+    this._width = Math.round(this._canvasW * this._padFactor);
+    this._height = Math.round(this._canvasH * this._padFactor);
+    this._updateCrop();
 
     const sw = this._scaledW;
     const sh = this._scaledH;
@@ -664,8 +720,22 @@ export class RealtimeRaytracer {
     // samples slightly different positions; the TAA resolve averages them into
     // supersampled edges. Restored after the frame so callers see a clean matrix.
     const proj = camera.projectionMatrix;
+    const savedProj0 = proj.elements[0];
+    const savedProj5 = proj.elements[5];
     const savedProj8 = proj.elements[8];
     const savedProj9 = proj.elements[9];
+    // Overscan: widen the frustum so the padded image covers proportionally
+    // more FOV. Scaling elements[0]/[5] (the x/y projection scale) by 1/padFactor
+    // makes each axis see (1 + 2·overscan)× as much — the extra content lands in
+    // the padding that the final crop discards. Applied like the TAA jitter
+    // (temporary; the caller's matrix is restored at frame end), and BEFORE the
+    // jitter so the two compose. Previous-frame matrices captured below are the
+    // widened ones, keeping temporal reprojection consistent in padded space.
+    if (this._overscan > 0) {
+      const inv = 1 / this._padFactor;
+      proj.elements[0] *= inv;
+      proj.elements[5] *= inv;
+    }
     // Debug views (outputMode != 0) bypass the TAA resolve, so skip the jitter
     // too — otherwise the raw buffers visibly shake.
     if (this.taa && this.outputMode === 0) {
@@ -817,13 +887,17 @@ export class RealtimeRaytracer {
     cU.uVolumetric.value = volumetricTex;
     cU.uVolEnabled.value = volumetricTex !== null;
     cU.uVolTexelSize.value.set(1 / this._volW, 1 / this._volH);
+    // With TAA on we composite into the padded offscreen target (no crop — the
+    // TAA copy crops on its way to screen). Without TAA the composite IS the
+    // on-screen draw, so it applies the central crop itself.
     this.composite.render(
       this.renderer,
       irradiance,
       this.gbuffer,
       scene.background,
       useTaa ? this._sceneColor : null,
-      specularTex
+      specularTex,
+      useTaa ? null : this._crop
     );
 
     // 5. temporal anti-aliasing resolve (jitter + neighbourhood-clamped history).
@@ -835,7 +909,9 @@ export class RealtimeRaytracer {
         this._prevViewProj, // last frame's jittered VP
         this._jitterUv,
         this._prevJitterUv,
-        this.taaBlend
+        this.taaBlend,
+        null, // outputTarget: null = screen (the final on-screen draw)
+        this._crop // central-crop the padded resolve onto the canvas
       );
     } else if (this.taa) {
       // In a debug view: keep history fresh so switching back doesn't ghost.
@@ -844,7 +920,10 @@ export class RealtimeRaytracer {
 
     this.renderer.autoClear = prevAutoClear;
 
-    // Restore the caller's projection matrix (remove this frame's jitter).
+    // Restore the caller's projection matrix (remove this frame's jitter + the
+    // overscan widening) so callers always see their own clean matrix.
+    proj.elements[0] = savedProj0;
+    proj.elements[5] = savedProj5;
     proj.elements[8] = savedProj8;
     proj.elements[9] = savedProj9;
 
