@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 — 2026-07-22
 
 - **Demo:** the room is now a designed gallery (water pool with kerbs under the
   emissive panel, helmet spotlight, duck-in-a-vitrine transparency exhibit,

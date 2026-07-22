@@ -10,6 +10,18 @@ the scene, **ReSTIR many-light sampling** (flat cost in light count),
 **blue-noise sampling**, and real-time **temporal denoising + anti-aliasing**.
 Runs on plain WebGL2.
 
+This round adds **GGX PBR specular** — Cook-Torrance dielectric highlights in a
+separate specular buffer, so `roughness` finally matters on non-metals — plus
+**normal / roughness / metalness maps**, **alpha-blended transparency**
+(single-layer deferred blend), **deforming dynamic meshes** (a mirror-water pool
+whose traced reflections follow the live wave surface), **overscan** to hide
+leading-edge convergence noise while the camera turns, and **emissive importance
+sampling** (area × luminance) for calmer area lights. The zero-config renderer
+now ships **conservative, self-scaling defaults** — it starts low-but-ray-traced
+and an on-by-default governor scales quality up toward `targetFps`; an optional
+async **GPU tier probe** reads real WebGPU adapter limits for a smarter starting
+point.
+
 The library ships as **untranspiled ES modules** (the `src/` folder) — it has no
 build step of its own, so you consume it through your bundler (Vite, webpack,
 esbuild, …) or a browser import map that resolves the bare `three` /
@@ -281,7 +293,7 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `emissive` | ✅ | A *static* emissive mesh becomes a real **area light** (NEE) — casts soft light + shadows, including a GGX highlight. |
 | `emissiveMap` | ⚠️ visible only | A map-masked emissive **glows on screen** but the map **zeroes its area-light table** — it lights nothing. Use a flat `emissive` colour (no map) for an emitter that should illuminate. |
 | `transmission` (Physical) | ✅ | Glass: Fresnel reflection (with analytic-light glints) + two-interface refraction. |
-| `transparent` + `opacity` | ✅ | Alpha blend: the surface is composited over the geometry behind it (a straight-through traced ray), weighted by scalar `opacity` and **tinted by `color`/`map`**. Single layer — nearest transparent surface wins, overlapping panes don't inter-sort. Kept out of the BVH, so it casts no shadow. Toggle with `transparency`. |
+| `transparent` + `opacity` | ✅ | Alpha blend: the surface is composited over the geometry behind it (a straight-through traced ray), weighted by scalar `opacity` and **tinted by `color`/`map`**. The behind-radiance rides the **specular buffer** and the opacity blend happens at **composite** (where the pane's albedo lives), so **needs `specular: true`** — with the specular buffer off, blend surfaces degrade to opaque. Single layer — nearest transparent surface wins, overlapping panes don't inter-sort. Kept out of the BVH, so it casts no shadow. Toggle with `transparency`. |
 | `opacity` on an opaque material | ❌ | Only read when `transparent: true`; an opaque material always writes at full coverage. |
 | **dielectric specular** | ✅ | Cook-Torrance **GGX** direct highlights for *every* surface, in a separate white (`F0 ≈ 0.04`) specular buffer the composite adds without the albedo multiply. Toggle with `specular` (default on). |
 | `roughnessMap` | ✅ | `roughness × roughnessMap.g` (three.js convention) — sampled in the G-buffer. |
@@ -349,9 +361,11 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `denoise` | `true` | Edge-aware à-trous denoiser. |
 | `gi` | `true` | 1-bounce global illumination (vs. direct-only). |
 | `emissiveNEE` | `true` | Sample static emissive meshes as area lights (next-event estimation). Off = emitters only light via lucky GI rays. |
+| `emissiveImportance` | `true` | Pick WHICH emissive triangle NEE samples proportional to **area × emitted luminance** (compile-time power CDF) instead of a uniform 1-of-N. Same mean, far less sparkle when emitters differ in size/brightness. Off = legacy uniform pick. |
+| `specular` | `true` | Cook-Torrance **GGX** dielectric highlights for every surface, in a separate white (`F0 ≈ 0.04`) buffer the composite adds without the albedo multiply. Off = the old Lambert-only look. Also required by `transparency`. |
 | `reflections` | `true` | Traced mirror/glossy reflections on metallic surfaces (sharpest at `renderScale: 1`). |
 | `refraction` | `true` | Traced two-interface refraction for `MeshPhysicalMaterial.transmission` surfaces. |
-| `transparency` | `true` | Alpha-blended transparency: composite `transparent` meshes over the geometry behind them (single-layer, weighted by `opacity`, tinted by albedo). Off = they render fully opaque. |
+| `transparency` | `true` | Alpha-blended transparency: composite `transparent` meshes over the geometry behind them (single-layer, weighted by `opacity`, tinted by albedo). Needs the specular buffer (`specular: true`). Off = they render fully opaque. |
 | `restir` | `true` | ReSTIR direct lighting: per-pixel reservoirs with temporal + spatial reuse, one visibility ray regardless of light count. Flat cost in light count; cuts emissive area-light noise. |
 | `ior` | `1.5` | Index of refraction used by `refraction`. |
 | `volumetric` | *off* | Physically-based god rays: single-scatter fog, one BVH-shadowed light sample per lighting pixel per frame, temporally accumulated. `{ enabled, density, maxDist, zones }`, where `zones` is an optional array of up to 8 AABBs `{ min:[x,y,z], max:[x,y,z], density }` that add localized fog on top of (or instead of) the global `density`. |
@@ -466,16 +480,29 @@ npm install
 npm run dev       # http://localhost:8115
 ```
 
-The demo ([`examples/`](examples/)) is an ordinary three.js app — see
+The demo ([`examples/`](examples/)) is a **panoramic museum gallery** — a
+Cornell-style room (saturated red/teal side walls for obvious colour bleed, open
+top) staged as an exhibit where every renderer feature gets its own vignette: a
+**deforming mirror-water pool** under the emissive gallery light, the
+DamagedHelmet hero on a pedestal under a toggleable **spotlight** (normal /
+roughness maps + analytic-light glints), a glossy teapot showing **GGX dielectric
+specular** against the teal wall, a gold torus knot and mirror sphere (traced
+reflections), a glass sphere (refraction), a roughness ramp on plinths, and the
+**duck in a glass vitrine** (alpha-blended transparency that casts no shadow onto
+the exhibit). An always-on **fps readout** sits top-left and a **collapsible
+control panel** (starts collapsed on phones) toggles every feature, drives a
+clerestory-window light slider, and spawns the 40-body physics pile. See
 [`examples/main.js`](examples/main.js) for the full, commented integration
 (scene → physics → compile → render loop). `npm run deploy` builds and publishes
 it to GitHub Pages.
 
 ## Gallery & benchmarks
 
-[`gallery.html`](gallery.html) drops the raytracer into **stock glTF scenes it
-was never authored for** — LittlestTokyo, Lantern, Antique Camera, BoomBox,
-Corset, Water Bottle, and the Damaged Helmet — streamed straight from their
+[`gallery.html`](gallery.html) opens on a built-in **Cornell box** (the classic
+GI reference — coloured walls, an emissive ceiling panel) and drops the raytracer
+into **stock glTF scenes it was never authored for** — Littlest Tokyo, Lantern,
+Damaged Helmet, Antique Camera, BoomBox, Corset, Water Bottle, Toy Car,
+Iridescence Lamp, Mosquito in Amber, and Fox — streamed straight from their
 public hosts (no assets committed). A one-button toggle A/Bs ray tracing against
 plain rasterized three.js with an fps + triangle readout, and a compact options
 strip exposes GI / emissive NEE / reflections / refraction / ReSTIR / denoise /
@@ -515,7 +542,8 @@ is **feature-detected** — it appears only when the loaded build exposes an
 | 6. Specular | ✅ | Mirror/glossy reflections on metals + two-interface glass refraction |
 | 6b. Sampling | ✅ | Blue-noise sampling + ReSTIR direct lighting (temporal + spatial reuse) |
 | 6c. Any-hit shadows | ✅ | Unordered early-out BVH traversal for occlusion rays — same image, up to ~2× cheaper shadows |
-| 7. Publish | — | npm publish; refractive water; per-material IOR |
+| 6d. PBR materials | ✅ | Cook-Torrance GGX dielectric specular + normal/roughness/metalness maps, alpha-blended transparency, deforming (water) meshes, overscan |
+| 7. Next | — | Skinned-mesh (animated) shadows; DDGI irradiance probes; ReSTIR GI (indirect reservoir reuse); WGSL / WebGPU backend; per-material IOR |
 
 ## Credits
 
