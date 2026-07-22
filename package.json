@@ -17,6 +17,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test:render": "node scripts/selftest.mjs",
     "deploy": "vite build && gh-pages -d dist -t"
   },
   "keywords": [

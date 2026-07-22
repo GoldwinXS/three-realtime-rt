@@ -21,6 +21,7 @@ import { RealtimeRaytracer } from "../src/index.js";
 import { buildScene } from "./scene.js";
 import { Physics } from "./physics.js";
 import { buildUI } from "./ui.js";
+import { createSelftest } from "./selftest.js";
 
 const boot = document.getElementById("boot");
 const bootMsg = document.getElementById("boot-msg");
@@ -36,6 +37,11 @@ const setBoot = (t) => { if (bootMsg) bootMsg.textContent = t; };
 // plus an explicit ?safe=1 opt-in.
 const PARAMS = new URLSearchParams(location.search);
 const SAFE = PARAMS.has("safe");
+// ?selftest=1: run the render self-test (examples/selftest.js). Forces the full
+// lighting stack on, then reads the drawing buffer back after 90 rendered frames
+// and emits a machine-readable verdict. Needs preserveDrawingBuffer to read the
+// canvas — enabled only in this mode so normal runs keep the cheaper default.
+const SELFTEST = PARAMS.has("selftest");
 let safeModeTriggered = false;
 const enterSafeMode = (why) => {
   if (SAFE || safeModeTriggered) return;
@@ -67,7 +73,7 @@ async function main() {
 
   // 2. Renderer + raytracer. The raytracer takes over lighting; three.js still
   //    rasterizes primary visibility (the G-buffer) for free.
-  const renderer = new THREE.WebGLRenderer({ antialias: false });
+  const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: SELFTEST });
   // Keep the CANVAS sharp (geometry/texture edges carry readability) and let
   // the adaptive governor cut cost on the lighting side instead. Phones get up
   // to 1.5× DPR — pixelRatio 1 on a 3× phone screen reads as mush.
@@ -202,6 +208,22 @@ async function main() {
     sky,                // (disabled indoors) procedural sky as GI ambient + background
     fog: { enabled: false, color: new THREE.Color(0.5, 0.55, 0.62), density: 0.04 },
   });
+
+  // Self-test mode turns the full lighting stack on (GI + emissive NEE +
+  // reflections + refraction) at 50% lighting resolution, matching the config
+  // the render verdicts are calibrated against. The scene, physics and UI stay
+  // exactly as a human sees them so the test exercises the real pipeline.
+  let selftest = null;
+  if (SELFTEST) {
+    rt.gi = true;
+    rt.emissiveNEE = true;
+    rt.reflections = true;
+    rt.refraction = true;
+    rt.renderScale = 0.5;
+    rt.adaptiveQuality = false; // hold the resolution fixed so the count is meaningful
+    rt.resetAccumulation();
+    selftest = createSelftest({ rt, renderer });
+  }
 
   // The dynamic set = the (opt-in) physics pile PLUS the CPU-deformed water
   // pool PLUS the animated fox. The water is flagged rtDeforming in scene.js, so
@@ -432,6 +454,10 @@ async function main() {
     }
 
     if (!booted) { booted = true; boot?.classList.add("hidden"); }
+
+    // Render self-test: evaluate verdicts off the drawing buffer once enough
+    // frames have accumulated. No-op after the verdict is emitted.
+    if (selftest) selftest.onFrame();
 
     frames++;
     if (now - lastFps >= 500) {

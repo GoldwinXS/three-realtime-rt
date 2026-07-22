@@ -603,6 +603,69 @@ JSON line to the console every 2s for automated scraping. The overscan control
 is **feature-detected** — it appears only when the loaded build exposes an
 `overscan` property.
 
+## Render self-test
+
+The renderer can pass every compile and framebuffer check and still draw a black
+screen — that is exactly what shipped in 0.4.0 on iOS (WebKit's GLSL-to-Metal
+translation silently broke at a 4th `traceRadiance` call site; clean compile, no
+console error, black output). The only defence against that class of failure is
+to **look at the pixels**, so the demo has a headless-friendly self-test.
+
+**In the browser:** load [`/?selftest=1`](examples/selftest.js). It forces the
+full lighting stack on (GI + emissive NEE + reflections + refraction, lighting at
+50%), renders the normal gallery scene, and after **90 rendered frames** reads
+the drawing buffer back and emits one JSON line to the console (`[selftest] …`)
+and into a hidden `#selftest-verdict` DOM node:
+
+```json
+{ "pass": true, "meanLum": 139.08, "irrLum": 169.73, "glErrors": 0,
+  "specMRT": true, "supported": true, "frames": 91, "ua": "…" }
+```
+
+The pass gate wants `meanLum` in `[12, 230]` (calibrated: a healthy composite of
+the gallery centre reads ~140 on desktop; a black screen reads ~0), `irrLum > 6`,
+`glErrors == 0` and `supported == true`.
+
+- `meanLum` / `irrLum` — mean Rec.709 luma (0–255) of the **centre 25%** of the
+  composite, and of the raw irradiance buffer (`outputMode 3`) for one frame. The
+  irradiance readback proves the **lighting** is alive, not just emissive geometry
+  surviving the composite (0.4.0's black image still showed emitters). A near-zero
+  reading is the black-screen class; the pass gate wants a lit mid-range value.
+- `glErrors` — count of nonzero `gl.getError()` samples (any nonzero fails).
+- `specMRT` / `supported` — the two capability fallbacks, for triage.
+
+The page keeps rendering after the verdict so a human can watch. This mode builds
+the renderer with `preserveDrawingBuffer: true` so the canvas can be read back;
+normal runs keep the cheaper default.
+
+**In CI:** `npm run test:render` ([`scripts/selftest.mjs`](scripts/selftest.mjs))
+starts vite on a free port and drives `?selftest=1` through Playwright across
+**chromium, firefox and webkit**, printing a pass/fail/skip table and exiting
+nonzero on any real failure (a documented environmental *skip* does not fail the
+suite). Playwright is loaded from a sibling checkout — see the top of the script.
+
+Machine-specific note (Windows + NVIDIA, the current dev box): the chromium leg
+runs **headed** with **`--use-angle=gl`**. ANGLE's default D3D11/FXC backend
+never finishes compiling the BVH megakernel here — headless chromium,
+headed+`--use-angle=d3d11` and system Chrome all freeze at ~3 frames with silent
+`VALIDATE_STATUS=false` storms — whereas the native NVIDIA GL backend compiles
+it in ~137ms. A visible chromium window on the desktop during the run is
+expected. On this box **firefox** and **webkit** come back `skip`: firefox
+renders through that same stalling ANGLE-D3D11 backend and exposes no native-GL
+switch, and Playwright's Windows webkit has no usable WebGL2 (context lost). Both
+would actually run on a real-GPU Linux runner with native GL; only chromium is
+required to pass here.
+
+**What this catches, and what it does not.** The matrix catches API / JavaScript
+/ GLSL-frontend divergence between engines, and any regression that blackens or
+errors the image on the engines it runs. It does **not** catch the original iOS
+bug: Playwright's `webkit` on Windows is the WPE/GTK WebKit build, **not Apple's
+Metal stack**, so it never exercises the GLSL-to-Metal code generator that
+actually failed. **Real-device iOS testing stays manual.** The field kit for that
+is on-device URL flags: `?diag=1` mirrors console errors onto the page (so a
+photo of an iPad is a usable bug report) and `?nospecmrt=1` forces the
+single-attachment WebKit fallback on any machine.
+
 ## Roadmap
 
 | Stage | Status | What |

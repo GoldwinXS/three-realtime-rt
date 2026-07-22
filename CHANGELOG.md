@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+
+- **Render self-test (`?selftest=1`) + CI smoke matrix.** A net for the class of
+  failure behind the 0.4.0 iOS incident: a pipeline that compiles clean, reports
+  framebuffer-complete, logs no error, and still draws black. The demo's new
+  `?selftest=1` mode (`examples/selftest.js`) forces the full lighting stack on
+  (GI + emissive NEE + reflections + refraction at 50% lighting), renders the
+  standard scene, and after 90 rendered frames reads the drawing buffer back to
+  assert the image is actually lit — a centre-25% luminance gate on both the
+  composite and the raw irradiance buffer (`outputMode 3`), plus a `gl.getError()`
+  gate and the `specMRT` / `supported` fallbacks. It emits one JSON verdict line
+  to the console and a `#selftest-verdict` DOM node, and keeps rendering after so
+  a human can watch. This mode is the only path that builds the renderer with
+  `preserveDrawingBuffer: true`.
+- **`npm run test:render`** (`scripts/selftest.mjs`) drives `?selftest=1` through
+  Playwright across chromium, firefox and webkit, prints a pass/fail/skip table
+  and exits nonzero on any failure. **Caveat, documented in the README:**
+  Playwright's `webkit` on Windows is the WPE/GTK build, not Apple's Metal stack,
+  so this matrix would NOT have caught the original iOS bug (a GLSL-to-Metal
+  codegen failure). It catches API / JS / GLSL-frontend divergence between
+  engines; real-device iOS testing stays manual (`?diag=1` / `?nospecmrt=1`).
 - **BVH traversal-cost heatmap debug view** (`outputMode: 7`, "bvh cost" in the
   demo's view dropdown). The any-hit shadow-ray traversal now counts the BVH
   nodes it visits into a per-pixel `gBvhVisits` accumulator; the lighting pass
