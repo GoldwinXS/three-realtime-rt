@@ -40,9 +40,28 @@ float luminance(vec3 c) {
 }
 
 // Irradiance tap with the optional GI add folded into rgb (alpha untouched).
+// METAL DIFFUSE WEIGHT: the GI add is DIFFUSE indirect irradiance. Metals have
+// essentially no diffuse response — their indirect light rides the traced
+// REFLECTION path — so their diffuse weight is (1 - metalness). RTLightingPass
+// applies this implicitly to the inline GI: sampleIrr = mix(direct + indirect,
+// reflRad, metal), scaling inline indirect by (1 - metal) on metals. The
+// external ReSTIR GI add is injected HERE, downstream of that mix, so it never
+// picked up the weight — a metalness-0.85 surface (the gold torus knot) received
+// full-strength diffuse GI, ~6.6x too much. That excess is not just too bright:
+// it is the ReSTIR resolve's residual per-pixel variance at full amplitude,
+// which reads as bright gold speckles on the curved metal (worst on iOS/Metal,
+// where the firefly stack has the least headroom). Re-apply the same
+// (1 - metalness) diffuse weight to the add so the two GI paths are energy-
+// consistent on metals and the speckle amplitude drops with the mean. Packed
+// metal word (GBufferPass): metalness lives in [0,1]; glass [2,4) and alpha
+// blend [4,5] are non-metal (weight 1, unchanged from before).
 vec4 sampleIrr(vec2 uv) {
   vec4 c = texture(uIrradiance, uv);
-  if (uHasAdd) c.rgb += texture(uAddTex, uv).rgb;
+  if (uHasAdd) {
+    float mw = texture(uGNormalMetal, uv).w;
+    float metalT = mw < 2.0 ? clamp(mw, 0.0, 1.0) : 0.0;
+    c.rgb += texture(uAddTex, uv).rgb * (1.0 - metalT);
+  }
   return c;
 }
 

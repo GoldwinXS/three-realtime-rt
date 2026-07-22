@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Fix: ReSTIR GI speckles on metals.** The external ReSTIR GI irradiance is
+  added at the denoise stage, downstream of RTLightingPass's `mix(diffuse,
+  reflRad, metal)`, so it never received the `(1 - metalness)` diffuse weight the
+  inline GI path gets — metals (the gold torus knot, metalness 0.85) were lit by
+  full-strength diffuse GI (~6.6x too much), whose residual per-pixel variance
+  read as bright gold speckles on the curved surface (worst on iOS/Metal).
+  `DenoisePass` now weights the GI add by `(1 - metalness)` per tap, making the
+  ReSTIR and inline GI paths energy-consistent on metals and dropping the speckle
+  amplitude with the excess brightness. No new samplers or `traceRadiance` sites;
+  the firefly stack is untouched; non-metal surfaces and the non-GI/inline-GI
+  paths are byte-identical.
+
 - **Chromatic dispersion for glass (`dispersion`).** A new lib option / live
   property (`0..0.5`, clamped, default `0` = off) splits refracted white light
   into a spectrum — a diamond throws a rainbow. It uses **stochastic spectral
