@@ -160,7 +160,7 @@ function lightRow(name, light, hasColor, rt, scene) {
   return row;
 }
 
-export function buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setCanvasScale, canvasScale }) {
+export function buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setWindows, setCanvasScale, canvasScale }) {
   document.head.append(el("style", null, CSS));
 
   const panel = el("div");
@@ -274,6 +274,9 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   for (const { label, light, color } of lights) {
     lSec.append(lightRow(label, light, color, rt, scene));
   }
+  // Emissive clerestory windows — each is a true sampled area light; moving
+  // this recompiles the light tables (deliberate, same hitch as pile spawn).
+  lSec.append(slider("windows", 0, 6, 1, 3, (x) => Number(x).toFixed(0), (v) => setWindows && setWindows(Math.round(v))));
   lSec.append(slider("party lights", 0, 13, 1, 0, (x) => Number(x).toFixed(0), (v) => setExtraLights(Math.round(v))));
   panel.append(lSec);
 

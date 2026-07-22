@@ -124,6 +124,49 @@ function sunAndSky(scene, intensity = 3.2, pos = [8, 14, 6]) {
 }
 
 const SCENES = {
+  // The classic Cornell box: white floor/ceiling/back, red left wall, green
+  // right wall, two rotated blocks, ONE ceiling area light and nothing else.
+  // The standard reference for GI colour bleed, soft area shadows and emissive
+  // NEE — with ray tracing toggled off it goes nearly black, which is the
+  // whole point (raster has no path from an emissive quad to the walls).
+  async cornell() {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x000000);
+    const S = 5.6;
+    const white = new THREE.MeshStandardMaterial({ color: 0xd6d0c2, roughness: 0.9 });
+    const red = new THREE.MeshStandardMaterial({ color: 0xb01e12, roughness: 0.9 });
+    const green = new THREE.MeshStandardMaterial({ color: 0x1c8a1a, roughness: 0.9 });
+    const box = (w, h, d, x, y, z, mat) => {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+      m.position.set(x, y, z);
+      scene.add(m);
+      return m;
+    };
+    box(S, 0.1, S, 0, -0.05, 0, white);              // floor
+    box(S, 0.1, S, 0, S + 0.05, 0, white);           // ceiling
+    box(S, S, 0.1, 0, S / 2, -S / 2 - 0.05, white);  // back
+    box(0.1, S, S, -S / 2 - 0.05, S / 2, 0, red);    // left
+    box(0.1, S, S, S / 2 + 0.05, S / 2, 0, green);   // right
+    box(1.7, 3.4, 1.7, -1.0, 1.7, -1.0, white).rotation.y = 0.3;  // tall block
+    box(1.7, 1.7, 1.7, 1.05, 0.85, 0.9, white).rotation.y = -0.3; // short block
+    const lamp = new THREE.Mesh(
+      new THREE.BoxGeometry(1.9, 0.06, 1.5),
+      new THREE.MeshStandardMaterial({
+        color: 0x000000,
+        emissive: 0xffe9c4,
+        emissiveIntensity: 16,
+      })
+    );
+    lamp.position.set(0, S - 0.04, 0);
+    scene.add(lamp);
+    return {
+      scene,
+      sky: { enabled: false },
+      cam: [0, 2.8, 7.8],
+      target: [0, 2.7, 0],
+      env: { color: new THREE.Color(0.0, 0.0, 0.0), intensity: 0.0 },
+    };
+  },
   async tokyo() {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x10151d);

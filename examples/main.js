@@ -51,7 +51,7 @@ const enterSafeMode = (why) => {
 
 async function main() {
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
-  const { scene, camera, bounds, lights, sky, ready, showcase, water } = buildScene();
+  const { scene, camera, bounds, lights, sky, ready, showcase, water, windows } = buildScene();
 
   // A Rapier physics playground drops a pool of props onto the ground. Their
   // meshes are plain three.js meshes — we'll hand them to the raytracer as the
@@ -185,7 +185,7 @@ async function main() {
   const controls = new OrbitControls(camera, renderer.domElement);
   // Expose for debugging / automated verification.
   Object.assign(window, { RT: rt, SCENE: scene, CAMERA: camera, PHYSICS: physics, CONTROLS: controls });
-  controls.target.set(-0.8, 1.4, -1.6); // bias toward the exhibit cluster
+  controls.target.set(-1.0, 1.8, -2.8); // bias toward the exhibit frieze
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.maxPolarAngle = Math.PI * 0.5; // stay above the ground
@@ -201,11 +201,17 @@ async function main() {
   // The orbiting ceiling light is animated in the loop (below) — find it once.
   const orbitLight = lights.find((l) => l.label === "orbit light").light;
 
-  // Panel feature toggles route through here. Reflections/refraction also reveal
-  // their showcase sphere, which changes mesh visibility — the BVH skips
-  // invisible meshes, so those two must recompile. Every case ends by resetting
+  // Clerestory windows: emissive area lights are snapshotted at compile time,
+  // so changing how many are open rebuilds the light tables (a deliberate,
+  // visible cost — same hitch as spawning the pile).
+  const setWindows = (n) => {
+    windows.forEach((w, i) => (w.visible = i < n));
+    rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
+    rt.resetAccumulation();
+  };
+
+  // Panel feature toggles route through here. Every case ends by resetting
   // accumulation so the change isn't smeared by stale history.
-  const recompile = () => rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
   const setFeature = (name, on) => {
     switch (name) {
       case "gi":
@@ -214,17 +220,14 @@ async function main() {
       case "emissive":
         rt.emissiveNEE = on;
         break;
+      // Reflections/refraction transform the materials-bench spheres in place
+      // (chrome/gold/glass are always in the scene), so no visibility change
+      // and no recompile — just the flag and a fresh accumulation.
       case "reflections":
         rt.reflections = on;
-        showcase.mirror.visible = on;
-        showcase.mirrorPed.visible = on;
-        recompile();
         break;
       case "refraction":
         rt.refraction = on;
-        showcase.glass.visible = on;
-        showcase.glassPed.visible = on;
-        recompile();
         break;
     }
     rt.resetAccumulation();
@@ -234,7 +237,7 @@ async function main() {
   // dynamic set (a one-time hitch, same as the initial compile).
   const spawnPile = () => {
     if (physics.meshes.length > 0) return;
-    physics.spawnPool(scene, 40, new THREE.Vector3(2.6, 0, 3.0));
+    physics.spawnPool(scene, 40, new THREE.Vector3(2.6, 0, 2.4));
     rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
   };
 
@@ -300,7 +303,7 @@ async function main() {
     applyCanvasSize();
     rt.setSize(...bufferSize());
   };
-  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setCanvasScale, canvasScale });
+  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setWindows, setCanvasScale, canvasScale });
 
   window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;

@@ -35,9 +35,9 @@ export function buildScene() {
     0.1,
     100
   );
-  camera.position.set(6.8, 4.6, 10.4);
+  camera.position.set(4.5, 4.2, 11.0);
 
-  const bounds = { x: 9, z: 9, wallH: 7, floorY: 0 };
+  const bounds = { x: 12, z: 7, wallH: 7, floorY: 0 };
 
   // Room shell — thin boxes. Saturated side walls so colour bleed is obvious;
   // the floor keeps a mild sheen so the GGX pass picks up the emissive strips.
@@ -46,20 +46,23 @@ export function buildScene() {
   const red = new THREE.MeshStandardMaterial({ color: 0xc42f2a, roughness: 0.85 });
   const teal = new THREE.MeshStandardMaterial({ color: 0x22808f, roughness: 0.8 });
 
-  const ground = new THREE.Mesh(new THREE.BoxGeometry(18, 0.2, 18), white);
+  // Panoramic gallery: wider than deep, exhibits stationed left-to-right along
+  // the back band so the natural move is to PAN along the frieze; the open
+  // front half is the physics floor (pile drops there).
+  const ground = new THREE.Mesh(new THREE.BoxGeometry(24, 0.2, 14), white);
   ground.position.y = -0.1;
   scene.add(ground);
 
-  const backWall = new THREE.Mesh(new THREE.BoxGeometry(18, 7, 0.2), backGrey);
-  backWall.position.set(0, 3.5, -9);
+  const backWall = new THREE.Mesh(new THREE.BoxGeometry(24, 7, 0.2), backGrey);
+  backWall.position.set(0, 3.5, -7);
   scene.add(backWall);
 
-  const leftWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 7, 18), red);
-  leftWall.position.set(-9, 3.5, 0);
+  const leftWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 7, 14), red);
+  leftWall.position.set(-12, 3.5, 0);
   scene.add(leftWall);
 
-  const rightWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 7, 18), teal);
-  rightWall.position.set(9, 3.5, 0);
+  const rightWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 7, 14), teal);
+  rightWall.position.set(12, 3.5, 0);
   scene.add(rightWall);
 
   function pedestal(x, z, height = 1.0, radius = 0.9) {
@@ -76,7 +79,7 @@ export function buildScene() {
   // Placed at the water's edge so the pool catches its reflection; its own
   // spotlight (toggleable) rakes it from the front-right for map detail +
   // an analytic glint on the visor.
-  const HELMET_POS = new THREE.Vector3(0.8, 2.6, -6.0);
+  const HELMET_POS = new THREE.Vector3(-0.6, 2.6, -4.2);
   pedestal(HELMET_POS.x, HELMET_POS.z, 1.6);
 
   // --- mid-left: gold knot (traced reflections + glints on metal) --------
@@ -87,8 +90,8 @@ export function buildScene() {
     // finds the dark open ceiling — full metal read as mottled camo there.
     new THREE.MeshStandardMaterial({ color: 0xd4af6a, roughness: 0.28, metalness: 0.85 })
   );
-  pedestal(0.2, -1.6, 0.8);
-  knot.position.set(0.2, 1.7, -1.6);
+  pedestal(1.4, -0.8, 0.8);
+  knot.position.set(1.4, 1.7, -0.8);
   scene.add(knot);
 
   // --- back-right: glossy cream teapot against the teal wall (GGX star) ---
@@ -96,63 +99,43 @@ export function buildScene() {
     new TeapotGeometry(0.8, 10),
     new THREE.MeshStandardMaterial({ color: 0xe4dccd, roughness: 0.12, metalness: 0.0 })
   );
-  pedestal(5.8, -4.6);
-  teapot.position.set(5.8, 1.75, -4.6);
+  pedestal(10.2, -1.5);
+  teapot.position.set(10.2, 1.75, -1.5);
   scene.add(teapot);
 
-  // --- back wall, right half: the roughness ramp ---------------------------
-  // Five IDENTICAL white spheres on ONE long bench, seen straight-on from the
-  // default camera, differing ONLY in roughness (0.05 left -> 0.9 right): the
-  // cool light above gives the mirror-end sphere a single tight highlight that
-  // visibly broadens and dims down the row. One bench, even spacing, same size
-  // — so it reads as a single "what roughness does" exhibit, not five props.
-  // Lambert-only (PBR specular off) all five look identically flat.
-  const rampRoughness = [0.05, 0.2, 0.4, 0.65, 0.9];
+  // --- back wall, right half: the MATERIALS bench --------------------------
+  // Six IDENTICAL spheres on one long bench, seen straight-on from the default
+  // camera — a single curated exhibit of the whole material model. Left to
+  // right: a dielectric roughness trio (0.05 / 0.35 / 0.75 — the GGX highlight
+  // visibly broadens and dims), then chrome (traced mirror reflection), gold
+  // (albedo-tinted metal), and solid glass (two-interface refraction). The
+  // "reflections" / "refraction" toggles transform the last three IN PLACE —
+  // no props popping in and out of the room.
   const bench = new THREE.Mesh(
-    new THREE.BoxGeometry(6.0, 0.5, 1.3),
+    new THREE.BoxGeometry(8.0, 0.5, 1.3),
     new THREE.MeshStandardMaterial({ color: 0x9aa1ab, roughness: 0.5 })
   );
-  bench.position.set(5.2, 0.25, -8.0);
+  bench.position.set(5.4, 0.25, -6.2);
   scene.add(bench);
-  for (let i = 0; i < rampRoughness.length; i++) {
-    const s = new THREE.Mesh(
-      new THREE.SphereGeometry(0.45, 40, 28),
-      new THREE.MeshStandardMaterial({
-        color: 0xdfe3ea,
-        roughness: rampRoughness[i],
-        metalness: 0.0,
-      })
-    );
-    s.position.set(3.2 + i * 1.0, 0.95, -8.0);
-    scene.add(s);
-  }
-
-  // --- reveals: mirror sphere (reflections) and glass sphere (refraction) --
-  const mirror = new THREE.Mesh(
-    new THREE.SphereGeometry(0.85, 48, 32),
-    new THREE.MeshStandardMaterial({ color: 0xf2f4f8, roughness: 0.05, metalness: 1.0 })
-  );
-  const mirrorPed = pedestal(-6.6, -1.2);
-  mirrorPed.visible = false;
-  mirror.position.set(-6.6, 1.85, -1.2); // near the red wall: reflects pool + panel
-  mirror.visible = false; // appears (with its pedestal) when "reflections" is enabled
-  scene.add(mirror);
-
-  const glass = new THREE.Mesh(
-    new THREE.SphereGeometry(0.8, 48, 32),
+  const gamut = [
+    new THREE.MeshStandardMaterial({ color: 0xdfe3ea, roughness: 0.05, metalness: 0 }),
+    new THREE.MeshStandardMaterial({ color: 0xdfe3ea, roughness: 0.35, metalness: 0 }),
+    new THREE.MeshStandardMaterial({ color: 0xdfe3ea, roughness: 0.75, metalness: 0 }),
+    new THREE.MeshStandardMaterial({ color: 0xf2f4f8, roughness: 0.05, metalness: 1.0 }),
+    new THREE.MeshStandardMaterial({ color: 0xd4af6a, roughness: 0.25, metalness: 1.0 }),
     new THREE.MeshPhysicalMaterial({
       color: 0xffffff,
       roughness: 0.02,
       metalness: 0.0,
       transmission: 1.0,
       ior: 1.5,
-    })
-  );
-  const glassPed = pedestal(4.2, -1.4, 0.9);
-  glassPed.visible = false;
-  glass.position.set(4.2, 1.75, -1.4); // the room inverts through it from the camera
-  glass.visible = false; // appears (with its pedestal) when "refraction" is enabled
-  scene.add(glass);
+    }),
+  ];
+  for (let i = 0; i < gamut.length; i++) {
+    const s = new THREE.Mesh(new THREE.SphereGeometry(0.45, 40, 28), gamut[i]);
+    s.position.set(2.3 + i * 1.25, 0.95, -6.2);
+    scene.add(s);
+  }
 
   // --- front-left: the duck vitrine (alpha-blend transparency) ------------
   // A museum display case: marble plinth, duck exhibit, thin glass panes all
@@ -170,7 +153,7 @@ export function buildScene() {
     new THREE.BoxGeometry(1.5, 0.7, 1.5),
     new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.25 })
   );
-  plinth.position.set(-5.6, 0.35, 4.0);
+  plinth.position.set(-4.8, 0.35, 0.8);
   scene.add(plinth);
   const vitrine = new THREE.Group();
   const paneGeoSide = new THREE.BoxGeometry(1.56, 1.7, 0.04);
@@ -201,12 +184,17 @@ export function buildScene() {
   );
   puck.position.y = 0.8;
   vitrine.add(puck);
-  vitrine.position.set(-5.6, 1.55, 4.0);
+  vitrine.position.set(-4.8, 1.55, 0.8);
   scene.add(vitrine);
 
-  // --- front: freestanding amber pane the camera looks through ------------
+  // --- glass "paintings": tinted panes hung on the side walls -------------
+  // Each floats 0.45m proud of its wall like gallery art. The straight-through
+  // trace hits the saturated wall right behind, so they read as BACKLIT STAINED
+  // GLASS — amber over teal goes warm olive, blue over red goes violet — and
+  // because transparent surfaces cast no shadow, there is no dark rectangle
+  // behind them spoiling the lightbox illusion.
   const paneAmber = new THREE.Mesh(
-    new THREE.BoxGeometry(2.4, 3.0, 0.08),
+    new THREE.BoxGeometry(3.0, 2.1, 0.06),
     new THREE.MeshStandardMaterial({
       color: 0xff9a5c,
       roughness: 0.3,
@@ -214,17 +202,12 @@ export function buildScene() {
       opacity: 0.45,
     })
   );
-  // On the teal wall — the right-side twin of the blue pane on the red wall:
-  // teal bleeds through amber as a warm olive. Kept out of the hero sightline
-  // on purpose: the straight-through trace is 1 ray + short history, so a huge
-  // pane filling the default view reads grainy rather than impressive.
-  paneAmber.position.set(8.0, 1.6, 2.6);
-  paneAmber.rotation.y = -0.9;
+  paneAmber.position.set(11.45, 2.3, 0.2);
+  paneAmber.rotation.y = -Math.PI / 2;
   scene.add(paneAmber);
 
-  // A second, bluer pane flanking the red wall — red bleeds through it purple.
   const paneBlue = new THREE.Mesh(
-    new THREE.BoxGeometry(2.2, 2.8, 0.08),
+    new THREE.BoxGeometry(3.0, 2.1, 0.06),
     new THREE.MeshStandardMaterial({
       color: 0x6fb4ff,
       roughness: 0.3,
@@ -232,9 +215,32 @@ export function buildScene() {
       opacity: 0.3,
     })
   );
-  paneBlue.position.set(-8.1, 1.6, 1.2);
-  paneBlue.rotation.y = 1.0;
+  paneBlue.position.set(-11.45, 2.3, 1.2);
+  paneBlue.rotation.y = Math.PI / 2;
   scene.add(paneBlue);
+
+  // Bronze frames turn the panes into hung artwork. The frames are OPAQUE, so
+  // unlike the glass they sit in the BVH and ground the pieces with a real
+  // contact shadow on the wall.
+  const frameMat = new THREE.MeshStandardMaterial({
+    color: 0x3a3128,
+    roughness: 0.4,
+    metalness: 0.6,
+  });
+  const framePiece = (w, h, d, x, y, z) => {
+    const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMat);
+    f.position.set(x, y, z);
+    scene.add(f);
+  };
+  for (const [wx, z0] of [
+    [-11.5, 1.2],
+    [11.5, 0.2],
+  ]) {
+    framePiece(0.12, 0.12, 3.24, wx, 2.3 + 1.11, z0); // top rail
+    framePiece(0.12, 0.12, 3.24, wx, 2.3 - 1.11, z0); // bottom rail
+    framePiece(0.12, 2.34, 0.12, wx, 2.3, z0 + 1.56); // stiles
+    framePiece(0.12, 2.34, 0.12, wx, 2.3, z0 - 1.56);
+  }
 
   // --- back-left: the water pool (deforming dynamic BVH) ------------------
   // Directly beneath the emissive gallery light with the helmet at its edge:
@@ -249,7 +255,7 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({ color: 0x2a6f97, roughness: 0.1, metalness: 0.8 })
   );
   water.rotation.x = -Math.PI / 2; // lie flat: local +z displacement -> world height
-  water.position.set(-4.6, 0.35, -5.4);
+  water.position.set(-7.5, 0.35, -3.6);
   water.userData.rtDeforming = true; // opt in to per-frame live-geometry reads
   scene.add(water);
   // A slim stone kerb so the pool reads as built, not painted on the floor.
@@ -261,7 +267,7 @@ export function buildScene() {
     [0.2, 5.5, -2.85, 0],
   ]) {
     const kerb = new THREE.Mesh(new THREE.BoxGeometry(w, 0.5, d), kerbMat);
-    kerb.position.set(-4.6 + dx, 0.25, -5.4 + dz);
+    kerb.position.set(-7.5 + dx, 0.25, -3.6 + dz);
     scene.add(kerb);
   }
 
@@ -287,52 +293,61 @@ export function buildScene() {
     waterGeo.computeVertexNormals();  // required: deforming meshes must supply normals
   };
 
-  // --- emissive: the gallery light + corner strips (NEE area lights) ------
-  // The wide panel is the room's key area light, hung over the pool; two cool
-  // vertical strips in the back corners give the walls a designed cove glow
-  // and the glossy floor something to streak.
-  const panel = new THREE.Mesh(
-    new THREE.BoxGeometry(5.0, 1.4, 0.1),
-    new THREE.MeshStandardMaterial({
-      color: 0x000000,
-      emissive: 0xfff2d8,
-      emissiveIntensity: 5.5,
-    })
-  );
-  panel.position.set(-3.6, 3.3, -8.85);
-  scene.add(panel);
+  // --- emissive: clerestory windows + corner strips (NEE area lights) -----
+  // A row of six "daylight" windows high on the back wall — each is an
+  // emissive pane the raytracer samples as a true area light. The demo's
+  // windows slider shows/hides them (emissive lights are baked at compile, so
+  // each change recompiles — a deliberate, visible cost). Three start open;
+  // the first hangs over the pool so the water always has a glow to ripple.
+  const windows = [];
+  for (let i = 0; i < 6; i++) {
+    const win = new THREE.Mesh(
+      new THREE.BoxGeometry(1.9, 2.1, 0.1),
+      new THREE.MeshStandardMaterial({
+        color: 0x000000,
+        emissive: 0xeaf2ff,
+        emissiveIntensity: 7,
+      })
+    );
+    win.position.set(-8.75 + i * 3.5, 4.1, -6.85);
+    win.visible = i < 3;
+    scene.add(win);
+    windows.push(win);
+  }
 
-  for (const x of [-8.78, 8.78]) {
+  for (const x of [-11.78, 11.78]) {
     const strip = new THREE.Mesh(
       new THREE.BoxGeometry(0.12, 5.2, 0.12),
       new THREE.MeshStandardMaterial({
         color: 0x000000,
         emissive: 0xa8d4ff,
-        emissiveIntensity: 3.2,
+        emissiveIntensity: 4.5,
       })
     );
-    strip.position.set(x, 2.8, -8.78);
+    strip.position.set(x, 2.8, -6.78);
     scene.add(strip);
   }
 
   // --- analytic lights -----------------------------------------------------
   // The demo starts MINIMAL (warm key light only) — everything else is an
   // opt-in add-on so its frame cost is visible.
-  const warm = new THREE.PointLight(0xffd9a0, 16);
-  warm.position.set(-2.6, 6.0, 3.4);
-  warm.userData.rtRadius = 0.35;
+  // The wide room needs two default keys: warm carries the left half (pool /
+  // vitrine), cool carries the right (bench / teapot). Everything else stays
+  // an opt-in add-on.
+  const warm = new THREE.PointLight(0xffd9a0, 30);
+  warm.position.set(-4.5, 6.2, 2.8);
+  warm.userData.rtRadius = 0.4;
   scene.add(warm);
 
-  const cool = new THREE.PointLight(0x9fc4ff, 11);
-  cool.position.set(5.2, 5.6, -4.4); // in front of and above the roughness ramp
-  cool.userData.rtRadius = 0.3;
-  cool.visible = false;
+  const cool = new THREE.PointLight(0x9fc4ff, 22);
+  cool.position.set(5.5, 5.8, -2.6); // in front of and above the roughness ramp
+  cool.userData.rtRadius = 0.35;
   scene.add(cool);
 
   // Spotlight raking the helmet: cone + penumbra + a visor glint, and a
   // visible shaft when volumetric fog is on.
   const spot = new THREE.SpotLight(0xfff4e0, 45, 0, 0.5, 0.45);
-  spot.position.set(3.4, 6.6, -2.2);
+  spot.position.set(2.6, 6.6, -0.6);
   spot.target.position.copy(HELMET_POS);
   spot.userData.rtRadius = 0.3;
   spot.visible = false;
@@ -380,7 +395,7 @@ export function buildScene() {
     scene.add(helmet.scene);
 
     duck.scene.scale.setScalar(0.75);
-    duck.scene.position.set(-5.6, 0.7, 4.0); // on the vitrine plinth
+    duck.scene.position.set(-4.8, 0.7, 0.8); // on the vitrine plinth
     duck.scene.rotation.y = -0.5;
     scene.add(duck.scene);
   })();
@@ -390,7 +405,9 @@ export function buildScene() {
     // The CPU-deformed water pool: its mesh joins the dynamic set and
     // updateWater(t) is called each frame before rt.updateDynamic().
     water: { mesh: water, update: updateWater },
-    // Objects the demo shows/hides as their RT feature is toggled.
-    showcase: { mirror, mirrorPed, glass, glassPed, panel, orbit, paneBlue, paneAmber },
+    // The clerestory windows (emissive panes) driven by the demo's slider.
+    windows,
+    // Feature-linked scene objects the demo may want handles to.
+    showcase: { orbit, paneBlue, paneAmber },
   };
 }
