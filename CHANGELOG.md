@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **Deforming dynamic meshes** (`mesh.userData.rtDeforming`): a dynamic mesh can
+  now be CPU-deformed (water, cloth, morph targets) and have its *traced* rays —
+  shadows, GI, reflections — follow the actual deformed shape. Previously dynamic
+  meshes were rigid: only `matrixWorld` was applied to a compile-time vertex
+  snapshot, so per-frame edits to the `position` attribute showed in the raster
+  G-buffer but not in the traced lighting. Flagged segments re-read their live
+  `position`/`normal` attributes each frame (expanded through a de-index mapping
+  snapshotted at compile time) and upload normals every frame instead of every
+  8th. The app owns normal correctness (call `computeVertexNormals()` after
+  deforming); a live vertex-count change throws asking for a recompile. Keep
+  these meshes low-poly — the per-frame refit is O(dynamic tris). New demo:
+  a mirror-water pool (48×48 plane, summed sine waves) with moving traced
+  reflections.
+
 ## 0.3.2 — 2026-07-19
 
 - **Localized fog zones** (`volumetric.zones`): up to 8 world-space AABBs, each

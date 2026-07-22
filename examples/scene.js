@@ -101,6 +101,47 @@ export function buildScene() {
   glass.visible = false; // appears (with its pedestal) when "refraction" is enabled
   scene.add(glass);
 
+  // Mirror-water pool — a low-poly plane deformed on the CPU every frame with a
+  // few summed sine waves. It is registered in `dynamicMeshes` AND flagged
+  // `rtDeforming`, so the raytracer re-reads its live (deformed) vertices each
+  // frame: the moving surface casts correct traced shadows and, with the
+  // reflections feature on, shows the room rippling across it. Kept low-poly
+  // (48x48 ≈ 4.6k tris) because the per-frame BVH refit scales with tri count.
+  const WATER_SEGMENTS = 48;
+  const waterGeo = new THREE.PlaneGeometry(5, 5, WATER_SEGMENTS, WATER_SEGMENTS);
+  const water = new THREE.Mesh(
+    waterGeo,
+    // Low roughness + high metalness reads as mirror-water — the current engine
+    // shows moving traced reflections most clearly on near-specular surfaces.
+    new THREE.MeshStandardMaterial({ color: 0x2a6f97, roughness: 0.1, metalness: 0.8 })
+  );
+  water.rotation.x = -Math.PI / 2; // lie flat: local +z displacement -> world height
+  water.position.set(0, 0.35, 3.4);
+  water.userData.rtDeforming = true; // opt in to per-frame live-geometry reads
+  scene.add(water);
+
+  // Cache the flat rest positions (x, y; z is the wave height we overwrite).
+  const waterPos = waterGeo.getAttribute("position");
+  const waterRestX = Float32Array.from({ length: waterPos.count }, (_, i) => waterPos.getX(i));
+  const waterRestY = Float32Array.from({ length: waterPos.count }, (_, i) => waterPos.getY(i));
+  // Sum of three travelling sine waves (a cheap Gerstner-ish height field). The
+  // app OWNS normal correctness for deforming meshes: we call
+  // computeVertexNormals() after moving the vertices so the traced shading and
+  // reflections track the ripples (the raytracer just reads the result).
+  const updateWater = (t) => {
+    for (let i = 0; i < waterPos.count; i++) {
+      const x = waterRestX[i];
+      const y = waterRestY[i];
+      const z =
+        0.10 * Math.sin(x * 1.1 + t * 1.3) +
+        0.06 * Math.sin(y * 1.7 - t * 0.9) +
+        0.05 * Math.sin((x + y) * 0.9 + t * 2.1);
+      waterPos.setZ(i, z);
+    }
+    waterPos.needsUpdate = true;      // also refreshes the rasterized G-buffer
+    waterGeo.computeVertexNormals();  // required: deforming meshes must supply normals
+  };
+
   // Emissive panel — an area light sampled directly by the raytracer (NEE).
   const panel = new THREE.Mesh(
     new THREE.BoxGeometry(2.6, 1.5, 0.1),
@@ -174,6 +215,9 @@ export function buildScene() {
 
   return {
     scene, camera, bounds, lights, sky, ready,
+    // The CPU-deformed water pool: its mesh joins the dynamic set and
+    // updateWater(t) is called each frame before rt.updateDynamic().
+    water: { mesh: water, update: updateWater },
     // Objects the demo shows/hides as their RT feature is toggled.
     showcase: { mirror, mirrorPed, glass, glassPed, panel, orbit },
   };

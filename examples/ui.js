@@ -241,6 +241,9 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   const pSec = el("div", "sec");
   pSec.append(el("h3", null, `${ICON.cube} Physics`));
   pSec.append(toggle("simulate", !state.physicsPaused, (v) => (state.physicsPaused = !v)).row);
+  // The CPU-deformed water pool (rtDeforming) — its motion is independent of the
+  // rigid-body sim, so it gets its own switch.
+  pSec.append(toggle("water waves", state.waterEnabled, (v) => { state.waterEnabled = v; rt.resetAccumulation(); }).row);
   pSec.append(slider("gravity", 0, 20, 0.5, 9.81, (x) => "-" + x.toFixed(0), (v) => physics.setGravity(-v)));
   const btns = el("div", "btns");
   const mkBtn = (icon, text, wide, fn) => {

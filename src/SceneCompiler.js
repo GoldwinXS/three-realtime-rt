@@ -40,8 +40,11 @@ export class CompiledScene {
     this.dynamicMerged = null;
     this.dynamicPacked = null; // Float32Array + BufferAttribute for re-baking
     this.dynamicPackedAttr = null;
-    this.dynamic = []; // [{ mesh, start, count, localPos, localNorm }]
+    this.dynamic = []; // [{ mesh, start, count, localPos, localNorm, deforming, ... }]
     this.hasDynamic = false;
+    // True when any dynamic segment is CPU-deformed (rtDeforming) — such segments
+    // read their live geometry every frame and force a per-frame normal upload.
+    this.hasDeforming = false;
 
     this.materialsTex = null;
     this.materials = [];
@@ -75,32 +78,82 @@ export class CompiledScene {
       seg.mesh.updateWorldMatrix(true, false);
       const m = seg.mesh.matrixWorld.elements;
       const nm = this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements;
-      const lp = seg.localPos;
-      const ln = seg.localNorm;
       let o = seg.start * 3;
       let p = seg.start * 4;
-      for (let i = 0; i < seg.count; i++) {
-        const x = lp[i * 3], y = lp[i * 3 + 1], z = lp[i * 3 + 2];
-        const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
-        const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
-        const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
-        pos[o] = wx;
-        pos[o + 1] = wy;
-        pos[o + 2] = wz;
-        if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
-        if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
-        if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
-        const nx = ln[i * 3], ny = ln[i * 3 + 1], nz = ln[i * 3 + 2];
-        const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
-        const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
-        const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
-        const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
-        packed[p] = tx * il;
-        packed[p + 1] = ty * il;
-        packed[p + 2] = tz * il;
-        // packed[p + 3] (matIndex) never changes
-        o += 3;
-        p += 4;
+
+      if (seg.deforming) {
+        // CPU-deformed mesh (water/cloth): read the LIVE geometry every frame
+        // and expand it back to the merged de-indexed layout through the mapping
+        // snapshotted at compile time. `indexMap` (the source geometry's index
+        // buffer, or null for an already-non-indexed source) maps each merged
+        // triangle-soup vertex slot to its source-vertex index; the source
+        // attributes carry the shared, deformed values.
+        const livePosAttr = seg.liveGeometry.getAttribute("position");
+        if (livePosAttr.count !== seg.srcVertexCount) {
+          throw new Error(
+            "three-realtime-rt: deforming mesh vertex count changed since " +
+            `compile (${seg.srcVertexCount} -> ${livePosAttr.count}); the merged ` +
+            "BVH layout is fixed at compile time — call compileScene() again."
+          );
+        }
+        const sp = livePosAttr.array;
+        const snAttr = seg.liveGeometry.getAttribute("normal");
+        const sn = snAttr ? snAttr.array : null;
+        const map = seg.indexMap; // null = identity (non-indexed source)
+        const ln = seg.localNorm; // fallback if the app never recomputed normals
+        for (let i = 0; i < seg.count; i++) {
+          const sv = map ? map[i] : i;
+          const x = sp[sv * 3], y = sp[sv * 3 + 1], z = sp[sv * 3 + 2];
+          const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+          const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+          const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+          pos[o] = wx;
+          pos[o + 1] = wy;
+          pos[o + 2] = wz;
+          if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+          if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+          if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+          let nx, ny, nz;
+          if (sn) { nx = sn[sv * 3]; ny = sn[sv * 3 + 1]; nz = sn[sv * 3 + 2]; }
+          else { nx = ln[i * 3]; ny = ln[i * 3 + 1]; nz = ln[i * 3 + 2]; }
+          const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
+          const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
+          const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
+          const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
+          packed[p] = tx * il;
+          packed[p + 1] = ty * il;
+          packed[p + 2] = tz * il;
+          // packed[p + 3] (matIndex) never changes
+          o += 3;
+          p += 4;
+        }
+      } else {
+        // Rigid mover: transform the frozen local snapshot by the world matrix.
+        const lp = seg.localPos;
+        const ln = seg.localNorm;
+        for (let i = 0; i < seg.count; i++) {
+          const x = lp[i * 3], y = lp[i * 3 + 1], z = lp[i * 3 + 2];
+          const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+          const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+          const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+          pos[o] = wx;
+          pos[o + 1] = wy;
+          pos[o + 2] = wz;
+          if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+          if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+          if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+          const nx = ln[i * 3], ny = ln[i * 3 + 1], nz = ln[i * 3 + 2];
+          const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
+          const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
+          const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
+          const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
+          packed[p] = tx * il;
+          packed[p + 1] = ty * il;
+          packed[p + 2] = tz * il;
+          // packed[p + 3] (matIndex) never changes
+          o += 3;
+          p += 4;
+        }
       }
     }
     posAttr.needsUpdate = true;
@@ -124,8 +177,11 @@ export class CompiledScene {
       this.dynamicBvh.refit();
     }
     this.dynamicBvhUniform.updateFrom(this.dynamicBvh);
-    // Normals only feed GI-bounce shading off movers — amortize their upload.
-    if (this._normalFrame++ % 8 === 0) {
+    // Normals only feed GI-bounce shading off movers — amortize their upload for
+    // rigid movers. Deforming meshes change shape (not just orientation) every
+    // frame, so their normals must go up every frame or the shading lags the
+    // silhouette; one deforming segment forces the whole (shared) upload.
+    if (this.hasDeforming || this._normalFrame++ % 8 === 0) {
       this.dynamicAttrTex.updateFrom(this.dynamicPackedAttr);
     }
   }
@@ -142,9 +198,8 @@ export class CompiledScene {
 }
 
 function extractMeshGeometry(mesh, materialIndex) {
-  const src = mesh.geometry.index
-    ? mesh.geometry.toNonIndexed()
-    : mesh.geometry.clone();
+  const indexed = mesh.geometry.index;
+  const src = indexed ? mesh.geometry.toNonIndexed() : mesh.geometry.clone();
 
   if (!src.getAttribute("normal")) src.computeVertexNormals();
   const localPos = src.getAttribute("position").array.slice();
@@ -158,7 +213,17 @@ function extractMeshGeometry(mesh, materialIndex) {
   const count = geo.getAttribute("position").count;
   const mi = new Float32Array(count).fill(materialIndex);
   geo.setAttribute("materialIndex", new THREE.BufferAttribute(mi, 1));
-  return { geo, localPos, localNorm, count };
+
+  // For CPU-deformed (rtDeforming) meshes we re-read the LIVE geometry each
+  // frame. The merged BVH is de-indexed triangle soup, so record how to expand
+  // the live (source) vertices back into that layout: `indexMap[i]` is the
+  // source-vertex index feeding merged slot `i` (a snapshot of the index
+  // buffer), or null when the source was already non-indexed (identity map).
+  // `srcVertexCount` is the live position count at compile time — used to catch
+  // a topology change that would invalidate this mapping.
+  const indexMap = indexed ? mesh.geometry.index.array.slice() : null;
+  const srcVertexCount = mesh.geometry.getAttribute("position").count;
+  return { geo, localPos, localNorm, count, indexMap, srcVertexCount };
 }
 
 // Effective emissive colour (already scaled by intensity), or null if the
@@ -310,12 +375,20 @@ export function compileScene(scene, options = {}) {
     }
     if (isDynamic) {
       dynamicGeoms.push(extracted.geo);
+      // Opt-in CPU deformation: the mesh must be BOTH in dynamicMeshes AND carry
+      // userData.rtDeforming, and its live geometry is read every frame.
+      const deforming = obj.userData.rtDeforming === true;
+      if (deforming) compiled.hasDeforming = true;
       compiled.dynamic.push({
         mesh: obj,
         start: dynVertexOffset,
         count: extracted.count,
         localPos: extracted.localPos,
         localNorm: extracted.localNorm,
+        deforming,
+        liveGeometry: deforming ? obj.geometry : null,
+        indexMap: deforming ? extracted.indexMap : null,
+        srcVertexCount: deforming ? extracted.srcVertexCount : 0,
       });
       dynVertexOffset += extracted.count;
     } else {
