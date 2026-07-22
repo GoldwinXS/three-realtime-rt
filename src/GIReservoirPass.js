@@ -590,7 +590,7 @@ void main() {
   if (any(isnan(gi)) || any(isinf(gi))) gi = vec3(0.0);
   // Resolve EMA (see the emaPrevGi note above): ~5-frame effective average.
   // Cuts selection-churn flicker near emitters ~5x for ~5 frames of lag.
-  if (emaPrevOk) gi = mix(emaPrevGi, gi, 0.2);
+  if (emaPrevOk) gi = mix(emaPrevGi, gi, 0.15);
 
   // --- STORE the TEMPORAL-only reservoir as history (see snapshot note above).
   // Resolve its own W from the temporal-merged wSum/M so the stored W is valid for

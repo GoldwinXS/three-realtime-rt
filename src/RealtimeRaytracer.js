@@ -627,7 +627,10 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * reweighted, with a final visibility ray). Clamped to 0..4; `0` reproduces
      * the v1 temporal-only behaviour. Default 2.
      */
-    this.restirGISpatialTaps = options.restirGISpatialTaps ?? 2;
+    // Default 1 (not 2): each reconnection tap adds its own estimator noise;
+    // one tap keeps most of the disocclusion win at half the artifact surface
+    // (tuned on-device — raise it for scenes with heavy camera motion).
+    this.restirGISpatialTaps = options.restirGISpatialTaps ?? 1;
     this.giReservoirPass = new GIReservoirPass(this._scaledW, this._scaledH);
     this._giMissWarned = false;
 
