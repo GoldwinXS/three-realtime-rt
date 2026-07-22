@@ -264,7 +264,7 @@ export class CompiledScene {
   }
 }
 
-function extractMeshGeometry(mesh, materialIndex) {
+function extractMeshGeometry(mesh) {
   const indexed = mesh.geometry.index;
   const src = indexed ? mesh.geometry.toNonIndexed() : mesh.geometry.clone();
 
@@ -278,8 +278,9 @@ function extractMeshGeometry(mesh, materialIndex) {
   geo.applyMatrix4(mesh.matrixWorld); // bake world transform
 
   const count = geo.getAttribute("position").count;
-  const mi = new Float32Array(count).fill(materialIndex);
-  geo.setAttribute("materialIndex", new THREE.BufferAttribute(mi, 1));
+  // The per-vertex materialIndex attribute is filled by resolveGroups (which the
+  // caller runs with the shared materials table), so a multi-material mesh gets
+  // its groups mapped to distinct materials rather than a single flat index.
 
   // For CPU-deformed (rtDeforming) meshes we re-read the LIVE geometry each
   // frame. The merged BVH is de-indexed triangle soup, so record how to expand
@@ -291,6 +292,45 @@ function extractMeshGeometry(mesh, materialIndex) {
   const indexMap = indexed ? mesh.geometry.index.array.slice() : null;
   const srcVertexCount = mesh.geometry.getAttribute("position").count;
   return { geo, localPos, localNorm, count, indexMap, srcVertexCount };
+}
+
+// Fill the per-vertex materialIndex for a (possibly multi-material) mesh and
+// return the material ranges for per-group emissive collection. Groups on the
+// INDEXED geometry are ranges over the index buffer; toNonIndexed() lays vertices
+// out in index order, so a group's [start, start+count) maps to the SAME range of
+// de-indexed vertices (identity for an already-non-indexed source). Each group's
+// material is registered in the shared table via registerMaterial.
+function resolveMeshMaterials(mesh, count, registerMaterial) {
+  const isArray = Array.isArray(mesh.material);
+  const groups = mesh.geometry.groups;
+  const matIdx = new Float32Array(count);
+  const ranges = [];
+  if (isArray && groups && groups.length > 0) {
+    // Ungrouped vertices (if any) default to material[0].
+    const base = mesh.material[0];
+    matIdx.fill(registerMaterial(base));
+    for (const g of groups) {
+      const gm = mesh.material[g.materialIndex] ?? base;
+      if (gm.transparent) {
+        throw new Error(
+          "three-realtime-rt: a transparent group material on a multi-material " +
+          "mesh is not supported for BVH tracing (transparent surfaces use the " +
+          "out-of-BVH straight-through blend path, which is per-mesh). Split the " +
+          `transparent group (materialIndex ${g.materialIndex}) into its own mesh.`
+        );
+      }
+      const gi = registerMaterial(gm);
+      const start = Math.max(0, g.start);
+      const end = Math.min(count, g.start + g.count);
+      for (let v = start; v < end; v++) matIdx[v] = gi;
+      ranges.push({ start, vcount: end - start, material: gm });
+    }
+  } else {
+    const mat = isArray ? mesh.material[0] : mesh.material;
+    matIdx.fill(registerMaterial(mat));
+    ranges.push({ start: 0, vcount: count, material: mat });
+  }
+  return { matIdx, ranges };
 }
 
 // Effective emissive colour (already scaled by intensity), or null if the
@@ -371,10 +411,14 @@ function buildSceneDataTexture(materials, emissiveTris) {
 }
 
 // Collect world-space triangles of an emissive mesh for the NEE light list.
-// `geo` is already non-indexed and world-baked by extractMeshGeometry.
-function collectEmissiveTriangles(geo, emit, out) {
+// `geo` is already non-indexed and world-baked by extractMeshGeometry. An
+// optional [vStart, vCount) vertex range restricts collection to one material
+// group (ranges are triangle-aligned, so this stays whole-triangle).
+function collectEmissiveTriangles(geo, emit, out, vStart = 0, vCount = -1) {
   const pos = geo.getAttribute("position").array;
-  for (let i = 0; i + 8 < pos.length; i += 9) {
+  const begin = vStart * 3;
+  const end = vCount < 0 ? pos.length : Math.min(pos.length, (vStart + vCount) * 3);
+  for (let i = begin; i + 9 <= end; i += 9) {
     const e1 = [pos[i + 3] - pos[i], pos[i + 4] - pos[i + 1], pos[i + 5] - pos[i + 2]];
     const e2 = [pos[i + 6] - pos[i], pos[i + 7] - pos[i + 1], pos[i + 8] - pos[i + 2]];
     const cx = e1[1] * e2[2] - e1[2] * e2[1];
@@ -439,28 +483,56 @@ export function compileScene(scene, options = {}) {
   let dynVertexOffset = 0;
   const tmpGeoms = []; // to dispose after merge
 
+  const registerMaterial = (m) => {
+    let i = materials.indexOf(m);
+    if (i < 0) { i = materials.length; materials.push(m); }
+    return i;
+  };
+
   scene.traverse((obj) => {
     if (!obj.isMesh || !obj.geometry || !obj.visible || obj.userData.rtExclude) return;
-    const mat = Array.isArray(obj.material) ? obj.material[0] : obj.material;
+    const isArray = Array.isArray(obj.material);
+    const rep = isArray ? obj.material[0] : obj.material;
     // Transparent surfaces must not act as opaque occluders — e.g.
     // LittlestTokyo's glass display case (texture-alpha, opacity 1) would put
     // the whole model in shadow. Alpha-textured glass can't be cheaply tested,
     // so ANY transparent material is skipped like rtExclude (still
     // rasterized). alphaTest cut-outs (transparent: false) stay occluders.
-    if (mat.transparent) return;
-    let mi = materials.indexOf(mat);
-    if (mi < 0) { mi = materials.length; materials.push(mat); }
+    if (rep.transparent) return;
 
-    const extracted = extractMeshGeometry(obj, mi);
+    const isDynamic = dynamicSet && dynamicSet.has(obj);
+    // Opt-in CPU deformation: the mesh must be BOTH in dynamicMeshes AND carry
+    // userData.rtDeforming, and its live geometry is read every frame.
+    const deforming = isDynamic && obj.userData.rtDeforming === true;
+    const hasGroups = isArray && obj.geometry.groups && obj.geometry.groups.length > 0;
+    // Multi-material groups are supported on static and rigid-dynamic meshes; the
+    // deforming rebake path assumes a single contiguous material range per merged
+    // segment, so reject the combination clearly rather than mis-shade it.
+    if (hasGroups && deforming) {
+      throw new Error(
+        "three-realtime-rt: multi-material groups on a CPU-deforming (rtDeforming) " +
+        "mesh are not supported — the per-frame live-geometry rebake assumes one " +
+        "material range. Use groups on a static or rigid-dynamic mesh, or split the " +
+        "deforming mesh into one mesh per material."
+      );
+    }
+
+    const extracted = extractMeshGeometry(obj);
     tmpGeoms.push(extracted.geo);
+    // Map groups → per-vertex material indices (registers each group material in
+    // the shared table) and get the ranges for per-group emissive collection.
+    const { matIdx, ranges } = resolveMeshMaterials(obj, extracted.count, registerMaterial);
+    extracted.geo.setAttribute("materialIndex", new THREE.BufferAttribute(matIdx, 1));
     // Static emissive meshes become NEE area lights (sampled directly with
     // shadow rays instead of waiting for a GI ray to stumble into them).
     // Dynamic emitters are left out — their world-space triangles would go
-    // stale — so they keep lighting the old way, via GI-ray hits.
-    const isDynamic = dynamicSet && dynamicSet.has(obj);
+    // stale — so they keep lighting the old way, via GI-ray hits. Each emissive
+    // GROUP contributes its own range.
     if (!isDynamic) {
-      const emit = emissiveColor(mat);
-      if (emit) collectEmissiveTriangles(extracted.geo, emit, emissiveTris);
+      for (const r of ranges) {
+        const emit = emissiveColor(r.material);
+        if (emit) collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount);
+      }
     }
     if (isDynamic) {
       dynamicGeoms.push(extracted.geo);

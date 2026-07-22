@@ -137,7 +137,11 @@ export function buildScene() {
       roughness: 0.02,
       metalness: 0.0,
       transmission: 1.0,
-      ior: 1.5,
+      // Diamond IOR (2.42) — carried PER MATERIAL now, not the global rt.ior.
+      // The G-buffer clamps it into the packed word's [1, 1.98] range, so it
+      // refracts markedly harder than the old global 1.5 (visible with the
+      // "refraction" toggle on).
+      ior: 2.42,
     }),
   ];
   for (let i = 0; i < gamut.length; i++) {
@@ -195,6 +199,36 @@ export function buildScene() {
   vitrine.add(puck);
   vitrine.position.set(-4.8, 1.55, 0.8);
   scene.add(vitrine);
+
+  // --- front-left: vertex-painted icosahedron sculpture -------------------
+  // Its albedo comes entirely from a baked per-vertex `color` attribute (no
+  // texture, no map): the hue sweeps with height so the whole form carries a
+  // smooth gradient. Demonstrates geometry vertex colours multiplying into the
+  // G-buffer albedo. (Secondary GI/reflection rays see the flat material colour —
+  // the same documented caveat as texture maps.)
+  const icoGeo = new THREE.IcosahedronGeometry(0.85, 1);
+  const icoPos = icoGeo.getAttribute("position");
+  const icoColors = new Float32Array(icoPos.count * 3);
+  const icoBox = new THREE.Box3().setFromBufferAttribute(icoPos);
+  const icoTmp = new THREE.Color();
+  const spanY = Math.max(icoBox.max.y - icoBox.min.y, 1e-6);
+  for (let i = 0; i < icoPos.count; i++) {
+    const h = (icoPos.getY(i) - icoBox.min.y) / spanY; // 0 at bottom, 1 at top
+    icoTmp.setHSL(0.62 * h, 0.72, 0.55); // violet base → cyan/green crown
+    icoColors[i * 3] = icoTmp.r;
+    icoColors[i * 3 + 1] = icoTmp.g;
+    icoColors[i * 3 + 2] = icoTmp.b;
+  }
+  icoGeo.setAttribute("color", new THREE.BufferAttribute(icoColors, 3));
+  const ico = new THREE.Mesh(
+    icoGeo,
+    // vertexColors:true so the RASTER fallback (RT off) also shows the gradient;
+    // the ray traced G-buffer reads the color attribute regardless of this flag.
+    new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.0 })
+  );
+  pedestal(-8.5, 2.5, 1.0, 0.6);
+  ico.position.set(-8.5, 1.4, 2.5);
+  scene.add(ico);
 
   // --- glass "paintings": tinted panes hung on the side walls -------------
   // Each floats 0.45m proud of its wall like gallery art. The straight-through
