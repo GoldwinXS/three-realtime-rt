@@ -199,6 +199,12 @@ export interface RealtimeRaytracerOptions {
   taa?: boolean;
   /** Fresh-sample weight in the TAA blend (lower = smoother/more AA, more lag). */
   taaBlend?: number;
+  /**
+   * Scales the TAA sub-pixel jitter amplitude. Set to your canvas scale when
+   * rendering a reduced drawing buffer CSS-stretched to the screen, so jitter
+   * stays constant in screen pixels (no visible wobble at low quality). Default 1.
+   */
+  taaJitterScale?: number;
   /** Edge-aware à-trous denoise on the irradiance buffer. */
   denoise?: boolean;
   /**

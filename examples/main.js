@@ -362,6 +362,9 @@ async function main() {
     canvasScale = s;
     applyCanvasSize();
     rt.setSize(...bufferSize());
+    // Keep TAA jitter constant in SCREEN pixels: at reduced canvas scale the
+    // CSS stretch magnifies buffer-pixel jitter into visible wobble.
+    rt.taaJitterScale = s;
   };
   const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setWindows, setCanvasScale, canvasScale });
 

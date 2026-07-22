@@ -560,6 +560,13 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.taa = options.taa ?? true;
     /** Fresh-sample weight in the TAA blend (lower = smoother/more AA, more lag). */
     this.taaBlend = options.taaBlend ?? 0.1;
+    /**
+     * Scales the TAA sub-pixel jitter amplitude. Set this to your canvas scale
+     * when you render a reduced drawing buffer CSS-stretched to the screen
+     * (canvasScaleHook), so the jitter stays constant in SCREEN pixels instead
+     * of being magnified by the stretch (visible wobble at low quality).
+     */
+    this.taaJitterScale = options.taaJitterScale ?? 1;
 
     /**
      * Volumetric lighting — real "god rays": single-scatter fog integrated
@@ -1007,8 +1014,15 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // too — otherwise the raw buffers visibly shake.
     if (this.taa && this.outputMode === 0) {
       this._jitterIndex = (this._jitterIndex + 1) % 16;
-      const jx = (halton(this._jitterIndex + 1, 2) - 0.5) * 2 / this._width;
-      const jy = (halton(this._jitterIndex + 1, 3) - 0.5) * 2 / this._height;
+      // taaJitterScale: when the app renders a REDUCED drawing buffer and CSS-
+      // stretches it to the screen (the canvas-scale ladder), a half-buffer-pixel
+      // jitter is magnified by the stretch and reads as visible screen wobble.
+      // The app sets this to its canvas scale (see canvasScaleHook) so the
+      // jitter stays constant in SCREEN pixels — slightly less sub-pixel AA
+      // coverage at low canvas scales, in exchange for a steady image.
+      const js = this.taaJitterScale;
+      const jx = (halton(this._jitterIndex + 1, 2) - 0.5) * 2 * js / this._width;
+      const jy = (halton(this._jitterIndex + 1, 3) - 0.5) * 2 * js / this._height;
       proj.elements[8] += jx;
       proj.elements[9] += jy;
       // Where this jitter moves the image, in UV space: elements[8/9] multiply

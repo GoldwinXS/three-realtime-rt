@@ -2,7 +2,12 @@
 
 ## Unreleased
 
-
+- **Fix: TAA wobble at reduced canvas scale** (`taaJitterScale`). The sub-pixel
+  jitter is sized in buffer pixels, so a CSS-stretched reduced drawing buffer
+  magnified it into visible screen shake — the lower the quality, the worse the
+  wobble. The new property (default `1`) scales the jitter amplitude; the demo's
+  canvas-scale hook sets it to the canvas scale so jitter stays constant in
+  screen pixels.
 - **Render self-test (`?selftest=1`) + CI smoke matrix.** A net for the class of
   failure behind the 0.4.0 iOS incident: a pipeline that compiles clean, reports
   framebuffer-complete, logs no error, and still draws black. The demo's new
