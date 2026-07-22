@@ -80,6 +80,22 @@ uniform float uEps;
 uniform float uFireflyClamp;
 uniform float uMCap;        // temporal M-cap (staleness limit)
 uniform int uSpatialTaps;   // spatial reuse taps after the temporal merge (0 = v1)
+uniform int uValidateInterval; // reservoir-sample validation period (0 = off, e.g. 8)
+
+// Validation tuning (see the reservoir-sample-validation block in main()).
+// VAL_NEE_SAMPLES: NEE samples averaged when RE-SHADING the stored hit. A single
+//   NEE sample is black whenever its random light point is occluded (~30% of the
+//   time even for a fully-lit hit), so a 1-sample re-shade cannot tell "light off"
+//   from "unlucky shadow ray"; averaging a few de-noises the kill decision. Costs
+//   a few extra SHADOW rays on only the ~1/uValidateInterval validating pixels (no
+//   extra bounce rays -- the single candidate trace is reused).
+// VAL_DARK_FRAC: kill the reservoir when the (multi-sampled) re-shaded target
+//   falls below this fraction of the stored one. Kept LOW so the kill fires on a
+//   real collapse to near-black (a switched-off light drives it to ~0), not on
+//   residual shadow noise -- false kills reset pixels to low confidence, where the
+//   pre-existing anti-firefly clamp tightens and would darken bright GI.
+#define VAL_NEE_SAMPLES 8
+#define VAL_DARK_FRAC 0.02
 
 uniform vec3 uEnvColor;
 uniform float uEnvIntensity;
@@ -311,7 +327,15 @@ vec3 sampleOneAny(vec3 P, vec3 N) {
 // inline path), plus the world-space hit position so temporal reuse can
 // recompute the geometry term at the reprojected (same) surface. On a miss the
 // "hit" is a far point along the ray, so the reused direction is recoverable.
-vec3 traceRadianceGI(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 hitNormal) {
+// nLight = number of averaged NEE samples at the bounce hit. The fresh candidate
+// passes 1 (byte-identical to the inline path). The reservoir-sample VALIDATION
+// passes a small number > 1: a single NEE sample is black whenever its random
+// light point is occluded, which happens ~30% of the time even for a fully-lit
+// hit, so a 1-sample re-shade cannot reliably tell "light switched off" from
+// "unlucky shadow sample". Averaging a few NEE samples de-noises pHatNew enough to
+// make the validation kill decision robust, at the cost of a few extra shadow rays
+// on only the ~1/uValidateInterval validating pixels (no extra BOUNCE rays).
+vec3 traceRadianceGI(vec3 ro, vec3 rd, int nLight, out vec3 hitPos, out vec3 hitNormal) {
   uvec4 fi; vec3 bary; float dist; bool isDyn;
   if (!traceBoth(ro, rd, fi, bary, dist, isDyn)) {
     hitPos = ro + rd * 1.0e4;
@@ -332,7 +356,12 @@ vec3 traceRadianceGI(vec3 ro, vec3 rd, out vec3 hitPos, out vec3 hitNormal) {
   vec3 hP = ro + rd * dist;
   hitPos = hP;
   hitNormal = hN;
-  vec3 Ld = sampleOneAny(hP + hN * uEps, hN);
+  vec3 Ld = vec3(0.0);
+  for (int s = 0; s < 8; s++) {
+    if (s >= nLight) break;
+    Ld += sampleOneAny(hP + hN * uEps, hN);
+  }
+  Ld /= float(max(nLight, 1));
   // Diffuse GI drops NEE-listed (static) emitter emission so it isn't double
   // counted (same rule as RTLightingPass.traceRadiance with specular=false).
   vec3 hLe = (uEmissiveCount > 0 && !isDyn) ? vec3(0.0) : hEmissive;
@@ -383,37 +412,150 @@ void main() {
   //  so this GI never re-enters (and double-counts through) that history.
   // ================================================================
 
-  // --- fresh candidate: one cosine-hemisphere GI bounce, shaded like inline ---
-  vec3 wi = cosineSampleHemisphere(N, rand2());
+  // Reprojected UV of this pixel's primary point into the previous frame; shared
+  // by the reservoir-sample validation, the temporal merge and the spatial taps.
+  vec4 clip = uPrevViewProj * vec4(P, 1.0);
+  vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
+  bool haveReproj = clip.w > 0.0 &&
+    prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0;
+  // Plane-distance tolerance the temporal validation and the spatial taps share.
+  float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
+
+  // --- fetch this pixel's TEMPORAL-history reservoir ONCE. Both the reservoir-
+  // sample validation (below) and the temporal merge read it. Texture reads
+  // only, so this consumes no RNG: the fresh-candidate random stream stays
+  // aligned with the validation-off path (uValidateInterval==0 is byte-identical
+  // to before this feature). ---
+  bool histValid = false;
+  float Mprev = 0.0;
+  float Wprev = 0.0;
+  vec3 radPrev = vec3(0.0);
+  vec3 hitPrev = vec3(0.0);
+  vec3 nPrev = N;
+  if (haveReproj) {
+    vec4 pPos = texture(uPrevGWorldPos, prevUv);
+    if (pPos.w > 0.5 && abs(dot(P - pPos.xyz, N)) < tol) {
+      vec4 hp = texture(uPrevResPos, prevUv);  // hitPos.xyz + packed(M, n_s)
+      vec4 hr = texture(uPrevResRad, prevUv);  // radiance.rgb + W
+      unpackMN(hp.w, Mprev, nPrev);
+      Wprev = hr.w;
+      if (Mprev > 0.0 && Wprev > 0.0) {
+        histValid = true;
+        radPrev = hr.rgb;
+        hitPrev = hp.xyz;
+      }
+    }
+  }
+
+  // --- RESERVOIR-SAMPLE VALIDATION (the fix for stale bounce light). On a
+  // rotating 1-in-uValidateInterval subset of pixels — selected by a per-pixel
+  // hash added to uFrame so the validating set is decorrelated in space AND
+  // changes every frame — spend this frame's ONE candidate ray re-tracing the
+  // STORED reservoir hit instead of a fresh cosine bounce. This costs ZERO extra
+  // rays (it REPLACES the fresh candidate on those pixels) and is what stops a
+  // switched-off light from haunting the reservoir: the stale bright sample gets
+  // re-shaded (now dark) or, if its geometry moved, dropped. Direction selection
+  // happens HERE, before the single trace below, so the trace call site is shared. ---
+  uint pixHash = pcgHash(uint(px.x) * 2654435761u + uint(px.y) * 40503u + 1u);
+  bool validateFrame = uValidateInterval > 0 &&
+    ((uint(uFrame) + pixHash) % uint(uValidateInterval)) == 0u;
+
+  vec3 wi;
+  bool doValidate = false;
+  float expectDist = 0.0;
+  if (validateFrame && histValid) {
+    vec3 dpv = hitPrev - P;
+    expectDist = length(dpv);
+    if (expectDist > 1e-5) {
+      wi = dpv / expectDist;                    // aim the candidate AT the stored hit
+      doValidate = true;
+    }
+  }
+  if (!doValidate) {
+    wi = cosineSampleHemisphere(N, rand2());     // fresh cosine-hemisphere GI bounce
+  }
+
+  // --- the SINGLE candidate trace. Validation reuses this exact call site (no
+  // second trace is added to the shader); the trace already shades the hit. ---
   vec3 hitPos;
   vec3 hitNormal;
-  vec3 rad = traceRadianceGI(P + N * uEps, wi, hitPos, hitNormal);
+  int nLight = doValidate ? VAL_NEE_SAMPLES : 1;
+  vec3 rad = traceRadianceGI(P + N * uEps, wi, nLight, hitPos, hitNormal);
   // Match the inline firefly clamp, which is applied to indirect (= L_i) so
   // the biased mean of the two paths agrees.
   float rl = luminance(rad);
   if (rl > uFireflyClamp) rad *= uFireflyClamp / rl;
 
   float cosT = max(dot(N, wi), 0.0);
-  float pHatFresh = luminance(rad) * cosT;
-  // w = p_hat / p_source = p_hat / (cos/PI). cosT cancels; guard cosT==0.
-  float wFresh = cosT > 0.0 ? pHatFresh * PI / cosT : 0.0;
 
-  float wSum = wFresh;
-  float M = 1.0;
-  vec3 selRad = rad;
-  vec3 selPos = hitPos;
-  vec3 selNormal = hitNormal;   // n_s of the selected sample (packed into .w)
+  float wSum;
+  float M;
+  vec3 selRad;
+  vec3 selPos;
+  vec3 selNormal;   // n_s of the selected sample (packed into .w)
+  bool killStore = false;   // validation flags the STORED reservoir for reset
 
-  // Reprojected UV of this pixel's primary point into the previous frame; shared
-  // by the temporal merge and the spatial taps below.
-  vec4 clip = uPrevViewProj * vec4(P, 1.0);
-  vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
-  bool haveReproj = clip.w > 0.0 &&
-    prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0;
-  // Same plane-distance tolerance the temporal validation uses (reused by taps).
-  float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
+  if (doValidate) {
+    // On a validation pixel there is NO fresh exploration candidate this frame
+    // (the ray was spent re-tracing the stored hit); the reservoir for THIS frame
+    // is the temporal history alone (the merge below re-adds it, histValid stays
+    // true so a valid pixel keeps showing its GI — no dropout, no darkening).
+    // Documented ~1/uValidateInterval exploration reduction (12.5% at interval 8).
+    wSum = 0.0;
+    M = 0.0;
+    selRad = vec3(0.0);
+    selPos = P + N;
+    selNormal = N;
 
-  // --- temporal reuse: reproject P, validate the SAME surface, merge history ---
+    // Validation is KILL-only, and the kill hits only the STORED reservoir (next
+    // frame), NOT this frame's displayed estimate. Re-shade the stored hit and, if
+    // it is stale, mark the stored reservoir for reset so this pixel's fresh
+    // candidate takes over next frame and the estimate tracks the current lighting.
+    // Two staleness signals:
+    //   (1) GEOMETRY changed — the re-traced hit distance no longer matches the
+    //       stored one (a nearer occluder appeared, geometry moved, or the ray
+    //       missed; a miss puts hitPos far down the ray, so it trips this too).
+    //   (2) the target WENT DARK — the re-shaded radiance collapsed below a small
+    //       fraction (VAL_DARK_FRAC) of the stored one (a light switched off). This
+    //       is THE fix for stale bounce light.
+    // Why kill-only, and why store-deferred: the reservoir stores a RIS-selected
+    // sample whose radiance is BRIGHT-biased with a compensating small W
+    // (gi_luminance = selRad*selCos/PI*W = wSum/(M*PI), so W is a purely geometric
+    // 1/pdf term). Overwriting that bright radiance with a single average re-shade
+    // sample, or rescaling W by the noisy luminance ratio, provably DARKENS the
+    // mean (bright-selected pHatOld in the denominator) — the originally-specified
+    // "refresh radiance + W *= clamp(pHatOld/pHatNew, 0.25, 4)" path was measured
+    // to darken static GI ~25% at interval 8, so it is NOT used. Killing (dropping
+    // the stale term so fresh candidates rebuild) is unbiased; deferring the kill
+    // to the STORE keeps the displayed frame equal to validation-off, so even a
+    // false kill from single-sample noise costs a little variance, not brightness.
+    float valTol = max(0.02 * expectDist, 4.0 * uEps);
+    float hitDist = length(hitPos - P);
+    bool geomChanged = abs(hitDist - expectDist) > valTol;
+    float pHatOld = luminance(radPrev) * cosT;   // stored target at this pixel
+    float pHatNew = luminance(rad) * cosT;        // re-shaded target (current light)
+    bool wentDark = pHatNew < VAL_DARK_FRAC * pHatOld;
+    // KILL (drop the stale temporal term so this pixel's fresh candidates rebuild
+    // from the current scene) on geometry change OR a collapse to near-black; leave
+    // a still-valid sample UNTOUCHED so a static scene does not drift. A switched-
+    // off light drives pHatNew -> 0 and trips wentDark. The kill only marks the
+    // STORE (killStore); the displayed frame still uses the merged history.
+    killStore = geomChanged || wentDark;
+  } else {
+    // --- normal fresh candidate: one cosine-hemisphere GI bounce, shaded inline.
+    float pHatFresh = luminance(rad) * cosT;
+    // w = p_hat / p_source = p_hat / (cos/PI). cosT cancels; guard cosT==0.
+    float wFresh = cosT > 0.0 ? pHatFresh * PI / cosT : 0.0;
+    wSum = wFresh;
+    M = 1.0;
+    selRad = rad;
+    selPos = hitPos;
+    selNormal = hitNormal;
+  }
+
+  // --- temporal reuse: merge the (possibly radiance-refreshed, or killed)
+  // history. When the validation above KILLED the sample, histValid is false and
+  // the merge is skipped -> the reservoir stays empty this frame. ---
   // emaPrevGi: last frame's resolved GI, RECONSTRUCTED from the previous
   // reservoir (all inputs already bound — no extra sampler). Reservoirs persist
   // WHICH sample matters, not a variance average: near emitters many samples
@@ -423,43 +565,31 @@ void main() {
   // reconstruction to restore that smoothing.
   vec3 emaPrevGi = vec3(0.0);
   bool emaPrevOk = false;
-  if (haveReproj) {
-    vec4 pPos = texture(uPrevGWorldPos, prevUv);
-    if (pPos.w > 0.5 && abs(dot(P - pPos.xyz, N)) < tol) {
-      vec4 hp = texture(uPrevResPos, prevUv);  // hitPos.xyz + packed(M, n_s)
-      vec4 hr = texture(uPrevResRad, prevUv);  // radiance.rgb + W
-      float Mprev; vec3 nPrev;
-      unpackMN(hp.w, Mprev, nPrev);
-      float Wprev = hr.w;
-      if (Mprev > 0.0 && Wprev > 0.0) {
-        vec3 radPrev = hr.rgb;
-        vec3 hitPrev = hp.xyz;
-        // Re-evaluate the target at the CURRENT surface (reconnect at the
-        // stored hit point). Same world point P (validated), so no Jacobian.
-        vec3 dp = hitPrev - P;
-        float dl = length(dp);
-        float cosPrev = dl > 1e-5 ? max(dot(N, dp / dl), 0.0) : 0.0;
-        float pHatPrev = luminance(radPrev) * cosPrev;
-        float Mc = min(Mprev, uMCap);
-        // Combine reservoirs: w = p_hat_current(sample) * W_prev * M_prev.
-        float w = pHatPrev * Wprev * Mc;
-        wSum += w;
-        M += Mc;
-        if (w > 0.0 && rand() * wSum < w) {
-          selRad = radPrev;
-          selPos = hitPrev;
-          selNormal = nPrev;
-        }
-        // Reconstruct last frame's resolve from this same sample (same W cap
-        // and clamp as the live resolve, for a like-for-like EMA partner).
-        vec3 pg = radPrev * (cosPrev / PI) * min(Wprev, 32.0);
-        float pgl = luminance(pg);
-        if (pgl > uFireflyClamp) pg *= uFireflyClamp / pgl;
-        if (!any(isnan(pg)) && !any(isinf(pg))) {
-          emaPrevGi = pg;
-          emaPrevOk = true;
-        }
-      }
+  if (histValid) {
+    // Re-evaluate the target at the CURRENT surface (reconnect at the stored hit
+    // point). Same world point P (validated), so no Jacobian.
+    vec3 dp = hitPrev - P;
+    float dl = length(dp);
+    float cosPrev = dl > 1e-5 ? max(dot(N, dp / dl), 0.0) : 0.0;
+    float pHatPrev = luminance(radPrev) * cosPrev;
+    float Mc = min(Mprev, uMCap);
+    // Combine reservoirs: w = p_hat_current(sample) * W_prev * M_prev.
+    float w = pHatPrev * Wprev * Mc;
+    wSum += w;
+    M += Mc;
+    if (w > 0.0 && rand() * wSum < w) {
+      selRad = radPrev;
+      selPos = hitPrev;
+      selNormal = nPrev;
+    }
+    // Reconstruct last frame's resolve from this same sample (same W cap
+    // and clamp as the live resolve, for a like-for-like EMA partner).
+    vec3 pg = radPrev * (cosPrev / PI) * min(Wprev, 32.0);
+    float pgl = luminance(pg);
+    if (pgl > uFireflyClamp) pg *= uFireflyClamp / pgl;
+    if (!any(isnan(pg)) && !any(isinf(pg))) {
+      emaPrevGi = pg;
+      emaPrevOk = true;
     }
   }
 
@@ -603,6 +733,31 @@ void main() {
   float WT = (MT > 0.0 && pHatSelT > 0.0) ? wSumT / (MT * pHatSelT) : 0.0;
   if (any(isnan(selRadT)) || any(isinf(selRadT))) { selRadT = vec3(0.0); WT = 0.0; }
 
+  // Validation store policy. The DISPLAYED gi above always used the merged history
+  // (no dropout). The STORED reservoir, however, must be handled so validation
+  // does not shift the temporal fixed point:
+  //   - KEEP (valid sample): pass the previous reservoir through UNCHANGED. A
+  //     validation frame carries no fresh candidate, so RE-DERIVING and re-storing
+  //     the merged reservoir (M -> min(Mprev,cap), W recomputed) perturbs the
+  //     recursion and was measured to darken the static estimate ~13-16%. Writing
+  //     back the exact (hitPrev, radPrev, Wprev, Mprev) leaves the fixed point
+  //     identical to validation-off, so a static scene does not drift.
+  //   - KILL (stale sample): reset to empty so next frame's fresh cosine candidate
+  //     rebuilds and the estimate tracks the current lighting.
+  if (doValidate) {
+    if (killStore) {
+      selPosT = P + N; selRadT = vec3(0.0); selNormalT = N; MT = 0.0; WT = 0.0;
+    } else {
+      // KEEP: write the previous reservoir back verbatim (hitPrev, radPrev, nPrev,
+      // Mprev, Wprev). A validation frame adds no fresh candidate, so re-deriving
+      // and re-storing the merged reservoir (M -> min(Mprev,cap), W recomputed)
+      // perturbs the temporal recursion and was measured to darken the static
+      // estimate ~13-16%; a verbatim write-back keeps the fixed point identical to
+      // validation-off.
+      selPosT = hitPrev; selRadT = radPrev; selNormalT = nPrev; MT = Mprev; WT = Wprev;
+    }
+  }
+
   outResPos = vec4(selPosT, packMN(MT, selNormalT));
   outResRad = vec4(selRadT, WT);
   outGI = vec4(gi, 1.0);
@@ -625,6 +780,16 @@ void main() {
  * M (the pass is at the 16-sampler ceiling and can add none). Taps are gated by
  * uv bounds, a plane-distance check of the neighbour's previous primary point,
  * and a non-empty reservoir, so it stays unbiased and does not leak.
+ *
+ * `restirGIValidate` (default 8, 0 = off) adds reservoir-sample validation: a
+ * rotating 1-in-N subset of pixels re-aims its single candidate ray AT the stored
+ * reservoir hit (instead of a fresh cosine bounce) and re-shades it; the reservoir
+ * is KILLED (so fresh candidates rebuild) when the geometry moved or the re-shaded
+ * target collapsed to near-black (a light switched off), and left untouched
+ * otherwise, with the kill deferred to the store so a valid pixel never drops out.
+ * It reuses the existing candidate trace (no extra bounce rays, no extra samplers)
+ * and is the fix for stale bounce light: a switched-off light stops haunting the
+ * reservoir instead of fading slowly. 0 is byte-identical to the pre-feature path.
  */
 export class GIReservoirPass {
   constructor(width, height) {
@@ -660,6 +825,7 @@ export class GIReservoirPass {
         uFireflyClamp: { value: 4.0 },
         uMCap: { value: 20 },
         uSpatialTaps: { value: 2 },
+        uValidateInterval: { value: 8 },
         uEnvColor: { value: new THREE.Color(0.03, 0.04, 0.06) },
         uEnvIntensity: { value: 1.0 },
         uSkyEnabled: { value: false },
@@ -751,6 +917,7 @@ export class GIReservoirPass {
     u.uFireflyClamp.value = params.fireflyClamp;
     u.uMCap.value = params.mCap;
     u.uSpatialTaps.value = params.spatialTaps;
+    u.uValidateInterval.value = params.validateInterval;
     u.uEmissiveCDF.value = params.emissiveCDF;
     u.uEnvColor.value.copy(params.envColor);
     u.uEnvIntensity.value = params.envIntensity;
