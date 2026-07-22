@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased
+
+- **Skinned meshes — animated characters cast moving traced shadows.** A
+  `SkinnedMesh` listed in `dynamicMeshes` is now **auto-detected** (via
+  `isSkinnedMesh`, no `userData` flag) and CPU-skinned into the dynamic BVH every
+  frame, so a rigged character casts a traced shadow that moves with its gait
+  *and* rasterizes in its animated pose instead of the bind pose:
+  - **BVH side** (`SceneCompiler`): each frame the mesh's *source* vertices are
+    skinned once with three's own `SkinnedMesh.getVertexPosition` /
+    `applyBoneTransform` (bind matrix + bone weights/matrices → local space),
+    expanded through the de-index mapping into the merged triangle soup, then
+    transformed by `matrixWorld` — matching the rigid/deforming paths. Skinning is
+    O(source verts × 4 bones) with **no per-vertex allocation** (reused temporary),
+    and secondary-ray **normals are per-face**, recomputed from the skinned
+    triangle positions (no CPU normal skinning). Skinned segments force the
+    per-frame normal upload like deforming ones.
+  - **G-buffer side** (`GBufferPass`): the swapped `ShaderMaterial` now includes
+    three's standard `skinning_pars_vertex` / `skinbase_vertex` / `skinnormal_vertex`
+    / `skinning_vertex` chunks, so a `SkinnedMesh` rasterizes its animated pose
+    (three defines `USE_SKINNING` and supplies the bind/bone-texture uniforms
+    automatically; a non-skinned mesh compiles the identical source with the chunks
+    collapsed to nothing). Primary visibility keeps smooth skinned normals; the
+    per-mesh material cache means skinned/non-skinned meshes never share a program.
+  - **Demo:** an animated **Fox** exhibit (Khronos glTF) trots on a low platform
+    in the front-right floor, driven by an `AnimationMixer` ("Run" clip) and gated
+    by a new **"fox walk"** toggle (Physics section, default on). ≈ 1.7k skinned
+    source verts skin in ≈ 0.3 ms/frame.
+  - The Fox ships without a `normal` attribute; the demo calls
+    `computeVertexNormals()` on load so the raster path has bind-pose normals to
+    skin (the BVH path derives its own per-face normals and was never affected).
+
 ## 0.4.2 — 2026-07-22
 
 - **Real fix for black lighting on iOS** (root-caused by live bisection on an

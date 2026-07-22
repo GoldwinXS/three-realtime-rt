@@ -1,6 +1,19 @@
 import * as THREE from "three";
 
+// three defines USE_SKINNING and supplies the bindMatrix / bindMatrixInverse /
+// boneTexture uniforms + skinIndex / skinWeight attributes automatically when the
+// rendered object is a SkinnedMesh (this is a ShaderMaterial, not a
+// RawShaderMaterial, so it inherits three's default vertex prefix and #include
+// resolution). For a non-skinned mesh USE_SKINNING is undefined and every chunk
+// below collapses to nothing — the shader source is identical in both cases.
+// The chunks operate on `transformed` (position) and `objectNormal` (normal) in
+// the mesh's LOCAL/bind space, so we map our own variables in and out. The
+// skinned local position/normal then go through modelMatrix / uNormalMatrixWorld
+// exactly like the un-skinned path — matching the CPU BVH skinning in
+// SceneCompiler (both skin to local, then transform to world).
 const gbufferVert = /* glsl */ `
+#include <skinning_pars_vertex>
+
 out vec3 vWorldPos;
 out vec3 vWorldNormal;
 out vec2 vUvCoord;
@@ -8,9 +21,15 @@ out vec2 vUvCoord;
 uniform mat3 uNormalMatrixWorld;
 
 void main() {
-  vec4 wp = modelMatrix * vec4(position, 1.0);
+  vec3 transformed = position;
+  vec3 objectNormal = normal;
+  #include <skinbase_vertex>
+  #include <skinnormal_vertex>
+  #include <skinning_vertex>
+
+  vec4 wp = modelMatrix * vec4(transformed, 1.0);
   vWorldPos = wp.xyz;
-  vWorldNormal = normalize(uNormalMatrixWorld * normal);
+  vWorldNormal = normalize(uNormalMatrixWorld * objectNormal);
   vUvCoord = uv;
   gl_Position = projectionMatrix * viewMatrix * wp;
 }

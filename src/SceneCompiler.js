@@ -45,6 +45,9 @@ export class CompiledScene {
     // True when any dynamic segment is CPU-deformed (rtDeforming) — such segments
     // read their live geometry every frame and force a per-frame normal upload.
     this.hasDeforming = false;
+    // True when any dynamic segment is a SkinnedMesh — CPU-skinned every frame
+    // (shape changes each frame, so it forces a per-frame normal upload too).
+    this.hasSkinned = false;
 
     this.materialsTex = null;
     this.materials = [];
@@ -58,6 +61,7 @@ export class CompiledScene {
     this._m3 = new THREE.Matrix3();
     this._normalFrame = 0;
     this._dynBuildVolume = null; // world-volume of the dynamic set at build time
+    this._skinVec = new THREE.Vector3(); // reused per-vertex temp for CPU skinning
   }
 
   /**
@@ -81,7 +85,69 @@ export class CompiledScene {
       let o = seg.start * 3;
       let p = seg.start * 4;
 
-      if (seg.deforming) {
+      if (seg.skinned) {
+        // Animated SkinnedMesh: CPU-skin the SOURCE vertices with three's own
+        // applyBoneTransform (bindMatrix + bone weights/matrices), then expand
+        // through the de-index mapping into the merged triangle soup. In r160
+        // applyBoneTransform/getVertexPosition return the vertex in the mesh's
+        // LOCAL (bind-relative) space — NOT world — so matrixWorld is still
+        // applied here, exactly like the rigid/deforming paths.
+        const mesh = seg.mesh;
+        // Keep the skeleton's bone texture coherent for the raster (G-buffer)
+        // path; applyBoneTransform itself reads bone.matrixWorld, which the app
+        // must have posed (mixer.update + a world-matrix update) before this call.
+        if (mesh.skeleton) mesh.skeleton.update();
+        const local = seg.skinnedLocal;   // Float32Array(srcVertexCount * 3)
+        const tmp = this._skinVec;
+        const srcN = seg.srcVertexCount;
+        // 1. Skin each UNIQUE source vertex ONCE (O(verts x 4 bones)); shared
+        //    triangle-soup slots then reuse the cached result.
+        for (let sv = 0; sv < srcN; sv++) {
+          mesh.getVertexPosition(sv, tmp); // bind pos -> skinned LOCAL space
+          local[sv * 3] = tmp.x;
+          local[sv * 3 + 1] = tmp.y;
+          local[sv * 3 + 2] = tmp.z;
+        }
+        const map = seg.indexMap; // null = identity (non-indexed source)
+        // 2. Expand to the merged layout and transform to world.
+        for (let i = 0; i < seg.count; i++) {
+          const sv = map ? map[i] : i;
+          const x = local[sv * 3], y = local[sv * 3 + 1], z = local[sv * 3 + 2];
+          const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+          const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+          const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+          pos[o] = wx;
+          pos[o + 1] = wy;
+          pos[o + 2] = wz;
+          if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+          if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+          if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+          o += 3;
+        }
+        // 3. PER-FACE normals from the skinned world triangles — the merged
+        //    layout is already a de-indexed triangle soup, so each face's 3
+        //    slots get the same geometric normal (flat-shaded). Secondary rays
+        //    (shadows/GI) only need the geometry to be right; primary visibility
+        //    still gets smooth normals from the raster path. This skips
+        //    CPU-skinning the normal attribute entirely.
+        let fp = seg.start * 4;
+        for (let i = 0; i < seg.count; i += 3) {
+          const b = (seg.start + i) * 3;
+          const ax = pos[b], ay = pos[b + 1], az = pos[b + 2];
+          const e1x = pos[b + 3] - ax, e1y = pos[b + 4] - ay, e1z = pos[b + 5] - az;
+          const e2x = pos[b + 6] - ax, e2y = pos[b + 7] - ay, e2z = pos[b + 8] - az;
+          let nx = e1y * e2z - e1z * e2y;
+          let ny = e1z * e2x - e1x * e2z;
+          let nz = e1x * e2y - e1y * e2x;
+          const il = 1.0 / (Math.hypot(nx, ny, nz) || 1);
+          nx *= il; ny *= il; nz *= il;
+          packed[fp] = nx; packed[fp + 1] = ny; packed[fp + 2] = nz;       // v0
+          packed[fp + 4] = nx; packed[fp + 5] = ny; packed[fp + 6] = nz;   // v1
+          packed[fp + 8] = nx; packed[fp + 9] = ny; packed[fp + 10] = nz;  // v2
+          // packed[fp + 3|7|11] (matIndex) never changes
+          fp += 12;
+        }
+      } else if (seg.deforming) {
         // CPU-deformed mesh (water/cloth): read the LIVE geometry every frame
         // and expand it back to the merged de-indexed layout through the mapping
         // snapshotted at compile time. `indexMap` (the source geometry's index
@@ -178,10 +244,11 @@ export class CompiledScene {
     }
     this.dynamicBvhUniform.updateFrom(this.dynamicBvh);
     // Normals only feed GI-bounce shading off movers — amortize their upload for
-    // rigid movers. Deforming meshes change shape (not just orientation) every
-    // frame, so their normals must go up every frame or the shading lags the
-    // silhouette; one deforming segment forces the whole (shared) upload.
-    if (this.hasDeforming || this._normalFrame++ % 8 === 0) {
+    // rigid movers. Deforming and skinned meshes change shape (not just
+    // orientation) every frame, so their normals must go up every frame or the
+    // shading lags the silhouette; one such segment forces the whole (shared)
+    // upload.
+    if (this.hasDeforming || this.hasSkinned || this._normalFrame++ % 8 === 0) {
       this.dynamicAttrTex.updateFrom(this.dynamicPackedAttr);
     }
   }
@@ -397,10 +464,14 @@ export function compileScene(scene, options = {}) {
     }
     if (isDynamic) {
       dynamicGeoms.push(extracted.geo);
-      // Opt-in CPU deformation: the mesh must be BOTH in dynamicMeshes AND carry
-      // userData.rtDeforming, and its live geometry is read every frame.
-      const deforming = obj.userData.rtDeforming === true;
+      // A SkinnedMesh is auto-detected (no userData flag): it is CPU-skinned from
+      // its live skeleton pose every frame. Opt-in CPU deformation (water/cloth)
+      // instead requires userData.rtDeforming and reads live geometry. The two are
+      // mutually exclusive; skinning wins if a mesh is somehow both.
+      const skinned = obj.isSkinnedMesh === true;
+      const deforming = !skinned && obj.userData.rtDeforming === true;
       if (deforming) compiled.hasDeforming = true;
+      if (skinned) compiled.hasSkinned = true;
       compiled.dynamic.push({
         mesh: obj,
         start: dynVertexOffset,
@@ -408,9 +479,15 @@ export function compileScene(scene, options = {}) {
         localPos: extracted.localPos,
         localNorm: extracted.localNorm,
         deforming,
+        skinned,
         liveGeometry: deforming ? obj.geometry : null,
-        indexMap: deforming ? extracted.indexMap : null,
-        srcVertexCount: deforming ? extracted.srcVertexCount : 0,
+        // Skinned and deforming segments both expand live/source vertices back
+        // into the merged de-indexed layout through this mapping.
+        indexMap: deforming || skinned ? extracted.indexMap : null,
+        srcVertexCount: deforming || skinned ? extracted.srcVertexCount : 0,
+        // Cache of per-source-vertex skinned LOCAL positions (skinned segs only),
+        // filled each frame so shared triangle-soup slots reuse one skin solve.
+        skinnedLocal: skinned ? new Float32Array(extracted.srcVertexCount * 3) : null,
       });
       dynVertexOffset += extracted.count;
     } else {

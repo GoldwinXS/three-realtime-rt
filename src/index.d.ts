@@ -235,6 +235,16 @@ export interface CompileSceneOptions {
    * normal attribute current (e.g. call `geometry.computeVertexNormals()` after
    * deforming). The live vertex count is fixed at compile time — changing it
    * throws; call `compileScene()` again after a topology change.
+   *
+   * A **`SkinnedMesh` is auto-detected** (no flag needed) and CPU-skinned into the
+   * dynamic BVH every frame from its live skeleton pose, so an animated character
+   * casts a moving traced shadow and rasterizes in its animated pose (the G-buffer
+   * skins via three's standard skinning chunks). Pose the skeleton *before*
+   * `updateDynamic()` — `mixer.update(dt)` then `characterRoot.updateMatrixWorld(true)`
+   * — since the skinning reads each bone's `matrixWorld`. Cost is O(source verts ×
+   * 4 bones); secondary-ray normals are per-face (recomputed from the skinned
+   * triangles), while primary visibility keeps smooth skinned normals from the
+   * raster path. Budget ~10–20k skinned source verts for a sub-2 ms frame.
    */
   dynamicMeshes?: Object3D[];
 }

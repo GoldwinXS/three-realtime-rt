@@ -5,6 +5,11 @@ import { TeapotGeometry } from "three/addons/geometries/TeapotGeometry.js";
 import helmetUrl from "./assets/DamagedHelmet.glb?url";
 import duckUrl from "./assets/Duck.glb?url";
 
+// The animated hero: Khronos' Fox, a skinned/rigged glTF. Streamed from its
+// canonical host (same pattern the gallery uses) rather than committed.
+const foxUrl =
+  "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Fox/glTF-Binary/Fox.glb";
+
 /**
  * An indoor gallery: a Cornell-style room (saturated side walls, open top)
  * arranged as a deliberate exhibit — every renderer feature gets a staged
@@ -246,6 +251,24 @@ export function buildScene() {
     framePiece(0.12, 2.34, 0.12, wx, 2.3, z0 - 1.56);
   }
 
+  // --- front-right: the animated fox (skinned dynamic BVH) ----------------
+  // A low granite platform in the open front-right floor, clear of the pile pad
+  // (2.6, 2.4), the bench, and the teapot. The Fox (loaded async below) trots on
+  // top; its skeleton is CPU-skinned into the dynamic BVH every frame, so the
+  // warm/cool lights cast a traced shadow that moves with the gait.
+  const FOX_POS = new THREE.Vector3(6.5, 0.3, 2.8);
+  const foxPlatform = new THREE.Mesh(
+    new THREE.BoxGeometry(2.4, 0.3, 2.0),
+    new THREE.MeshStandardMaterial({ color: 0x6f747c, roughness: 0.6 })
+  );
+  foxPlatform.position.set(FOX_POS.x, 0.15, FOX_POS.z);
+  scene.add(foxPlatform);
+
+  // Handle returned to the demo; populated once the glTF resolves in `ready`.
+  // `meshes` are the SkinnedMesh instances handed to the dynamic set;
+  // update(dt) advances the gait and poses the skeleton for the tracer.
+  const fox = { root: null, mixer: null, meshes: [], update: () => {} };
+
   // --- back-left: the water pool (deforming dynamic BVH) ------------------
   // Directly beneath the emissive gallery light with the helmet at its edge:
   // the ripples carry moving traced reflections of both. Low-poly on purpose —
@@ -402,6 +425,54 @@ export function buildScene() {
     duck.scene.position.set(-4.8, 0.7, 0.8); // on the vitrine plinth
     duck.scene.rotation.y = -0.5;
     scene.add(duck.scene);
+
+    // The Fox: a skinned/rigged glTF with "Survey", "Walk" and "Run" clips.
+    const foxGltf = await load(foxUrl);
+    const root = foxGltf.scene;
+    // Fox is authored ~100 units long — normalize its longest axis to ~1.5m.
+    const box = new THREE.Box3().setFromObject(root);
+    const span = box.getSize(new THREE.Vector3());
+    root.scale.setScalar(1.5 / Math.max(span.x, span.y, span.z));
+    // Re-measure after scaling to seat it exactly on the platform top (y=0.3).
+    box.setFromObject(root);
+    root.position.set(FOX_POS.x, FOX_POS.y - box.min.y, FOX_POS.z);
+    root.rotation.y = -Math.PI / 2.5; // quarter onto the camera so the gait reads
+    root.traverse((o) => {
+      if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; }
+    });
+    scene.add(root);
+
+    // Collect the SkinnedMesh instances for the dynamic set (auto-detected as
+    // skinned by compileScene via isSkinnedMesh — no userData flag needed).
+    const skinnedMeshes = [];
+    root.traverse((o) => { if (o.isSkinnedMesh) skinnedMeshes.push(o); });
+    // Fox.glb ships WITHOUT a normal attribute, so the rasterized G-buffer would
+    // get a zero (NaN once normalized) normal and shade the fox black. Compute
+    // bind-pose normals so the G-buffer skinning has something to skin (the BVH
+    // path derives its own per-face normals from the skinned positions, so it was
+    // never affected).
+    for (const m of skinnedMeshes) {
+      if (!m.geometry.getAttribute("normal")) m.geometry.computeVertexNormals();
+    }
+
+    const mixer = new THREE.AnimationMixer(root);
+    const clip =
+      THREE.AnimationClip.findByName(foxGltf.animations, "Run") ||
+      THREE.AnimationClip.findByName(foxGltf.animations, "Walk") ||
+      foxGltf.animations[0];
+    if (clip) mixer.clipAction(clip).play();
+
+    fox.root = root;
+    fox.mixer = mixer;
+    fox.meshes = skinnedMeshes;
+    // Advance the gait, then propagate the animated bone poses into world
+    // matrices NOW (updateMatrixWorld with force) so the CPU skinning in
+    // updateDynamic() — which reads bone.matrixWorld — matches this frame's
+    // raster. Without this the traced shadow would lag the fox by one frame.
+    fox.update = (dt) => {
+      mixer.update(dt);
+      root.updateMatrixWorld(true);
+    };
   })();
 
   return {
@@ -409,6 +480,9 @@ export function buildScene() {
     // The CPU-deformed water pool: its mesh joins the dynamic set and
     // updateWater(t) is called each frame before rt.updateDynamic().
     water: { mesh: water, update: updateWater },
+    // The animated Fox (skinned): its SkinnedMesh(es) join the dynamic set and
+    // fox.update(dt) advances/poses it each frame before rt.updateDynamic().
+    fox,
     // The clerestory windows (emissive panes) driven by the demo's slider.
     windows,
     // Feature-linked scene objects the demo may want handles to.

@@ -51,7 +51,7 @@ const enterSafeMode = (why) => {
 
 async function main() {
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
-  const { scene, camera, bounds, lights, sky, ready, showcase, water, windows } = buildScene();
+  const { scene, camera, bounds, lights, sky, ready, showcase, water, windows, fox } = buildScene();
 
   // A Rapier physics playground drops a pool of props onto the ground. Their
   // meshes are plain three.js meshes — we'll hand them to the raytracer as the
@@ -204,9 +204,10 @@ async function main() {
   });
 
   // The dynamic set = the (opt-in) physics pile PLUS the CPU-deformed water
-  // pool. The water is flagged rtDeforming in scene.js, so the raytracer reads
-  // its live geometry each frame; the physics meshes are rigid movers.
-  const dynamicMeshes = () => [...physics.meshes, water.mesh];
+  // pool PLUS the animated fox. The water is flagged rtDeforming in scene.js, so
+  // the raytracer reads its live geometry each frame; the fox's SkinnedMesh is
+  // auto-detected and CPU-skinned each frame; the physics meshes are rigid movers.
+  const dynamicMeshes = () => [...physics.meshes, water.mesh, ...fox.meshes];
 
   // 3. Compile once. `dynamicMeshes` marks meshes that move every frame — they
   //    get re-baked into the BVH on updateDynamic() (see the loop below).
@@ -221,7 +222,7 @@ async function main() {
 
   const controls = new OrbitControls(camera, renderer.domElement);
   // Expose for debugging / automated verification.
-  Object.assign(window, { RT: rt, SCENE: scene, CAMERA: camera, PHYSICS: physics, CONTROLS: controls });
+  Object.assign(window, { RT: rt, SCENE: scene, CAMERA: camera, PHYSICS: physics, CONTROLS: controls, FOX: fox });
   controls.target.set(-1.0, 1.8, -2.8); // bias toward the exhibit frieze
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
@@ -233,7 +234,7 @@ async function main() {
   // Lights only need re-reading when they actually change, so the UI calls this
   // instead of us polling every frame.
   const refreshLights = () => rt.updateLights(scene);
-  const state = { rtEnabled: true, physicsPaused: false, waterEnabled: true };
+  const state = { rtEnabled: true, physicsPaused: false, waterEnabled: true, foxEnabled: true };
 
   // The orbiting ceiling light is animated in the loop (below) — find it once.
   const orbitLight = lights.find((l) => l.label === "orbit light").light;
@@ -392,21 +393,30 @@ async function main() {
     // is awake. Advance it before updateDynamic() so the fresh vertices/normals
     // are what gets baked in.
     if (state.waterEnabled) water.update(now / 1000);
+    // Advance the fox's gait and pose its skeleton (bones -> world matrices) so
+    // this frame's CPU skinning in updateDynamic() matches the raster.
+    if (state.foxEnabled && fox.update) fox.update(dt);
 
     if (state.rtEnabled) {
-      // Re-bake the dynamic BVH when anything moved: the water (if enabled) or an
-      // awake physics body. At full rest with water off, the whole step (and its
-      // BVH upload) is skipped, which is most of the frame.
+      // Re-bake the dynamic BVH when anything moved: the water (if enabled), the
+      // fox (if walking), or an awake physics body. At full rest with water/fox
+      // off, the whole step (and its BVH upload) is skipped, which is most of the
+      // frame.
       const physicsActive = !state.physicsPaused && physics.anyAwake();
       try {
-        if (state.waterEnabled || physicsActive) {
+        if (state.waterEnabled || state.foxEnabled || physicsActive) {
           const tDyn = performance.now();
           rt.updateDynamic();
-          // One-shot perf probe: what does re-baking the deforming water cost?
-          if (!waterPerfLogged && state.waterEnabled) {
+          // One-shot perf probe: what does re-baking the deforming water +
+          // CPU-skinning the fox cost?
+          if (!waterPerfLogged && (state.waterEnabled || state.foxEnabled)) {
             waterPerfLogged = true;
+            const foxVerts = fox.meshes.reduce(
+              (n, m) => n + m.geometry.getAttribute("position").count, 0
+            );
             console.log(
-              `[three-realtime-rt demo] updateDynamic() with water active: ` +
+              `[three-realtime-rt demo] updateDynamic() (water=${state.waterEnabled}, ` +
+                `fox=${state.foxEnabled}, ${foxVerts.toLocaleString()} skinned src verts): ` +
                 `${(performance.now() - tDyn).toFixed(2)} ms ` +
                 `(${rt.compiled.triangleCount.toLocaleString()} dynamic+static tris)`
             );
