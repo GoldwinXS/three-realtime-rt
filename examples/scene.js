@@ -99,8 +99,12 @@ export function buildScene() {
     new TeapotGeometry(0.8, 10),
     new THREE.MeshStandardMaterial({ color: 0xe4dccd, roughness: 0.12, metalness: 0.0 })
   );
-  pedestal(10.2, -1.5);
-  teapot.position.set(10.2, 1.75, -1.5);
+  pedestal(9.7, -1.5);
+  teapot.position.set(9.7, 1.75, -1.5);
+  // Spout points +x by default — straight into the teal wall from this spot.
+  // Turn it to face back-left into the room (profile view from the camera),
+  // and keep half a metre of air between the handle and the amber painting.
+  teapot.rotation.y = 2.3;
   scene.add(teapot);
 
   // --- back wall, right half: the MATERIALS bench --------------------------
