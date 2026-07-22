@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-07-22
 
 - **ReSTIR GI reservoir-sample validation (experimental).** Fixes stale bounce
   light: switch a light off and the reservoirs used to keep bouncing its ghost,
