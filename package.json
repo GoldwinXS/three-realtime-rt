@@ -1,6 +1,6 @@
 {
   "name": "three-realtime-rt",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Turn-on ray traced lighting for three.js: a hybrid deferred renderer with BVH-traced soft shadows, one-bounce global illumination, temporal reprojection, an a-trous denoiser and TAA.",
   "type": "module",
   "main": "src/index.js",

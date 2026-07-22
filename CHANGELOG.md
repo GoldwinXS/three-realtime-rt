@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-07-22
 
 - **Fix: TAA wobble at reduced canvas scale** (`taaJitterScale`). The sub-pixel
   jitter is sized in buffer pixels, so a CSS-stretched reduced drawing buffer
