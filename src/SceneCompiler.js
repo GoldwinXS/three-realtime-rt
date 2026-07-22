@@ -239,12 +239,18 @@ function emissiveColor(mat) {
 // Row 1: emissive triangles for NEE, 4 texels each:
 //   [v0.xyz | area] [e1.xyz | emit.r] [e2.xyz | emit.g] [n.xyz | emit.b]
 // Rows 2..65: a 64x64 RGBA blue-noise tile for low-discrepancy sampling.
+// Row 66 (2 + BLUE_NOISE_SIZE): the emissive power CDF, 1 texel per triangle:
+//   [cdf | prob | 0 | 0] — cumulative and individual pick probability, both
+//   proportional to area x emitted luminance. Lets NEE importance-sample WHICH
+//   triangle to shoot at instead of picking uniformly (a big/bright panel gets
+//   sampled proportionally more than a tiny dim strip), which is the main
+//   variance lever for emissive lighting outside of ReSTIR.
 // All packed into ONE texture because the lighting pass already sits at the
 // WebGL2-guaranteed 16-sampler limit — extra samplers are not available.
 function buildSceneDataTexture(materials, emissiveTris) {
   const bn = decodeBlueNoise();
   const width = Math.max(materials.length * 2, emissiveTris.length * 4, BLUE_NOISE_SIZE);
-  const height = 2 + BLUE_NOISE_SIZE;
+  const height = 2 + BLUE_NOISE_SIZE + 1;
   const data = new Float32Array(width * height * 4);
   materials.forEach((mat, i) => {
     const o = i * 8;
@@ -272,6 +278,22 @@ function buildSceneDataTexture(materials, emissiveTris) {
     const src = y * BLUE_NOISE_SIZE * 4;
     for (let i = 0; i < BLUE_NOISE_SIZE * 4; i++) {
       data[o + i] = (bn[src + i] + 0.5) / 256.0;
+    }
+  }
+  // Emissive power CDF (see the layout comment above). Weight = area x
+  // emitted luminance; degenerate totals fall back to the uniform pick.
+  if (emissiveTris.length > 0) {
+    const w = emissiveTris.map(
+      (t) => t.area * (0.2126 * t.emit[0] + 0.7152 * t.emit[1] + 0.0722 * t.emit[2])
+    );
+    const total = w.reduce((a, b) => a + b, 0);
+    const cdfRow = (2 + BLUE_NOISE_SIZE) * row;
+    let cum = 0;
+    for (let i = 0; i < emissiveTris.length; i++) {
+      const p = total > 0 ? w[i] / total : 1 / emissiveTris.length;
+      cum += p;
+      data[cdfRow + i * 4 + 0] = i === emissiveTris.length - 1 ? 1.0 : cum;
+      data[cdfRow + i * 4 + 1] = p;
     }
   }
   const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);

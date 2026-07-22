@@ -378,6 +378,13 @@ export class RealtimeRaytracer {
      */
     this.emissiveNEE = options.emissiveNEE ?? true;
     /**
+     * Importance-sample WHICH emissive triangle NEE shoots at, proportional to
+     * area x emitted luminance (a compile-time power CDF), instead of a uniform
+     * 1-of-N pick. Same mean, far less sparkle in scenes whose emitters differ
+     * in size/brightness. Off = legacy uniform pick (A/B comparison hook).
+     */
+    this.emissiveImportance = options.emissiveImportance ?? true;
+    /**
      * PBR direct specular: Cook-Torrance GGX highlights for all surfaces, in a
      * separate specular buffer added without the albedo multiply (dielectric
      * highlights are white, F0 ~= 0.04). Off = the old Lambert-only look.
@@ -598,6 +605,17 @@ export class RealtimeRaytracer {
     if (!this.supported) return null;
     if (this.compiled) this.compiled.dispose();
     this.compiled = compileScene(scene, options);
+    // Emissive area lights are the noisiest direct-light path: one triangle
+    // sample per pixel per frame, and the 1/dist^2 term spikes near a small
+    // emitter (fireflies). ReSTIR's reservoirs are what tame this — warn when
+    // a scene relies on emissive NEE without them. (fireflyClamp and the
+    // denoiser absorb the rest; see the README's emissive caveats.)
+    if (this.compiled.emissiveTriCount > 0 && this.emissiveNEE && !this.restir) {
+      console.info(
+        "[three-realtime-rt] this scene has emissive area lights but restir is off — " +
+          "emissive NEE alone is the noisiest sampling path; enable restir for a large noise win."
+      );
+    }
     if (this._autoEps) {
       // ~1/1000 of the scene diagonal, floored at the classic 1e-3.
       this.eps = Math.min(Math.max(1e-3, this.compiled.sceneDiagonal * 1.2e-3), 0.05);
@@ -918,6 +936,7 @@ export class RealtimeRaytracer {
     rtU.uGIEnabled.value = this.gi;
     rtU.uGIHalfRate.value = this.giHalfRate;
     rtU.uEmissiveCount.value = this.emissiveNEE ? this.compiled.emissiveTriCount : 0;
+    rtU.uEmissiveCDF.value = this.emissiveImportance;
     rtU.uReflEnabled.value = this.reflections;
     rtU.uRefrEnabled.value = this.refraction;
     rtU.uBlendEnabled.value = this.transparency;

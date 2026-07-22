@@ -50,6 +50,18 @@ const CSS = `
 #hint { position: fixed; bottom: 12px; left: 14px; z-index: 20; color: #6b7f8c;
   font: 11px ui-monospace, Consolas, monospace; background: rgba(14,18,24,0.7);
   border: 1px solid #26323c; border-radius: 6px; padding: 6px 10px; }
+/* fps readout — top-left, always visible even with the panel collapsed */
+#fps { position: fixed; top: 14px; left: 14px; z-index: 20; color: var(--accent-2);
+  font: 12px ui-monospace, "SF Mono", Consolas, monospace; font-variant-numeric: tabular-nums;
+  background: rgba(14,18,24,0.75); border: 1px solid #26323c; border-radius: 6px;
+  padding: 5px 9px; min-width: 58px; text-align: right; }
+/* collapsed panel: header only (the chevron in the header toggles it) */
+#panel .hd .fold { margin-left: 4px; flex: none; background: none; border: none;
+  padding: 2px; cursor: pointer; color: var(--ink-dim); display: flex; }
+#panel .hd .fold:hover { color: var(--accent); background: none; border: none; }
+#panel .hd .fold svg { width: 15px; height: 15px; transition: transform .15s; }
+#panel.min .hd .fold svg { transform: rotate(180deg); }
+#panel.min .sec, #panel.min .stats { display: none; }
 `;
 
 const ICON = {
@@ -63,6 +75,7 @@ const ICON = {
   reset: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8m0-5v5h5"/></svg>',
   fog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 8h16M4 12h16M4 16h16"/></svg>',
   sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 1v3M12 20v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1 12h3M20 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>',
+  chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 15l6-6 6 6"/></svg>',
 };
 
 function el(tag, cls, html) {
@@ -153,9 +166,35 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   const panel = el("div");
   panel.id = "panel";
 
-  panel.append(
-    el("div", "hd", `${ICON.chip}<b>three-realtime-rt</b><span class="tag">RT on</span>`)
-  );
+  const hd = el("div", "hd", `${ICON.chip}<b>three-realtime-rt</b><span class="tag">RT on</span>`);
+  // Collapse chevron: on phones the panel covers most of the scene, so it also
+  // starts collapsed there (the header stays as the handle to reopen it).
+  const fold = el("button", "fold", ICON.chev);
+  fold.title = "collapse / expand panel";
+  fold.addEventListener("click", () => panel.classList.toggle("min"));
+  hd.append(fold);
+  panel.append(hd);
+  if (matchMedia("(max-width: 700px)").matches) panel.classList.add("min");
+
+  // Always-on fps readout, top-left: counts real presented frames via its own
+  // rAF (rAF callbacks fire once per displayed frame, same cadence as the
+  // render loop), refreshed twice a second.
+  const fps = el("div");
+  fps.id = "fps";
+  fps.textContent = "-- fps";
+  document.body.append(fps);
+  let fpsFrames = 0;
+  let fpsLast = performance.now();
+  (function fpsTick() {
+    requestAnimationFrame(fpsTick);
+    fpsFrames++;
+    const now = performance.now();
+    if (now - fpsLast >= 500) {
+      fps.textContent = `${((fpsFrames * 1000) / (now - fpsLast)).toFixed(0)} fps`;
+      fpsFrames = 0;
+      fpsLast = now;
+    }
+  })();
 
   // --- Renderer (core pipeline; watch the fps readout as you change these) ---
   const rSec = el("div", "sec");

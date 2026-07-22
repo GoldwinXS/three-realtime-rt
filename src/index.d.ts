@@ -132,6 +132,13 @@ export interface RealtimeRaytracerOptions {
    */
   emissiveNEE?: boolean;
   /**
+   * Importance-sample WHICH emissive triangle NEE shoots at, proportional to
+   * area x emitted luminance (compile-time power CDF) instead of a uniform
+   * 1-of-N pick. Same mean, far less sparkle when emitters differ in
+   * size/brightness. Default true; false restores the legacy uniform pick.
+   */
+  emissiveImportance?: boolean;
+  /**
    * PBR direct specular: Cook-Torrance GGX highlights for every surface, kept in
    * a separate specular buffer the composite adds WITHOUT the albedo multiply
    * (dielectric highlights are white, F0 ~= 0.04). Metals' albedo-tinted specular
@@ -315,6 +322,8 @@ export class RealtimeRaytracer {
   gi: boolean;
   /** Sample static emissive meshes as area lights (NEE). */
   emissiveNEE: boolean;
+  /** Importance-sample emissive triangles by power (see the option of the same name). */
+  emissiveImportance: boolean;
   /** PBR direct specular (Cook-Torrance GGX) into a separate additive buffer. */
   specular: boolean;
   /** Traced mirror/glossy reflections on metallic surfaces. */

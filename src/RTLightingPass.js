@@ -61,6 +61,7 @@ uniform vec4 uLightColorRadius[MAX_LIGHTS]; // rgb color*intensity, w radius
 uniform vec4 uLightDirCone[MAX_LIGHTS];     // spot: direction.xyz + cos(outer angle)
 uniform int uLightCount;
 uniform int uEmissiveCount; // NEE area-light triangles in row 1 of uMaterialsTex
+uniform bool uEmissiveCDF;  // importance-sample tris by the power CDF (row 66)
 uniform bool uReflEnabled;  // traced reflections on metallic surfaces
 uniform bool uRefrEnabled;  // traced refraction on transmissive surfaces
 uniform bool uBlendEnabled; // straight-through view continuation on blend surfaces
@@ -287,9 +288,44 @@ vec3 sampleOneLight(vec3 P, vec3 N) {
 // pick one triangle, sample a point on it, cast one shadow ray, convert the
 // area pdf to solid angle. Turns emitters into proper soft area lights instead
 // of surfaces a GI ray has to hit by luck.
+//
+// NOISE CAVEAT: emissive NEE is the highest-variance direct-light path in the
+// engine — one triangle sample per pixel per frame, and the area-to-solid-angle
+// conversion carries a 1/dist^2 that spikes into fireflies when a shading point
+// sits close to a small emitter. Two mitigations stack here:
+//  1. uEmissiveCDF (default on): the triangle is IMPORTANCE-SAMPLED by
+//     area x emitted luminance via the power CDF in the scene-data texture
+//     (row 2 + 64 — see SceneCompiler's layout comment). A big bright panel is
+//     picked proportionally more often than a tiny dim strip, and each sample
+//     is weighted by its true pick probability — same mean, far less variance
+//     than the uniform 1-of-N pick.
+//  2. ReSTIR reservoirs converge each pixel onto the emitter that matters
+//     (the demo keeps restir on whenever emissive NEE is on;
+//     RealtimeRaytracer.compileScene logs a hint otherwise).
+// fireflyClamp and the denoiser absorb the residual tail. Distance-aware
+// selection and solid-angle triangle sampling remain future work.
 vec3 sampleEmissiveTri(vec3 P, vec3 N) {
   if (uEmissiveCount == 0) return vec3(0.0);
-  int i = min(int(rand() * float(uEmissiveCount)), uEmissiveCount - 1) * 4;
+  int idx;
+  float invProb; // 1 / P(picked this triangle)
+  if (uEmissiveCDF) {
+    // Binary search the power CDF: 8 steps covers MAX_EMISSIVE_TRIS = 256.
+    float u = rand();
+    int lo = 0;
+    int hi = uEmissiveCount - 1;
+    for (int s = 0; s < 8; s++) {
+      if (lo >= hi) break;
+      int mid = (lo + hi) >> 1;
+      if (u > texelFetch(uMaterialsTex, ivec2(mid, 66), 0).x) lo = mid + 1;
+      else hi = mid;
+    }
+    idx = lo;
+    invProb = 1.0 / max(texelFetch(uMaterialsTex, ivec2(idx, 66), 0).y, 1e-8);
+  } else {
+    idx = min(int(rand() * float(uEmissiveCount)), uEmissiveCount - 1);
+    invProb = float(uEmissiveCount);
+  }
+  int i = idx * 4;
   vec4 t0 = texelFetch(uMaterialsTex, ivec2(i, 1), 0);     // v0 | area
   vec4 t1 = texelFetch(uMaterialsTex, ivec2(i + 1, 1), 0); // e1 | emit.r
   vec4 t2 = texelFetch(uMaterialsTex, ivec2(i + 2, 1), 0); // e2 | emit.g
@@ -311,9 +347,10 @@ vec3 sampleEmissiveTri(vec3 P, vec3 N) {
   if (cosS <= 0.0 || cosL < 1e-4) return vec3(0.0);
   if (occluded(P + N * uEps, wi, dist)) return vec3(0.0);
 
-  // Uniform pick of 1-of-count tris + uniform point: pdf_area = 1/(count·area).
-  // Solid-angle conversion gives irradiance Le · cosS · cosL / (d² · pdf_area).
-  vec3 e = vec3(t1.w, t2.w, t3.w) * (cosS * cosL * float(uEmissiveCount) * t0.w / max(d2, 1e-6));
+  // Pick of one tri (probability 1/invProb) + uniform point on it:
+  // pdf_area = 1/(invProb·area). Solid-angle conversion gives irradiance
+  // Le · cosS · cosL / (d² · pdf_area).
+  vec3 e = vec3(t1.w, t2.w, t3.w) * (cosS * cosL * invProb * t0.w / max(d2, 1e-6));
 
   // Dielectric highlight from this emitter: e already folds in cosS, so the
   // specular is e * (GGX BRDF) toward the sampled point (wi).
@@ -853,6 +890,7 @@ export class RTLightingPass {
         uLightDirCone: { value: [] },
         uLightCount: { value: 0 },
         uEmissiveCount: { value: 0 },
+        uEmissiveCDF: { value: true },
         uReflEnabled: { value: true },
         uRefrEnabled: { value: true },
         uBlendEnabled: { value: true },

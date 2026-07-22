@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Demo:** the room is now a designed gallery (water pool with kerbs under the
+  emissive panel, helmet spotlight, duck-in-a-vitrine transparency exhibit,
+  roughness-ramp plinths, paired accent panes), with an always-on **fps readout**
+  (top-left) and a **collapsible control panel** (starts collapsed on phones).
+- **Emissive NEE importance sampling** (`emissiveImportance`, default on): the
+  triangle NEE shoots at is now picked proportional to **area × emitted
+  luminance** via a compile-time power CDF (binary-searched in-shader) instead
+  of uniformly 1-of-N. Same mean, far less sparkle when emitters differ in
+  size/brightness — a tiny bright puck no longer alternates between "ignored"
+  and "over-weighted 4×". Set `false` for the legacy uniform pick (A/B hook).
+- **Docs:** emissive area lights documented as the noisiest direct-light path,
+  with a runtime hint when a scene compiles emissive geometry while ReSTIR is
+  off (the reservoirs are the intended mitigation).
+
 - **PBR materials — real specular.** The renderer was Lambert-only for every
   dielectric; roughness/metalness maps and normal maps were ignored. This round:
   - **Cook-Torrance GGX direct specular** (GGX distribution + height-correlated

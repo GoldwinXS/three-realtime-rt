@@ -185,7 +185,7 @@ async function main() {
   const controls = new OrbitControls(camera, renderer.domElement);
   // Expose for debugging / automated verification.
   Object.assign(window, { RT: rt, SCENE: scene, CAMERA: camera, PHYSICS: physics, CONTROLS: controls });
-  controls.target.set(-0.8, 1.3, -1.0); // bias toward the exhibit cluster
+  controls.target.set(-0.8, 1.4, -1.6); // bias toward the exhibit cluster
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.maxPolarAngle = Math.PI * 0.5; // stay above the ground
@@ -234,7 +234,7 @@ async function main() {
   // dynamic set (a one-time hitch, same as the initial compile).
   const spawnPile = () => {
     if (physics.meshes.length > 0) return;
-    physics.spawnPool(scene, 40, new THREE.Vector3(2.4, 0, 2.2));
+    physics.spawnPool(scene, 40, new THREE.Vector3(2.6, 0, 3.0));
     rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
   };
 

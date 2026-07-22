@@ -303,6 +303,13 @@ scalar fields of `MeshStandardMaterial` / `MeshPhysicalMaterial` (Basic / Lamber
 | `RectAreaLight` | ❌ | Use an emissive mesh instead. |
 | `HemisphereLight` / `AmbientLight` | ❌ | Ignored — the procedural `sky` (or `envColor`) provides ambient. |
 
+- **Emissive noise caveat:** emissive NEE is the noisiest direct-light path — one
+  uniformly-picked triangle sample per pixel per frame, with a `1/dist²` term that
+  sparkles into fireflies near small, close emitters. **Keep `restir: true` in any
+  scene that leans on emissive lighting** (the reservoirs converge each pixel onto
+  the emitter that matters; the library logs a hint if you compile emissive
+  geometry with ReSTIR off). Prefer larger/dimmer emitter surfaces over tiny
+  bright ones, and let `fireflyClamp` do its job.
 - Up to **32** point/directional lights (`MAX_LIGHTS`); further lights are dropped.
 - Moving, toggling, recolouring or dimming a light → `rt.updateLights(scene)` (cheap, no recompile).
 - Changing a mesh's **emissive** (it's an area light baked at compile time) → `rt.compileScene(...)` again.

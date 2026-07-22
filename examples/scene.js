@@ -35,9 +35,9 @@ export function buildScene() {
     0.1,
     100
   );
-  camera.position.set(5.4, 3.9, 7.8);
+  camera.position.set(6.8, 4.6, 10.4);
 
-  const bounds = { x: 7, z: 7, wallH: 6, floorY: 0 };
+  const bounds = { x: 9, z: 9, wallH: 7, floorY: 0 };
 
   // Room shell — thin boxes. Saturated side walls so colour bleed is obvious;
   // the floor keeps a mild sheen so the GGX pass picks up the emissive strips.
@@ -46,20 +46,20 @@ export function buildScene() {
   const red = new THREE.MeshStandardMaterial({ color: 0xc42f2a, roughness: 0.85 });
   const teal = new THREE.MeshStandardMaterial({ color: 0x22808f, roughness: 0.8 });
 
-  const ground = new THREE.Mesh(new THREE.BoxGeometry(14, 0.2, 14), white);
+  const ground = new THREE.Mesh(new THREE.BoxGeometry(18, 0.2, 18), white);
   ground.position.y = -0.1;
   scene.add(ground);
 
-  const backWall = new THREE.Mesh(new THREE.BoxGeometry(14, 6, 0.2), backGrey);
-  backWall.position.set(0, 3, -7);
+  const backWall = new THREE.Mesh(new THREE.BoxGeometry(18, 7, 0.2), backGrey);
+  backWall.position.set(0, 3.5, -9);
   scene.add(backWall);
 
-  const leftWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 6, 14), red);
-  leftWall.position.set(-7, 3, 0);
+  const leftWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 7, 18), red);
+  leftWall.position.set(-9, 3.5, 0);
   scene.add(leftWall);
 
-  const rightWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 6, 14), teal);
-  rightWall.position.set(7, 3, 0);
+  const rightWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 7, 18), teal);
+  rightWall.position.set(9, 3.5, 0);
   scene.add(rightWall);
 
   function pedestal(x, z, height = 1.0, radius = 0.9) {
@@ -76,7 +76,7 @@ export function buildScene() {
   // Placed at the water's edge so the pool catches its reflection; its own
   // spotlight (toggleable) rakes it from the front-right for map detail +
   // an analytic glint on the visor.
-  const HELMET_POS = new THREE.Vector3(0.6, 2.6, -4.6);
+  const HELMET_POS = new THREE.Vector3(0.8, 2.6, -6.0);
   pedestal(HELMET_POS.x, HELMET_POS.z, 1.6);
 
   // --- mid-left: gold knot (traced reflections + glints on metal) --------
@@ -87,8 +87,8 @@ export function buildScene() {
     // finds the dark open ceiling — full metal read as mottled camo there.
     new THREE.MeshStandardMaterial({ color: 0xd4af6a, roughness: 0.28, metalness: 0.85 })
   );
-  pedestal(0.4, -1.0, 0.8);
-  knot.position.set(0.4, 1.7, -1.0);
+  pedestal(0.2, -1.6, 0.8);
+  knot.position.set(0.2, 1.7, -1.6);
   scene.add(knot);
 
   // --- back-right: glossy cream teapot against the teal wall (GGX star) ---
@@ -96,18 +96,25 @@ export function buildScene() {
     new TeapotGeometry(0.8, 10),
     new THREE.MeshStandardMaterial({ color: 0xe4dccd, roughness: 0.12, metalness: 0.0 })
   );
-  pedestal(4.6, -3.2);
-  teapot.position.set(4.6, 1.75, -3.2);
+  pedestal(5.8, -4.6);
+  teapot.position.set(5.8, 1.75, -4.6);
   scene.add(teapot);
 
-  // --- right wall: roughness ramp on plinths ------------------------------
-  // Five dielectric spheres from near-mirror to nearly matte, receding along
-  // the teal wall past the cool light: a tight bright highlight up front that
-  // broadens and dims down the row. Lambert-only they'd all look identical.
+  // --- back wall, right half: the roughness ramp ---------------------------
+  // Five IDENTICAL white spheres on ONE long bench, seen straight-on from the
+  // default camera, differing ONLY in roughness (0.05 left -> 0.9 right): the
+  // cool light above gives the mirror-end sphere a single tight highlight that
+  // visibly broadens and dims down the row. One bench, even spacing, same size
+  // — so it reads as a single "what roughness does" exhibit, not five props.
+  // Lambert-only (PBR specular off) all five look identically flat.
   const rampRoughness = [0.05, 0.2, 0.4, 0.65, 0.9];
+  const bench = new THREE.Mesh(
+    new THREE.BoxGeometry(6.0, 0.5, 1.3),
+    new THREE.MeshStandardMaterial({ color: 0x9aa1ab, roughness: 0.5 })
+  );
+  bench.position.set(5.2, 0.25, -8.0);
+  scene.add(bench);
   for (let i = 0; i < rampRoughness.length; i++) {
-    const z = 3.4 - i * 1.3;
-    pedestal(5.6, z, 0.45, 0.52);
     const s = new THREE.Mesh(
       new THREE.SphereGeometry(0.45, 40, 28),
       new THREE.MeshStandardMaterial({
@@ -116,7 +123,7 @@ export function buildScene() {
         metalness: 0.0,
       })
     );
-    s.position.set(5.6, 0.9, z);
+    s.position.set(3.2 + i * 1.0, 0.95, -8.0);
     scene.add(s);
   }
 
@@ -125,9 +132,9 @@ export function buildScene() {
     new THREE.SphereGeometry(0.85, 48, 32),
     new THREE.MeshStandardMaterial({ color: 0xf2f4f8, roughness: 0.05, metalness: 1.0 })
   );
-  const mirrorPed = pedestal(-4.9, -0.6);
+  const mirrorPed = pedestal(-6.6, -1.2);
   mirrorPed.visible = false;
-  mirror.position.set(-4.9, 1.85, -0.6); // near the red wall: reflects pool + panel
+  mirror.position.set(-6.6, 1.85, -1.2); // near the red wall: reflects pool + panel
   mirror.visible = false; // appears (with its pedestal) when "reflections" is enabled
   scene.add(mirror);
 
@@ -141,9 +148,9 @@ export function buildScene() {
       ior: 1.5,
     })
   );
-  const glassPed = pedestal(3.4, -0.9, 0.9);
+  const glassPed = pedestal(4.2, -1.4, 0.9);
   glassPed.visible = false;
-  glass.position.set(3.4, 1.75, -0.9); // the room inverts through it from the camera
+  glass.position.set(4.2, 1.75, -1.4); // the room inverts through it from the camera
   glass.visible = false; // appears (with its pedestal) when "refraction" is enabled
   scene.add(glass);
 
@@ -163,7 +170,7 @@ export function buildScene() {
     new THREE.BoxGeometry(1.5, 0.7, 1.5),
     new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.25 })
   );
-  plinth.position.set(-4.3, 0.35, 3.2);
+  plinth.position.set(-5.6, 0.35, 4.0);
   scene.add(plinth);
   const vitrine = new THREE.Group();
   const paneGeoSide = new THREE.BoxGeometry(1.56, 1.7, 0.04);
@@ -194,7 +201,7 @@ export function buildScene() {
   );
   puck.position.y = 0.8;
   vitrine.add(puck);
-  vitrine.position.set(-4.3, 1.55, 3.2);
+  vitrine.position.set(-5.6, 1.55, 4.0);
   scene.add(vitrine);
 
   // --- front: freestanding amber pane the camera looks through ------------
@@ -208,12 +215,11 @@ export function buildScene() {
     })
   );
   // On the teal wall — the right-side twin of the blue pane on the red wall:
-  // teal bleeds through amber as a warm olive, and the ramp's cool light gives
-  // it a specular streak. Kept out of the hero sightline on purpose: the
-  // straight-through trace is 1 ray + short history, so a huge pane filling
-  // the default view reads grainy rather than impressive.
-  paneAmber.position.set(6.0, 1.5, 1.4);
-  paneAmber.rotation.y = -1.05;
+  // teal bleeds through amber as a warm olive. Kept out of the hero sightline
+  // on purpose: the straight-through trace is 1 ray + short history, so a huge
+  // pane filling the default view reads grainy rather than impressive.
+  paneAmber.position.set(8.0, 1.6, 2.6);
+  paneAmber.rotation.y = -0.9;
   scene.add(paneAmber);
 
   // A second, bluer pane flanking the red wall — red bleeds through it purple.
@@ -226,8 +232,8 @@ export function buildScene() {
       opacity: 0.3,
     })
   );
-  paneBlue.position.set(-6.1, 1.5, 0.9);
-  paneBlue.rotation.y = 1.05;
+  paneBlue.position.set(-8.1, 1.6, 1.2);
+  paneBlue.rotation.y = 1.0;
   scene.add(paneBlue);
 
   // --- back-left: the water pool (deforming dynamic BVH) ------------------
@@ -235,7 +241,7 @@ export function buildScene() {
   // the ripples carry moving traced reflections of both. Low-poly on purpose —
   // the per-frame refit is O(dynamic tris).
   const WATER_SEGMENTS = 48;
-  const waterGeo = new THREE.PlaneGeometry(4.5, 4.5, WATER_SEGMENTS, WATER_SEGMENTS);
+  const waterGeo = new THREE.PlaneGeometry(5.5, 5.5, WATER_SEGMENTS, WATER_SEGMENTS);
   const water = new THREE.Mesh(
     waterGeo,
     // Low roughness + high metalness reads as mirror-water — the current engine
@@ -243,19 +249,19 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({ color: 0x2a6f97, roughness: 0.1, metalness: 0.8 })
   );
   water.rotation.x = -Math.PI / 2; // lie flat: local +z displacement -> world height
-  water.position.set(-3.4, 0.35, -4.2);
+  water.position.set(-4.6, 0.35, -5.4);
   water.userData.rtDeforming = true; // opt in to per-frame live-geometry reads
   scene.add(water);
   // A slim stone kerb so the pool reads as built, not painted on the floor.
   const kerbMat = new THREE.MeshStandardMaterial({ color: 0x8a8478, roughness: 0.7 });
   for (const [w, d, dx, dz] of [
-    [4.9, 0.2, 0, 2.35],
-    [4.9, 0.2, 0, -2.35],
-    [0.2, 4.5, 2.35, 0],
-    [0.2, 4.5, -2.35, 0],
+    [5.9, 0.2, 0, 2.85],
+    [5.9, 0.2, 0, -2.85],
+    [0.2, 5.5, 2.85, 0],
+    [0.2, 5.5, -2.85, 0],
   ]) {
     const kerb = new THREE.Mesh(new THREE.BoxGeometry(w, 0.5, d), kerbMat);
-    kerb.position.set(-3.4 + dx, 0.25, -4.2 + dz);
+    kerb.position.set(-4.6 + dx, 0.25, -5.4 + dz);
     scene.add(kerb);
   }
 
@@ -286,47 +292,47 @@ export function buildScene() {
   // vertical strips in the back corners give the walls a designed cove glow
   // and the glossy floor something to streak.
   const panel = new THREE.Mesh(
-    new THREE.BoxGeometry(4.2, 1.3, 0.1),
+    new THREE.BoxGeometry(5.0, 1.4, 0.1),
     new THREE.MeshStandardMaterial({
       color: 0x000000,
       emissive: 0xfff2d8,
       emissiveIntensity: 5.5,
     })
   );
-  panel.position.set(-3.0, 3.1, -6.85);
+  panel.position.set(-3.6, 3.3, -8.85);
   scene.add(panel);
 
-  for (const x of [-6.78, 6.78]) {
+  for (const x of [-8.78, 8.78]) {
     const strip = new THREE.Mesh(
-      new THREE.BoxGeometry(0.12, 4.6, 0.12),
+      new THREE.BoxGeometry(0.12, 5.2, 0.12),
       new THREE.MeshStandardMaterial({
         color: 0x000000,
         emissive: 0xa8d4ff,
         emissiveIntensity: 3.2,
       })
     );
-    strip.position.set(x, 2.5, -6.78);
+    strip.position.set(x, 2.8, -8.78);
     scene.add(strip);
   }
 
   // --- analytic lights -----------------------------------------------------
   // The demo starts MINIMAL (warm key light only) — everything else is an
   // opt-in add-on so its frame cost is visible.
-  const warm = new THREE.PointLight(0xffd9a0, 13);
-  warm.position.set(-2.0, 5.2, 2.8);
+  const warm = new THREE.PointLight(0xffd9a0, 16);
+  warm.position.set(-2.6, 6.0, 3.4);
   warm.userData.rtRadius = 0.35;
   scene.add(warm);
 
-  const cool = new THREE.PointLight(0x9fc4ff, 9);
-  cool.position.set(5.0, 5.0, 1.2); // over the roughness ramp
+  const cool = new THREE.PointLight(0x9fc4ff, 11);
+  cool.position.set(5.2, 5.6, -4.4); // in front of and above the roughness ramp
   cool.userData.rtRadius = 0.3;
   cool.visible = false;
   scene.add(cool);
 
   // Spotlight raking the helmet: cone + penumbra + a visor glint, and a
   // visible shaft when volumetric fog is on.
-  const spot = new THREE.SpotLight(0xfff4e0, 35, 0, 0.5, 0.45);
-  spot.position.set(3.0, 5.9, -1.0);
+  const spot = new THREE.SpotLight(0xfff4e0, 45, 0, 0.5, 0.45);
+  spot.position.set(3.4, 6.6, -2.2);
   spot.target.position.copy(HELMET_POS);
   spot.userData.rtRadius = 0.3;
   spot.visible = false;
@@ -334,8 +340,8 @@ export function buildScene() {
   scene.add(spot.target);
 
   // Orbiting ceiling light — shows moving ray traced shadows sweeping the room.
-  const orbit = new THREE.PointLight(0xfff0dd, 11);
-  orbit.position.set(4.0, 5.4, 0);
+  const orbit = new THREE.PointLight(0xfff0dd, 13);
+  orbit.position.set(4.5, 6.2, 0);
   orbit.userData.rtRadius = 0.28;
   orbit.visible = false;
   scene.add(orbit);
@@ -374,7 +380,7 @@ export function buildScene() {
     scene.add(helmet.scene);
 
     duck.scene.scale.setScalar(0.75);
-    duck.scene.position.set(-4.3, 0.7, 3.2); // on the vitrine plinth
+    duck.scene.position.set(-5.6, 0.7, 4.0); // on the vitrine plinth
     duck.scene.rotation.y = -0.5;
     scene.add(duck.scene);
   })();
