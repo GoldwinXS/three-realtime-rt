@@ -143,8 +143,38 @@ async function main() {
   // Debug hook: ?nospecmrt=1 forces the WebKit/iOS single-attachment lighting
   // fallback on ANY machine, so the iOS code path can be exercised (and eye-
   // balled) without an Apple device in hand.
-  if (new URLSearchParams(location.search).has("nospecmrt")) {
+  const urlFlags = new URLSearchParams(location.search);
+  if (urlFlags.has("nospecmrt")) {
     RealtimeRaytracer._specMrtSupported = () => false;
+  }
+  // ?diag=1: on-page console capture for devices with no reachable devtools
+  // (iPads in the field). Shader compile/link failures land in console.error —
+  // this surfaces the ERROR lines right on the screen so a photo of the device
+  // is a usable bug report.
+  if (urlFlags.has("diag")) {
+    const box = document.createElement("div");
+    box.style.cssText =
+      "position:fixed;top:48px;left:8px;right:8px;max-height:45vh;overflow-y:auto;z-index:99;" +
+      "background:rgba(10,5,5,0.92);color:#ff8f7a;border:1px solid #703030;border-radius:6px;" +
+      "font:10px/1.4 ui-monospace,Consolas,monospace;padding:8px;white-space:pre-wrap;word-break:break-all;";
+    box.textContent = "diag: capturing console…";
+    document.body.append(box);
+    const add = (tag, args) => {
+      const raw = args.map((a) => String(a)).join(" ");
+      // Shader dumps run thousands of lines — keep the ERROR lines + head.
+      const errLines = raw.split("\n").filter((l) => /ERROR|error:|failed|Failed/.test(l));
+      const text = (errLines.length ? errLines.join("\n") : raw).slice(0, 700);
+      box.textContent += `\n[${tag}] ${text}\n`;
+    };
+    for (const level of ["error", "warn"]) {
+      const orig = console[level].bind(console);
+      console[level] = (...args) => {
+        add(level, args);
+        orig(...args);
+      };
+    }
+    window.addEventListener("error", (e) => add("window", [e.message]));
+    window.addEventListener("unhandledrejection", (e) => add("promise", [e.reason]));
   }
 
   // The demo starts at the user's tested MINIMAL config on every tier: a lean
