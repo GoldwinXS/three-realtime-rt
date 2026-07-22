@@ -80,14 +80,19 @@ export default defineConfig({
   build: {
     target: "esnext",
     rollupOptions: {
-      input: { main: "index.html", gallery: "gallery.html", bench: "bench.html" },
+      input: {
+        main: "index.html",
+        gallery: "gallery.html",
+        bench: "bench.html",
+        harness: "harness.html",
+      },
     },
   },
   // Only scan OUR entries. By default vite crawls every .html under root, which
   // pulls in RealTimeJSRayTracer/ (a git-ignored reference clone) whose bare
   // imports (vox-reader) aren't installed — failing dep optimization and
   // stalling the dev server.
-  optimizeDeps: { entries: ["index.html", "gallery.html", "bench.html"] },
+  optimizeDeps: { entries: ["index.html", "gallery.html", "bench.html", "harness.html"] },
   plugins: [shotSaver(), benchSaver()],
   server: {
     host: "0.0.0.0",

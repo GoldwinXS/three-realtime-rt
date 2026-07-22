@@ -64,6 +64,34 @@
   never mutated — the widened projection is applied/restored per frame like the
   TAA jitter. Every pass runs in the shared padded space; the only crop point is
   the final draw (the TAA resolve's out-copy, or the composite when TAA is off).
+- **Conservative, self-scaling defaults** (behaviour change): zero-config
+  `new RealtimeRaytracer(renderer)` now starts *low but still ray traced* and
+  scales **up**, rather than starting near high. The changed constructor
+  defaults are `renderScale: 0.5` (unchanged), `denoiseIterations: 2` (was `3`),
+  `stochasticLights: true` (was `false`), and `adaptiveQuality: true` (was
+  `false`). The net effect: the default renderer runs acceptably on weak
+  discrete/integrated GPUs, and the now-on-by-default adaptive governor climbs
+  `renderScale` toward `targetFps` (up to full-resolution lighting) on strong
+  hardware. **Breaking-ish** for anyone who relied on the *implicit* near-high
+  defaults — pass explicit options, or
+  `recommendedOptions(detectTier(renderer))`, to restore the old starting point.
+  `recommendedOptions("high")` is unchanged in behaviour (it now pins
+  `stochasticLights: false` explicitly so the flipped default can't leak into
+  it), and the demos already pass explicit options so their look is unchanged.
+- **`RealtimeRaytracer.probeGPUTier(renderer?)`** — a new optional, async GPU
+  tier probe. When WebGPU is present it inspects the real `adapter.limits` /
+  `adapter.info` and factors in screen resolution; otherwise it falls back to
+  the WebGL `detectTier` heuristic. Returns
+  `{ tier, source: "webgpu"|"webgl"|"fallback", details }`. Honest about its
+  limits — **WebGPU does not expose VRAM**, so it classifies from buffer/texture
+  limits as a proxy (documented in the README and JSDoc). The constructor stays
+  synchronous.
+- **Movement-artifact harness** ([`harness.html`](harness.html)): a diagnostic
+  page that quantifies edge-of-screen convergence noise during camera motion.
+  Deterministic strafe/orbit paths, per-pixel temporal luminance variance in
+  left-edge / right-edge / center bands with a live edge-vs-center ratio HUD, a
+  magnified side-by-side inset, and a JSON metric line logged every 2s. The
+  overscan control is feature-detected.
 
 ## 0.3.2 — 2026-07-19
 

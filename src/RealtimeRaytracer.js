@@ -79,7 +79,135 @@ export class RealtimeRaytracer {
         adaptiveQuality: true,
       };
     }
-    return { renderScale: 0.5, denoiseIterations: 3, adaptiveQuality: true };
+    // High: full per-light direct shadows (stochasticLights pinned false).
+    // Pinned explicitly because the constructor default is now `true` (the
+    // conservative-default change) — high must keep its original behaviour.
+    return { renderScale: 0.5, denoiseIterations: 3, stochasticLights: false, adaptiveQuality: true };
+  }
+
+  /**
+   * GPU tier probe. An OPTIONAL, async companion to {@link detectTier}: when the
+   * browser exposes WebGPU it inspects the real adapter limits, otherwise it
+   * falls back to the WebGL heuristic. Returns
+   * `{ tier: "none"|"mid"|"high", source: "webgpu"|"webgl"|"fallback", details }`.
+   *
+   *   const probe = await RealtimeRaytracer.probeGPUTier();
+   *   const rt = new RealtimeRaytracer(renderer, RealtimeRaytracer.recommendedOptions(probe.tier));
+   *
+   * HONEST-HEURISTIC CAVEAT: WebGPU does NOT expose VRAM. `adapter.limits`
+   * advertises binding/allocation ceilings (`maxBufferSize` etc.), which are a
+   * driver-reported proxy for "how beefy is this GPU", not a memory size — a
+   * card with 8GB and a card with 24GB can report the identical 2GB
+   * `maxBufferSize`. `adapter.info` (vendor/architecture/description) is masked
+   * on many browsers for fingerprinting reasons, so it is treated as a hint
+   * only. The classification is therefore deliberately coarse.
+   *
+   * Classification (WebGPU path), all thresholds echoed back in `details`:
+   *  - Software signature in adapter.info (swiftshader / llvmpipe / "basic
+   *    render" / paravirtual) → `"none"`.
+   *  - "strong" = `maxBufferSize >= 2GiB` AND `maxTextureDimension2D >= 16384`
+   *    (integrated GPUs typically report an 8192 texture limit and a smaller
+   *    buffer ceiling).
+   *  - Screen-demand factor: `screenPixels = screen.width * screen.height *
+   *    min(devicePixelRatio, 2)` (DPR clamped so a 3× phone doesn't read as a
+   *    workstation). A 4K-class panel (`screenPixels >= 6e6`) has to fill ~4×
+   *    the pixels of 1080p for the same lighting resolution, so a "strong" GPU
+   *    is only called `"high"` on such a screen when it ALSO clears a 4GiB
+   *    `maxBufferSize` bar; otherwise it is demoted to `"mid"`.
+   *  - strong (clearing the screen bar) → `"high"`, else → `"mid"`.
+   *
+   * No WebGPU (or requestAdapter fails) → the existing {@link detectTier} WebGL
+   * heuristic, `source: "webgl"` when a renderer was supplied to probe, or
+   * `source: "fallback"` when the tier is a pure user-agent guess (no context).
+   */
+  static async probeGPUTier(renderer) {
+    const GiB = 1024 * 1024 * 1024;
+    const details = {};
+
+    // Screen-demand factor (used by every path). DPR clamped to 2 so a phone's
+    // 3×/4× ratio doesn't inflate demand past what its tiny CSS area needs.
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+    const scr =
+      typeof window !== "undefined" && window.screen
+        ? window.screen
+        : { width: 1920, height: 1080 };
+    const screenPixels = Math.round(scr.width * scr.height * Math.min(dpr, 2));
+    const demanding = screenPixels >= 6e6; // 4K-class panel
+    details.screenPixels = screenPixels;
+    details.demanding = demanding;
+
+    if (typeof navigator !== "undefined" && navigator.gpu) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (adapter) {
+          const L = adapter.limits || {};
+          const maxBufferSize = Number(L.maxBufferSize || 0);
+          const maxStorageBufferBindingSize = Number(L.maxStorageBufferBindingSize || 0);
+          const maxTextureDimension2D = Number(L.maxTextureDimension2D || 0);
+          const maxComputeWorkgroupStorageSize = Number(L.maxComputeWorkgroupStorageSize || 0);
+          Object.assign(details, {
+            maxBufferSize,
+            maxStorageBufferBindingSize,
+            maxTextureDimension2D,
+            maxComputeWorkgroupStorageSize,
+          });
+
+          // adapter.info is a plain property in newer specs; older Chromium
+          // exposed it via the async requestAdapterInfo(). Both are masked on
+          // some browsers — treat any of it as an optional hint.
+          let info = {};
+          try {
+            info =
+              adapter.info ||
+              (adapter.requestAdapterInfo ? await adapter.requestAdapterInfo() : {}) ||
+              {};
+          } catch {
+            info = {};
+          }
+          details.vendor = info.vendor || null;
+          details.architecture = info.architecture || null;
+          details.description = info.description || null;
+          const infoStr = `${info.vendor || ""} ${info.architecture || ""} ${
+            info.description || ""
+          } ${info.device || ""}`.toLowerCase();
+
+          if (/swiftshader|llvmpipe|software|basic render|microsoft basic|paravirtual/.test(infoStr)) {
+            details.reason = "software renderer signature in adapter.info";
+            return { tier: "none", source: "webgpu", details };
+          }
+
+          const strong = maxBufferSize >= 2 * GiB && maxTextureDimension2D >= 16384;
+          const hugeBuffer = maxBufferSize >= 4 * GiB;
+          let tier;
+          if (strong && (!demanding || hugeBuffer)) {
+            tier = "high";
+            details.reason =
+              demanding && hugeBuffer
+                ? "strong limits + >=4GiB buffer clears 4K-class screen demand -> high"
+                : "large buffer + textures -> high";
+          } else if (strong && demanding) {
+            tier = "mid";
+            details.reason =
+              "strong limits but 4K-class screen without a >=4GiB buffer budget -> mid";
+          } else {
+            tier = "mid";
+            details.reason = "modest adapter limits -> mid";
+          }
+          return { tier, source: "webgpu", details };
+        }
+        details.reason = "navigator.gpu present but requestAdapter returned no adapter";
+      } catch (err) {
+        details.error = String((err && err.message) || err);
+      }
+    } else {
+      details.reason = "no navigator.gpu (WebGPU unavailable)";
+    }
+
+    // WebGL heuristic fallback. With a renderer we actually probe the GL
+    // context (source "webgl"); without one the tier is a pure user-agent guess
+    // (source "fallback").
+    const tier = RealtimeRaytracer.detectTier(renderer);
+    return { tier, source: renderer ? "webgl" : "fallback", details };
   }
 
   /**
@@ -271,18 +399,22 @@ export class RealtimeRaytracer {
      * One stochastic direct shadow ray per pixel per frame (source picked at
      * random) instead of one per light — the biggest ray-count lever for
      * many-light scenes and mobile GPUs. Slightly noisier moving shadows;
-     * temporal accumulation + the denoiser absorb it.
+     * temporal accumulation + the denoiser absorb it. Defaults ON so the
+     * zero-config renderer stays cheap on weak GPUs; the governor turns it off
+     * again once it has scaled resolution up on a strong machine.
      */
-    this.stochasticLights = options.stochasticLights ?? false;
+    this.stochasticLights = options.stochasticLights ?? true;
     /**
      * Adaptive quality governor: watches the app's real frame time and walks
      * QUALITY_LADDER — degrading when frames run long, cautiously probing a
      * better level when there is headroom (reverting if the probe fails). The
      * portable way to "work well" on unknown hardware. Drives renderScale,
      * denoiseIterations and stochasticLights; setting those manually while
-     * enabled will be overridden — turn this off for manual control.
+     * enabled will be overridden — turn this off for manual control. Defaults
+     * ON so the conservative default resolution scales UP toward targetFps on
+     * capable hardware instead of being stuck low.
      */
-    this.adaptiveQuality = options.adaptiveQuality ?? false;
+    this.adaptiveQuality = options.adaptiveQuality ?? true;
     /** Frame-rate target for the adaptive governor. */
     this.targetFps = options.targetFps ?? 55;
     /**
@@ -315,8 +447,12 @@ export class RealtimeRaytracer {
     this._canvasLevelIdx = 0;
     /** Edge-aware à-trous denoise on the irradiance buffer. */
     this.denoise = options.denoise ?? true;
-    /** À-trous iterations (steps 1, 2, 4, ...). */
-    this.denoiseIterations = options.denoiseIterations ?? 3;
+    /**
+     * À-trous iterations (steps 1, 2, 4, ...). Defaults to a lean 2; the
+     * adaptive governor raises it (via _qualityFor) as it lowers resolution,
+     * where the extra passes run at lighting res and are nearly free.
+     */
+    this.denoiseIterations = options.denoiseIterations ?? 2;
 
     /**
      * Temporal anti-aliasing: sub-pixel projection jitter + a full-res history

@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt — movement-artifact harness</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
+    body { color: #cfe0ea; font: 12px/1.5 ui-monospace, Consolas, monospace; }
+    #app { position: fixed; inset: 0; }
+    #app canvas { display: block; width: 100%; height: 100%; }
+
+    /* Shared card look for the DOM overlays (no framework, plain divs). */
+    .card {
+      position: fixed; z-index: 20; background: rgba(14, 18, 24, 0.82);
+      border: 1px solid #26323c; border-radius: 8px; padding: 10px 12px;
+      backdrop-filter: blur(3px);
+    }
+    #controls { top: 12px; left: 12px; display: grid; gap: 8px; width: 220px; }
+    #controls h1 { font-size: 12px; color: #7fd8c8; margin: 0 0 2px; font-weight: 600; }
+    #controls label { display: flex; justify-content: space-between; align-items: center; gap: 8px; color: #a9bccb; }
+    #controls select, #controls input[type="range"] { font: inherit; color: inherit; }
+    #controls select {
+      background: #16202b; border: 1px solid #2c3a46; border-radius: 5px; padding: 3px 6px;
+    }
+    #controls button {
+      font: inherit; color: inherit; background: #16202b; border: 1px solid #2c3a46;
+      border-radius: 5px; padding: 5px 10px; cursor: pointer;
+    }
+    #controls button:hover { border-color: #38d0e0; color: #7fd8c8; }
+    #controls button.on { border-color: #38d0e0; color: #7fd8c8; }
+    .row-val { color: #cfe0ea; min-width: 42px; text-align: right; }
+    #overscan-row { display: none; }
+
+    #hud { top: 12px; right: 12px; width: 250px; }
+    #hud h2 { font-size: 12px; color: #7fd8c8; margin: 0 0 6px; font-weight: 600; }
+    #hud .metric { display: flex; justify-content: space-between; padding: 1px 0; color: #a9bccb; }
+    #hud .metric b { color: #cfe0ea; font-weight: 600; }
+    #hud .headline {
+      margin-top: 6px; padding-top: 6px; border-top: 1px solid #26323c;
+      display: flex; justify-content: space-between; align-items: baseline;
+    }
+    #hud .headline b { font-size: 18px; }
+    #hud .good { color: #7fd8c8; }
+    #hud .bad { color: #ffcf8a; }
+    #hud .note { color: #6f8494; margin-top: 6px; font-size: 11px; }
+
+    /* Magnified side-by-side inset (left edge vs. center) for eyeballing. */
+    #inset { bottom: 12px; right: 12px; padding: 8px; }
+    #inset canvas { display: block; image-rendering: pixelated; border: 1px solid #26323c; }
+    #inset .labels { display: flex; justify-content: space-between; margin-top: 4px; color: #8fa3b3; }
+
+    #boot {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: #cfe0ea; background: radial-gradient(circle at 50% 40%, #16202b, #0a0f16);
+      z-index: 50; transition: opacity 0.4s; text-align: center; padding: 20px;
+    }
+    #boot.hidden { opacity: 0; pointer-events: none; }
+    #boot .err { color: #ff8a80; max-width: 520px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <div id="controls" class="card">
+    <h1>movement-artifact harness</h1>
+    <label>motion
+      <select id="mode">
+        <option value="strafe">strafe</option>
+        <option value="orbit">orbit</option>
+      </select>
+    </label>
+    <label>speed <span class="row-val" id="speed-val">1.0</span></label>
+    <input id="speed" type="range" min="0" max="3" step="0.1" value="1" />
+    <label>lighting res
+      <select id="res">
+        <option value="0.25">25%</option>
+        <option value="0.375">37.5%</option>
+        <option value="0.5" selected>50%</option>
+        <option value="0.75">75%</option>
+        <option value="1">100%</option>
+      </select>
+    </label>
+    <label id="overscan-row">overscan <span class="row-val" id="overscan-val">0.00</span></label>
+    <input id="overscan" type="range" min="0" max="0.25" step="0.01" value="0" style="display:none" />
+    <button id="pause">pause</button>
+  </div>
+
+  <div id="hud" class="card">
+    <h2>temporal luminance variance</h2>
+    <div class="metric"><span>left edge (10%)</span><b id="m-left">—</b></div>
+    <div class="metric"><span>right edge (10%)</span><b id="m-right">—</b></div>
+    <div class="metric"><span>center (10%)</span><b id="m-center">—</b></div>
+    <div class="headline"><span>edge / center</span><b id="m-ratio">—</b></div>
+    <div class="note" id="m-note">warming up window…</div>
+  </div>
+
+  <div id="inset" class="card">
+    <canvas id="zoom" width="384" height="240"></canvas>
+    <div class="labels"><span>edge (magnified)</span><span>center</span></div>
+  </div>
+
+  <div id="boot">loading harness…</div>
+
+  <script type="module" src="/examples/harness.js"></script>
+</body>
+</html>
