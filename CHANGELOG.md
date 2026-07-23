@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 — 2026-07-23
 
 - **Compile-failure status + graceful degradation (`rt.compileError` /
   `rt.status`).** A pass whose program fails to *link* renders black without
