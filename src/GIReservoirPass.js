@@ -133,7 +133,10 @@ vec4 fetchBlueNoise() {
   return fract(bn + shift);
 }
 
-float luminance(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+// Named rtLum, NOT luminance: three r166+ prepends its own rtLum(vec3)
+// to every non-raw ShaderMaterial fragment shader, and GLSL treats a second
+// (vec3) body as a redefinition — the whole program fails to compile.
+float rtLum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
 // ---------- reservoir .w bit-packing: M (8 bit) + oct-normal (12+12 bit) ------
 // The RGBA32F reservoir-position attachment is at the pass's hard 16-sampler
@@ -483,7 +486,7 @@ void main() {
   vec3 rad = traceRadianceGI(P + N * uEps, wi, nLight, hitPos, hitNormal);
   // Match the inline firefly clamp, which is applied to indirect (= L_i) so
   // the biased mean of the two paths agrees.
-  float rl = luminance(rad);
+  float rl = rtLum(rad);
   if (rl > uFireflyClamp) rad *= uFireflyClamp / rl;
 
   float cosT = max(dot(N, wi), 0.0);
@@ -532,8 +535,8 @@ void main() {
     float valTol = max(0.02 * expectDist, 4.0 * uEps);
     float hitDist = length(hitPos - P);
     bool geomChanged = abs(hitDist - expectDist) > valTol;
-    float pHatOld = luminance(radPrev) * cosT;   // stored target at this pixel
-    float pHatNew = luminance(rad) * cosT;        // re-shaded target (current light)
+    float pHatOld = rtLum(radPrev) * cosT;   // stored target at this pixel
+    float pHatNew = rtLum(rad) * cosT;        // re-shaded target (current light)
     bool wentDark = pHatNew < VAL_DARK_FRAC * pHatOld;
     // KILL (drop the stale temporal term so this pixel's fresh candidates rebuild
     // from the current scene) on geometry change OR a collapse to near-black; leave
@@ -543,7 +546,7 @@ void main() {
     killStore = geomChanged || wentDark;
   } else {
     // --- normal fresh candidate: one cosine-hemisphere GI bounce, shaded inline.
-    float pHatFresh = luminance(rad) * cosT;
+    float pHatFresh = rtLum(rad) * cosT;
     // w = p_hat / p_source = p_hat / (cos/PI). cosT cancels; guard cosT==0.
     float wFresh = cosT > 0.0 ? pHatFresh * PI / cosT : 0.0;
     wSum = wFresh;
@@ -571,7 +574,7 @@ void main() {
     vec3 dp = hitPrev - P;
     float dl = length(dp);
     float cosPrev = dl > 1e-5 ? max(dot(N, dp / dl), 0.0) : 0.0;
-    float pHatPrev = luminance(radPrev) * cosPrev;
+    float pHatPrev = rtLum(radPrev) * cosPrev;
     float Mc = min(Mprev, uMCap);
     // Combine reservoirs: w = p_hat_current(sample) * W_prev * M_prev.
     float w = pHatPrev * Wprev * Mc;
@@ -585,7 +588,7 @@ void main() {
     // Reconstruct last frame's resolve from this same sample (same W cap
     // and clamp as the live resolve, for a like-for-like EMA partner).
     vec3 pg = radPrev * (cosPrev / PI) * min(Wprev, 32.0);
-    float pgl = luminance(pg);
+    float pgl = rtLum(pg);
     if (pgl > uFireflyClamp) pg *= uFireflyClamp / pgl;
     if (!any(isnan(pg)) && !any(isinf(pg))) {
       emaPrevGi = pg;
@@ -650,7 +653,7 @@ void main() {
 
       // Target function at q (same shape the pass already uses).
       float cosQ = max(dot(N, normalize(xS - P)), 0.0);
-      float pHatQ = luminance(Ls) * cosQ;
+      float pHatQ = rtLum(Ls) * cosQ;
       // Invalid-shift reject: if the neighbour's hit x_s lies below q's shading
       // hemisphere (cosQ == 0) or carries no radiance, the reconnected target is
       // zero — the shift could never have produced this sample at q, so it must
@@ -676,7 +679,7 @@ void main() {
   vec3 sd = selPos - P;
   float sl = length(sd);
   float selCos = sl > 1e-5 ? max(dot(N, sd / sl), 0.0) : 0.0;
-  float pHatSel = luminance(selRad) * selCos;
+  float pHatSel = rtLum(selRad) * selCos;
   float W = (M > 0.0 && pHatSel > 0.0) ? wSum / (M * pHatSel) : 0.0;
 
   // --- final visibility (mandatory): ONE any-hit occlusion ray from x_q toward
@@ -715,7 +718,7 @@ void main() {
   // slightly dim GI on freshly revealed surfaces for a steady image in motion.
   float conf = clamp(M / uMCap, 0.0, 1.0);
   float cap = uFireflyClamp * mix(0.3, 1.0, conf);
-  float gil = luminance(gi);
+  float gil = rtLum(gi);
   if (gil > cap) gi *= cap / gil;
   if (any(isnan(gi)) || any(isinf(gi))) gi = vec3(0.0);
   // Resolve EMA (see the emaPrevGi note above): ~5-frame effective average.
@@ -729,7 +732,7 @@ void main() {
   vec3 sdT = selPosT - P;
   float slT = length(sdT);
   float selCosT = slT > 1e-5 ? max(dot(N, sdT / slT), 0.0) : 0.0;
-  float pHatSelT = luminance(selRadT) * selCosT;
+  float pHatSelT = rtLum(selRadT) * selCosT;
   float WT = (MT > 0.0 && pHatSelT > 0.0) ? wSumT / (MT * pHatSelT) : 0.0;
   if (any(isnan(selRadT)) || any(isinf(selRadT))) { selRadT = vec3(0.0); WT = 0.0; }
 

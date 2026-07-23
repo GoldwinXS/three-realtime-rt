@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **Fix: black lighting on three r166+ (`'luminance' : function already has a
+  body`).** Since r166, three.js prepends its own `float luminance(vec3)` to the
+  fragment shader of every non-raw `ShaderMaterial` (`getLuminanceFunction()` in
+  `WebGLProgram`). Our ReSTIR, GI-reservoir, and denoise shaders each defined a
+  `luminance` of the same signature, which GLSL rejects as a redefinition — the
+  affected programs failed to compile and everything those passes fed went black,
+  while `rt.supported` still read `true`. The helper is renamed `rtLum` in all
+  three passes (an `#ifndef` guard would not help: three's injected copy is
+  unguarded). Verified with the render self-test on three 0.169.0 (fail → pass,
+  glErrors 9 → 0, irradiance luminance 0 → 170) and on the pinned 0.160.1
+  (unchanged). Found in the field by a molecule-viewer integration on three
+  0.169; the library's peer range (`three >=0.155.0`) now actually holds again.
+
 ## 0.6.0 — 2026-07-22
 
 - **ReSTIR GI reservoir-sample validation (experimental).** Fixes stale bounce

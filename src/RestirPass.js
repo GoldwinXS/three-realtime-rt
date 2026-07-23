@@ -52,7 +52,10 @@ vec4 fetchBlueNoise() {
   return fract(bn + shift);
 }
 
-float luminance(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+// Named rtLum, NOT luminance: three r166+ prepends its own luminance(vec3)
+// to every non-raw ShaderMaterial fragment shader, and GLSL treats a second
+// (vec3) body as a redefinition — the whole program fails to compile.
+float rtLum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
 
 // Primary-surface roughness, set per pixel in main(). Drives the cheap specular
 // lobe below so reservoirs favour lights that land on a highlight.
@@ -121,7 +124,7 @@ vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
 // (Known approximation: a triangle whose centroid contributes zero but whose
 // far corner doesn't can be under-selected at grazing setups.)
 float phatOf(float id, vec3 P, vec3 N) {
-  return luminance(candidateContribution(id, vec2(1.0 / 3.0), P, N));
+  return rtLum(candidateContribution(id, vec2(1.0 / 3.0), P, N));
 }
 `;
 

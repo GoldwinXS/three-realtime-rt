@@ -35,7 +35,10 @@ uniform bool uBlendIsSpec;       // this instance filters the specular buffer
 uniform sampler2D uAddTex;
 uniform bool uHasAdd;
 
-float luminance(vec3 c) {
+// Named rtLum, NOT luminance: three r166+ prepends its own luminance(vec3)
+// to every non-raw ShaderMaterial fragment shader, and GLSL treats a second
+// (vec3) body as a redefinition — the whole program fails to compile.
+float rtLum(vec3 c) {
   return dot(c, vec3(0.299, 0.587, 0.114));
 }
 
@@ -123,16 +126,16 @@ void main() {
         vec2 tuv = vUv + vec2(float(dx), float(dy)) * uTexelSize;
         if (tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0) continue;
         if (texture(uGWorldPos, tuv).w < 0.5) continue;
-        maxL = max(maxL, luminance(sampleIrr(tuv).rgb));
+        maxL = max(maxL, rtLum(sampleIrr(tuv).rgb));
         found = 1.0;
       }
     }
     float cap = maxL * 1.25 + 1e-4;
-    float l = luminance(center.rgb);
+    float l = rtLum(center.rgb);
     if (found > 0.5 && l > cap) center.rgb *= cap / l;
   }
 
-  float lumC = luminance(center.rgb);
+  float lumC = rtLum(center.rgb);
 
   // 3x3 B-spline-ish kernel, edge-avoiding weights.
   vec3 sum = center.rgb * 4.0;
@@ -155,7 +158,7 @@ void main() {
       // flat floor has no geometric edge to protect it, so at high iteration
       // counts the wide passes would average it away ("floating" objects with
       // no contact shadow). Wide steps only get to blend near-equal luminance.
-      float wL = exp(-abs(luminance(s.rgb) - lumC) / (sigmaL * inversesqrt(uStep)));
+      float wL = exp(-abs(rtLum(s.rgb) - lumC) / (sigmaL * inversesqrt(uStep)));
       float w = k * wN * wZ * wL * (1.0 - specKeep);
       sum += s.rgb * w;
       wsum += w;
