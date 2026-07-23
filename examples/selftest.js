@@ -88,12 +88,32 @@ export function createSelftest({ rt, renderer }) {
   let irrLum = 0;
 
   const emitVerdict = () => {
+    // Compile-failure status surface (rt.status / rt.compileError). On the
+    // healthy path every rt:* pass links, so status.ok is true and compileError
+    // is null — assert both so a regression that silently auto-disables a pass
+    // (or blacks out a core pass) trips this gate, not just the pixel readback.
+    // Also confirm the DISCOVERY mechanism the diagnosis relies on: the pass
+    // programs really are named "rt:*" and visible in renderer.info.programs
+    // (rtPrograms > 0). Without that, status.ok:true would be a false pass.
+    let rtPrograms = 0;
+    try {
+      const progs = renderer.info && renderer.info.programs;
+      if (progs) {
+        for (const p of progs) {
+          if (p && typeof p.name === "string" && p.name.slice(0, 3) === "rt:") rtPrograms++;
+        }
+      }
+    } catch { /* info.programs unavailable — leaves rtPrograms 0, fails the gate */ }
+    const statusOk =
+      !!(rt.status && rt.status.ok === true) && rt.compileError == null && rtPrograms > 0;
+
     const pass =
       rt.supported === true &&
       meanLum >= SELFTEST.LIT_MIN &&
       meanLum <= SELFTEST.LIT_MAX &&
       glErrors === 0 &&
-      irrLum > SELFTEST.IRR_MIN;
+      irrLum > SELFTEST.IRR_MIN &&
+      statusOk;
 
     const verdict = {
       pass,
@@ -102,6 +122,10 @@ export function createSelftest({ rt, renderer }) {
       glErrors,
       specMRT: !!rt.specMRTSupported,
       supported: !!rt.supported,
+      statusOk,
+      rtPrograms,
+      compileError: (rt.status && rt.compileError) || null,
+      disabled: (rt.status && rt.status.disabled) || [],
       frames: rt.frame,
       ua: navigator.userAgent,
     };

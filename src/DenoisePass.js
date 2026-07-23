@@ -185,6 +185,9 @@ export class DenoisePass {
     this.targetB = this._makeTarget(width, height);
 
     this.material = new THREE.ShaderMaterial({
+      // Stable program name for compile-failure self-diagnosis; a link failure
+      // disables the optional `denoise` feature (image stays lit, just noisier).
+      name: "rt:denoise",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: atrousFrag,

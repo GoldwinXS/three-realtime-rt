@@ -47,6 +47,7 @@
     "@dimforge/rapier3d-compat": "^0.14.0",
     "gh-pages": "^6.3.0",
     "three": "^0.160.1",
+    "three-latest": "npm:three@latest",
     "three-mesh-bvh": "^0.7.8",
     "vite": "^5.0.11"
   }

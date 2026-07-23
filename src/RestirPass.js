@@ -300,8 +300,12 @@ export class RestirPass {
     this.targetB = this._makeTarget(width, height);
     this.spatialTarget = this._makeTarget(width, height);
 
-    const mkMaterial = (frag) =>
+    const mkMaterial = (frag, name) =>
       new THREE.ShaderMaterial({
+        // Stable program name for compile-failure self-diagnosis; a link failure
+        // in either reservoir stage disables `restir` (falls back to the
+        // non-reservoir per-light direct sampling path — image stays lit).
+        name,
         glslVersion: THREE.GLSL3,
         vertexShader: fullscreenVert,
         fragmentShader: frag,
@@ -332,8 +336,8 @@ export class RestirPass {
         depthWrite: false,
       });
 
-    this.material = mkMaterial(temporalFrag);
-    this.spatialMaterial = mkMaterial(spatialFrag);
+    this.material = mkMaterial(temporalFrag, "rt:restir-temporal");
+    this.spatialMaterial = mkMaterial(spatialFrag, "rt:restir-spatial");
 
     this.scene = new THREE.Scene();
     this.camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);

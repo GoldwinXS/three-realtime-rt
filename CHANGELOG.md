@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- **Compile-failure status + graceful degradation (`rt.compileError` /
+  `rt.status`).** A pass whose program fails to *link* renders black without
+  throwing (three logs and sets `program.diagnostics.runnable = false`, but
+  rendering proceeds), which is exactly how the r166+ `luminance` break looked
+  from the outside — indistinguishable from `supported: false`. Every pass
+  `ShaderMaterial` now carries a stable `name` (`rt:lighting`,
+  `rt:restir-temporal`, `rt:restir-spatial`, `rt:gi-reservoir`, `rt:denoise`,
+  `rt:taa`, `rt:volumetric`, `rt:gbuffer`, `rt:composite`, plus `rt:specular` /
+  `rt:taa-copy` / `rt:history-carry` helpers), and over the first several
+  rendered frames the renderer scans `renderer.info.programs` for failed `rt:*`
+  programs (polled, not frame-1-only, since three checks link status lazily and
+  can defer it under `KHR_parallel_shader_compile`). On a failure it either
+  **auto-disables the mapped optional feature** so the image stays lit
+  (`restir` → non-reservoir direct path, `restirGI`/`denoise`/`volumetric`/`taa`/
+  `specular` → off) and `console.warn`s once with the pass name + driver log, or,
+  for a **core** pass (gbuffer/lighting/composite) with no fallback, records it
+  and keeps rendering the now-diagnosed black frame. Results are surfaced as
+  `rt.compileError` (`string | null`, first/most-severe summary) and `rt.status`
+  (`{ ok, disabled: [{ pass, feature, reason }], coreFailure }`), so an integrator
+  can render an honest `raster (reason)` fallback. Typed in `src/index.d.ts`; the
+  render self-test now asserts `rt.status.ok` on the healthy path.
+- **Self-test three-version matrix + `three@latest` compatibility.** The
+  `luminance` break shipped because nothing tested a newer three, so
+  `scripts/selftest.mjs` now runs the chromium leg **twice** — once against the
+  pinned `three` (0.160.1) and once against a `three-latest` devDependency
+  (`npm:three@latest`) via a second vite with `RT_THREE=latest` (aliased in
+  `vite.config.js`; default behaviour is byte-identical). Both chromium legs are
+  required to pass. Making the `three@latest` leg green surfaced a second
+  peer-range break: three **r172 removed `WebGLMultipleRenderTargets`** (its
+  successor is `WebGLRenderTarget({ count })`, whose attachments are `.textures`,
+  not an array `.texture`). A small JS shim (`src/mrtCompat.js`, `makeMRT`)
+  constructs the right target for the installed three and keeps the library's
+  `.texture[i]` call sites working on both — no GLSL touched. Verified green on
+  three 0.160.1 **and** 0.185.1.
+- **Empty-scene `compileScene` is a no-op.** `rt.compileScene(scene)` on a scene
+  with no traceable meshes previously threw (`no meshes found`); it now warns once
+  and keeps any previously compiled scene, and `render()` with nothing compiled
+  falls back to plain rasterization instead of crashing or drawing black. This
+  makes "construct the tracer, then add meshes" a valid call order. Covered by a
+  new `?selftest=empty` check in the self-test matrix.
+
 - **Fix: black lighting on three r166+ (`'luminance' : function already has a
   body`).** Since r166, three.js prepends its own `float luminance(vec3)` to the
   fragment shader of every non-raw `ShaderMaterial` (`getLuminanceFunction()` in

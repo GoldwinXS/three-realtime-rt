@@ -37,6 +37,9 @@ void main() {
 export class CopyPass {
   constructor() {
     this.material = new THREE.ShaderMaterial({
+      // Generic fullscreen history-carry blit (resize only); a link failure is
+      // non-fatal, so it classifies as auxiliary in the self-diagnosis.
+      name: "rt:history-carry",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: copyFrag,

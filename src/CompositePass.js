@@ -195,6 +195,9 @@ void main() {
 export class CompositePass {
   constructor() {
     this.material = new THREE.ShaderMaterial({
+      // Stable program name for compile-failure self-diagnosis: this is a CORE
+      // pass (the final tonemap/upsample) — a link failure has no fallback.
+      name: "rt:composite",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: compositeFrag,

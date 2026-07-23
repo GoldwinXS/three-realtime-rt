@@ -277,6 +277,9 @@ export class VolumetricPass {
     this.targetB = this._makeTarget(width, height);
 
     this.material = new THREE.ShaderMaterial({
+      // Stable program name for compile-failure self-diagnosis; a link failure
+      // disables the optional `volumetric` feature (image stays lit, no god rays).
+      name: "rt:volumetric",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: volumetricFrag,

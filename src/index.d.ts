@@ -277,6 +277,45 @@ export interface VolumetricState {
   zones: FogZone[];
 }
 
+/** One optional feature auto-disabled after its pass program failed to link. */
+export interface DisabledPass {
+  /** The failed pass program's stable name (e.g. `"rt:taa"`, `"rt:denoise"`). */
+  pass: string;
+  /**
+   * The instance toggle that was set false to keep the image lit: one of
+   * `"restir"`, `"restirGI"`, `"denoise"`, `"volumetric"`, `"taa"`, `"specular"`.
+   */
+  feature: string;
+  /** First line of the driver's shader/link info log for the failure. */
+  reason: string;
+}
+
+/**
+ * Compile-health summary for the ray tracing pipeline, on
+ * {@link RealtimeRaytracer.status}. A pass whose program fails to LINK renders
+ * black without throwing (three logs and sets `program.diagnostics.runnable`
+ * false, but rendering proceeds), so this is how an integrator distinguishes a
+ * working RT image from a broken one — and renders an honest raster fallback
+ * with a reason instead of guessing. Populated over the first several rendered
+ * frames (link status is checked lazily / can be deferred by the driver).
+ */
+export interface RaytracerStatus {
+  /**
+   * True while every ray tracing pass is running as intended. Flips to false the
+   * moment ANY `rt:*` pass program fails to link — whether a core pass (see
+   * `coreFailure`) or an optional feature that was auto-disabled (see `disabled`).
+   */
+  ok: boolean;
+  /** Optional features turned off to keep the image lit after their pass failed to link. */
+  disabled: DisabledPass[];
+  /**
+   * Set when a CORE pass (gbuffer / lighting / composite) failed to link. Such a
+   * pass has no fallback, so the image is black — but now diagnosed. The string
+   * is a `"rt:<pass>: <driver log>"` summary; null when no core pass has failed.
+   */
+  coreFailure: string | null;
+}
+
 /** Options accepted by {@link RealtimeRaytracer.compileScene} and {@link compileScene}. */
 export interface CompileSceneOptions {
   /**
@@ -370,6 +409,22 @@ export class RealtimeRaytracer {
   specMRTSupported: boolean;
   /** The current compiled scene, or null before the first compile / when unsupported. */
   compiled: CompiledScene | null;
+  /**
+   * First/most-severe pass compile-failure summary (`"rt:<pass>: <driver log>"`),
+   * or null while every ray tracing pass compiles clean. A quick honest signal
+   * for "should I show the RT image?"; see {@link status} for the structured form.
+   * Core failures (gbuffer/lighting/composite) outrank auto-disabled features here.
+   */
+  compileError: string | null;
+  /**
+   * Structured compile-health of the pipeline (see {@link RaytracerStatus}).
+   * `status.ok` is true on the healthy path and false once any pass fails to
+   * link; `status.disabled` lists auto-disabled optional features; and
+   * `status.coreFailure` names an unrecoverable core-pass failure. Populated over
+   * the first several rendered frames. When `supported` is false, `status.ok` is
+   * false too (the RT pipeline is not operational).
+   */
+  status: RaytracerStatus;
   /** Accumulated frame counter. */
   frame: number;
   /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular, 7 bvh cost. */

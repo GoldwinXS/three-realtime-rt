@@ -3,6 +3,7 @@ import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS } from "./SceneCompiler.js";
 import { SKY_GLSL } from "./sky.glsl.js";
 import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
+import { makeMRT } from "./mrtCompat.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -800,6 +801,9 @@ export class GIReservoirPass {
     this.targetB = this._makeTarget(width, height);
 
     this.material = new THREE.ShaderMaterial({
+      // Stable program name for compile-failure self-diagnosis; a link failure
+      // disables the experimental `restirGI` feature (falls back to inline GI).
+      name: "rt:gi-reservoir",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: giFrag,
@@ -854,7 +858,7 @@ export class GIReservoirPass {
     // (needs fp32) + M + radiance + W, which must never be interpolated. All fp32
     // (rather than a mixed fp32/fp16 layout) sidesteps drivers that reject mixed
     // MRT precision; the resolved GI (attachment 2) is read 1:1 by the denoise.
-    const t = new THREE.WebGLMultipleRenderTargets(width, height, 3, {
+    const t = makeMRT(width, height, 3, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       format: THREE.RGBAFormat,

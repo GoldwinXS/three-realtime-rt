@@ -9,6 +9,7 @@ import { VolumetricPass } from "./VolumetricPass.js";
 import { RestirPass } from "./RestirPass.js";
 import { GIReservoirPass } from "./GIReservoirPass.js";
 import { CopyPass } from "./CopyPass.js";
+import { makeMRT } from "./mrtCompat.js";
 
 // Van der Corput / Halton radical inverse — deterministic low-discrepancy
 // sub-pixel offsets for temporal jitter.
@@ -256,7 +257,7 @@ export class RealtimeRaytracer {
     let mrt, out, mat, copy, quad, scene2, cam;
     const prevTarget = renderer.getRenderTarget();
     try {
-      mrt = new THREE.WebGLMultipleRenderTargets(2, 2, 2, {
+      mrt = makeMRT(2, 2, 2, {
         format: THREE.RGBAFormat,
         type: THREE.HalfFloatType,
         depthBuffer: false,
@@ -337,6 +338,17 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   // frames of confidence". See RTLightingPass.resizeCarry.
   static HISTORY_CARRY_FRAMES = 8;
 
+  // Compile-failure diagnosis polling window (see _scanPrograms). three checks
+  // link status lazily at a program's first USE, and under
+  // KHR_parallel_shader_compile it may hold a mesh back for a few frames until
+  // its program is ready — so a single frame-1 scan can miss a failure. Poll
+  // from frame 1 up to DIAG_WINDOW_FRAMES, and early-out once the set of rt:*
+  // programs has been stable (no new programs, no unhandled failures) for
+  // DIAG_STABLE_FRAMES past a DIAG_MIN_FRAMES warmup floor.
+  static DIAG_MIN_FRAMES = 8;
+  static DIAG_STABLE_FRAMES = 4;
+  static DIAG_WINDOW_FRAMES = 45;
+
   constructor(renderer, options = {}) {
     this.renderer = renderer;
 
@@ -354,6 +366,12 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       );
       this.compiled = null;
       this.frame = 0;
+      // Status surface (see the supported path for the shapes). Unsupported =
+      // the RT pipeline is not operational at all; `supported` is the primary
+      // signal, but status is kept consistent so integrators can read one field.
+      this.compileError = null;
+      this.status = { ok: false, disabled: [], coreFailure: null };
+      this._diagDone = true;
       return;
     }
 
@@ -690,6 +708,150 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       );
       this._renderScale = 0.375;
     }
+
+    // ---- compile-failure status surface -----------------------------------
+    // The pipeline is a stack of ShaderMaterial passes; a program that fails to
+    // LINK renders black with no exception (three logs to the console and sets
+    // program.diagnostics.runnable=false, but rendering proceeds). Before this,
+    // a broken pass looked identical to `supported:false` from the outside — the
+    // failure that shipped the r166+ black image. These two fields let an
+    // integrator render honestly ("raster (reason)") instead of guessing:
+    //
+    //   compileError : string | null
+    //       First/most-severe failure summary ("rt:lighting: <driver log>"), or
+    //       null while every rt:* pass is compiling clean.
+    //   status : { ok, disabled, coreFailure }
+    //       ok          false once ANY rt:* pass failed to link (a core pass, or
+    //                   a feature that was auto-disabled). true = pipeline is
+    //                   running as intended.
+    //       disabled    [{ pass, feature, reason }] — optional features turned
+    //                   off to keep the image lit (e.g. taa, denoise, restir).
+    //       coreFailure string | null — a core pass (gbuffer/lighting/composite)
+    //                   failed and has no fallback; the image is black-but-diagnosed.
+    this.compileError = null;
+    this.status = { ok: true, disabled: [], coreFailure: null };
+    this._diagDone = false; // set once the polling window settles
+    this._diagFrames = 0; // rendered frames scanned so far
+    this._diagStable = 0; // consecutive scans with an unchanged rt:* program set
+    this._diagSig = ""; // signature of the rt:* program-name set last scan
+    this._diagHandled = new Set(); // rt:* names already acted on (warn-once)
+    this._compileErrSev = -1; // severity behind the current compileError (2/1/0)
+  }
+
+  // Classify an rt:* pass program by how a LINK failure degrades. CORE passes
+  // have no fallback (record and keep rendering the black result so it is
+  // DIAGNOSED, not silent). Optional passes map to the EXACT runtime toggle that
+  // already gates them, so disabling one keeps the image lit. Unknown rt:* names
+  // (history-carry blits) are auxiliary: non-fatal, warn only. Returns one of
+  // { core:true } | { feature, disable } | { aux:true }.
+  _passClass(name) {
+    switch (name) {
+      case "rt:gbuffer":
+      case "rt:lighting":
+      case "rt:composite":
+        return { core: true };
+      case "rt:restir-temporal":
+      case "rt:restir-spatial":
+        return { feature: "restir", disable: () => { this.restir = false; } };
+      case "rt:gi-reservoir":
+        return { feature: "restirGI", disable: () => { this.restirGI = false; } };
+      case "rt:denoise":
+        return { feature: "denoise", disable: () => { this.denoise = false; } };
+      case "rt:volumetric":
+        return { feature: "volumetric", disable: () => { this.volumetric.enabled = false; } };
+      case "rt:taa":
+      case "rt:taa-copy":
+        return { feature: "taa", disable: () => { this.taa = false; } };
+      case "rt:specular":
+        return { feature: "specular", disable: () => { this.specular = false; } };
+      default:
+        return { aux: true };
+    }
+  }
+
+  // Compact one-line driver message from three's program.diagnostics. The
+  // GLSL-frontend error lives in the fragment (or vertex) shader log; programLog
+  // is the linker fallback. First line, capped, so it fits a console.warn / a UI.
+  _diagLog(diag) {
+    const pick = [
+      diag && diag.fragmentShader && diag.fragmentShader.log,
+      diag && diag.vertexShader && diag.vertexShader.log,
+      diag && diag.programLog,
+    ].find((s) => s && s.trim());
+    return (pick || "(no driver log)").trim().split("\n")[0].slice(0, 200);
+  }
+
+  // Keep compileError at the FIRST failure of the HIGHEST severity seen
+  // (core 2 > feature 1 > aux 0): a later core failure overrides an earlier
+  // feature summary, but two failures of equal severity keep the first.
+  _noteCompileError(summary, severity) {
+    if (severity > this._compileErrSev) {
+      this.compileError = summary;
+      this._compileErrSev = severity;
+    }
+  }
+
+  // Act on one failed rt:* program (called at most once per pass name).
+  _handleFailedProgram(name, diag) {
+    const log = this._diagLog(diag);
+    const cls = this._passClass(name);
+    const summary = `${name}: ${log}`;
+    this.status.ok = false;
+    if (cls.core) {
+      if (!this.status.coreFailure) this.status.coreFailure = summary;
+      this._noteCompileError(summary, 2);
+      console.warn(
+        `three-realtime-rt: core pass ${name} failed to link — the image will ` +
+          `be black (no fallback for a core pass). Driver log: ${log}`
+      );
+    } else if (cls.feature) {
+      cls.disable();
+      this.status.disabled.push({ pass: name, feature: cls.feature, reason: log });
+      this._noteCompileError(summary, 1);
+      console.warn(
+        `three-realtime-rt: pass ${name} failed to link — auto-disabled ` +
+          `"${cls.feature}" to keep the image lit. Driver log: ${log}`
+      );
+    } else {
+      this._noteCompileError(summary, 0);
+      console.warn(
+        `three-realtime-rt: auxiliary pass ${name} failed to link (non-fatal — ` +
+          `resize history is not carried). Driver log: ${log}`
+      );
+    }
+  }
+
+  // Scan renderer.info.programs for failed rt:* pass programs. Called each frame
+  // until the window settles (see the DIAG_* constants). Cheap: ~a dozen entries,
+  // string prefix check, warn-once via _diagHandled.
+  _scanPrograms() {
+    if (this._diagDone) return;
+    const programs = this.renderer.info && this.renderer.info.programs;
+    if (!programs) { this._diagDone = true; return; }
+    this._diagFrames++;
+    let names = "";
+    for (const p of programs) {
+      const name = p && p.name;
+      if (!name || name.slice(0, 3) !== "rt:") continue;
+      names += name + "|";
+      const diag = p.diagnostics; // set at first USE; runnable:false = link failed
+      if (diag && diag.runnable === false && !this._diagHandled.has(name)) {
+        this._diagHandled.add(name);
+        this._handleFailedProgram(name, diag);
+      }
+    }
+    // Early-out: the rt:* program set has stopped growing and nothing new failed
+    // for DIAG_STABLE_FRAMES past the warmup floor → every active pass has been
+    // seen and validated. Otherwise stop at the hard window.
+    if (names === this._diagSig) this._diagStable++;
+    else { this._diagStable = 0; this._diagSig = names; }
+    if (
+      (this._diagFrames >= RealtimeRaytracer.DIAG_MIN_FRAMES &&
+        this._diagStable >= RealtimeRaytracer.DIAG_STABLE_FRAMES) ||
+      this._diagFrames >= RealtimeRaytracer.DIAG_WINDOW_FRAMES
+    ) {
+      this._diagDone = true;
+    }
   }
 
   // Consecutive catastrophic frames mean the GPU is drowning — cut quality
@@ -748,8 +910,31 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
    */
   compileScene(scene, options) {
     if (!this.supported) return null;
+    // "Construct the tracer, then add meshes" is a natural call order, so a
+    // scene with no traceable meshes is a NO-OP, not a throw: warn once and keep
+    // any previously compiled scene. Compile the new scene BEFORE disposing the
+    // old one so an empty-scene call never destroys a good scene. Only the
+    // SceneCompiler's specific "no meshes" signal is swallowed here; every other
+    // compile error (bad geometry, oversized attribute) still propagates.
+    let compiled;
+    try {
+      compiled = compileScene(scene, options);
+    } catch (err) {
+      if (/no meshes found/.test(String(err && err.message))) {
+        if (!this._emptyWarned) {
+          console.warn(
+            "three-realtime-rt: compileScene() called on a scene with no traceable " +
+              "meshes — keeping the current scene. Until meshes are added and " +
+              "recompiled, render() falls back to plain rasterization (no crash, no black)."
+          );
+          this._emptyWarned = true;
+        }
+        return this.compiled; // unchanged (may still be null)
+      }
+      throw err;
+    }
     if (this.compiled) this.compiled.dispose();
-    this.compiled = compileScene(scene, options);
+    this.compiled = compiled;
     // Emissive area lights are the noisiest direct-light path: one triangle
     // sample per pixel per frame, and the 1/dist^2 term spikes near a small
     // emitter (fireflies). ReSTIR's reservoirs are what tame this — warn when
@@ -1019,6 +1204,13 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     if (this.adaptiveQuality) this._adaptQuality();
     if (this.overloadProtection) this._overloadBrake();
     if (!this.compiled) this.compileScene(scene);
+    // Still nothing to trace (empty scene — tracer built before meshes were
+    // added). Show the user's raster scene rather than crashing or rendering
+    // black; the pipeline picks up automatically once compileScene() succeeds.
+    if (!this.compiled) {
+      this.renderer.render(scene, camera);
+      return;
+    }
 
     this.frame += 1;
     camera.updateMatrixWorld();
@@ -1303,6 +1495,12 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // Record this frame's (jittered) view-projection + jitter for next frame.
     this._prevViewProj.copy(this._jitteredViewProj);
     this._prevJitterUv.copy(this._jitterUv);
+
+    // Compile-failure diagnosis: every pass program used this frame has now had
+    // its link status checked by three (diagnostics populated on first use), so
+    // scan for failures. Runs at frame END (downstream of the passes) and only
+    // until the polling window settles — a no-op on the healthy steady state.
+    if (!this._diagDone) this._scanPrograms();
   }
 
   dispose() {

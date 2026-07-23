@@ -7,13 +7,26 @@
  * failure behind the 0.4.0 iOS black-screen incident: a pipeline that compiles
  * clean and reports framebuffer-complete but renders nothing.
  *
+ * THREE-VERSION MATRIX: chromium runs TWICE — once against the pinned three
+ * (0.160.1) and once against three@latest (a second vite with RT_THREE=latest,
+ * which vite.config aliases to the three-latest devDependency). Nothing tested a
+ * newer three before, which is how the r166+ `luminance` collision shipped a
+ * black image while rt.supported still read true; the chromium@3latest leg is the
+ * guard. The PASS gate requires BOTH chromium legs. firefox/webkit stay
+ * single-leg (both are environmental skips on this machine — see ENGINE_CONFIG).
+ *
+ * EMPTY-SCENE CHECK: a fourth chromium load of ?selftest=empty confirms
+ * compileScene() on a scene with no meshes is a no-op and render() falls back to
+ * plain raster instead of crashing (the "construct tracer, then add meshes" order).
+ *
  * Flow per run:
- *   1. spawn vite on a free port (NOT 8115/8119; another dev server may own those),
- *      wait for its ready line, and tear it (and its child tree) down on exit.
- *   2. for each engine: launch, load /?selftest=1, wait up to 90s for the
+ *   1. spawn two vite servers on free ports (NOT 8115/8119; another dev server may
+ *      own those) — default three and RT_THREE=latest — and tear both (and their
+ *      child trees) down on exit.
+ *   2. drive each matrix leg: launch, load the ?selftest URL, wait for the
  *      #selftest-verdict node, parse its JSON, classify pass / fail / skip.
- *   3. print a summary table; exit nonzero if any engine FAILS (a documented
- *      environmental skip does not fail the suite).
+ *   3. print a summary table; exit nonzero unless BOTH chromium legs and the
+ *      empty-scene check pass (a documented environmental skip does not fail).
  *
  * HONESTY: Playwright's webkit on Windows is the WPE/GTK WebKit build, NOT
  * Apple's Metal stack. It would NOT have caught the real 0.4.0 bug (WebKit's
@@ -92,13 +105,15 @@ function killTree(pid) {
 }
 
 // Spawn vite directly (node node_modules/vite/bin/vite.js) so we own a single
-// killable process, and resolve once it advertises the local URL.
-function startVite(port) {
+// killable process, and resolve once it advertises the local URL. `env` is
+// merged over process.env — the three-version matrix passes RT_THREE=latest so
+// vite.config.js aliases `three` to the three-latest devDependency for that leg.
+function startVite(port, env = {}) {
   const viteBin = path.join(ROOT, "node_modules", "vite", "bin", "vite.js");
   const child = spawn(
     process.execPath,
     [viteBin, "--port", String(port), "--strictPort", "--host", "127.0.0.1", "--clearScreen", "false"],
-    { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"] }
+    { cwd: ROOT, stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } }
   );
   const base = `http://127.0.0.1:${port}`;
   return new Promise((resolve, reject) => {
@@ -270,41 +285,105 @@ async function driveEngine(name, launcher, base, { headless, timeoutMs }) {
   }
 }
 
+// Drive the empty-scene regression check (examples/main.js ?selftest=empty) to a
+// verdict on chromium. Confirms compileScene() on a scene with no meshes is a
+// no-op and render() falls back to plain raster instead of crashing — the
+// "construct the tracer, then add meshes" order. Cheap: one page load, resolves
+// as soon as the tracer has run a handful of frames.
+async function driveEmpty(base) {
+  const t0 = Date.now();
+  let browser;
+  try {
+    browser = await chromium.launch(launchOpts("chromium", false));
+  } catch (err) {
+    return { status: "skip", reason: `launch failed: ${err.message}`, ms: Date.now() - t0 };
+  }
+  const logs = [];
+  try {
+    const page = await browser.newPage();
+    page.on("console", (m) => logs.push(m.text()));
+    page.on("pageerror", (e) => logs.push(`PAGEERROR: ${e.message}`));
+    await page.goto(`${base}/?selftest=empty`, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+    await page.waitForFunction(
+      () => {
+        const n = document.getElementById("selftest-verdict");
+        return !!(n && n.textContent && n.textContent.length > 0);
+      },
+      { timeout: 60_000 }
+    );
+    const text = await page.$eval("#selftest-verdict", (n) => n.textContent);
+    await browser.close();
+    let v;
+    try { v = JSON.parse(text); } catch { return { status: "fail", reason: `unparseable: ${text}`, ms: Date.now() - t0 }; }
+    if (v.pass) return { status: "pass", verdict: v, ms: Date.now() - t0 };
+    return {
+      status: "fail",
+      reason: v.threw
+        ? `compileScene/render threw on an empty scene: ${v.error}`
+        : `empty-scene invariants failed: ${JSON.stringify(v)}`,
+      verdict: v,
+      ms: Date.now() - t0,
+    };
+  } catch (err) {
+    try { await browser.close(); } catch {}
+    const pageErr = logs.filter((l) => /PAGEERROR|Error/i.test(l)).slice(-1)[0];
+    return { status: "fail", reason: `driver error: ${err.message}${pageErr ? ` (${pageErr})` : ""}`, ms: Date.now() - t0 };
+  }
+}
+
+// Run one chromium leg (with the headed->headless recovery) against a base URL.
+async function runChromiumLeg(label, base) {
+  const cfg = ENGINE_CONFIG.chromium;
+  console.log(`\n=== ${label} === (${cfg.headless ? "headless" : "headed"}, timeout ${cfg.timeoutMs}ms)`);
+  let r = await driveEngine("chromium", chromium, base, cfg);
+  if (r.status === "fail" && !cfg.headless) {
+    console.log("chromium failed headed; retrying headless as a fallback...");
+    const alt = await driveEngine("chromium", chromium, base, { headless: true, timeoutMs: cfg.timeoutMs });
+    if (alt.status !== "fail") {
+      alt.reason = `${alt.reason ? alt.reason + "; " : ""}passed headless (headed failed)`;
+      r = alt;
+    }
+  }
+  const v = r.verdict;
+  console.log(
+    `  -> ${r.status.toUpperCase()} (${r.ms}ms)` +
+      (v ? ` meanLum=${v.meanLum} irrLum=${v.irrLum} glErrors=${v.glErrors} specMRT=${v.specMRT} statusOk=${v.statusOk} rtPrograms=${v.rtPrograms} frames=${v.frames}` : "") +
+      (r.reason ? `\n     reason: ${r.reason}` : "")
+  );
+  return r;
+}
+
 // --- main ------------------------------------------------------------------
 
 async function main() {
+  // Default leg: vite serving the pinned three (0.160.1).
   const port = await freePort();
-  console.log(`Starting vite on free port ${port}...`);
+  console.log(`Starting vite (three 0.160.1) on free port ${port}...`);
   const { child, base } = await startVite(port);
 
-  const cleanup = () => killTree(child.pid);
+  // Latest leg: a SECOND vite with RT_THREE=latest so vite.config aliases three
+  // to the three-latest devDependency (npm:three@latest). Started up front so
+  // its dep-optimize runs while the default legs drive; torn down with the first.
+  const portLatest = await freePort();
+  console.log(`Starting vite (three@latest) on free port ${portLatest}...`);
+  const { child: childLatest, base: baseLatest } = await startVite(portLatest, { RT_THREE: "latest" });
+
+  const cleanup = () => { killTree(child.pid); killTree(childLatest.pid); };
   process.on("exit", cleanup);
   process.on("SIGINT", () => { cleanup(); process.exit(130); });
 
-  const engines = [
-    ["chromium", chromium],
-    ["firefox", firefox],
-    ["webkit", webkit],
-  ];
-
+  // Matrix rows. chromium runs TWICE (once per three version); the luminance
+  // regression that shipped would fail the chromium@3latest row. firefox/webkit
+  // stay single-leg against the default three (both are environmental skips on
+  // this machine — see the ENGINE_CONFIG notes above).
   const results = [];
+  let empty = null;
   try {
-    for (const [name, launcher] of engines) {
+    results.push(["chromium", await runChromiumLeg("chromium", base)]);
+    for (const [name, launcher] of [["firefox", firefox], ["webkit", webkit]]) {
       const cfg = ENGINE_CONFIG[name];
       console.log(`\n=== ${name} === (${cfg.headless ? "headless" : "headed"}, timeout ${cfg.timeoutMs}ms)`);
-      let r = await driveEngine(name, launcher, base, cfg);
-      // Chromium recovery: it runs headed by default here (headless is known to
-      // stall under ANGLE-HLSL on this machine). If a headed attempt still
-      // fails, retry headless once so a machine where the opposite is true (a
-      // real GPU CI runner) can still pass without editing the script.
-      if (name === "chromium" && r.status === "fail" && !cfg.headless) {
-        console.log("chromium failed headed; retrying headless as a fallback...");
-        const alt = await driveEngine(name, launcher, base, { headless: true, timeoutMs: cfg.timeoutMs });
-        if (alt.status !== "fail") {
-          alt.reason = `${alt.reason ? alt.reason + "; " : ""}passed headless (headed failed)`;
-          r = alt;
-        }
-      }
+      const r = await driveEngine(name, launcher, base, cfg);
       results.push([name, r]);
       const v = r.verdict;
       console.log(
@@ -313,6 +392,16 @@ async function main() {
           (r.reason ? `\n     reason: ${r.reason}` : "")
       );
     }
+    results.push(["chromium@3latest", await runChromiumLeg("chromium@3latest", baseLatest)]);
+
+    // Empty-scene regression check (chromium, default three).
+    console.log(`\n=== empty-scene (chromium, ?selftest=empty) ===`);
+    empty = await driveEmpty(base);
+    console.log(
+      `  -> ${empty.status.toUpperCase()} (${empty.ms}ms)` +
+        (empty.reason ? `\n     reason: ${empty.reason}` : "") +
+        (empty.verdict ? `\n     ${JSON.stringify(empty.verdict)}` : "")
+    );
   } finally {
     cleanup();
   }
@@ -320,12 +409,12 @@ async function main() {
   // Summary table.
   console.log("\n================ render self-test matrix ================");
   const pad = (s, n) => String(s).padEnd(n);
-  console.log(pad("engine", 10) + pad("status", 8) + pad("meanLum", 10) + pad("irrLum", 9) + pad("glErr", 7) + "specMRT");
-  console.log("-".repeat(56));
+  console.log(pad("engine", 18) + pad("status", 8) + pad("meanLum", 10) + pad("irrLum", 9) + pad("glErr", 7) + "specMRT");
+  console.log("-".repeat(64));
   for (const [name, r] of results) {
     const v = r.verdict || {};
     console.log(
-      pad(name, 10) +
+      pad(name, 18) +
         pad(r.status, 8) +
         pad(v.meanLum ?? "-", 10) +
         pad(v.irrLum ?? "-", 9) +
@@ -333,14 +422,27 @@ async function main() {
         (v.specMRT === undefined ? "-" : String(v.specMRT))
     );
   }
+  console.log(pad("empty-scene", 18) + pad(empty ? empty.status : "-", 8) + "(compileScene no-op + render fallback)");
   for (const [name, r] of results) {
     if (r.status !== "pass" && r.reason) console.log(`  ${name}: ${r.reason}`);
   }
+  if (empty && empty.status !== "pass" && empty.reason) console.log(`  empty-scene: ${empty.reason}`);
   console.log("========================================================");
 
-  const failed = results.filter(([, r]) => r.status === "fail");
-  if (failed.length) {
-    console.log(`\nFAIL: ${failed.map(([n]) => n).join(", ")}`);
+  // Gate: BOTH chromium legs (default three AND three@latest) must PASS, and the
+  // empty-scene check must pass. A hard "fail" on any row fails the suite; a
+  // documented environmental skip (firefox/webkit) does not.
+  const problems = [];
+  for (const label of ["chromium", "chromium@3latest"]) {
+    const row = results.find(([n]) => n === label);
+    if (!row || row[1].status !== "pass") problems.push(`${label} (${row ? row[1].status : "missing"})`);
+  }
+  if (!empty || empty.status !== "pass") problems.push(`empty-scene (${empty ? empty.status : "missing"})`);
+  const failed = results.filter(([, r]) => r.status === "fail").map(([n]) => n);
+  for (const n of failed) if (!problems.some((p) => p.startsWith(n))) problems.push(`${n} (fail)`);
+
+  if (problems.length) {
+    console.log(`\nFAIL: ${problems.join(", ")}`);
     process.exit(1);
   }
   const skipped = results.filter(([, r]) => r.status === "skip").map(([n]) => n);

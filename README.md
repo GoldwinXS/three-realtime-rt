@@ -134,7 +134,11 @@ A checklist for dropping the tracer into a scene you already have:
 2. **Compile once; recompile after structural changes** — `rt.compileScene(scene)`
    bakes geometry into a static BVH and snapshots materials + emissive area
    lights. Call it again after you add/remove meshes, swap geometry, or change a
-   material's `emissive` / `color` / `roughness` / `metalness`.
+   material's `emissive` / `color` / `roughness` / `metalness`. <a id="empty-scene"></a>Calling it on a
+   scene with **no meshes yet** is a **no-op** (it warns once and keeps any
+   previously compiled scene), so "construct the tracer, then add meshes" is a
+   valid order — until meshes are added and recompiled, `rt.render()` falls back
+   to plain rasterization (no crash, no black screen).
 3. **Declare movers** — pass moving meshes to
    `rt.compileScene(scene, { dynamicMeshes: [...] })`, then call
    `rt.updateDynamic()` each frame after you move them (e.g. after a physics
@@ -610,8 +614,37 @@ is **feature-detected** — it appears only when the loaded build exposes an
 The renderer can pass every compile and framebuffer check and still draw a black
 screen — that is exactly what shipped in 0.4.0 on iOS (WebKit's GLSL-to-Metal
 translation silently broke at a 4th `traceRadiance` call site; clean compile, no
-console error, black output). The only defence against that class of failure is
-to **look at the pixels**, so the demo has a headless-friendly self-test.
+console error, black output), and again on three r166+ when three's injected
+`luminance` helper collided with the library's own and the affected pass programs
+failed to link. The only defence against that class of failure is to **look at
+the pixels**, so the demo has a headless-friendly self-test.
+
+**Programmatic signal (`rt.compileError` / `rt.status`).** A pass whose program
+fails to *link* renders black without throwing — three logs to the console and
+sets `program.diagnostics.runnable = false`, but rendering proceeds. So over the
+first several rendered frames the renderer inspects `renderer.info.programs` for
+its own (stably named `rt:*`) pass programs and reports what it finds:
+
+```js
+rt.render(scene, camera); // ...for a few frames
+if (!rt.status.ok) {
+  // rt.compileError → "rt:lighting: 'luminance' : function already has a body"
+  if (rt.status.coreFailure) showRaster(`raster (${rt.compileError})`);
+  else console.warn("degraded:", rt.status.disabled); // e.g. [{pass, feature, reason}]
+}
+```
+
+- **`rt.compileError`** (`string | null`) — first / most-severe failure summary
+  (`"rt:<pass>: <driver log>"`), or `null` while every pass compiles clean.
+- **`rt.status`** (`{ ok, disabled, coreFailure }`) — `ok` is `true` on the healthy
+  path and `false` once any `rt:*` pass fails to link. **Optional** features whose
+  pass failed are **auto-disabled** so the image stays lit (`restir`, `restirGI`,
+  `denoise`, `volumetric`, `taa`, `specular`), each listed in `disabled` as
+  `{ pass, feature, reason }` with a one-line driver log. A **core** pass
+  (`gbuffer` / `lighting` / `composite`) has no fallback: `coreFailure` names it
+  and the image is black-but-diagnosed. This lets an integrator render an honest
+  `raster (reason)` fallback instead of guessing. (When `supported` is `false` the
+  RT pipeline never runs, so `status.ok` is `false` too — check `supported` first.)
 
 **In the browser:** load [`/?selftest=1`](examples/selftest.js). It forces the
 full lighting stack on (GI + emissive NEE + reflections + refraction, lighting at
@@ -621,12 +654,16 @@ and into a hidden `#selftest-verdict` DOM node:
 
 ```json
 { "pass": true, "meanLum": 139.08, "irrLum": 169.73, "glErrors": 0,
-  "specMRT": true, "supported": true, "frames": 91, "ua": "…" }
+  "specMRT": true, "supported": true, "statusOk": true, "rtPrograms": 15,
+  "compileError": null, "disabled": [], "frames": 91, "ua": "…" }
 ```
 
 The pass gate wants `meanLum` in `[12, 230]` (calibrated: a healthy composite of
 the gallery centre reads ~140 on desktop; a black screen reads ~0), `irrLum > 6`,
-`glErrors == 0` and `supported == true`.
+`glErrors == 0`, `supported == true`, and `statusOk == true` — the last asserts
+the compile-failure surface above stayed clean (`rt.status.ok`, `compileError`
+null) *and* that the named pass programs were actually discoverable
+(`rtPrograms > 0`), so a broken diagnosis can't read as a false pass.
 
 - `meanLum` / `irrLum` — mean Rec.709 luma (0–255) of the **centre 25%** of the
   composite, and of the raw irradiance buffer (`outputMode 3`) for one frame. The
@@ -641,12 +678,23 @@ the renderer with `preserveDrawingBuffer: true` so the canvas can be read back;
 normal runs keep the cheaper default.
 
 **In CI:** `npm run test:render` ([`scripts/selftest.mjs`](scripts/selftest.mjs))
-starts vite on a free port and drives `?selftest=1` through Playwright across
+starts vite on free ports and drives `?selftest=1` through Playwright across
 **chromium, firefox and webkit**, printing a pass/fail/skip table and exiting
 nonzero on any real failure (a documented environmental *skip* does not fail the
 suite). Playwright is loaded from a sibling checkout — see the top of the script.
 
-Machine-specific note (Windows + NVIDIA, the current dev box): the chromium leg
+**Three-version matrix.** The r166+ `luminance` break shipped because nothing
+tested a newer three, so **chromium runs twice**: once against the pinned three
+(`0.160.1`) and once against **`three@latest`** (a second vite with
+`RT_THREE=latest`, which [`vite.config.js`](vite.config.js) aliases `three` to the
+`three-latest` devDependency). The `chromium@3latest` row is the guard for that
+class of regression, and **the pass gate requires both chromium legs**. A fourth
+chromium load of `?selftest=empty` asserts the [empty-scene no-op](#empty-scene)
+(`compileScene` on a scene with no meshes is a no-op and `render()` falls back to
+plain raster instead of crashing). firefox/webkit stay single-leg against the
+default three (both are environmental skips here — see below).
+
+Machine-specific note (Windows + NVIDIA, the current dev box): each chromium leg
 runs **headed** with **`--use-angle=gl`**. ANGLE's default D3D11/FXC backend
 never finishes compiling the BVH megakernel here — headless chromium,
 headed+`--use-angle=d3d11` and system Chrome all freeze at ~3 frames with silent

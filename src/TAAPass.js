@@ -128,6 +128,9 @@ export class TAAPass {
     this._reset = true;
 
     this.material = new THREE.ShaderMaterial({
+      // Stable program name for compile-failure self-diagnosis; a link failure
+      // disables the optional `taa` feature (image stays lit, just aliased).
+      name: "rt:taa",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: taaFrag,
@@ -147,6 +150,9 @@ export class TAAPass {
     });
 
     this.copyMaterial = new THREE.ShaderMaterial({
+      // The TAA resolve-to-screen / history-carry blit; folded into the `taa`
+      // feature classification (a failure makes TAA unusable → disable taa).
+      name: "rt:taa-copy",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: copyFrag,

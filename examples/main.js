@@ -56,6 +56,14 @@ const enterSafeMode = (why) => {
 };
 
 async function main() {
+  // ?selftest=empty: the empty-scene no-op check (see runEmptySceneSelftest).
+  // Self-contained and returns before the demo scene is built, so it exercises
+  // exactly the "construct the tracer, then add meshes" call order.
+  if (PARAMS.get("selftest") === "empty") {
+    await runEmptySceneSelftest();
+    return;
+  }
+
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
   const { scene, camera, bounds, lights, sky, ready, showcase, water, windows, fox } = buildScene();
 
@@ -538,6 +546,86 @@ async function main() {
     }
   }
   animate();
+}
+
+/**
+ * Empty-scene regression check (?selftest=empty). compileScene() on a scene with
+ * no meshes must be a no-op (warn once, keep the current scene) and render() must
+ * not crash — the natural "construct the tracer, then add meshes" order. Drives
+ * that order end to end, then confirms adding meshes and recompiling brings the
+ * tracer online. Emits a machine-readable verdict into the same #selftest-verdict
+ * node the Playwright driver reads (scripts/selftest.mjs), with `emptyScene:true`.
+ */
+async function runEmptySceneSelftest() {
+  const emit = (v) => {
+    const line = JSON.stringify({ emptyScene: true, ...v });
+    console.log("[selftest:empty] " + line);
+    let node = document.getElementById("selftest-verdict");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "selftest-verdict";
+      node.style.cssText =
+        "position:fixed;left:-99999px;top:0;white-space:pre;pointer-events:none;";
+      document.body.appendChild(node);
+    }
+    node.textContent = line;
+    node.setAttribute("data-pass", String(!!v.pass));
+  };
+
+  let renderer = null;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setSize(64, 64);
+    const rt = new RealtimeRaytracer(renderer);
+    const supported = !!rt.supported;
+
+    // The status surface must exist immediately after construction.
+    const statusPresent =
+      !!rt.status && Array.isArray(rt.status.disabled) && "ok" in rt.status;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
+    camera.position.set(0, 0, 3);
+
+    // 1. compileScene on the empty scene: no throw, no compiled scene yet.
+    const compiledEmpty = rt.compileScene(scene);
+    const emptyIsNoop = rt.compiled == null && compiledEmpty == null;
+
+    // 2. render() a few frames with nothing to trace: must fall back to plain
+    //    rasterization instead of crashing or dereferencing a null scene.
+    for (let i = 0; i < 3; i++) rt.render(scene, camera);
+    const framesAfterEmpty = rt.frame; // stays 0 — the fallback returns early
+
+    // 3. now add meshes + a light and recompile: the tracer must come online.
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(1, 1, 1),
+      new THREE.MeshStandardMaterial({ color: 0x88aaff, roughness: 0.6 })
+    );
+    scene.add(mesh);
+    const light = new THREE.DirectionalLight(0xffffff, 3);
+    light.position.set(2, 3, 2);
+    scene.add(light);
+    rt.compileScene(scene);
+    const compiledAfterAdd = supported ? rt.compiled != null : true;
+    for (let i = 0; i < 3; i++) rt.render(scene, camera);
+
+    rt.dispose();
+
+    const pass = statusPresent && emptyIsNoop && compiledAfterAdd;
+    emit({
+      pass,
+      threw: false,
+      supported,
+      statusPresent,
+      emptyIsNoop,
+      framesAfterEmpty,
+      compiledAfterAdd,
+    });
+  } catch (err) {
+    emit({ pass: false, threw: true, error: (err && err.message) || String(err) });
+  } finally {
+    try { if (renderer) renderer.dispose(); } catch { /* ignore */ }
+  }
 }
 
 main().catch((err) => {

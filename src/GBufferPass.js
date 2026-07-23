@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { makeMRT } from "./mrtCompat.js";
 
 // three defines USE_SKINNING and supplies the bindMatrix / bindMatrixInverse /
 // boneTexture uniforms + skinIndex / skinWeight attributes automatically when the
@@ -190,7 +191,7 @@ export class GBufferPass {
   }
 
   _makeTarget(width, height) {
-    const t = new THREE.WebGLMultipleRenderTargets(width, height, 4, {
+    const t = makeMRT(width, height, 4, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       type: THREE.FloatType,
@@ -240,6 +241,10 @@ export class GBufferPass {
 
   _makeGbufferMaterial(mesh) {
     const material = new THREE.ShaderMaterial({
+      // Stable program name for the compile-failure self-diagnosis (see
+      // RealtimeRaytracer._scanPrograms). Per-mesh materials share one program
+      // cache key, so they all surface as the single core pass "rt:gbuffer".
+      name: "rt:gbuffer",
       glslVersion: THREE.GLSL3,
       vertexShader: gbufferVert,
       fragmentShader: gbufferFrag,

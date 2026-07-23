@@ -3,6 +3,7 @@ import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS } from "./SceneCompiler.js";
 import { SKY_GLSL } from "./sky.glsl.js";
 import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
+import { makeMRT } from "./mrtCompat.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -995,6 +996,10 @@ export class RTLightingPass {
     this.specB = specMRT ? this._makeSpecTarget(width, height) : null;
 
     this.material = new THREE.ShaderMaterial({
+      // Stable program name for compile-failure self-diagnosis: this is the
+      // CORE lighting megakernel — a link failure here has no fallback (see
+      // RealtimeRaytracer._passClass -> coreFailure).
+      name: "rt:lighting",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: specMRT
@@ -1057,6 +1062,9 @@ export class RTLightingPass {
     // Specular temporal accumulation program (its own sampler budget — well
     // clear of the lighting pass's 16-sampler ceiling).
     this.specMaterial = new THREE.ShaderMaterial({
+      // Optional additive specular buffer — a link failure degrades to the
+      // Lambert-only look (RealtimeRaytracer disables `specular`), image stays lit.
+      name: "rt:specular",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: specAccumFrag,
@@ -1081,6 +1089,9 @@ export class RTLightingPass {
     // buffers. In single-target fallback the second output collapses the same
     // way as the lighting shader's.
     this.carryMaterial = new THREE.ShaderMaterial({
+      // Resize-only history-carry blit; a link failure is non-fatal (history is
+      // not carried across a resolution step) so it classifies as auxiliary.
+      name: "rt:history-carry",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
       fragmentShader: specMRT
@@ -1120,7 +1131,7 @@ export class RTLightingPass {
       t.texture.generateMipmaps = false;
       return t;
     }
-    const t = new THREE.WebGLMultipleRenderTargets(width, height, 2, opts);
+    const t = makeMRT(width, height, 2, opts);
     for (const tex of t.texture) tex.generateMipmaps = false;
     return t;
   }

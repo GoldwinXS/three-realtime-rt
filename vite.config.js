@@ -71,10 +71,28 @@ function benchSaver() {
   };
 }
 
+// Three-version matrix hook for the render self-test (scripts/selftest.mjs): with
+// RT_THREE=latest, resolve every bare `three` (and `three/...` subpath, incl.
+// `three/addons`) import to the `three-latest` devDependency (npm:three@latest)
+// instead of the pinned 0.160.1, so the same demo runs against current three.
+// three-mesh-bvh imports `three` too, so it is remapped as well — no dual-three.
+// Unset (the default) the alias is absent and behaviour is byte-identical.
+const RT_THREE_LATEST = process.env.RT_THREE === "latest";
+
 export default defineConfig({
   // Relative asset paths so the production build works when served from a
   // GitHub Pages project sub-path (https://user.github.io/three-realtime-rt/).
   base: "./",
+  ...(RT_THREE_LATEST
+    ? {
+        resolve: { alias: { three: "three-latest" } },
+        // Isolate the dep-optimize cache so a concurrent default-three vite (the
+        // selftest runs both at once) does not share node_modules/.vite — a
+        // shared cache gets re-optimized for whichever config loaded last,
+        // clobbering the other server's `three` resolution mid-serve.
+        cacheDir: "node_modules/.vite-three-latest",
+      }
+    : {}),
   // The example uses top-level await; target a modern engine (WebGL2 already
   // requires one). esbuild's default "modules" target rejects TLA.
   build: {
