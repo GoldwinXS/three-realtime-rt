@@ -422,6 +422,18 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
           "(WebKit/iOS) — specular buffer disabled, alpha-blend surfaces render opaque."
       );
     }
+    // Fragment-shader texture-unit budget. The lighting megakernel already binds
+    // exactly the WebGL2-guaranteed minimum of 16 fragment samplers, so the
+    // world-space 3D-texture-albedo feature's SECONDARY-ray path (an extra
+    // sampler3D) can only be compiled in on a GPU that exposes >= 17. Primary
+    // visibility (the G-buffer, which has ample headroom) samples the volume
+    // regardless; only the traced GI/reflection bounce is gated on this. Most
+    // desktop GPUs report 32.
+    this._maxFragTexUnits = renderer.getContext().getParameter(
+      renderer.getContext().MAX_TEXTURE_IMAGE_UNITS
+    );
+    this._volumeUnitWarned = false;
+
     this.gbuffer = new GBufferPass(this._width, this._height, { mixedPrecision });
     this.rtPass = new RTLightingPass(this._scaledW, this._scaledH, {
       specMRT: this.specMRTSupported,
@@ -954,8 +966,38 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
     this.giReservoirPass.setCompiledScene(this.compiled);
+    this._syncVolumeAlbedo();
     this.resetAccumulation();
     return this.compiled;
+  }
+
+  /**
+   * Push the compiled scene's world-space 3D-texture albedo (if any) into the
+   * passes. Primary visibility (G-buffer) always gets it — it has spare samplers.
+   * The traced SECONDARY-ray path (GI/reflection colour) needs a 17th fragment
+   * sampler, so it is only enabled on a GPU that exposes one; on a bare-minimum
+   * 16-unit device the bounces fall back to the material's flat table albedo
+   * (primary visibility still shows the full field), logged once.
+   */
+  _syncVolumeAlbedo() {
+    const vol = this.compiled ? this.compiled.volumeAlbedo : null;
+    this.gbuffer.setVolume(!!vol);
+    const secondaryOk = !!vol && this._maxFragTexUnits >= 17;
+    // NOTE: only the inline-GI lighting pass (rtPass.traceRadiance) samples the
+    // volume for the traced bounce. The experimental ReSTIR GI pass
+    // (giReservoirPass, off by default) has its own GI kernel and is NOT wired
+    // for volume albedo in v1 — a volume surface's indirect bounce falls back to
+    // its flat table colour while restirGI is on (documented limitation).
+    this.rtPass.setVolumeAlbedo(secondaryOk ? vol : null);
+    if (vol && !secondaryOk && !this._volumeUnitWarned) {
+      this._volumeUnitWarned = true;
+      console.info(
+        "[three-realtime-rt] volume albedo: this GPU exposes only " +
+          `${this._maxFragTexUnits} fragment texture units (< 17 needed for the ` +
+          "traced-bounce sampler), so GI / reflection bounces use the material's flat " +
+          "base colour. Primary visibility still shows the full 3D-texture field."
+      );
+    }
   }
 
   /**

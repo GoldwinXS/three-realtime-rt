@@ -5,10 +5,55 @@ import type {
   Color,
   Vector3,
   Object3D,
+  Data3DTexture,
 } from "three";
 
 /** Capability tier used to pick sensible defaults. */
 export type Tier = "none" | "mid" | "high";
+
+/**
+ * World-space 3D-texture albedo ("volumetric surface albedo"). Set it on a
+ * material's `userData.rtVolumeAlbedo` to make the tracer sample a 3D texture at
+ * the world-space HIT POINT for that surface's albedo — colouring a mesh by a
+ * volumetric data field (stress, temperature, density) instead of a flat colour
+ * or a 2D UV map. The colour replaces the base albedo in BOTH primary visibility
+ * (the G-buffer, so the raster/hybrid view agrees) and the traced GI / reflection
+ * bounces (so the field's colours bleed correctly through global illumination).
+ * Roughness, metalness and emissive still compose normally.
+ *
+ * ```js
+ * material.userData.rtVolumeAlbedo = {
+ *   texture,                      // THREE.Data3DTexture, RGB(A), already colour-mapped
+ *   origin: new THREE.Vector3(),  // world position of the texel-(0,0,0) corner
+ *   size:   new THREE.Vector3(1,1,1), // world extent of the full volume
+ * };
+ * rt.compileScene(scene);         // (re)compile after adding/changing it
+ * ```
+ *
+ * The hit point `p` maps to `uvw = clamp((p - origin) / size, 0, 1)` and is
+ * sampled trilinearly (the library sets Linear filtering + ClampToEdge on the
+ * texture at compile time). The texture must be **already colour-mapped to RGB** —
+ * the library samples `.rgb` directly and contains no colormap logic. Changing the
+ * texture DATA later needs only `texture.needsUpdate = true` (no recompile);
+ * changing which material carries the field, or its `origin` / `size`, needs a
+ * `compileScene()`.
+ *
+ * **v1 is single-volume for the traced-bounce path.** Any number of materials may
+ * carry distinct volumes and each renders correctly in primary visibility, but the
+ * GI / reflection bounce samples only the FIRST registered volume (the lighting
+ * megakernel is at the WebGL2 16-sampler minimum; the feature adds one sampler3D,
+ * enabled only when the GPU exposes ≥ 17 fragment texture units — on a bare-minimum
+ * 16-unit device the bounces fall back to the material's flat base colour while
+ * primary visibility still shows the full field). Multi-volume bounces are future work.
+ */
+export interface VolumeAlbedo {
+  /** A THREE.Data3DTexture, RGB(A) and already colour-mapped; `.rgb` is sampled. */
+  texture: Data3DTexture;
+  /** World position of the texel-(0,0,0) corner of the volume. */
+  origin: Vector3;
+  /** World extent of the full texture volume along each axis (non-zero). */
+  size: Vector3;
+}
 
 /** Result of {@link RealtimeRaytracer.probeGPUTier}. */
 export interface GPUTierProbe {
@@ -359,6 +404,15 @@ export class CompiledScene {
   sceneDiagonal: number;
   /** True when any dynamic emitter contributes NEE rows refreshed each frame. */
   hasDynamicEmissive: boolean;
+  /**
+   * The resolved world-space 3D-texture albedo for the traced-bounce path (see
+   * {@link VolumeAlbedo}), or `null` when no material opted in via
+   * `userData.rtVolumeAlbedo`. `matIndex` is the material's index in the compiled
+   * table (v1 keeps the first opted-in material for the GI/reflection path).
+   */
+  volumeAlbedo:
+    | { matIndex: number; texture: Data3DTexture; origin: Vector3; size: Vector3; material: unknown }
+    | null;
   /** CPU cost (ms) of the most recent dynamic-emissive refresh (0 if none). */
   lastEmissiveRefreshMs: number;
   /**

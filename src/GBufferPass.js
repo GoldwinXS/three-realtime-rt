@@ -86,6 +86,20 @@ uniform bool uHasMetalnessMap;
 uniform bool uBlend;
 uniform float uOpacity;
 
+// World-space 3D-texture albedo ("volumetric surface albedo"), compiled in ONLY
+// when a scene registers a material with userData.rtVolumeAlbedo (the whole block
+// is behind the RT_VOLUME_ALBEDO define, so a scene without the feature builds a
+// byte-identical G-buffer program with no extra sampler). Primary visibility can
+// afford this sampler3D — the raster pass has ample sampler headroom, unlike the
+// lighting megakernel. The value is gated per-mesh by uHasVolume, so non-volume
+// meshes sharing this program write exactly the same albedo they did before.
+#ifdef RT_VOLUME_ALBEDO
+uniform highp sampler3D uVolumeTex;
+uniform vec3 uVolumeOrigin;
+uniform vec3 uVolumeSize;
+uniform bool uHasVolume;
+#endif
+
 // Screen-space cotangent frame (Mikkelsen 2010): reconstruct a tangent basis
 // from derivatives of world position and uv, so tangent-space normal maps work
 // without a per-vertex tangent attribute (none is uploaded to the BVH/G-buffer).
@@ -106,6 +120,17 @@ void main() {
     albedo *= texture(uMap, vUvCoord).rgb;
   }
   albedo *= vColor; // vertex colours (white when the mesh has no color attribute)
+  // Volumetric surface albedo: sample a world-space 3D texture at this fragment's
+  // world position and use it as the base colour, replacing color x map x vColor.
+  // uvw = clamp((p - origin) / size, 0, 1); the ClampToEdge sampler + this clamp
+  // keep hits just outside the volume reading the boundary colour instead of
+  // wrapping. Gated so only rtVolumeAlbedo meshes are affected.
+#ifdef RT_VOLUME_ALBEDO
+  if (uHasVolume) {
+    vec3 uvw = clamp((vWorldPos - uVolumeOrigin) / uVolumeSize, 0.0, 1.0);
+    albedo = texture(uVolumeTex, uvw).rgb;
+  }
+#endif
   vec3 emissive = uEmissive;
   if (uHasEmissiveMap) {
     emissive *= texture(uEmissiveMap, vUvCoord).rgb;
@@ -188,6 +213,42 @@ export class GBufferPass {
     this._materialCache = new WeakMap(); // mesh -> gbuffer ShaderMaterial
     this._swapped = []; // [mesh, originalMaterial] pairs during render
     this._normalMat3 = new THREE.Matrix3();
+    // World-space 3D-texture albedo: off unless a scene registers a material with
+    // userData.rtVolumeAlbedo (see setVolume). When off, the gbuffer program is
+    // compiled WITHOUT the RT_VOLUME_ALBEDO define — no sampler3D, byte-identical.
+    this._volumeEnabled = false;
+    this._dummyVolumeTex = null; // 1x1x1 fallback bound to non-volume meshes when on
+  }
+
+  // A valid 1x1x1 3D texture to bind on gbuffer materials whose mesh is NOT a
+  // volume material while the feature is compiled in — keeps every declared
+  // sampler3D pointing at a complete texture (its branch is never taken, so the
+  // value is irrelevant; it just must not be an unbound/incomplete sampler).
+  _dummyVolume() {
+    if (!this._dummyVolumeTex) {
+      const t = new THREE.Data3DTexture(new Uint8Array([255, 255, 255, 255]), 1, 1, 1);
+      t.format = THREE.RGBAFormat;
+      t.type = THREE.UnsignedByteType;
+      t.minFilter = THREE.LinearFilter;
+      t.magFilter = THREE.LinearFilter;
+      t.needsUpdate = true;
+      this._dummyVolumeTex = t;
+    }
+    return this._dummyVolumeTex;
+  }
+
+  /**
+   * Enable/disable the world-space 3D-texture albedo path for the primary
+   * (G-buffer) visibility. Compiles the RT_VOLUME_ALBEDO define into the per-mesh
+   * gbuffer program when on. Toggling clears the material cache so the programs
+   * recompile with/without the define. Called by RealtimeRaytracer after each
+   * compile with whether the scene registered any rtVolumeAlbedo material.
+   */
+  setVolume(enabled) {
+    const on = !!enabled;
+    if (on === this._volumeEnabled) return;
+    this._volumeEnabled = on;
+    this._materialCache = new WeakMap(); // force recompile with the new define
   }
 
   _makeTarget(width, height) {
@@ -246,6 +307,10 @@ export class GBufferPass {
       // cache key, so they all surface as the single core pass "rt:gbuffer".
       name: "rt:gbuffer",
       glslVersion: THREE.GLSL3,
+      // RT_VOLUME_ALBEDO is present only while a scene uses the volumetric-albedo
+      // feature (see setVolume); absent, the compiled program is identical to the
+      // pre-feature G-buffer (no sampler3D, no volume branch).
+      defines: this._volumeEnabled ? { RT_VOLUME_ALBEDO: "1" } : {},
       vertexShader: gbufferVert,
       fragmentShader: gbufferFrag,
       uniforms: {
@@ -269,6 +334,16 @@ export class GBufferPass {
         uHasMetalnessMap: { value: false },
         uBlend: { value: false },
         uOpacity: { value: 1.0 },
+        // Volume-albedo uniforms are always present in the JS uniform object
+        // (harmless when the define is off — three uploads only uniforms that
+        // exist in the compiled program, so a non-volume scene never touches
+        // these). While the define is on, _syncGbufferMaterial binds either the
+        // material's own volume texture or the shared dummy, so a non-volume mesh
+        // never leaves an incomplete sampler3D bound.
+        uVolumeTex: { value: null },
+        uVolumeOrigin: { value: new THREE.Vector3() },
+        uVolumeSize: { value: new THREE.Vector3(1, 1, 1) },
+        uHasVolume: { value: false },
       },
       side: THREE.FrontSide,
     });
@@ -314,6 +389,23 @@ export class GBufferPass {
     // lighting pass. opacity 1 renders opaque, matching the old force-opaque path.
     u.uBlend.value = !!src.transparent;
     u.uOpacity.value = src.opacity ?? 1.0;
+    // World-space 3D-texture albedo. Only meshes whose material opted in via
+    // userData.rtVolumeAlbedo get uHasVolume=true; every other mesh keeps the
+    // dummy sampler (branch never taken) so its albedo is byte-identical. This is
+    // per-mesh, so DISTINCT volumes each render correctly in primary visibility.
+    if (this._volumeEnabled) {
+      const vol = src.userData && src.userData.rtVolumeAlbedo;
+      if (vol && vol.texture) {
+        u.uHasVolume.value = true;
+        u.uVolumeTex.value = vol.texture;
+        u.uVolumeOrigin.value.copy(vol.origin ?? { x: 0, y: 0, z: 0 });
+        const s = vol.size ?? { x: 1, y: 1, z: 1 };
+        u.uVolumeSize.value.set(s.x || 1, s.y || 1, s.z || 1);
+      } else {
+        u.uHasVolume.value = false;
+        u.uVolumeTex.value = this._dummyVolume();
+      }
+    }
     u.uNormalMatrixWorld.value.getNormalMatrix(mesh.matrixWorld);
     material.side = src.side ?? THREE.FrontSide;
   }
@@ -377,5 +469,6 @@ export class GBufferPass {
 
   dispose() {
     for (const t of this._targets) t.dispose();
+    if (this._dummyVolumeTex) this._dummyVolumeTex.dispose();
   }
 }

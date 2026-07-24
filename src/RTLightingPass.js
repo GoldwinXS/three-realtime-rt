@@ -193,6 +193,27 @@ void fetchMaterial(float matIndex, out vec3 albedo, out float roughness,
   metalness = t1.a;
 }
 
+// World-space 3D-texture albedo ("volumetric surface albedo") for the traced
+// SECONDARY rays (GI bounces + reflection/refraction), so global illumination and
+// mirror views carry the same field colours the primary G-buffer shows. Compiled
+// in ONLY behind RT_VOLUME_ALBEDO: this megakernel already sits at the WebGL2
+// 16-sampler minimum, so the extra sampler3D is added exclusively when a scene
+// registers a volume AND the GPU exposes >= 17 fragment texture units (the
+// RealtimeRaytracer gates both conditions). Absent, the shader is textually
+// identical to the pre-feature megakernel — same 16 samplers, same program. v1 is
+// single-volume: one texture + one material index; a hit on that material samples
+// the field, every other hit reads its flat table albedo unchanged.
+#ifdef RT_VOLUME_ALBEDO
+uniform highp sampler3D uVolumeTex;
+uniform vec3 uVolumeOrigin;
+uniform vec3 uVolumeSize;
+uniform int uVolumeMatIndex;
+vec3 sampleVolumeAlbedo(vec3 p) {
+  vec3 uvw = clamp((p - uVolumeOrigin) / uVolumeSize, 0.0, 1.0);
+  return texture(uVolumeTex, uvw).rgb;
+}
+#endif
+
 // ---------- PBR specular (Cook-Torrance GGX) ----------
 // A separate specular radiance is accumulated for the primary surface's DIRECT
 // lighting alongside the demodulated diffuse irradiance. Because CompositePass
@@ -495,6 +516,12 @@ vec3 traceRadiance(vec3 ro, vec3 rd, bool specular) {
   vec3 hN = normalize(attr.xyz);
   if (dot(hN, rd) > 0.0) hN = -hN;
   vec3 hP = ro + rd * dist;
+  // Volumetric surface albedo: if this hit is the volume material, replace its
+  // flat table albedo with the 3D-texture sample at the world hit point, so GI /
+  // reflection bounces carry the field colours (matches the primary G-buffer).
+#ifdef RT_VOLUME_ALBEDO
+  if (int(round(attr.w)) == uVolumeMatIndex) hAlbedo = sampleVolumeAlbedo(hP);
+#endif
   vec3 Ld = sampleOneAny(hP + hN * uEps, hN);
   vec3 hLe = (!specular && uEmissiveCount > 0) ? vec3(0.0) : hEmissive;
   return hLe + hAlbedo * Ld * (1.0 / PI);
@@ -1001,6 +1028,11 @@ export class RTLightingPass {
       // RealtimeRaytracer._passClass -> coreFailure).
       name: "rt:lighting",
       glslVersion: THREE.GLSL3,
+      // RT_VOLUME_ALBEDO is injected only when a scene uses world-space 3D-texture
+      // albedo AND the GPU has a spare fragment sampler (see setVolumeAlbedo +
+      // RealtimeRaytracer). Absent, this megakernel is textually identical to the
+      // pre-feature build — same 16 samplers, same Metal translation.
+      defines: {},
       vertexShader: fullscreenVert,
       fragmentShader: specMRT
         ? rtLightingFrag
@@ -1054,6 +1086,13 @@ export class RTLightingPass {
         uSkyZenith: { value: new THREE.Color(0.18, 0.34, 0.62) },
         uSkyHorizon: { value: new THREE.Color(0.7, 0.8, 0.9) },
         uSkyIntensity: { value: 1.0 },
+        // World-space 3D-texture albedo (present only in the compiled program when
+        // the RT_VOLUME_ALBEDO define is set; harmless otherwise — three uploads
+        // only uniforms the program actually declares).
+        uVolumeTex: { value: null },
+        uVolumeOrigin: { value: new THREE.Vector3() },
+        uVolumeSize: { value: new THREE.Vector3(1, 1, 1) },
+        uVolumeMatIndex: { value: -1 },
       },
       depthTest: false,
       depthWrite: false,
@@ -1235,6 +1274,36 @@ export class RTLightingPass {
     u.uLightDirCone.value = compiled.lightDirCone;
     u.uLightCount.value = compiled.lightCount;
     u.uEmissiveCount.value = compiled.emissiveTriCount;
+  }
+
+  /**
+   * Enable/disable the world-space 3D-texture albedo path for the traced
+   * SECONDARY rays (GI + reflections). Pass the compiled `volumeAlbedo` descriptor
+   * ({ texture, origin, size, matIndex }) to turn it on, or null to turn it off.
+   * Toggling the RT_VOLUME_ALBEDO define recompiles this megakernel (adds/removes
+   * the single sampler3D), which the caller does at compile time, not per frame.
+   * The caller is responsible for only enabling this when the GPU has a spare
+   * fragment texture unit — this pass is at the 16-sampler minimum, so the 17th
+   * sampler would fail to link on a bare-minimum WebGL2 device.
+   */
+  setVolumeAlbedo(volume) {
+    const wasOn = this.material.defines.RT_VOLUME_ALBEDO !== undefined;
+    const on = !!volume;
+    const u = this.material.uniforms;
+    if (on) {
+      u.uVolumeTex.value = volume.texture;
+      u.uVolumeOrigin.value.copy(volume.origin);
+      u.uVolumeSize.value.copy(volume.size);
+      u.uVolumeMatIndex.value = volume.matIndex;
+    } else {
+      u.uVolumeTex.value = null;
+      u.uVolumeMatIndex.value = -1;
+    }
+    if (on !== wasOn) {
+      if (on) this.material.defines.RT_VOLUME_ALBEDO = "1";
+      else delete this.material.defines.RT_VOLUME_ALBEDO;
+      this.material.needsUpdate = true; // recompile with/without the sampler3D
+    }
   }
 
   /**

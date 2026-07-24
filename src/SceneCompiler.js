@@ -51,6 +51,13 @@ export class CompiledScene {
 
     this.materialsTex = null;
     this.materials = [];
+    // World-space 3D-texture albedo (see collectVolumeAlbedo). null when no
+    // material opted in via userData.rtVolumeAlbedo. v1 is single-volume: the
+    // FIRST opted-in material wins for the traced-bounce path (the lighting
+    // megakernel takes one sampler3D + one material index). Primary visibility
+    // (the G-buffer) can carry any number of distinct volumes; only the traced
+    // secondary rays are limited to one in v1.
+    this.volumeAlbedo = null;
     this.lightPosType = [];
     this.lightColorRadius = [];
     this.lightDirCone = []; // spot direction.xyz + cos(outer angle)
@@ -488,6 +495,65 @@ function emissiveColor(mat) {
   return [mat.emissive.r * i, mat.emissive.g * i, mat.emissive.b * i];
 }
 
+// World-space 3D-texture albedo ("volumetric surface albedo"). A material opts
+// in with `material.userData.rtVolumeAlbedo = { texture, origin, size }`:
+//   texture — a THREE.Data3DTexture, ALREADY colour-mapped to RGB(A); the tracer
+//             samples its .rgb at the hit point (no colormap logic in the library)
+//   origin  — THREE.Vector3, world position of the texel-(0,0,0) corner
+//   size    — THREE.Vector3, world extent of the full volume along each axis
+// The hit point p maps to uvw = clamp((p - origin) / size, 0, 1) and the trilinear
+// sample replaces the material's base albedo. Everything else (roughness, metalness,
+// emissive) composes normally. Returns { matIndex, texture, origin, size, material }
+// for the FIRST opted-in material (v1 single-volume for the traced-bounce path), or
+// null. `materials` is the deduped table, so matIndex is the exact index the BVH
+// per-vertex attribute stores and the lighting pass reads via fetchMaterial().
+function collectVolumeAlbedo(materials) {
+  let found = null;
+  let extra = 0;
+  for (let i = 0; i < materials.length; i++) {
+    const desc = materials[i] && materials[i].userData && materials[i].userData.rtVolumeAlbedo;
+    if (!desc) continue;
+    if (found) { extra++; continue; }
+    const texture = desc.texture;
+    const is3D = texture && (texture.isData3DTexture || texture.isDataArrayTexture ||
+      (texture.image && texture.image.depth > 0));
+    if (!texture || !is3D) {
+      console.warn(
+        "three-realtime-rt: userData.rtVolumeAlbedo.texture must be a THREE.Data3DTexture " +
+        "(RGB[A], pre-colormapped) — ignoring this material's volume albedo."
+      );
+      continue;
+    }
+    const origin = new THREE.Vector3().copy(desc.origin ?? new THREE.Vector3(0, 0, 0));
+    // Guard a zero extent (would divide by zero in the shader) — fall back to 1.
+    const size = new THREE.Vector3().copy(desc.size ?? new THREE.Vector3(1, 1, 1));
+    if (size.x === 0) size.x = 1;
+    if (size.y === 0) size.y = 1;
+    if (size.z === 0) size.z = 1;
+    // Trilinear + clamp-to-edge is what "sample the field on the surface" means;
+    // set it here so callers don't have to remember (the shader also clamps uvw,
+    // so wrapping only matters for the edge texel's interpolation). We only touch
+    // filtering/wrapping, never the caller's data or colour space.
+    let changed = false;
+    if (texture.magFilter !== THREE.LinearFilter) { texture.magFilter = THREE.LinearFilter; changed = true; }
+    if (texture.minFilter !== THREE.LinearFilter) { texture.minFilter = THREE.LinearFilter; changed = true; }
+    if (texture.wrapS !== THREE.ClampToEdgeWrapping) { texture.wrapS = THREE.ClampToEdgeWrapping; changed = true; }
+    if (texture.wrapT !== THREE.ClampToEdgeWrapping) { texture.wrapT = THREE.ClampToEdgeWrapping; changed = true; }
+    if (texture.wrapR !== THREE.ClampToEdgeWrapping) { texture.wrapR = THREE.ClampToEdgeWrapping; changed = true; }
+    if (changed) texture.needsUpdate = true;
+    found = { matIndex: i, texture, origin, size, material: materials[i] };
+  }
+  if (extra > 0) {
+    console.warn(
+      `three-realtime-rt: ${extra + 1} materials set userData.rtVolumeAlbedo, but v1 samples ` +
+      `only ONE volume in the traced-bounce (GI/reflection) path — keeping the first. The other ` +
+      `volumes still render correctly in primary visibility (the G-buffer); multi-volume bounces ` +
+      `are future work.`
+    );
+  }
+  return found;
+}
+
 // Row 0: materials, 2 texels each (albedo+rough, emissive+metal).
 // Row 1: emissive triangles for NEE, 4 texels each:
 //   [v0.xyz | area] [e1.xyz | emit.r] [e2.xyz | emit.g] [n.xyz | emit.b]
@@ -796,6 +862,10 @@ export function compileScene(scene, options = {}) {
   }
   compiled.hasDynamicEmissive = compiled._dynamicEmissive.length > 0;
   compiled.materialsTex = buildSceneDataTexture(materials, emissiveTris);
+  // World-space 3D-texture albedo opt-in (userData.rtVolumeAlbedo). Resolved from
+  // the deduped material table so the recorded matIndex matches what the BVH
+  // per-vertex attribute stores and the lighting pass reads.
+  compiled.volumeAlbedo = collectVolumeAlbedo(materials);
   syncLights(scene, compiled);
 
   // Static merged geometry is owned by its BVH (disposed with it); dynamic

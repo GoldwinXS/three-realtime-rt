@@ -317,6 +317,71 @@ allocation, plus the usual O(dynamic tris) BVH refit and normal upload. Budget
 ≈ 1.7k source verts and skins in ≈ 0.3 ms. As with any dynamic mesh, keep the
 skinned tris low and there is no static-world cost.
 
+## Volumetric surface albedo (world-space 3D-texture colour)
+
+Colour a surface by a **world-space 3D texture** sampled at the ray hit point,
+instead of a flat colour or a 2D UV map. This is how you paint a **volumetric data
+field** — stress, temperature, density, a distance field — onto a mesh in a path
+tracer, where a custom fragment shader can't run. Opt a material in through
+`userData`, and the tracer samples your (already colour-mapped) `Data3DTexture` for
+that surface's albedo in **both** primary visibility (the G-buffer, so the
+raster/hybrid view agrees) **and** the traced GI / reflection bounces (so the
+field's colours bleed correctly through global illumination):
+
+```js
+import * as THREE from "three";
+
+// An RGB(A) 3D texture you have ALREADY colour-mapped (the tracer samples .rgb —
+// it contains no colormap logic). RGBA8 is fine; no float-filtering required.
+const field = new THREE.Data3DTexture(rgbaBytes, N, N, N); // your data
+field.format = THREE.RGBAFormat;
+field.type = THREE.UnsignedByteType;
+field.needsUpdate = true;
+
+// Map the volume into world space: origin = world position of the texel-(0,0,0)
+// corner, size = the world extent of the whole volume. A mesh's world AABB is the
+// natural choice, so the field fills the mesh.
+mesh.updateMatrixWorld(true);
+const box = new THREE.Box3().setFromObject(mesh);
+mesh.material.userData.rtVolumeAlbedo = {
+  texture: field,
+  origin: box.min.clone(),
+  size:   box.getSize(new THREE.Vector3()),
+};
+
+rt.compileScene(scene);   // detects the opt-in; recompile after adding/changing it
+```
+
+At the hit point `p`, the tracer computes `uvw = clamp((p - origin) / size, 0, 1)`
+and samples the texture **trilinearly** (it sets `LinearFilter` + `ClampToEdge` on
+your texture at compile time). The sampled RGB **replaces the base albedo**;
+`roughness`, `metalness` and `emissive` still compose normally. Updating the
+texture **data** later (an animated field) needs only `texture.needsUpdate = true`
+— no recompile; changing which material carries the field, or its `origin` / `size`,
+needs a `compileScene()`.
+
+**Demo:** [`volumetric-albedo.html`](volumetric-albedo.html) — a torus knot coloured
+by a procedural 3D noise field (turbo colormap) under an emissive area light, with
+the field's colours bleeding onto white walls through GI.
+
+**v1 is single-volume for the traced-bounce path.** Any number of materials may
+carry distinct volumes and each renders correctly in **primary visibility**; the
+GI / reflection **bounce** samples only the first registered volume. The reason is
+the sampler budget: the lighting megakernel already binds the WebGL2-guaranteed
+minimum of **16** fragment samplers, and this feature's bounce path adds one
+`sampler3D` (the 17th). It is compiled in only when a scene uses the feature **and**
+the GPU exposes ≥ 17 fragment texture units (`MAX_TEXTURE_IMAGE_UNITS` — most
+desktop GPUs report 32). On a bare-minimum 16-unit device the bounces fall back to
+the material's flat base colour (a one-time `console.info`), while primary
+visibility still shows the full field. The whole feature is behind a compile-time
+`RT_VOLUME_ALBEDO` define that is **off unless a volume material is registered**, so
+scenes that don't use it compile byte-identical shaders. Multi-volume bounces are
+future work — the `userData` API doesn't preclude them. One more edge: the
+**experimental** `restirGI` path (off by default) resolves the indirect bounce in
+its own kernel and does **not** yet sample the volume — a volume surface's
+*indirect* contribution falls back to its flat colour while `restirGI` is on (the
+default inline-GI path carries the field correctly).
+
 ## Live lighting & sky
 
 Lights can be toggled, moved, and recoloured every frame without recompiling:
@@ -378,6 +443,7 @@ material of a group* row).
 | `normalMap` | ✅ | Perturbs the shading normal via a screen-space cotangent frame (no tangent attribute needed); respects `material.normalScale`. |
 | `clearcoat`, `sheen`, `iridescence` | ❌ | Per-pixel lobe parameters have **no remaining G-buffer channel** — the 4-MRT WebGL2 guarantee is fully packed (see the `GBufferPass` layout comment), so these stay unmodelled rather than risk corrupting the packing; revisit if a WebGPU backend lands. |
 | vertex colors | ✅ | Geometry `color` attribute (3- or 4-component; `.rgb` used) multiplies into G-buffer albedo, gated so meshes without one render byte-identically. **Caveat:** secondary GI/reflection rays see the flat `material.color` (same as texture maps). |
+| `userData.rtVolumeAlbedo` | ✅ | **World-space 3D-texture albedo** — sample a colour-mapped `Data3DTexture` at the world hit point for the surface's albedo, in primary visibility **and** GI/reflection bounces. For volumetric data fields (stress/temperature/density) on a surface. See *[Volumetric surface albedo](#volumetric-surface-albedo-world-space-3d-texture-colour)*. Single volume in the bounce path in v1 (needs a 17th fragment sampler; primary visibility is unlimited). |
 | per-material `ior` | ✅ | `MeshPhysicalMaterial.ior` refracts per material, encoded in the packed material word for fully-transmissive glass. Supported range **[1.0, 1.98]** (values clamp; the tight ceiling keeps the packed word clear of the alpha-blend boundary). `rt.ior` is the global fallback (partial-transmission glass + the default); **`material.ior` wins when present**. |
 | 2nd+ material of a group | ✅ | Each group material of a multi-material mesh (`mesh.material` array + `geometry.groups`) is registered separately in the G-buffer **and** the BVH, with per-vertex material indices; emissive group materials also join the NEE area-light list. **Limits:** opaque groups only (a transparent group throws — split it out); not supported on CPU-deforming (`rtDeforming`) meshes (throws). |
 

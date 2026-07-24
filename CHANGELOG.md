@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+- **World-space 3D-texture albedo (`userData.rtVolumeAlbedo`) — "volumetric
+  surface albedo".** A material can now be coloured by a **3D texture sampled at
+  the world-space ray hit point** instead of a flat colour or a 2D UV map — the
+  path-tracer-native way to paint a **volumetric data field** (stress,
+  temperature, density, a distance field) onto a surface, where a custom fragment
+  shader can't run. Opt in with
+  `material.userData.rtVolumeAlbedo = { texture, origin, size }` (an
+  already-colour-mapped `THREE.Data3DTexture` plus a world→texture transform:
+  `origin` = world position of the texel-(0,0,0) corner, `size` = the volume's
+  world extent). At the hit point `p` the tracer computes
+  `uvw = clamp((p - origin) / size, 0, 1)` and samples the texture **trilinearly**
+  (Linear + ClampToEdge are set on the texture at compile time), and the sampled
+  RGB **replaces the base albedo** — `roughness` / `metalness` / `emissive` still
+  compose normally. The substitution runs in **both** the G-buffer (primary
+  visibility, so raster/hybrid views agree) **and** the traced GI / reflection
+  bounces (so the field's colours bleed correctly through global illumination).
+  The library samples `.rgb` directly and contains **no colormap logic** — the
+  caller supplies the colours. RGBA8 works (no float-texture filtering required).
+  Updating the texture *data* (an animated field) needs only
+  `texture.needsUpdate = true`; changing which material carries it, or its
+  `origin` / `size`, needs a `compileScene()`.
+  - **Off-by-default, byte-identical when unused.** The entire GLSL is behind a
+    compile-time `RT_VOLUME_ALBEDO` define, injected only when a scene registers a
+    volume material. Scenes that don't use the feature compile the **exact same**
+    G-buffer and lighting programs as before (no extra sampler, no extra branch);
+    the render self-test's gallery scene is unchanged (`meanLum ≈ 139.8`,
+    `rtPrograms = 15`, `statusOk`).
+  - **Single-volume in the bounce path (v1); unlimited in primary visibility.**
+    The lighting megakernel already binds the WebGL2-guaranteed minimum of **16**
+    fragment samplers, so the bounce path's `sampler3D` (the 17th) is compiled in
+    only when the GPU exposes ≥ 17 fragment texture units (`MAX_TEXTURE_IMAGE_UNITS`
+    — most desktop GPUs report 32). On a 16-unit device the GI/reflection bounce
+    falls back to the material's flat base colour (one-time `console.info`) while
+    the G-buffer still shows the full field. The G-buffer path is per-mesh, so
+    **distinct volumes each render correctly in primary visibility**; only the
+    traced bounce is limited to the first volume. Multi-volume bounces are future
+    work — the `userData` API doesn't preclude them.
+  - **New demo page** [`volumetric-albedo.html`](volumetric-albedo.html): a torus
+    knot coloured by a procedural 3D noise field (turbo colormap) under an emissive
+    area light, its colours bleeding onto white walls through GI. Wired into the
+    vite build inputs and `npm run deploy`.
+  - Typed in `src/index.d.ts` (`VolumeAlbedo` interface + `CompiledScene.volumeAlbedo`).
+
 ## 0.6.1 — 2026-07-23
 
 - **Compile-failure status + graceful degradation (`rt.compileError` /
