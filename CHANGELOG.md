@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — 2026-07-25
 
 *(0.7.0 candidate. Also carries the volumetric-albedo entry further down, which
 landed on master unreleased.)*
