@@ -138,7 +138,9 @@ A checklist for dropping the tracer into a scene you already have:
    scene with **no meshes yet** is a **no-op** (it warns once and keeps any
    previously compiled scene), so "construct the tracer, then add meshes" is a
    valid order — until meshes are added and recompiled, `rt.render()` falls back
-   to plain rasterization (no crash, no black screen).
+   to plain rasterization (no crash, no black screen). Call it **explicitly**: if
+   `render()` finds no compiled scene it compiles one itself, with *no options*,
+   so everything is static (it warns once — `implicit-compile`).
 3. **Declare movers** — pass moving meshes to
    `rt.compileScene(scene, { dynamicMeshes: [...] })`, then call
    `rt.updateDynamic()` each frame after you move them (e.g. after a physics
@@ -437,15 +439,16 @@ material of a group* row).
 | `transmission` (Physical) | ✅ | Glass: Fresnel reflection (with analytic-light glints) + two-interface refraction. |
 | `transparent` + `opacity` | ✅ | Alpha blend: the surface is composited over the geometry behind it (a straight-through traced ray), weighted by scalar `opacity` and **tinted by `color`/`map`**. The behind-radiance rides the **specular buffer** and the opacity blend happens at **composite** (where the pane's albedo lives), so **needs `specular: true`** — with the specular buffer off, blend surfaces degrade to opaque. Single layer — nearest transparent surface wins, overlapping panes don't inter-sort. Kept out of the BVH, so it casts no shadow. Toggle with `transparency`. |
 | `opacity` on an opaque material | ❌ | Only read when `transparent: true`; an opaque material always writes at full coverage. |
+| `alphaMap` | ❌ | There is **no per-pixel opacity route**: opacity is a **scalar per material**, packed into the material word the lighting pass reads. An `alphaMap` is ignored — a mesh carrying one blends at its uniform `opacity` (see the `transparent` + `opacity` row, the supported path), so a partly-cut-out texture reads as an evenly translucent surface. For hard cut-outs use `alphaTest` (`transparent: false`), which occludes as full triangles. |
 | **dielectric specular** | ✅ | Cook-Torrance **GGX** direct highlights for *every* surface, in a separate white (`F0 ≈ 0.04`) specular buffer the composite adds without the albedo multiply. Toggle with `specular` (default on). |
 | `roughnessMap` | ✅ | `roughness × roughnessMap.g` (three.js convention) — sampled in the G-buffer. |
 | `metalnessMap` | ✅ | `metalness × metalnessMap.b` (a packed ORM texture works — G = roughness, B = metalness). |
 | `normalMap` | ✅ | Perturbs the shading normal via a screen-space cotangent frame (no tangent attribute needed); respects `material.normalScale`. |
 | `clearcoat`, `sheen`, `iridescence` | ❌ | Per-pixel lobe parameters have **no remaining G-buffer channel** — the 4-MRT WebGL2 guarantee is fully packed (see the `GBufferPass` layout comment), so these stay unmodelled rather than risk corrupting the packing; revisit if a WebGPU backend lands. |
 | vertex colors | ✅ | Geometry `color` attribute (3- or 4-component; `.rgb` used) multiplies into G-buffer albedo, gated so meshes without one render byte-identically. **Caveat:** secondary GI/reflection rays see the flat `material.color` (same as texture maps). |
-| `userData.rtVolumeAlbedo` | ✅ | **World-space 3D-texture albedo** — sample a colour-mapped `Data3DTexture` at the world hit point for the surface's albedo, in primary visibility **and** GI/reflection bounces. For volumetric data fields (stress/temperature/density) on a surface. See *[Volumetric surface albedo](#volumetric-surface-albedo-world-space-3d-texture-colour)*. Single volume in the bounce path in v1 (needs a 17th fragment sampler; primary visibility is unlimited). |
+| `userData.rtVolumeAlbedo` *(since 0.7.0)* | ✅ | **World-space 3D-texture albedo** — sample a colour-mapped `Data3DTexture` at the world hit point for the surface's albedo, in primary visibility **and** GI/reflection bounces. For volumetric data fields (stress/temperature/density) on a surface. See *[Volumetric surface albedo](#volumetric-surface-albedo-world-space-3d-texture-colour)*. Single volume in the bounce path in v1 (needs a 17th fragment sampler; primary visibility is unlimited). |
 | per-material `ior` | ✅ | `MeshPhysicalMaterial.ior` refracts per material, encoded in the packed material word for fully-transmissive glass. Supported range **[1.0, 1.98]** (values clamp; the tight ceiling keeps the packed word clear of the alpha-blend boundary). `rt.ior` is the global fallback (partial-transmission glass + the default); **`material.ior` wins when present**. |
-| 2nd+ material of a group | ✅ | Each group material of a multi-material mesh (`mesh.material` array + `geometry.groups`) is registered separately in the G-buffer **and** the BVH, with per-vertex material indices; emissive group materials also join the NEE area-light list. **Limits:** opaque groups only (a transparent group throws — split it out); not supported on CPU-deforming (`rtDeforming`) meshes (throws). |
+| 2nd+ material of a group | ✅ | Each group material of a multi-material mesh (`mesh.material` array + `geometry.groups`) is registered separately in the G-buffer **and** the BVH, with per-vertex material indices; emissive group materials also join the NEE area-light list. **Limits:** opaque groups only (a transparent group throws — split it out); not supported on a mesh that is **both** listed in `dynamicMeshes` **and** flagged `userData.rtDeforming` — that combination is what the per-frame live-geometry rebake can't express, and it throws. (`rtDeforming` *without* `dynamicMeshes` membership is inert: the flag is ignored, the mesh compiles static, and the library warns — see *[Supported object types](#supported-object-types)*.) |
 
 ### Lights
 
@@ -471,10 +474,26 @@ material of a group* row).
 - **Moving** a dynamic emitter → `rt.updateDynamic()` refreshes its area-light rows + CDF from the new geometry. But an emitter's **emission itself** (its `emissive` colour / `emissiveIntensity`, or the map's average) is frozen at compile time: **changing what it emits — static or dynamic — needs `rt.compileScene(...)` again** (`updateDynamic`/`updateLights` do not rescan emissive meshes). A dynamic emitter that never moves also needs a recompile to reflect an emission change.
 - Emissive area lights are capped at **256 triangles** (shared across static + dynamic; largest by compile-time area kept, with a console warning) — prefer low-poly emitter meshes, especially dynamic ones.
 
+### Supported object types
+
+What kind of `Object3D` the tracer can actually see. Anything it cannot trace is
+also excluded from the rasterized G-buffer, so the traced frame stays consistent
+with what the lighting was computed against — and the library **warns once**,
+naming the object (see *[Diagnostics](#diagnostics-statuswarnings)*).
+
+| Object | Supported | Notes |
+|--------|-----------|-------|
+| `Mesh` | ✅ | The normal case: merged into the static BVH, or into the per-frame dynamic BVH when listed in `dynamicMeshes`. |
+| `SkinnedMesh` | ✅ | Auto-detected (no flag). **CPU-skinned** into the dynamic BVH every frame from its live skeleton pose — list it in `dynamicMeshes`. See *[Skinned meshes](#skinned-meshes-animated-characters)*. |
+| `InstancedMesh` | ❌ | **Instancing is not supported.** The per-instance matrices are a GPU attribute the compiler never reads, so it **collapses to a single instance** in the traced output *and* in the G-buffer. Warns (`instanced-mesh`). Expand it to individual meshes, or exclude it with `userData.rtExclude`. |
+| `Sprite` / `Line` / `LineSegments` / `Points` | — | Not traceable geometry, and their materials write a single `gl_FragColor`, which cannot feed the 4-attachment G-buffer. They are **automatically hidden for the traced frame** (and restored right after), so they simply do not appear. Warns (`untraceable-object`). Draw them yourself in an **overlay pass on top of `rt.render()`**, or set `userData.rtExclude` on them to silence the warning. |
+| `userData.rtExclude` | ✅ honored | Keeps a mesh out of the BVH entirely — it still rasterizes into the G-buffer and gets lit, it just never occludes or bounces light. Also suppresses the warnings above, so it is the way to say "yes, I meant that". |
+| `Group` / `Object3D` / `Bone` | ✅ | Pure transform nodes; traversed for their mesh children. |
+
 ### Geometry & occlusion
 
 - Every non-excluded visible mesh is **merged into one static BVH at compile time**. Add / remove geometry → recompile.
-- Meshes that move must be declared via `dynamicMeshes` and driven with `updateDynamic()`. Anything not declared is treated as static — moving it on screen won't move its traced shadow.
+- Meshes that move must be declared via `dynamicMeshes` and driven with `updateDynamic()`. Anything not declared is treated as static — moving it on screen won't move its traced shadow. The library **detects this and warns** (`stale-transform` / `stale-geometry`); see *[Diagnostics](#diagnostics-statuswarnings)*.
 - **Transparent materials never occlude** (by design — a glass case shouldn't cast an opaque shadow). They still rasterize normally.
 - **`alphaTest` cut-outs** (`transparent: false`) *do* occlude — but as **full triangles**, not per-texel, so their shadows are blocky.
 - `mesh.userData.rtExclude = true` removes a mesh from the BVH entirely (it still rasterizes and gets lit) — handy for water / translucent surfaces.
@@ -486,6 +505,10 @@ material of a group* row).
 - **Refraction** is two-interface (front + back). IOR is **per material** (`MeshPhysicalMaterial.ior`, encoded in the G-buffer for fully-transmissive glass, range [1.0, 1.98]); `rt.ior` is the global fallback. Optional **chromatic dispersion** (`rt.dispersion`, off by default) splits the refracted term into a spectrum by stochastic spectral sampling (one channel per glass pixel per frame, blended by temporal accumulation — no extra rays); it is a **global** control, not yet per-material.
 - **Volumetric** is **single-scatter** god rays, not multiple-scattering fog.
 - **Transparency** is a **single-layer deferred blend**: a `transparent` surface writes as the nearest layer of the G-buffer and the lighting pass composites it over the geometry behind by tracing one straight-through ray. The behind-radiance is fully lit (direct + 1-bounce GI) and tinted by the pane's albedo. Overlapping transparent surfaces do **not** inter-sort (only the nearest is kept), and there is no per-pixel back-to-front over-blend of many layers as in raster three.js. Turn it off with `transparency: false` (blend surfaces then render fully opaque).
+  - **What's behind the glass is a genuinely traced ray**, not a re-sorted draw of the same rasterized surfaces — so it is *stronger* than sorted transparency in the one way that matters: the surface seen through the pane is shaded with real traced direct light and GI at its own hit point, including things outside the frustum and things the raster pass never drew.
+  - **Only BVH geometry shows through.** The blend ray hits the compiled scene, so anything kept out of the BVH is invisible behind glass — including *other transparent surfaces* (they are never occluders). The nearest transparent surface wins, so an **intermediate translucent layer disappears the moment another transparent surface covers it**: two panes in a row read as one.
+  - **Behind-radiance bypasses the firefly / irradiance clamps.** It is composited as radiance rather than filtered demodulated irradiance, so a bright emitter **seen through glass reads hotter than the same emitter viewed directly** (which the clamps tame). That is a known asymmetry, not a bug in your scene — dim the emitter or thicken the pane's `opacity` if it bothers you.
+- **Transparent meshes are never dynamic.** They are dropped before the dynamic registration, so listing one in `dynamicMeshes` does nothing at all (the library warns: `transparent-dynamic`).
 
 ### Platform
 
@@ -500,6 +523,9 @@ material of a group* row).
 | `renderScale` | `0.5` | Lighting resolution vs. the G-buffer. `1.0` = max quality. |
 | `overscan` | `0` | Render past the canvas edges and crop the centre back, so leading-edge disocclusion noise during camera motion is born off-screen. Padding fraction per edge (0–0.25); `0.1` costs 1.44× the pixels. See *Edge convergence and overscan*. |
 | `adaptiveQuality` | `true` | Governor that steers `renderScale` / `denoiseIterations` / `stochasticLights` toward `targetFps` — scales **up** on strong hardware, **down** on weak. Turn off for manual control. |
+| `targetFps` | `55` | Frame rate the governor steers toward. |
+| `canvasScaleHook` | `null` | Callback `(scale) => void` letting the governor drive your **canvas scale** — its deepest, most valuable lever. See *[canvasScaleHook](#canvasscalehook-the-governors-deepest-lever)*. |
+| `taaJitterScale` | `1` | Scales the sub-pixel TAA jitter. Set it to your current canvas scale when you CSS-stretch a reduced drawing buffer, so the jitter stays constant in *screen* pixels instead of wobbling. |
 | `denoiseIterations` | `2` | À-trous denoise passes; the governor raises this as it lowers resolution. |
 | `taa` | `true` | Temporal anti-aliasing (jitter + neighbourhood clamp). |
 | `denoise` | `true` | Edge-aware à-trous denoiser. |
@@ -617,6 +643,79 @@ starting point or take manual control:
   pixel per frame instead of one per light — the biggest ray-count lever for
   many-light scenes and mobile GPUs.
 
+### canvasScaleHook (the governor's deepest lever)
+
+`renderScale` only shrinks the *lighting* buffer. **Canvas scale** shrinks the
+whole drawing buffer, so every pass — the raster G-buffer, lighting, denoise,
+TAA, resolve — gets quadratically cheaper. That makes it the strongest lever the
+governor has, and the one it reaches for **first when recovering** quality and
+**last when cutting** it (once `renderScale` has bottomed out at `0.2`).
+
+The canvas belongs to your app, not the library, so the governor cannot resize it
+itself: it calls **`canvasScaleHook(scale)`** with the next value from
+`RealtimeRaytracer.CANVAS_LEVELS` (`[1, 0.85, 0.75, 0.62, 0.5]`) and leaves the
+implementation to you. The pattern is: render a **reduced drawing buffer**, then
+**CSS-stretch** the canvas back to full size.
+
+```js
+let canvasScale = 1;
+
+const applyCanvasSize = () => {
+  // CSS size stays the full layout size; the BUFFER shrinks.
+  renderer.domElement.style.width = `${innerWidth}px`;
+  renderer.domElement.style.height = `${innerHeight}px`;
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2) * canvasScale);
+  renderer.setSize(innerWidth, innerHeight, false);
+};
+
+const setCanvasScale = (s) => {
+  canvasScale = s;
+  applyCanvasSize();
+  rt.setSize(...renderer.getDrawingBufferSize(new THREE.Vector2()).toArray());
+  // Keep the TAA jitter constant in SCREEN pixels: at a reduced canvas scale the
+  // CSS stretch magnifies buffer-pixel jitter into visible wobble.
+  rt.taaJitterScale = s;
+};
+```
+
+Two rules: call `rt.setSize(...)` with **drawing-buffer pixels** after the resize,
+and set **`rt.taaJitterScale = s`**. Skipping the second is the usual cause of
+"the image shimmers once auto-quality kicks in". The hook is optional — without
+it the governor simply never uses the canvas lever. Live examples:
+[`examples/main.js`](examples/main.js) and [`examples/gallery.js`](examples/gallery.js).
+
+### Recommended integration
+
+Tier detection for the starting point, the governor for everything after, and the
+canvas hook so the governor has its deepest lever:
+
+```js
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setSize(innerWidth, innerHeight);
+
+const tier = RealtimeRaytracer.detectTier(renderer);   // "none" | "mid" | "high"
+const rt = new RealtimeRaytracer(renderer, {
+  ...RealtimeRaytracer.recommendedOptions(tier),       // sensible start for the GPU
+  adaptiveQuality: true,                               // (already the default)
+  targetFps: 55,
+  canvasScaleHook: (s) => setCanvasScale(s),           // see above
+});
+
+rt.compileScene(scene, { dynamicMeshes: movers });     // explicit — see Diagnostics
+
+function frame() {
+  requestAnimationFrame(frame);
+  rt.updateDynamic();                 // only on frames where something moved
+  rt.render(scene, camera);
+}
+frame();
+```
+
+`detectTier` picks *where you start*; `adaptiveQuality` decides *where you end up*
+on the machine that actually loaded the page; `canvasScaleHook` widens the range
+it can move through. On a device too slow to trace at all, `rt.supported` is
+`false` and `rt.render()` is a plain `renderer.render()` — no branch needed.
+
 WebGPU: not used as a backend (this is a WebGL2 library); a WGSL compute
 backend is on the roadmap.
 
@@ -675,6 +774,75 @@ JSON line to the console every 2s for automated scraping. The overscan control
 is **feature-detected** — it appears only when the loaded build exposes an
 `overscan` property.
 
+## Diagnostics (`status.warnings`)
+
+*Since 0.7.0.* Most integration mistakes in a hybrid tracer are **silent**: the
+image still renders, nothing throws, and the lighting is quietly computed against
+a scene that is not the one on screen. So the library detects the common ones at
+compile time (and on a cheap periodic scan while rendering), prints **one**
+`console.warn` naming the object and the exact fix, and records the same thing on
+`rt.status.warnings`:
+
+```js
+rt.render(scene, camera);
+for (const w of rt.status.warnings) {
+  console.log(w.code, w.message); // e.g. "stale-transform", "three-realtime-rt: ..."
+}
+```
+
+`rt.status.warnings` is `{ code, message }[]`, deduplicated, and **never affects
+`status.ok`** — these are scene-setup diagnostics, not pipeline failures (for
+those see [`compileError` / `status.coreFailure`](#render-self-test)).
+
+| Code | Fires when | Consequence |
+|------|------------|-------------|
+| `stale-geometry` | A **static** mesh's `position` buffer changed after `compileScene()`. | Traced lighting still uses the ORIGINAL shape. |
+| `stale-transform` | A **static** mesh was moved after `compileScene()`. | Traced lighting still uses the ORIGINAL transform — its shadow stays behind. |
+| `rtdeforming-not-dynamic` | `userData.rtDeforming` is set on a mesh that is **not** in `dynamicMeshes`. | The flag is ignored; the mesh compiles static. |
+| `implicit-compile` | `render()` had to compile the scene itself. | Compiled with **no options** — everything is static. |
+| `untraceable-object` | A visible `Sprite` / `Line` / `Points`. | Auto-hidden from the traced frame; render it in your own overlay pass. |
+| `instanced-mesh` | An `InstancedMesh`. | Collapses to a single instance. |
+| `transparent-dynamic` | A `transparent` mesh listed in `dynamicMeshes`. | That entry does nothing. |
+
+The stale scan runs **every 30th frame**, compares one integer and one matrix per
+static mesh, stops checking a mesh once it has reported, and caps at 8 reports —
+so it costs effectively nothing in a correct scene. Set `userData.rtExclude` on
+an object to say "this is intentional" and silence its warning.
+
+### Troubleshooting
+
+**"Black patches", "the shadow doesn't move", "rays still hit the original
+shape".** All three are the same bug: a **stale BVH**. The tracer bakes geometry
+into a BVH at `compileScene()` time. Move a mesh (or edit its vertices) after
+that without declaring it, and the rasterized image shows the new pose while the
+traced lighting still shadows, bounces and reflects off the **old** one — which
+reads as a shadow left behind, a reflection of something that isn't there, or a
+dark patch where the invisible old geometry still occludes.
+
+The fixes, in order of how much you are asking for:
+
+| Your object… | Do this |
+|--------------|---------|
+| never moves after setup | nothing — but call `compileScene(scene)` again after you add/remove/replace geometry. |
+| moves rigidly every frame | `compileScene(scene, { dynamicMeshes: [mesh] })`, then `rt.updateDynamic()` each frame. |
+| has **vertices** that move on the CPU (water, cloth, morphs) | the above **plus** `mesh.userData.rtDeforming = true`, and keep its `normal` attribute current. See *[Deforming meshes](#deforming-meshes-water-cloth)*. |
+| is an animated character | list its `SkinnedMesh` in `dynamicMeshes` — skinning is auto-detected. See *[Skinned meshes](#skinned-meshes-animated-characters)*. |
+| changed structurally (mesh added/removed, material swapped, emission changed) | `compileScene()` again. |
+
+You should not have to guess which one you hit: the `stale-geometry` /
+`stale-transform` / `rtdeforming-not-dynamic` warnings above name the mesh and
+the fix in the console. If a mesh is *deliberately* left out of the BVH, set
+`userData.rtExclude = true`.
+
+**"Nothing I do to `dynamicMeshes` has any effect."** Check for
+`implicit-compile` in the console: if the first `rt.render()` ran before any
+`compileScene()` call, the scene was compiled implicitly **with no options** and
+every mesh is static. Call `compileScene(scene, options)` yourself first.
+
+**"My HUD sprite / debug lines disappeared."** They are not traceable geometry
+and cannot write the G-buffer, so they are hidden for the traced frame
+(`untraceable-object`). Draw them in your own pass on top of `rt.render()`.
+
 ## Render self-test
 
 The renderer can pass every compile and framebuffer check and still draw a black
@@ -702,7 +870,7 @@ if (!rt.status.ok) {
 
 - **`rt.compileError`** (`string | null`) — first / most-severe failure summary
   (`"rt:<pass>: <driver log>"`), or `null` while every pass compiles clean.
-- **`rt.status`** (`{ ok, disabled, coreFailure }`) — `ok` is `true` on the healthy
+- **`rt.status`** (`{ ok, disabled, coreFailure, warnings }`) — `ok` is `true` on the healthy
   path and `false` once any `rt:*` pass fails to link. **Optional** features whose
   pass failed are **auto-disabled** so the image stays lit (`restir`, `restirGI`,
   `denoise`, `volumetric`, `taa`, `specular`), each listed in `disabled` as
@@ -711,6 +879,13 @@ if (!rt.status.ok) {
   and the image is black-but-diagnosed. This lets an integrator render an honest
   `raster (reason)` fallback instead of guessing. (When `supported` is `false` the
   RT pipeline never runs, so `status.ok` is `false` too — check `supported` first.)
+- **`rt.status.warnings`** (`{ code, message }[]`, **since 0.7.0**) — USAGE
+  diagnostics: a flag being ignored, an object type that cannot be traced, a
+  static mesh edited after `compileScene()`. Separate axis from the three fields
+  above: the pipeline is healthy, the scene setup is not what you probably meant,
+  so **warnings never change `status.ok`**. Full list in
+  *[Diagnostics](#diagnostics-statuswarnings)*. (`compileError` and the base
+  `status` surface are since 0.6.1.)
 
 **In the browser:** load [`/?selftest=1`](examples/selftest.js). It forces the
 full lighting stack on (GI + emissive NEE + reflections + refraction, lighting at
@@ -719,17 +894,22 @@ the drawing buffer back and emits one JSON line to the console (`[selftest] …`
 and into a hidden `#selftest-verdict` DOM node:
 
 ```json
-{ "pass": true, "meanLum": 139.08, "irrLum": 169.73, "glErrors": 0,
+{ "pass": true, "meanLum": 139.80, "irrLum": 170.53, "glErrors": 0,
   "specMRT": true, "supported": true, "statusOk": true, "rtPrograms": 15,
-  "compileError": null, "disabled": [], "frames": 91, "ua": "…" }
+  "compileError": null, "disabled": [], "warnings": 0, "warningCodes": [],
+  "frames": 91, "ua": "…" }
 ```
 
 The pass gate wants `meanLum` in `[12, 230]` (calibrated: a healthy composite of
 the gallery centre reads ~140 on desktop; a black screen reads ~0), `irrLum > 6`,
-`glErrors == 0`, `supported == true`, and `statusOk == true` — the last asserts
-the compile-failure surface above stayed clean (`rt.status.ok`, `compileError`
-null) *and* that the named pass programs were actually discoverable
-(`rtPrograms > 0`), so a broken diagnosis can't read as a false pass.
+`glErrors == 0`, `supported == true`, `statusOk == true`, and `warnings == 0`.
+`statusOk` asserts the compile-failure surface above stayed clean (`rt.status.ok`,
+`compileError` null) *and* that the named pass programs were actually discoverable
+(`rtPrograms > 0`), so a broken diagnosis can't read as a false pass. `warnings`
+is `rt.status.warnings.length`: the demo is the reference integration, so the
+healthy path must raise **none** — a nonzero count means either the demo really
+did something wrong, or a [diagnostic](#diagnostics-statuswarnings) has started
+firing on a correct scene.
 
 - `meanLum` / `irrLum` — mean Rec.709 luma (0–255) of the **centre 25%** of the
   composite, and of the raw irradiance buffer (`outputMode 3`) for one frame. The
@@ -757,8 +937,13 @@ tested a newer three, so **chromium runs twice**: once against the pinned three
 class of regression, and **the pass gate requires both chromium legs**. A fourth
 chromium load of `?selftest=empty` asserts the [empty-scene no-op](#empty-scene)
 (`compileScene` on a scene with no meshes is a no-op and `render()` falls back to
-plain raster instead of crashing). firefox/webkit stay single-leg against the
-default three (both are environmental skips here — see below).
+plain raster instead of crashing), and a fifth,
+[`?selftest=warnings`](#diagnostics-statuswarnings), drives a deliberately
+mis-configured scene and asserts every usage diagnostic fires **exactly once**,
+lands on `status.warnings`, leaves `status.ok` true, and that a visible
+`Sprite`/`Line` costs zero GL errors (it is hidden from the 4-attachment G-buffer
+rather than drawn into it). Both are gating. firefox/webkit stay single-leg
+against the default three (both are environmental skips here — see below).
 
 Machine-specific note (Windows + NVIDIA, the current dev box): each chromium leg
 runs **headed** with **`--use-angle=gl`**. ANGLE's default D3D11/FXC backend

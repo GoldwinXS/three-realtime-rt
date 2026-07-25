@@ -63,6 +63,12 @@ async function main() {
     await runEmptySceneSelftest();
     return;
   }
+  // ?selftest=warnings: the usage-diagnostics check (see runWarningsSelftest).
+  // Also self-contained — it builds a deliberately MIS-configured scene.
+  if (PARAMS.get("selftest") === "warnings") {
+    await runWarningsSelftest();
+    return;
+  }
 
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
   const { scene, camera, bounds, lights, sky, ready, showcase, water, windows, fox } = buildScene();
@@ -624,6 +630,243 @@ async function runEmptySceneSelftest() {
   } catch (err) {
     emit({ pass: false, threw: true, error: (err && err.message) || String(err) });
   } finally {
+    try { if (renderer) renderer.dispose(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Usage-diagnostics regression check (?selftest=warnings).
+ *
+ * The library's silent-mistake diagnostics (rt.status.warnings + one console
+ * warning each) are only worth anything if they FIRE on a wrong scene, fire
+ * EXACTLY ONCE, and stay quiet on a right one (the healthy half of that contract
+ * is asserted by the main ?selftest=1 leg, which requires warnings === 0).
+ *
+ * So this builds a deliberately mis-configured scene — every diagnostic's
+ * trigger, in one place — drives it through the real render loop, and asserts:
+ *
+ *   1. implicit compile (render() with no compileScene() call)   -> warns
+ *   2. userData.rtDeforming on a mesh not in dynamicMeshes       -> warns
+ *   3. an InstancedMesh                                          -> warns
+ *   4. a transparent mesh listed in dynamicMeshes                -> warns
+ *   5. a visible Sprite/Line                                     -> warns, AND
+ *      zero GL errors across the frames it is visible for (it is auto-hidden
+ *      from the 4-attachment G-buffer instead of being drawn into it — the
+ *      GL_INVALID_OPERATION this replaced)
+ *   6. a static mesh whose position buffer is edited after compileScene()
+ *      -> warns once the 30-frame staleness scan comes around
+ *   7. every one of the above fires EXACTLY ONCE across ~100 rendered frames
+ *   8. rt.status.warnings carries the expected codes
+ *   9. rt.status.ok stays TRUE (usage warnings are not pipeline failures)
+ *
+ * Emits its verdict into the same #selftest-verdict node the Playwright driver
+ * reads (scripts/selftest.mjs), tagged `warningsScene:true`.
+ */
+async function runWarningsSelftest() {
+  const emit = (v) => {
+    const line = JSON.stringify({ warningsScene: true, ...v });
+    console.log("[selftest:warnings] " + line);
+    let node = document.getElementById("selftest-verdict");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "selftest-verdict";
+      node.style.cssText =
+        "position:fixed;left:-99999px;top:0;white-space:pre;pointer-events:none;";
+      document.body.appendChild(node);
+    }
+    node.textContent = line;
+    node.setAttribute("data-pass", String(!!v.pass));
+  };
+
+  // Capture console.warn (still forwarding it) so "fired exactly once" is
+  // measurable, not just "the status array has an entry".
+  const seen = [];
+  const origWarn = console.warn.bind(console);
+  console.warn = (...args) => {
+    seen.push(args.map((a) => String(a)).join(" "));
+    origWarn(...args);
+  };
+  // Substring signatures, one per diagnostic. Kept short and specific so a
+  // reworded message still matches on the part that identifies the case.
+  const SIGS = {
+    implicit: "compiled the scene implicitly",
+    deforming: "userData.rtDeforming is set on a mesh",
+    instanced: "InstancedMesh is NOT supported",
+    transparent: "listed in dynamicMeshes does nothing",
+    untraceable: "not traceable geometry",
+    stale: "changed after compileScene()",
+  };
+  const count = (sig) => seen.filter((l) => l.includes(sig)).length;
+
+  let renderer = null;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setSize(128, 128);
+    const gl = renderer.getContext();
+    const rt = new RealtimeRaytracer(renderer, { adaptiveQuality: false });
+    const supported = !!rt.supported;
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, 1, 0.1, 100);
+    camera.position.set(0, 1.5, 5);
+    camera.lookAt(0, 0, 0);
+
+    // (a) a plain static mesh — the one we will edit behind the BVH's back.
+    const staticBox = new THREE.Mesh(
+      new THREE.BoxGeometry(1, 1, 1),
+      new THREE.MeshStandardMaterial({ color: 0x88aaff, roughness: 0.6 })
+    );
+    staticBox.name = "static-box";
+    staticBox.position.set(-1.5, 0, 0);
+    scene.add(staticBox);
+
+    // (b) rtDeforming WITHOUT dynamicMeshes membership — the flag is ignored.
+    const flagged = new THREE.Mesh(
+      new THREE.SphereGeometry(0.5, 16, 12),
+      new THREE.MeshStandardMaterial({ color: 0xffaa44, roughness: 0.5 })
+    );
+    flagged.name = "flagged-not-dynamic";
+    flagged.userData.rtDeforming = true;
+    scene.add(flagged);
+
+    // (c) an InstancedMesh — collapses to one instance.
+    const instanced = new THREE.InstancedMesh(
+      new THREE.BoxGeometry(0.4, 0.4, 0.4),
+      new THREE.MeshStandardMaterial({ color: 0x44ff88 }),
+      4
+    );
+    instanced.name = "instanced-crates";
+    for (let i = 0; i < 4; i++) {
+      instanced.setMatrixAt(i, new THREE.Matrix4().makeTranslation(i * 0.6 - 1, 1.2, 0));
+    }
+    scene.add(instanced);
+
+    // (d) a transparent mesh — later listed in dynamicMeshes, which does nothing.
+    const pane = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: true, opacity: 0.4 })
+    );
+    pane.name = "glass-pane";
+    pane.position.set(1.6, 0, 1);
+    scene.add(pane);
+
+    // (e) untraceable object types, visible, with no rtExclude.
+    const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ color: 0xff4488 }));
+    sprite.name = "hud-sprite";
+    sprite.position.set(0, 2, 0);
+    scene.add(sprite);
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(-2, -1, 0),
+        new THREE.Vector3(2, -1, 0),
+      ]),
+      new THREE.LineBasicMaterial({ color: 0xffffff })
+    );
+    line.name = "debug-line";
+    scene.add(line);
+
+    const light = new THREE.DirectionalLight(0xffffff, 3);
+    light.position.set(2, 4, 3);
+    scene.add(light);
+
+    // --- phase 1: implicit compile + the compile-time diagnostics ------------
+    gl.getError(); // clear any pre-existing flag so the count below is ours
+    let glErrors = 0;
+    for (let i = 0; i < 3; i++) {
+      rt.render(scene, camera);
+      if (gl.getError() !== 0) glErrors++;
+    }
+    const implicitFired = count(SIGS.implicit) === 1;
+    const deformingFired = count(SIGS.deforming) === 1;
+    const instancedFired = count(SIGS.instanced) === 1;
+    const untraceableFired = count(SIGS.untraceable) === 1;
+    // The sprite/line are still in the scene and visible — the G-buffer hid and
+    // restored them, so this must hold:
+    const untraceableStillVisible = sprite.visible === true && line.visible === true;
+    // No dynamicMeshes yet, so this one must NOT have fired.
+    const transparentQuietSoFar = count(SIGS.transparent) === 0;
+
+    // --- phase 2: edit a STATIC mesh, then cross the staleness scan ----------
+    const pos = staticBox.geometry.getAttribute("position");
+    pos.setY(0, pos.getY(0) + 0.5);
+    pos.needsUpdate = true; // bumps attribute.version — what the scan compares
+    // 60+ frames: crosses the 30-frame throttle twice, so a diagnostic that
+    // re-fires per scan (rather than once per mesh) is caught here.
+    for (let i = 0; i < 60; i++) {
+      rt.render(scene, camera);
+      if (gl.getError() !== 0) glErrors++;
+    }
+    const staleFired = count(SIGS.stale) === 1;
+
+    // --- phase 3: an explicit compile that mis-uses dynamicMeshes ------------
+    rt.compileScene(scene, { dynamicMeshes: [pane] });
+    for (let i = 0; i < 35; i++) {
+      rt.render(scene, camera);
+      if (gl.getError() !== 0) glErrors++;
+    }
+    const transparentFired = count(SIGS.transparent) === 1;
+    // Nothing re-fired across the recompile + another ~95 frames.
+    const firedOnce = Object.values(SIGS).every((sig) => count(sig) === 1);
+
+    // --- status surface ------------------------------------------------------
+    const codes = ((rt.status && rt.status.warnings) || []).map((w) => w.code);
+    const expected = [
+      "implicit-compile",
+      "rtdeforming-not-dynamic",
+      "instanced-mesh",
+      "untraceable-object",
+      "transparent-dynamic",
+      "stale-geometry",
+    ];
+    const codesPresent = expected.every((c) => codes.includes(c));
+    // Exactly once in the status array too (deduped by code + message).
+    const codesUnique = expected.every((c) => codes.filter((x) => x === c).length === 1);
+    // Usage warnings must NOT flip the pipeline-health flag.
+    const statusOk = !!(rt.status && rt.status.ok === true) && rt.compileError == null;
+
+    const frames = rt.frame;
+    rt.dispose();
+
+    const pass =
+      supported &&
+      implicitFired &&
+      deformingFired &&
+      instancedFired &&
+      untraceableFired &&
+      untraceableStillVisible &&
+      transparentQuietSoFar &&
+      staleFired &&
+      transparentFired &&
+      firedOnce &&
+      codesPresent &&
+      codesUnique &&
+      statusOk &&
+      glErrors === 0;
+
+    emit({
+      pass,
+      threw: false,
+      supported,
+      implicitFired,
+      deformingFired,
+      instancedFired,
+      untraceableFired,
+      untraceableStillVisible,
+      transparentQuietSoFar,
+      staleFired,
+      transparentFired,
+      firedOnce,
+      codesPresent,
+      codesUnique,
+      statusOk,
+      glErrors,
+      codes,
+      frames,
+    });
+  } catch (err) {
+    emit({ pass: false, threw: true, error: (err && err.message) || String(err) });
+  } finally {
+    console.warn = origWarn;
     try { if (renderer) renderer.dispose(); } catch { /* ignore */ }
   }
 }

@@ -16,6 +16,39 @@ const MAX_LIGHTS = 32; // stage-1 cap; a data-texture light list is future work
 // from the light list with a warning.
 const MAX_EMISSIVE_TRIS = 256;
 
+// ---- usage diagnostics (warn-once) -----------------------------------------
+// Silent "it looks wrong but nothing errored" mistakes are the expensive kind:
+// a flag that is ignored, an object type that never reaches the BVH, a mesh
+// edited after compileScene(). Each one below is detected at compile time and
+// reported ONCE per object (never per frame, never per recompile) with the exact
+// fix. The message text is also pushed onto the CompiledScene as
+// `warnings: [{ code, message }]` so RealtimeRaytracer can mirror it into
+// `status.warnings` for a UI / an automated check.
+//
+// Warn-once state is keyed by the OBJECT (a WeakMap of code sets), so recompiling
+// the same scene does not re-spam the console; the returned `warnings` array is
+// still rebuilt on every compile so the status surface stays complete.
+const _warnedObjects = new WeakMap();
+function _firstTime(obj, code) {
+  let set = _warnedObjects.get(obj);
+  if (!set) { set = new Set(); _warnedObjects.set(obj, set); }
+  if (set.has(code)) return false;
+  set.add(code);
+  return true;
+}
+
+// Human-readable identifier for a scene object in a diagnostic message.
+function describeObject(obj) {
+  if (!obj) return "(null)";
+  return obj.name ? `"${obj.name}"` : `(unnamed ${obj.type || "Object3D"})`;
+}
+
+// Join up to `max` object names for a message that covers a whole category.
+function describeList(objs, max = 4) {
+  const head = objs.slice(0, max).map(describeObject).join(", ");
+  return objs.length > max ? `${head} and ${objs.length - max} more` : head;
+}
+
 /**
  * A two-level BVH scene. Static geometry lives in one BVH uploaded to the GPU
  * ONCE; dynamic (moving) meshes live in a second, small BVH that is re-baked and
@@ -48,6 +81,15 @@ export class CompiledScene {
     // True when any dynamic segment is a SkinnedMesh — CPU-skinned every frame
     // (shape changes each frame, so it forces a per-frame normal upload too).
     this.hasSkinned = false;
+
+    // Usage diagnostics raised while compiling THIS scene: [{ code, message }].
+    // Console output happens once per offending object at collection time;
+    // RealtimeRaytracer mirrors this array into status.warnings.
+    this.warnings = [];
+    // Per-static-mesh fingerprints ({ ref: WeakRef, name, version, matrix,
+    // warned }) used to detect a static mesh edited after compile time. Only the
+    // WeakRef points at the app's mesh, so this never keeps a scene alive.
+    this.staticSources = [];
 
     this.materialsTex = null;
     this.materials = [];
@@ -335,6 +377,8 @@ export class CompiledScene {
     if (this.materialsTex) this.materialsTex.dispose();
     if (this.staticBvh) this.staticBvh.geometry.dispose();
     if (this.dynamicMerged) this.dynamicMerged.dispose();
+    // Drop the staleness fingerprints (WeakRefs + a 16-float matrix each).
+    this.staticSources = [];
   }
 }
 
@@ -716,6 +760,22 @@ export function compileScene(scene, options = {}) {
   let dynVertexOffset = 0;
   const tmpGeoms = []; // to dispose after merge
 
+  // Usage diagnostics collected during the traverse (see _warnedObjects above).
+  // Each category is reported as ONE aggregated message after the traverse, so a
+  // scene with fifty offenders costs one console line, not fifty.
+  const warnings = [];
+  const diag = {
+    "rtdeforming-not-dynamic": [],
+    "untraceable-object": [],
+    "instanced-mesh": [],
+    "transparent-dynamic": [],
+  };
+  // Per-static-mesh fingerprints for the post-compile staleness check (see
+  // RealtimeRaytracer._checkStale). WeakRef so a mesh removed from the scene
+  // can still be collected — the compiled scene must never keep it alive.
+  const staticSources = [];
+  const canTrack = typeof WeakRef === "function";
+
   const registerMaterial = (m) => {
     let i = materials.indexOf(m);
     if (i < 0) { i = materials.length; materials.push(m); }
@@ -723,7 +783,19 @@ export function compileScene(scene, options = {}) {
   };
 
   scene.traverse((obj) => {
+    // Object types the tracer cannot represent: they are not triangles in a BVH,
+    // and their ESSL1 materials cannot write the 4-attachment G-buffer either, so
+    // GBufferPass hides them for the traced frame. Say so once. An explicit
+    // rtExclude means the app already knows — stay quiet for those.
+    if ((obj.isSprite || obj.isLine || obj.isPoints) && obj.visible && !obj.userData.rtExclude) {
+      diag["untraceable-object"].push(obj);
+      return;
+    }
     if (!obj.isMesh || !obj.geometry || !obj.visible || obj.userData.rtExclude) return;
+    // An InstancedMesh is traversed as ONE mesh: its per-instance matrices are a
+    // GPU attribute the compiler never reads, so every instance past the first
+    // silently vanishes from the traced world (and from the G-buffer).
+    if (obj.isInstancedMesh) diag["instanced-mesh"].push(obj);
     const isArray = Array.isArray(obj.material);
     const rep = isArray ? obj.material[0] : obj.material;
     // Transparent surfaces must not act as opaque occluders — e.g.
@@ -731,9 +803,22 @@ export function compileScene(scene, options = {}) {
     // the whole model in shadow. Alpha-textured glass can't be cheaply tested,
     // so ANY transparent material is skipped like rtExclude (still
     // rasterized). alphaTest cut-outs (transparent: false) stay occluders.
-    if (rep.transparent) return;
+    if (rep.transparent) {
+      // Listing a transparent mesh in dynamicMeshes does nothing at all — it is
+      // dropped here, BEFORE the dynamic registration below, so it is never
+      // BVH-traced and updateDynamic() never touches it.
+      if (dynamicSet && dynamicSet.has(obj)) diag["transparent-dynamic"].push(obj);
+      return;
+    }
 
     const isDynamic = dynamicSet && dynamicSet.has(obj);
+    // rtDeforming alone does nothing: the flag is only read for meshes that are
+    // ALSO in dynamicMeshes (there is no dynamic segment to re-bake otherwise).
+    // Without this warning the mesh compiles static and its traced shadow keeps
+    // the compile-time shape forever, silently.
+    if (obj.userData.rtDeforming === true && !isDynamic) {
+      diag["rtdeforming-not-dynamic"].push(obj);
+    }
     // Opt-in CPU deformation: the mesh must be BOTH in dynamicMeshes AND carry
     // userData.rtDeforming, and its live geometry is read every frame.
     const deforming = isDynamic && obj.userData.rtDeforming === true;
@@ -802,8 +887,64 @@ export function compileScene(scene, options = {}) {
         const emit = emissiveColor(r.material);
         if (emit) collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount);
       }
+      // Fingerprint this static source so a later edit (vertices moved, mesh
+      // moved) can be DETECTED instead of quietly tracing the old shape. Two
+      // cheap comparands: the position attribute's version counter and a copy of
+      // matrixWorld. Held via WeakRef — never a strong reference.
+      if (canTrack) {
+        const pos = obj.geometry.getAttribute("position");
+        staticSources.push({
+          ref: new WeakRef(obj),
+          name: describeObject(obj),
+          version: pos ? pos.version : -1,
+          // Float64Array, NOT Float32Array: three's Matrix4.elements holds
+          // doubles, so a float32 snapshot rounds every element by up to ~1e-7
+          // and EVERY static mesh then compares as "moved" (measured: the demo
+          // scene reported 36 of 41 sources stale on the first run of this scan).
+          matrix: new Float64Array(obj.matrixWorld.elements),
+          warned: false,
+        });
+      }
     }
   });
+
+  // ---- report the collected usage diagnostics (one line per category) -------
+  const note = (code, message) => {
+    warnings.push({ code, message });
+  };
+  const report = (code, objs, build) => {
+    if (objs.length === 0) return;
+    const fresh = objs.filter((o) => _firstTime(o, code));
+    const message = build(objs);
+    note(code, message);
+    if (fresh.length > 0) console.warn(message);
+  };
+  report("rtdeforming-not-dynamic", diag["rtdeforming-not-dynamic"], (objs) =>
+    `three-realtime-rt: userData.rtDeforming is set on a mesh that is NOT in ` +
+    `compileScene(scene, {dynamicMeshes:[...]}) — the flag is IGNORED, the mesh ` +
+    `compiles STATIC, and traced shadows/GI keep its compile-time shape forever: ` +
+    `${describeList(objs)}. Add it to dynamicMeshes and call updateDynamic() each ` +
+    `frame to make it actually deform.`
+  );
+  report("untraceable-object", diag["untraceable-object"], (objs) =>
+    `three-realtime-rt: Sprite/Line/Points objects are not traceable geometry and ` +
+    `are auto-hidden from the traced frame (their materials cannot write the ` +
+    `4-attachment G-buffer): ${describeList(objs)}. Draw them in your own overlay ` +
+    `pass on top of rt.render(), or set userData.rtExclude = true to silence this.`
+  );
+  report("instanced-mesh", diag["instanced-mesh"], (objs) =>
+    `three-realtime-rt: InstancedMesh is NOT supported — it collapses to a single ` +
+    `instance in the traced output and in the G-buffer: ${describeList(objs)}. ` +
+    `Expand it to individual meshes, or set userData.rtExclude = true to exclude it.`
+  );
+  report("transparent-dynamic", diag["transparent-dynamic"], (objs) =>
+    `three-realtime-rt: a transparent mesh listed in dynamicMeshes does nothing — ` +
+    `transparent meshes are composited via the blend path and are never BVH-traced ` +
+    `or dynamic-registered: ${describeList(objs)}. Remove it from dynamicMeshes, or ` +
+    `make the material opaque (transparent: false) if it should cast traced shadows.`
+  );
+  compiled.warnings = warnings;
+  compiled.staticSources = staticSources;
 
   if (staticGeoms.length === 0 && dynamicGeoms.length === 0) {
     throw new Error("three-realtime-rt: no meshes found in scene");

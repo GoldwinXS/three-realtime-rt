@@ -344,6 +344,36 @@ export interface DisabledPass {
  * with a reason instead of guessing. Populated over the first several rendered
  * frames (link status is checked lazily / can be deferred by the driver).
  */
+/**
+ * A **usage** diagnostic on {@link RaytracerStatus.warnings} (since 0.7.0). Unlike
+ * {@link DisabledPass}, nothing is broken in the pipeline — the SCENE SETUP is
+ * not what the app probably intended (a flag that is being ignored, an object
+ * type that cannot be traced, a static mesh edited after `compileScene()`). Each
+ * one is also `console.warn`ed once, with the exact fix in the text.
+ */
+export interface RaytracerWarning {
+  /**
+   * Stable machine-readable identifier:
+   * - `"stale-geometry"` — a static mesh's `position` buffer changed after `compileScene()`.
+   * - `"stale-transform"` — a static mesh was moved after `compileScene()`.
+   * - `"rtdeforming-not-dynamic"` — `userData.rtDeforming` set on a mesh that is not in `dynamicMeshes` (ignored).
+   * - `"implicit-compile"` — `render()` compiled the scene itself, so it was compiled with no options.
+   * - `"untraceable-object"` — a visible `Sprite` / `Line` / `Points` was auto-hidden from the traced frame.
+   * - `"instanced-mesh"` — an `InstancedMesh` collapses to a single instance.
+   * - `"transparent-dynamic"` — a transparent mesh listed in `dynamicMeshes` (the entry does nothing).
+   */
+  code:
+    | "stale-geometry"
+    | "stale-transform"
+    | "rtdeforming-not-dynamic"
+    | "implicit-compile"
+    | "untraceable-object"
+    | "instanced-mesh"
+    | "transparent-dynamic";
+  /** Full human-readable message (names the object, the consequence and the fix). */
+  message: string;
+}
+
 export interface RaytracerStatus {
   /**
    * True while every ray tracing pass is running as intended. Flips to false the
@@ -359,6 +389,13 @@ export interface RaytracerStatus {
    * is a `"rt:<pass>: <driver log>"` summary; null when no core pass has failed.
    */
   coreFailure: string | null;
+  /**
+   * Usage diagnostics raised for this scene (**since 0.7.0**) — see
+   * {@link RaytracerWarning}. Deduplicated by `code` + `message`, and each one is
+   * also `console.warn`ed once. **`ok` is NOT affected by warnings**: the
+   * pipeline is compiling and running fine, the scene setup is what looks wrong.
+   */
+  warnings: RaytracerWarning[];
 }
 
 /** Options accepted by {@link RealtimeRaytracer.compileScene} and {@link compileScene}. */
@@ -415,6 +452,13 @@ export class CompiledScene {
     | null;
   /** CPU cost (ms) of the most recent dynamic-emissive refresh (0 if none). */
   lastEmissiveRefreshMs: number;
+  /**
+   * Usage diagnostics raised while compiling this scene (**since 0.7.0**). The
+   * standalone {@link compileScene} reports these to the console; going through
+   * {@link RealtimeRaytracer.compileScene} additionally mirrors them onto
+   * {@link RaytracerStatus.warnings}.
+   */
+  warnings: RaytracerWarning[];
   /**
    * Re-bake moving meshes' current world transforms and refit the dynamic BVH.
    * Also refreshes any dynamic emitters' NEE area-light rows + power CDF from the
@@ -476,7 +520,8 @@ export class RealtimeRaytracer {
    * link; `status.disabled` lists auto-disabled optional features; and
    * `status.coreFailure` names an unrecoverable core-pass failure. Populated over
    * the first several rendered frames. When `supported` is false, `status.ok` is
-   * false too (the RT pipeline is not operational).
+   * false too (the RT pipeline is not operational). `status.warnings` (since
+   * 0.7.0) carries USAGE diagnostics and never changes `status.ok`.
    */
   status: RaytracerStatus;
   /** Accumulated frame counter. */

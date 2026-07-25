@@ -2,6 +2,92 @@
 
 ## Unreleased
 
+*(0.7.0 candidate. Also carries the volumetric-albedo entry further down, which
+landed on master unreleased.)*
+
+- **Usage diagnostics: `rt.status.warnings`.** A hybrid tracer's worst failure
+  mode is the *silent* one — the image renders, nothing throws, and the lighting
+  is quietly computed against a scene that isn't the one on screen. The renderer
+  now detects the common integration mistakes, prints **one** `console.warn`
+  naming the object and the exact fix, and records the same thing as
+  `{ code, message }` on the new `status.warnings` array (deduplicated).
+  **`status.ok` is unaffected** — these are scene-setup diagnostics, not pipeline
+  failures, which keeps the 0.6.1 compile-failure surface (`ok` / `disabled` /
+  `coreFailure`) meaning exactly what it meant before. `compileScene()` also
+  returns them on the compiled scene (`compiled.warnings`), so the standalone
+  export reports too. Documented under *Diagnostics* in the README, with a
+  troubleshooting section for the symptoms people actually search for ("black
+  patches", "the shadow doesn't move", "still hit the original shape").
+  - `stale-geometry` / `stale-transform` — a **static** mesh whose `position`
+    buffer changed, or which was moved, after `compileScene()`. This is the
+    stale-BVH bug (rasterized image shows the new pose, traced lighting still
+    shadows/bounces off the old one) and it was completely silent before. The
+    compiler fingerprints every static source mesh (a `WeakRef`, its position
+    attribute's `version`, and a `Float64Array` copy of `matrixWorld.elements`);
+    `render()` re-checks them on **every 30th frame**, stops checking a mesh once
+    it has reported, and caps at 8 reports — no allocation, no measurable
+    per-frame cost, and no strong reference to the app's meshes.
+  - `rtdeforming-not-dynamic` — `userData.rtDeforming` set on a mesh that is not
+    in `dynamicMeshes`. The flag was silently ignored (the mesh compiled static);
+    it also meant a *grouped* mesh with the ignored flag skipped the
+    groups+deforming throw, so the combination looked supported. The README's
+    multi-material-groups row now says the throw applies to the flag **plus**
+    membership, which is what the code always did.
+  - `implicit-compile` — `render()` compiled the scene itself because no
+    `compileScene()` call preceded it. That path takes no options, so everything
+    is static and `updateDynamic()` has nothing to update.
+  - `untraceable-object` — a visible `Sprite` / `Line` / `Points`.
+  - `instanced-mesh` — an `InstancedMesh` (collapses to a single instance).
+  - `transparent-dynamic` — a `transparent` mesh listed in `dynamicMeshes`, which
+    does nothing (transparent meshes are dropped before dynamic registration).
+- **Sprite / Line / Points are excluded from the G-buffer (bug fix).** Their
+  materials write a single `gl_FragColor`, and rendering one into the G-buffer's
+  4-attachment MRT framebuffer is a `GL_INVALID_OPERATION` — an ESSL1 fragment
+  shader cannot feed multiple draw buffers. The G-buffer pass now **hides** such
+  objects for the duration of its draw and restores their `visible` flag right
+  after (the same save/restore discipline it already used for material swaps), so
+  a scene with a HUD sprite no longer errors. They were never traceable geometry
+  either — the BVH compiler always skipped them — so this makes the two halves
+  agree, and the accompanying `untraceable-object` warning tells you to draw them
+  in your own overlay pass on top of `rt.render()`. `userData.rtExclude` silences
+  the warning. The new `?selftest=warnings` leg asserts **zero GL errors** across
+  frames with a `Sprite` and a `Line` visible.
+- **Adaptive quality now works below 10 fps (bug fix).** `_adaptQuality` bailed
+  out of any frame longer than 100 ms, on the theory that such a frame is a
+  hidden-tab stall. The result was a **dead zone**: a device steadily rendering at
+  2.5–10 fps fed the governor *no samples at all*, so it never adapted — and
+  `_overloadBrake`, the only other safety net, needs three consecutive frames over
+  400 ms. The exact devices that most need dynamic resolution scaling were the
+  ones that never got it. Hidden tabs are now excluded properly (a
+  `document.visibilityState === "hidden"` check that resets the timer, mirroring
+  `_overloadBrake`), only frames over **2 s** are discarded as genuine
+  stall/resume, and everything from 100 ms to 2 s feeds the EMA. Because a single
+  very slow sample can now imply a huge correction, one adaptation may move
+  `renderScale` by at most `MAX_SCALE_STEP` (0.25 — five ladder steps); the
+  cooldown takes the next step if the device is still slow. `_overloadBrake` is
+  unchanged.
+- **Render self-test:** new gating `?selftest=warnings` leg (chromium) that drives
+  a deliberately mis-configured scene and asserts each diagnostic fires **exactly
+  once** across ~100 frames, that `status.warnings` carries the expected codes,
+  that `status.ok` stays true, and that the visible `Sprite`/`Line` produces zero
+  GL errors. The healthy `?selftest=1` verdict now reports `warnings` /
+  `warningCodes` and its pass gate **requires `warnings === 0`** — so a diagnostic
+  that starts false-positiving on a correct scene fails the suite. (It caught one
+  immediately: snapshotting `matrixWorld` into a `Float32Array` rounded three's
+  doubles enough that 36 of the demo's 41 static meshes read as "moved".)
+- **README:** new *Diagnostics* + *Troubleshooting* sections; a
+  *Supported object types* table (`Mesh` / `SkinnedMesh` / `InstancedMesh` /
+  `Sprite`·`Line`·`Points` / `rtExclude`); first-ever documentation of
+  **`canvasScaleHook`** (with the CSS-stretch recipe and the `taaJitterScale`
+  rule) plus a *Recommended integration* block wiring `detectTier()` →
+  `recommendedOptions()` → `adaptiveQuality` + `canvasScaleHook`; an `alphaMap`
+  row in the materials table (unsupported — opacity is a scalar per material);
+  `targetFps` / `canvasScaleHook` / `taaJitterScale` in the options table; and
+  three additions to the transparency notes (the blend-behind radiance is a
+  genuinely traced ray, only BVH geometry shows through so an intermediate
+  translucent layer disappears when covered, and behind-radiance bypasses the
+  firefly/irradiance clamps so emitters read hotter through glass).
+
 - **World-space 3D-texture albedo (`userData.rtVolumeAlbedo`) — "volumetric
   surface albedo".** A material can now be coloured by a **3D texture sampled at
   the world-space ray hit point** instead of a flat colour or a 2D UV map — the

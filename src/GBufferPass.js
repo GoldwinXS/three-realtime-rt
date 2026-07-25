@@ -212,6 +212,7 @@ export class GBufferPass {
 
     this._materialCache = new WeakMap(); // mesh -> gbuffer ShaderMaterial
     this._swapped = []; // [mesh, originalMaterial] pairs during render
+    this._hidden = []; // objects temporarily hidden for the G-buffer draw
     this._normalMat3 = new THREE.Matrix3();
     // World-space 3D-texture albedo: off unless a scene registers a material with
     // userData.rtVolumeAlbedo (see setVolume). When off, the gbuffer program is
@@ -445,11 +446,27 @@ export class GBufferPass {
     // material word + gEmissive.a, and the lighting pass blends them against the
     // geometry behind. opacity 1 writes fully opaque, so alpha-textured cases
     // (LittlestTokyo's glass) look exactly as before.
+    //
+    // Objects that are NOT meshes (Sprite / Line / Points) keep their OWN
+    // material here, and those materials write a single gl_FragColor. Rendering
+    // one into this 4-attachment MRT framebuffer is a GL_INVALID_OPERATION (an
+    // ESSL1 fragment shader cannot feed multiple draw buffers) and the object is
+    // not traceable geometry either — the BVH compiler skips it. So they are
+    // HIDDEN for the duration of the G-buffer draw and restored right after;
+    // draw them yourself in an overlay pass on top of rt.render() if you need
+    // them on screen. compileScene() warns once naming them.
     this._swapped.length = 0;
+    this._hidden.length = 0;
     scene.traverse((obj) => {
-      if (obj.isMesh && obj.geometry && obj.visible) {
+      if (!obj.visible) return;
+      if (obj.isMesh && obj.geometry) {
         this._swapped.push([obj, obj.material]);
         obj.material = this._gbufferMaterialFor(obj);
+        return;
+      }
+      if (obj.isSprite || obj.isLine || obj.isPoints) {
+        obj.visible = false;
+        this._hidden.push(obj);
       }
     });
 
@@ -465,6 +482,10 @@ export class GBufferPass {
     scene.background = prevBackground;
     for (const [mesh, mat] of this._swapped) mesh.material = mat;
     this._swapped.length = 0;
+    // Restore visibility exactly once per object (each was pushed once, and only
+    // if it was visible when we hid it).
+    for (const obj of this._hidden) obj.visible = true;
+    this._hidden.length = 0;
   }
 
   dispose() {

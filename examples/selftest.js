@@ -13,7 +13,7 @@
  * emits ONE machine-readable JSON line — to the console (prefixed `[selftest]`)
  * AND into a hidden DOM node `#selftest-verdict` for a Playwright driver to read:
  *
- *   { pass, meanLum, irrLum, glErrors, specMRT, supported, frames, ua }
+ *   { pass, meanLum, irrLum, glErrors, specMRT, supported, warnings, frames, ua }
  *
  *   meanLum  Rec.709 luma (0-255) of the composite over the CENTER 25% of the
  *            drawing buffer (a centred 50%x50% region = a quarter of the pixels).
@@ -24,6 +24,8 @@
  *   glErrors count of nonzero gl.getError() samples (one per GL_ERROR_EVERY
  *            frames); any nonzero sample fails the gate.
  *   specMRT / supported  the two capability fallbacks, reported for triage.
+ *   warnings count of rt.status.warnings (usage diagnostics). The reference
+ *            integration must raise none, so any nonzero value fails the gate.
  *
  * The page keeps rendering after the verdict (outputMode is restored) so a human
  * can watch. Readback uses the drawing buffer directly, which requires the demo
@@ -107,13 +109,20 @@ export function createSelftest({ rt, renderer }) {
     const statusOk =
       !!(rt.status && rt.status.ok === true) && rt.compileError == null && rtPrograms > 0;
 
+    // Usage diagnostics (status.warnings). The demo is the reference integration,
+    // so the HEALTHY path must raise exactly ZERO of them — a nonzero count here
+    // means either the demo picked up a real mistake, or a diagnostic started
+    // firing on a correct scene (a false positive is a bug in the diagnostic).
+    const warnings = (rt.status && rt.status.warnings) || [];
+
     const pass =
       rt.supported === true &&
       meanLum >= SELFTEST.LIT_MIN &&
       meanLum <= SELFTEST.LIT_MAX &&
       glErrors === 0 &&
       irrLum > SELFTEST.IRR_MIN &&
-      statusOk;
+      statusOk &&
+      warnings.length === 0;
 
     const verdict = {
       pass,
@@ -126,6 +135,11 @@ export function createSelftest({ rt, renderer }) {
       rtPrograms,
       compileError: (rt.status && rt.compileError) || null,
       disabled: (rt.status && rt.status.disabled) || [],
+      warnings: warnings.length,
+      warningCodes: warnings.map((w) => w.code),
+      // Only present when the gate trips — the message names the offending
+      // object and the fix, which is the whole point of triaging from a log.
+      warningMessages: warnings.length ? warnings.map((w) => w.message) : undefined,
       frames: rt.frame,
       ua: navigator.userAgent,
     };

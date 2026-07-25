@@ -19,6 +19,13 @@
  * compileScene() on a scene with no meshes is a no-op and render() falls back to
  * plain raster instead of crashing (the "construct tracer, then add meshes" order).
  *
+ * USAGE-DIAGNOSTICS CHECK: a fifth chromium load of ?selftest=warnings drives a
+ * deliberately mis-configured scene and asserts every silent-mistake diagnostic
+ * fires exactly once, lands on rt.status.warnings, leaves status.ok true, and
+ * that a visible Sprite/Line costs ZERO GL errors (it is hidden from the
+ * 4-attachment G-buffer instead of being drawn into it). The healthy half of the
+ * contract is asserted by the main leg, whose gate now requires warnings === 0.
+ *
  * Flow per run:
  *   1. spawn two vite servers on free ports (NOT 8115/8119; another dev server may
  *      own those) — default three and RT_THREE=latest — and tear both (and their
@@ -278,11 +285,85 @@ async function driveEngine(name, launcher, base, { headless, timeoutMs }) {
     if (!(verdict.meanLum >= 12 && verdict.meanLum <= 230)) fails.push(`meanLum=${verdict.meanLum}`);
     if (verdict.glErrors !== 0) fails.push(`glErrors=${verdict.glErrors}`);
     if (!(verdict.irrLum > 6)) fails.push(`irrLum=${verdict.irrLum}`);
+    if (verdict.warnings) fails.push(`warnings=${verdict.warnings} ${JSON.stringify(verdict.warningCodes || [])}`);
     return { status: "fail", reason: `gate(s): ${fails.join(", ") || "unknown"}`, verdict, ms: Date.now() - t0 };
   } catch (err) {
     try { await browser.close(); } catch {}
     return { status: "fail", reason: `driver error: ${err.message}`, ms: Date.now() - t0 };
   }
+}
+
+// Drive one of the self-contained chromium check pages (examples/main.js's
+// ?selftest=empty / ?selftest=warnings legs). Both are cheap single page loads
+// that build their own renderer, run a scripted sequence, and write ONE JSON
+// verdict into #selftest-verdict. `describe` turns a failing verdict into a
+// human sentence.
+async function driveCheck(base, mode, describe) {
+  const t0 = Date.now();
+  let browser;
+  try {
+    browser = await chromium.launch(launchOpts("chromium", false));
+  } catch (err) {
+    return { status: "skip", reason: `launch failed: ${err.message}`, ms: Date.now() - t0 };
+  }
+  const logs = [];
+  try {
+    const page = await browser.newPage();
+    page.on("console", (m) => logs.push(m.text()));
+    page.on("pageerror", (e) => logs.push(`PAGEERROR: ${e.message}`));
+    await page.goto(`${base}/?selftest=${mode}`, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+    await page.waitForFunction(
+      () => {
+        const n = document.getElementById("selftest-verdict");
+        return !!(n && n.textContent && n.textContent.length > 0);
+      },
+      { timeout: 120_000 }
+    );
+    const text = await page.$eval("#selftest-verdict", (n) => n.textContent);
+    await browser.close();
+    let v;
+    try { v = JSON.parse(text); } catch { return { status: "fail", reason: `unparseable: ${text}`, ms: Date.now() - t0 }; }
+    if (v.pass) return { status: "pass", verdict: v, ms: Date.now() - t0 };
+    if (v.supported === false) {
+      return {
+        status: "skip",
+        reason: "RT unsupported in this engine's GL (no WebGL2 + EXT_color_buffer_float on a hardware GPU)",
+        verdict: v,
+        ms: Date.now() - t0,
+      };
+    }
+    return { status: "fail", reason: describe(v), verdict: v, ms: Date.now() - t0 };
+  } catch (err) {
+    try { await browser.close(); } catch {}
+    const pageErr = logs.filter((l) => /PAGEERROR|Error/i.test(l)).slice(-1)[0];
+    return { status: "fail", reason: `driver error: ${err.message}${pageErr ? ` (${pageErr})` : ""}`, ms: Date.now() - t0 };
+  }
+}
+
+// Usage-diagnostics check (examples/main.js ?selftest=warnings). Confirms every
+// silent-mistake diagnostic fires (exactly once) on a deliberately mis-configured
+// scene, that status.warnings carries the codes, that status.ok stays true, and
+// that a visible Sprite/Line produces ZERO GL errors (it is hidden from the
+// 4-attachment G-buffer rather than drawn into it).
+function describeWarnings(v) {
+  if (v.threw) return `warnings scene threw: ${v.error}`;
+  const gates = [
+    ["implicitFired", v.implicitFired],
+    ["deformingFired", v.deformingFired],
+    ["instancedFired", v.instancedFired],
+    ["untraceableFired", v.untraceableFired],
+    ["untraceableStillVisible", v.untraceableStillVisible],
+    ["transparentQuietSoFar", v.transparentQuietSoFar],
+    ["staleFired", v.staleFired],
+    ["transparentFired", v.transparentFired],
+    ["firedOnce", v.firedOnce],
+    ["codesPresent", v.codesPresent],
+    ["codesUnique", v.codesUnique],
+    ["statusOk", v.statusOk],
+    ["glErrors==0", v.glErrors === 0],
+  ];
+  const bad = gates.filter(([, ok]) => !ok).map(([n]) => n);
+  return `gate(s): ${bad.join(", ") || "unknown"} (codes: ${JSON.stringify(v.codes || [])})`;
 }
 
 // Drive the empty-scene regression check (examples/main.js ?selftest=empty) to a
@@ -347,7 +428,7 @@ async function runChromiumLeg(label, base) {
   const v = r.verdict;
   console.log(
     `  -> ${r.status.toUpperCase()} (${r.ms}ms)` +
-      (v ? ` meanLum=${v.meanLum} irrLum=${v.irrLum} glErrors=${v.glErrors} specMRT=${v.specMRT} statusOk=${v.statusOk} rtPrograms=${v.rtPrograms} frames=${v.frames}` : "") +
+      (v ? ` meanLum=${v.meanLum} irrLum=${v.irrLum} glErrors=${v.glErrors} specMRT=${v.specMRT} statusOk=${v.statusOk} rtPrograms=${v.rtPrograms} warnings=${v.warnings} frames=${v.frames}` : "") +
       (r.reason ? `\n     reason: ${r.reason}` : "")
   );
   return r;
@@ -378,6 +459,7 @@ async function main() {
   // this machine — see the ENGINE_CONFIG notes above).
   const results = [];
   let empty = null;
+  let warnings = null;
   try {
     results.push(["chromium", await runChromiumLeg("chromium", base)]);
     for (const [name, launcher] of [["firefox", firefox], ["webkit", webkit]]) {
@@ -402,6 +484,15 @@ async function main() {
         (empty.reason ? `\n     reason: ${empty.reason}` : "") +
         (empty.verdict ? `\n     ${JSON.stringify(empty.verdict)}` : "")
     );
+
+    // Usage-diagnostics check (chromium, default three).
+    console.log(`\n=== usage diagnostics (chromium, ?selftest=warnings) ===`);
+    warnings = await driveCheck(base, "warnings", describeWarnings);
+    console.log(
+      `  -> ${warnings.status.toUpperCase()} (${warnings.ms}ms)` +
+        (warnings.reason ? `\n     reason: ${warnings.reason}` : "") +
+        (warnings.verdict ? `\n     ${JSON.stringify(warnings.verdict)}` : "")
+    );
   } finally {
     cleanup();
   }
@@ -423,10 +514,12 @@ async function main() {
     );
   }
   console.log(pad("empty-scene", 18) + pad(empty ? empty.status : "-", 8) + "(compileScene no-op + render fallback)");
+  console.log(pad("warnings", 18) + pad(warnings ? warnings.status : "-", 8) + "(usage diagnostics fire once, status.warnings)");
   for (const [name, r] of results) {
     if (r.status !== "pass" && r.reason) console.log(`  ${name}: ${r.reason}`);
   }
   if (empty && empty.status !== "pass" && empty.reason) console.log(`  empty-scene: ${empty.reason}`);
+  if (warnings && warnings.status !== "pass" && warnings.reason) console.log(`  warnings: ${warnings.reason}`);
   console.log("========================================================");
 
   // Gate: BOTH chromium legs (default three AND three@latest) must PASS, and the
@@ -438,6 +531,7 @@ async function main() {
     if (!row || row[1].status !== "pass") problems.push(`${label} (${row ? row[1].status : "missing"})`);
   }
   if (!empty || empty.status !== "pass") problems.push(`empty-scene (${empty ? empty.status : "missing"})`);
+  if (!warnings || warnings.status !== "pass") problems.push(`warnings (${warnings ? warnings.status : "missing"})`);
   const failed = results.filter(([, r]) => r.status === "fail").map(([n]) => n);
   for (const n of failed) if (!problems.some((p) => p.startsWith(n))) problems.push(`${n} (fail)`);
 

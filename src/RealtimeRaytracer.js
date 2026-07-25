@@ -349,6 +349,19 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   static DIAG_STABLE_FRAMES = 4;
   static DIAG_WINDOW_FRAMES = 45;
 
+  // Staleness scan (see _checkStale): a static mesh edited after compileScene()
+  // keeps tracing its compile-time shape/place. Checked every Nth frame only —
+  // the comparison is an int and 16 floats per static source, and each source
+  // stops being checked as soon as it has reported — and capped so a scene that
+  // moves everything can never flood the console.
+  static STALE_CHECK_FRAMES = 30;
+  static MAX_STALE_WARNINGS = 8;
+
+  // Largest renderScale change the adaptive governor may commit in one step
+  // (0.25 = five 0.05 ladder steps). Bounds the reaction to a single very slow
+  // frame now that 100ms-2s frames feed the EMA; see _adaptQuality.
+  static MAX_SCALE_STEP = 0.25;
+
   constructor(renderer, options = {}) {
     this.renderer = renderer;
 
@@ -370,7 +383,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       // the RT pipeline is not operational at all; `supported` is the primary
       // signal, but status is kept consistent so integrators can read one field.
       this.compileError = null;
-      this.status = { ok: false, disabled: [], coreFailure: null };
+      this.status = { ok: false, disabled: [], coreFailure: null, warnings: [] };
       this._diagDone = true;
       return;
     }
@@ -740,14 +753,25 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     //                   off to keep the image lit (e.g. taa, denoise, restir).
     //       coreFailure string | null — a core pass (gbuffer/lighting/composite)
     //                   failed and has no fallback; the image is black-but-diagnosed.
+    //       warnings    [{ code, message }] — USAGE diagnostics (a flag that is
+    //                   being ignored, an object type that cannot be traced, a
+    //                   static mesh edited after compileScene()). Each is also
+    //                   console.warn'd once. These never affect `ok`: the
+    //                   pipeline is healthy, the SCENE SETUP is not what the app
+    //                   probably intended.
     this.compileError = null;
-    this.status = { ok: true, disabled: [], coreFailure: null };
+    this.status = { ok: true, disabled: [], coreFailure: null, warnings: [] };
     this._diagDone = false; // set once the polling window settles
     this._diagFrames = 0; // rendered frames scanned so far
     this._diagStable = 0; // consecutive scans with an unchanged rt:* program set
     this._diagSig = ""; // signature of the rt:* program-name set last scan
     this._diagHandled = new Set(); // rt:* names already acted on (warn-once)
     this._compileErrSev = -1; // severity behind the current compileError (2/1/0)
+
+    // Usage-diagnostic state (see _checkStale / _warn).
+    this._staleDone = false; // nothing left worth scanning
+    this._staleWarnings = 0; // stale reports emitted (capped)
+    this._implicitCompileWarned = false;
   }
 
   // Classify an rt:* pass program by how a LINK failure degrades. CORE passes
@@ -902,6 +926,102 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     }
   }
 
+  // ---- usage diagnostics (status.warnings) ---------------------------------
+  // A usage warning is console.warn'd ONCE and recorded on status.warnings so a
+  // UI (or an automated check) can read the same signal. `ok` is untouched: the
+  // pipeline is fine, the scene setup is what looks wrong. Duplicate
+  // code+message pairs are collapsed so a recompile can't grow the array.
+  _warn(code, message) {
+    console.warn(message);
+    this._recordWarning(code, message);
+  }
+
+  _recordWarning(code, message) {
+    const list = this.status && this.status.warnings;
+    if (!list) return;
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].code === code && list[i].message === message) return;
+    }
+    list.push({ code, message });
+  }
+
+  // Mirror the compiler's usage diagnostics onto the status surface. The
+  // compiler already wrote them to the console (once per offending object);
+  // this only makes them readable.
+  _absorbCompilerWarnings(compiled) {
+    const w = compiled && compiled.warnings;
+    if (!w || w.length === 0) return;
+    for (let i = 0; i < w.length; i++) this._recordWarning(w[i].code, w[i].message);
+  }
+
+  // Detect a STATIC mesh that was edited after compileScene(): its vertices were
+  // deformed, or it was moved. Either way the traced lighting still uses the
+  // shape/place baked into the static BVH, which reads as "the shadow doesn't
+  // move" or "rays still hit the original shape" — the single most common
+  // integration mistake, and completely silent before this.
+  //
+  // Cost: runs on every STALE_CHECK_FRAMES-th frame only, over a plain array of
+  // fingerprints, with no allocation; each source is checked until it warns once
+  // (or its mesh is collected), and the whole scan switches off when nothing is
+  // left to report or the warning cap is reached.
+  _checkStale() {
+    if (this._staleDone) return;
+    const srcs = this.compiled && this.compiled.staticSources;
+    if (!srcs || srcs.length === 0) { this._staleDone = true; return; }
+    let live = 0;
+    for (let i = 0; i < srcs.length; i++) {
+      const s = srcs[i];
+      if (s.warned) continue;
+      const mesh = s.ref.deref();
+      if (!mesh) { s.warned = true; continue; } // collected — nothing to report
+      let stale = null;
+      const geo = mesh.geometry;
+      const pos = geo ? geo.getAttribute("position") : null;
+      if (!pos || pos.version !== s.version) {
+        stale = "geometry";
+      } else {
+        // Relative tolerance rather than an exact compare: an app that rebuilds
+        // an unchanged transform each frame (setFromEuler, a physics engine
+        // writing back the same pose) can land a few ULPs away, and a sub-micron
+        // "move" is not what this diagnostic is about.
+        const e = mesh.matrixWorld.elements;
+        const m = s.matrix;
+        for (let k = 0; k < 16; k++) {
+          const d = e[k] - m[k];
+          if ((d < 0 ? -d : d) > 1e-6 * (1 + (m[k] < 0 ? -m[k] : m[k]))) {
+            stale = "transform";
+            break;
+          }
+        }
+      }
+      if (!stale) { live++; continue; }
+      s.warned = true;
+      this._staleWarnings++;
+      if (stale === "geometry") {
+        this._warn(
+          "stale-geometry",
+          `three-realtime-rt: position buffer of ${s.name} changed after compileScene() ` +
+            `but it is not a dynamic mesh — traced lighting still uses the ORIGINAL shape. ` +
+            `Add it to compileScene(scene, {dynamicMeshes:[...]}) and set ` +
+            `mesh.userData.rtDeforming = true, then call updateDynamic() each frame.`
+        );
+      } else {
+        this._warn(
+          "stale-transform",
+          `three-realtime-rt: ${s.name} was moved after compileScene() but it is not a ` +
+            `dynamic mesh — traced lighting still uses the ORIGINAL transform (its shadow ` +
+            `stays behind). Recompile with compileScene(scene), or declare it in ` +
+            `compileScene(scene, {dynamicMeshes:[...]}) and call updateDynamic() each frame.`
+        );
+      }
+      if (this._staleWarnings >= RealtimeRaytracer.MAX_STALE_WARNINGS) {
+        this._staleDone = true; // enough — do not flood the console
+        return;
+      }
+    }
+    if (live === 0) this._staleDone = true;
+  }
+
   _makeColorTarget(width, height) {
     const t = new THREE.WebGLRenderTarget(width, height, {
       minFilter: THREE.LinearFilter,
@@ -947,6 +1067,11 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     }
     if (this.compiled) this.compiled.dispose();
     this.compiled = compiled;
+    // Usage diagnostics raised while compiling (already console.warn'd once per
+    // offending object) become readable on status.warnings. A fresh compile also
+    // re-arms the staleness scan against the NEW fingerprints.
+    this._absorbCompilerWarnings(compiled);
+    this._staleDone = false;
     // Emissive area lights are the noisiest direct-light path: one triangle
     // sample per pixel per frame, and the 1/dist^2 term spikes near a small
     // emitter (fireflies). ReSTIR's reservoirs are what tame this — warn when
@@ -1155,10 +1280,24 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   // cap the frame time can't reveal headroom, so upscaling only happens when
   // frames are measurably faster than the target — it never thrashes.
   _adaptQuality() {
+    // Hidden tabs are exempt: browser throttling makes every frame look
+    // catastrophic, and adapting on that would drop quality for a tab nobody is
+    // watching (same rule as _overloadBrake).
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+      this._qLastT = null;
+      return;
+    }
     const now = performance.now();
     const dt = this._qLastT == null ? null : now - this._qLastT;
     this._qLastT = now;
-    if (dt == null || dt > 100) return; // first frame or hidden-tab stall
+    if (dt == null) return; // first frame — no interval yet
+    // Only a genuine stall/resume (a blocked main thread, a tab coming back, a
+    // debugger pause) is discarded. The old guard bailed above 100ms, which left
+    // every device running slower than 10fps unable to adapt AT ALL: the
+    // governor never saw a sample, and _overloadBrake only reacts past 400ms
+    // with three consecutive strikes. Frames from 100ms to 2s now feed the EMA,
+    // so a 3fps device walks down the ladder like any other.
+    if (dt > 2000) return;
     this._qEma = this._qEma == null ? dt : this._qEma * 0.9 + dt * 0.1;
     // Calmness: normally 2s between changes. When the last two steps reversed
     // direction the governor is hunting the boundary, so hold for 5s AND widen
@@ -1173,6 +1312,13 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     if (ratio < dbHi && ratio > dbLo) return; // comfortable — leave it alone
 
     let s = this._renderScale * Math.pow(1 / ratio, 0.35);
+    // Per-step clamp. Now that multi-hundred-millisecond frames feed the EMA, a
+    // single very slow measurement (ratio can reach ~100 at dt 2s) would
+    // otherwise slam the scale from 1.0 to the 0.2 floor in ONE step and throw
+    // away the image on a transient. Move at most MAX_SCALE_STEP per adaptation
+    // (5 ladder steps) and let the cooldown take the next one if it is still slow.
+    const step = RealtimeRaytracer.MAX_SCALE_STEP;
+    s = Math.min(this._renderScale + step, Math.max(this._renderScale - step, s));
     s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
 
     // When we're fast, give back the deepest lever FIRST: restore canvas scale
@@ -1245,7 +1391,23 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     }
     if (this.adaptiveQuality) this._adaptQuality();
     if (this.overloadProtection) this._overloadBrake();
-    if (!this.compiled) this.compileScene(scene);
+    if (!this.compiled) {
+      this.compileScene(scene);
+      // An implicit compile is the zero-config path: it works, but it takes NO
+      // options, so every mesh is static forever. Anything that moves needs the
+      // explicit call — say so once, and only once the compile actually produced
+      // a scene (an empty scene has its own warning).
+      if (this.compiled && !this._implicitCompileWarned) {
+        this._implicitCompileWarned = true;
+        this._warn(
+          "implicit-compile",
+          "three-realtime-rt: render() compiled the scene implicitly (no compileScene() " +
+            "call), so it was compiled with NO options — every mesh is static and " +
+            "updateDynamic() has nothing to update. Call compileScene(scene, options) " +
+            "yourself (e.g. {dynamicMeshes:[...]}) before the first render() if anything moves."
+        );
+      }
+    }
     // Still nothing to trace (empty scene — tracer built before meshes were
     // added). Show the user's raster scene rather than crashing or rendering
     // black; the pipeline picks up automatically once compileScene() succeeds.
@@ -1255,6 +1417,8 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     }
 
     this.frame += 1;
+    // Cheap periodic check that no STATIC mesh was edited behind the BVH's back.
+    if (this.frame % RealtimeRaytracer.STALE_CHECK_FRAMES === 0) this._checkStale();
     camera.updateMatrixWorld();
 
     // --- sub-pixel jitter (TAA): offset the projection a fraction of a pixel
