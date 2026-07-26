@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-07-25
 
 - **Per-material Beer-Lambert absorption — tinted glass done right.** Light
   crossing a glass material's interior is now attenuated `exp(−σ·d)` per RGB
