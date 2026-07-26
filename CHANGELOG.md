@@ -1,5 +1,122 @@
 # Changelog
 
+## Unreleased — coloured shadows
+
+- **Coloured shadows: shadow rays through absorbing glass are attenuated, not
+  blocked.** A shadow ray crossing a glass material that carries a Beer-Lambert
+  σ (0.8.0's `attenuationColor` + `attenuationDistance`, or
+  `userData.rtAttenuation`) is now multiplied by `exp(−σ·d)` per RGB channel over
+  the distance it spends inside, instead of being occluded outright. Stained
+  glass spills tinted light; a lightbox behind stacked translucent bodies now
+  **lights** what is in front of them instead of rendering as a black silhouette
+  (the 3D-print preview case, where 90-95% of pixels are multi-body stacks);
+  clear glass — a glass material with no `attenuationDistance` — stops casting a
+  shadow at all, which is the physically right answer and one 0.8.0 could not
+  express. New option/property `rt.absorptionShadows`, default `true`,
+  meaningful only when the compiled scene has an absorbing material.
+  - **An ORDERED closest-hit march with a current-medium state machine**, capped
+    at 8 interface events. Deliberately **not** the cheaper unordered any-hit
+    signed sum (+σ on front faces, −σ on back faces): real multi-body geometry
+    contains body-to-body interfaces where only ONE of two coincident walls
+    survives, so entry/exit events do not pair and a signed sum goes **negative**
+    — optical gain, bright halos. The march cannot produce negative optical depth
+    however unbalanced the interfaces are. Hitting the event cap returns the
+    transmittance accumulated so far: a slightly-off tint, never a black
+    silhouette. Optical depth is charged **interface to interface**, not from the
+    stepped-off ray origin — the difference is the `2 x eps` skipped past each
+    hit, which measured as a 10-15% under-attenuation of a 4 cm slab and rather
+    more in scenes whose auto-scaled epsilon is larger.
+  - **Scope, v1 — the two next-event shadow rays only** (analytic point / spot /
+    directional lights, and emissive-mesh area lights). Explicitly NOT: the
+    **ReSTIR visibility ray** (so with `restir: true`, the default, primary
+    direct light is still binary-shadowed — a real energy mismatch between the
+    reservoir path and the NEE path, documented rather than hidden), the
+    volumetric march's occlusion samples, and refraction (shadow rays are
+    straight segments). Any `transmission > 0` material is fully transmissive to
+    shadow rays; `transmission: 0.5` does not half-block. The view path is
+    unchanged.
+  - **Zero new resources.** No new sampler (this pass is at the WebGL2
+    16-sampler minimum), no new uniform, no new `traceRadiance` call site, and
+    exactly ONE textual call to the closest-hit kernel inside the march
+    (`traceBoth`, reused by the loop) to keep the inlined footprint small. The
+    "is this glass to a shadow ray" flag is the material's transmission, written
+    into row 67's previously-unused `.w` channel — a channel that was already
+    allocated, so it costs nothing. **This budget is real, not theoretical:** an
+    experimental any-hit fast path added inside the march (a pure, exact
+    short-circuit) failed to link on NVIDIA native GL with
+    `C5041: cannot locate suitable resource to bind variable "@_ustack..."` —
+    four inlined BVH traversal stacks in one call frame is over the driver's
+    budget. It was reverted; the shipped march has two.
+  - **Zero cost when unused, provably.** Source splice, not `#ifdef`:
+    `stripAbsorption` generalised to `stripMarked(src, tag)` over a second
+    `RT_ABSORB_SHADOWS` marker pair, giving three cached variants (plain /
+    absorption / absorption+shadows). With no absorbing material, or with
+    `absorptionShadows: false`, the generated fragment source is
+    **byte-identical** to master's — proved twice: at the module level against a
+    master worktree (plain 52 378 B `sha 44d6be4e...`, absorption-only 55 257 B
+    `sha 1804cf41...`, both matching) and **live** via `getShaderSource` on the
+    running program (54 118 B and 56 997 B after three's preamble, both
+    matching). Frame-time difference on the off-paths: **−0.03 ms** and
+    **+0.05 ms**, i.e. nothing. Every call site is add-lines-only — the existing
+    `occluded()` line survives the strip untouched and is disabled in the spliced
+    variant by a constant-false branch rather than by editing it.
+  - **Cost — this one is NOT free, and the README says so.** Fence-timed medians
+    on an RTX 3060, museum, 1280x720 at `renderScale 0.5`, full stack
+    (GI + emissive + reflections + refraction), single foregrounded page,
+    alternating master/feature navigation:
+
+    | leg | `restir: true` | `restir: false` |
+    |---|---|---|
+    | (a) master baseline | 67.20 ms | 78.17 ms |
+    | (b) feature, no absorbing material | 67.17 ms | 78.21 ms |
+    | (c) tinted glass on, `absorptionShadows: false` | 68.82 ms | 79.85 ms |
+    | (d) tinted glass on, `absorptionShadows: true` | 82.65 ms | 108.54 ms |
+    | **(d) − (c)** | **+13.83 ms** | **+28.69 ms** |
+
+    `restir: false` is the honest column — that is the configuration in which the
+    feature acts on primary direct light, and there it costs about a third of the
+    frame. Profiling with the event cap forced to 1 attributes ~21 ms of the
+    28.7 ms to the any-hit -> closest-hit swap **alone** (a bounded, unordered,
+    early-outing traversal replaced by an unbounded ordered one, on every NEE
+    shadow ray) and the rest to marching past glass interfaces. The cost
+    therefore scales with shadow-ray count, not with how much glass is on screen.
+    There was no pre-registered gate for this number; it is reported, not buried.
+    An interleaved two-tab measurement rig was discarded first — a backgrounded
+    WebGL context timed 27 ms where the same work read 71 ms in front.
+  - **Demo:** a **"tinted shadows"** sub-toggle under **"tinted glass"**, bound
+    to `rt.absorptionShadows` and nothing else, so the fps delta beside it is the
+    shadow march's isolated cost. The note under it names what the effect needs
+    (ReSTIR lights off, emissive area lights on) rather than silently flipping
+    them. With the piece revealed in a dimmed room the Sunset backlight now
+    lights the bronze frame's inner cheek amber and lays a warm halo on the red
+    wall; with the sub-toggle off, both go black
+    (`.shots/colored-shadows-museum.png` and its `-off` counterpart).
+  - **Regression rig:** `absorption.html` grows a phase 2 and 3. Phase 1 is
+    untouched (the new meshes start hidden, so the compiled scene is exactly what
+    it was) but gains a **quantitative** backlit assertion: the covered panel over
+    the uncovered one in **scene-linear** radiance (ACES and the 1/2.2 gamma are
+    inverted exactly) versus `exp(−σ·d)` over the Snell-refracted chord, with the
+    Fresnel share divided out and the additive leak **measured** on amber's
+    analytically-transparent red channel rather than assumed — plus the
+    geometry-free invariant `tau_B/tau_G = sigma_B/sigma_G` (2.213 measured vs
+    2.319 analytic). Phase 2 is the new stack case: two overlapping slabs 8 m
+    under a small lamp throwing amber, blue and their product onto a white floor
+    coplanar with the lightbox (so the lightbox, a huge emitter, contributes
+    exactly zero). Slab thickness equals `attenuationDistance`, so each slab's
+    analytic transmittance IS its `attenuationColor`. Measured vs analytic:
+    amber +0.2/+1.3/+1.9%, blue +2.9/−0.4/+0.9%, overlap +3.3/+3.2/+4.6%
+    (tolerance 10%); the **product** assertion — overlap vs measured-amber x
+    measured-blue — lands +0.1/+2.2/+1.8% (tolerance 8%). Phase 3 is the A/B
+    control: the same frame with `absorptionShadows: false` must put every
+    covered column back in hard shadow (max ratio 0.014). The rig is what caught
+    the interface-to-interface bookkeeping bug above.
+  - **Outstanding: WebKit/iPad verification.** Playwright's Windows WebKit has no
+    usable WebGL2 here and is not Apple's Metal stack, so the one engine whose
+    GLSL->Metal codegen has broken this megakernel before (the 0.4.0 fourth
+    `traceRadiance` call site) is untested with the march compiled in. The NVIDIA
+    `C5041` failure above shows the inlining budget is genuinely close. Verify on
+    a real iPad with the feature ACTIVE before release.
+
 ## 0.8.0 — 2026-07-25
 
 - **Per-material Beer-Lambert absorption — tinted glass done right.** Light

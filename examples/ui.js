@@ -27,6 +27,10 @@ const CSS = `
 #panel .row { display: flex; align-items: center; gap: 8px; min-height: 24px; margin: 3px 0; }
 #panel .row label { flex: 1; cursor: pointer; }
 #panel .row .val { color: var(--accent); font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
+/* sub-toggle: a modifier of the row above it, dimmed while its parent is off */
+#panel .row.sub { margin-left: 6px; padding-left: 9px; border-left: 2px solid var(--panel-br); }
+#panel .row.sub.dim { opacity: 0.4; }
+#panel .note { margin: 0 0 6px 15px; color: var(--ink-dim); font-size: 10px; line-height: 1.35; }
 /* toggle switch */
 .sw { position: relative; width: 34px; height: 18px; flex: none; }
 .sw input { opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
@@ -279,13 +283,41 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // while watching the fps readout IS the feature's cost measurement. The
   // effect only exists on refracted paths, so turning it on brings refraction
   // with it (same pattern as ReSTIR unchecking fast lights below).
+  // Coloured shadows, the shadow-ray half of the same feature: a shadow ray
+  // crossing absorbing glass is attenuated per channel instead of blocked, so
+  // the Sunset piece's backlight spills tinted light onto the wall and frame
+  // instead of stopping at a black silhouette. Declared before "tinted glass" so
+  // that toggle can dim it (it is a no-op with no absorbing material in the
+  // scene), appended after it as an indented sub-row. It swaps the megakernel's
+  // source on its own, so flipping THIS with tinted glass already on is the
+  // isolated cost A/B of the shadow march.
+  const tintedShadows = toggle("tinted shadows", rt.absorptionShadows, (v) => {
+    rt.absorptionShadows = v;
+  });
+  tintedShadows.row.classList.add("sub", "dim");
+  // Deliberately bound to NOTHING but rt.absorptionShadows: the neighbouring
+  // toggles it depends on are named in the note instead, so flipping this one
+  // changes exactly one thing and the fps delta beside it is the shadow march's
+  // real cost. (Contrast "tinted glass" above, which does pull refraction in —
+  // there the feature is meaningless without it.)
+  const tintedNote = el("div", "note");
+  tintedNote.textContent =
+    "acts on the direct + emissive shadow rays. With ReSTIR lights on, primary " +
+    "direct light is shaded by the reservoir's visibility ray, which stays binary " +
+    "in v1 — turn ReSTIR lights off, and emissive area lights on, to see the " +
+    "Sunset backlight spill onto the red wall.";
   fSec.append(toggle("tinted glass", false, (v) => {
     if (v && !rt.refraction) {
       refractionT.input.checked = true;
       setFeature("refraction", true);
     }
     setFeature("absorption", v);
+    tintedShadows.row.classList.toggle("dim", !v);
+    tintedNote.style.display = v ? "" : "none";
   }).row);
+  fSec.append(tintedShadows.row);
+  tintedNote.style.display = "none"; // revealed with the piece
+  fSec.append(tintedNote);
   // Chromatic dispersion on the refracted term — the diamond-ior glass sphere on
   // the materials bench splits white light into a rainbow. Default 0 (off): the
   // stochastic spectral sampling estimates one colour channel per glass pixel

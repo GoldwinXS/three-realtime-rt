@@ -533,6 +533,14 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * costs only on blend pixels. Off = blend surfaces render fully opaque.
      */
     this.transparency = options.transparency ?? true;
+    /**
+     * Coloured shadows: shadow rays crossing an ABSORBING glass material are
+     * attenuated exp(-sigma*d) per channel instead of blocked. Backing field for
+     * the accessor below (which recompiles the lighting megakernel); assigned
+     * directly here because the pass does not exist yet at this point in the
+     * constructor and compileScene pushes the state anyway.
+     */
+    this._absorptionShadows = options.absorptionShadows ?? true;
     /** Index of refraction used for transmissive surfaces. */
     this.ior = options.ior ?? 1.5;
     /**
@@ -1087,6 +1095,10 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       // ~1/1000 of the scene diagonal, floored at the classic 1e-3.
       this.eps = Math.min(Math.max(1e-3, this.compiled.sceneDiagonal * 1.2e-3), 0.05);
     }
+    // Coloured shadows are an AND with absorption inside the pass, so push the
+    // caller's flag BEFORE setCompiledScene decides the splice from
+    // compiled.absorption — otherwise a recompile would silently re-enable them.
+    this.rtPass.setAbsorptionShadows(this._absorptionShadows);
     this.rtPass.setCompiledScene(this.compiled);
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
@@ -1183,6 +1195,26 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   }
   get _volH() {
     return Math.max(1, this._height >> 2);
+  }
+
+  /**
+   * Coloured shadows (see the constructor field). Live-assignable, but it swaps
+   * the lighting megakernel's SOURCE — the same splice mechanism absorption
+   * itself uses — so treat it as a settings-time knob, not a per-frame one: the
+   * first frame after a change pays a shader compile. Meaningful only while the
+   * compiled scene has an absorbing material; with none, the program is the
+   * byte-identical no-absorption one either way.
+   */
+  get absorptionShadows() {
+    return this._absorptionShadows;
+  }
+  set absorptionShadows(v) {
+    const on = !!v;
+    if (on === this._absorptionShadows) return;
+    this._absorptionShadows = on;
+    if (!this.supported) return;
+    this.rtPass.setAbsorptionShadows(on);
+    this.resetAccumulation();
   }
 
   get renderScale() {

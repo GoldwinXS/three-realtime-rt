@@ -681,21 +681,36 @@ function absorptionSigmaFor(mat) {
 // Build the per-material absorption table from the DEDUPED material list, so
 // index i here is exactly the matIndex the BVH per-vertex attribute stores and
 // the lighting pass fetches. Returns { sigma: Float32Array(materials.length*3),
-// count } when at least one material absorbs, else null — and null keeps row 67
-// out of the scene-data texture and the absorption code out of the lighting
-// shader (RTLightingPass.setAbsorption), the zero-cost-when-unused contract.
+// glass: Float32Array(materials.length), count } when at least one material
+// absorbs, else null — and null keeps row 67 out of the scene-data texture and
+// the absorption code out of the lighting shader (RTLightingPass.setAbsorption),
+// the zero-cost-when-unused contract.
+//
+// `glass` is each material's TRANSMISSION, tabled for EVERY material (not just
+// the absorbing ones) because coloured shadows need the opposite question
+// answered: not "how much does this tint" but "does a shadow ray pass through
+// this at all". It rides row 67's otherwise-unused .w channel, so it costs no
+// bytes and no sampler. A hit whose material reads 0 there is opaque to shadow
+// rays exactly as it was before; a glass material with sigma 0 (clear glass)
+// passes light through untinted, which master could not express.
 function collectAbsorption(materials) {
   let count = 0;
   const sigma = new Float32Array(materials.length * 3);
+  const glass = new Float32Array(materials.length);
   for (let i = 0; i < materials.length; i++) {
-    const s = absorptionSigmaFor(materials[i]);
+    const mat = materials[i];
+    // Same glass test absorptionSigmaFor gates on, and the same one GBufferPass
+    // packs into the [2,4) band of the material word: a transparent surface is
+    // kept out of the BVH entirely, so it can never be a shadow-ray hit anyway.
+    glass[i] = mat && !mat.transparent ? mat.transmission ?? 0 : 0;
+    const s = absorptionSigmaFor(mat);
     if (!s) continue;
     sigma[i * 3 + 0] = s[0];
     sigma[i * 3 + 1] = s[1];
     sigma[i * 3 + 2] = s[2];
     count++;
   }
-  return count > 0 ? { sigma, count } : null;
+  return count > 0 ? { sigma, glass, count } : null;
 }
 
 // SCENE-DATA TEXTURE LAYOUT (RGBA32F, NEAREST, texelFetch only). Every consumer
@@ -713,9 +728,12 @@ function collectAbsorption(materials) {
 //   variance lever for emissive lighting outside of ReSTIR.
 // Row 67 (OPTIONAL — present only when `absorption` is non-null): per-material
 //   Beer-Lambert absorption coefficients, 1 texel per material:
-//   [sigma.r | sigma.g | sigma.b | 0] in 1/world-unit; see collectAbsorption for
-//   the derivation. RTLightingPass reads it only when its absorption code is
-//   spliced in, which is exactly when this row exists.
+//   [sigma.r | sigma.g | sigma.b | transmission] — sigma in 1/world-unit (see
+//   collectAbsorption for the derivation), and .w the material's transmission,
+//   which is the "is this glass to shadow rays" flag the coloured-shadow march
+//   keys on (it was a hard-coded 0 before that feature and cost a channel that
+//   was already allocated). RTLightingPass reads the row only when its
+//   absorption code is spliced in, which is exactly when the row exists.
 //   WHY A NEW ROW, NOT A WIDER PER-MATERIAL STRIDE: both row-0 texels are fully
 //   occupied (rgb+roughness, rgb+metalness — zero spare channels), and the *2
 //   stride arithmetic is duplicated across two shaders (fetchMaterial in
@@ -767,10 +785,12 @@ function buildSceneDataTexture(materials, emissiveTris, absorption) {
   if (absorption) {
     const absRow = (2 + BLUE_NOISE_SIZE + 1) * row;
     const s = absorption.sigma;
+    const g = absorption.glass;
     for (let i = 0; i < materials.length; i++) {
       data[absRow + i * 4 + 0] = s[i * 3 + 0];
       data[absRow + i * 4 + 1] = s[i * 3 + 1];
       data[absRow + i * 4 + 2] = s[i * 3 + 2];
+      data[absRow + i * 4 + 3] = g[i]; // transmission: the coloured-shadow glass flag
     }
   }
   const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);

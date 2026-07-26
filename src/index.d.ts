@@ -222,6 +222,15 @@ export interface RealtimeRaytracerOptions {
   /** Traced refraction for transmissive (MeshPhysicalMaterial.transmission) surfaces. */
   refraction?: boolean;
   /**
+   * Coloured shadows: shadow rays crossing an **absorbing** glass material are
+   * attenuated `exp(-sigma * d)` per channel instead of blocked. Default `true`,
+   * and meaningful only when the compiled scene has an absorbing material —
+   * with none (or set to `false`) the lighting program is byte-identical to the
+   * build without the feature. See {@link RealtimeRaytracer.absorptionShadows}
+   * for the scope limits.
+   */
+  absorptionShadows?: boolean;
+  /**
    * Alpha-blended transparency: `transparent: true` meshes are primary-visible
    * and composited against the geometry behind them (weighted by `opacity`).
    * Default true. Off = blend surfaces render fully opaque.
@@ -479,11 +488,15 @@ export class CompiledScene {
   /**
    * Per-material Beer-Lambert absorption table (see {@link RTAttenuation}), or
    * `null` when no compiled material absorbs. `sigma` holds 3 floats per
-   * material (1/world-unit, indexed by the compiled material table); `count` is
-   * how many materials opted in. When `null`, the lighting shader compiles
-   * WITHOUT the absorption code — byte-identical to the pre-feature program.
+   * material (1/world-unit, indexed by the compiled material table); `glass`
+   * holds each material's transmission (1 float per material — the flag
+   * {@link RealtimeRaytracer.absorptionShadows} uses to decide whether a shadow
+   * ray passes through a hit at all, tabled for every material, not just the
+   * absorbing ones); `count` is how many materials opted in. When `null`, the
+   * lighting shader compiles WITHOUT the absorption code — byte-identical to
+   * the pre-feature program.
    */
-  absorption: { sigma: Float32Array; count: number } | null;
+  absorption: { sigma: Float32Array; glass: Float32Array; count: number } | null;
   /** CPU cost (ms) of the most recent dynamic-emissive refresh (0 if none). */
   lastEmissiveRefreshMs: number;
   /**
@@ -604,6 +617,28 @@ export class RealtimeRaytracer {
   reflections: boolean;
   /** Traced refraction for transmissive surfaces. */
   refraction: boolean;
+  /**
+   * Coloured shadows (**since 0.9.0**): a shadow ray crossing an **absorbing**
+   * glass material is attenuated `exp(-sigma * d)` per channel over the distance
+   * it spends inside, instead of being blocked outright — stained glass spills
+   * tinted light, and an emissive panel behind stacked translucent bodies lights
+   * what is in front of them instead of rendering as a black silhouette. Clear
+   * glass (a glass material with no `attenuationDistance`) stops occluding
+   * entirely.
+   *
+   * Scope, v1 — the two next-event-estimation shadow rays only: analytic
+   * point/spot/directional lights, and emissive-mesh area lights. NOT the ReSTIR
+   * visibility ray (with `restir` on, the reservoir winner's shadow ray stays
+   * binary, so direct light through glass is still blocked on that path), NOT
+   * the volumetric march, and refraction is ignored (the shadow ray is a
+   * straight segment).
+   *
+   * Live-assignable, but it swaps the lighting megakernel's source — the first
+   * frame after a change pays a shader compile, so treat it as a settings knob.
+   * Meaningful only when the compiled scene has an absorbing material; with none
+   * (or `false`) the program is byte-identical to the build without the feature.
+   */
+  absorptionShadows: boolean;
   /** Alpha-blended transparency: composite `transparent` meshes over the geometry behind them. */
   transparency: boolean;
   /**
