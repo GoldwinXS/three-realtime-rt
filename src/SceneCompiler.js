@@ -100,6 +100,12 @@ export class CompiledScene {
     // (the G-buffer) can carry any number of distinct volumes; only the traced
     // secondary rays are limited to one in v1.
     this.volumeAlbedo = null;
+    // Per-material Beer-Lambert absorption (see collectAbsorption): { sigma,
+    // count } or null when no material opted in. null keeps row 67 out of the
+    // scene-data texture AND the absorption code out of the lighting shader
+    // (RTLightingPass strips it back to the byte-identical pre-feature source),
+    // so an unused feature costs exactly nothing.
+    this.absorption = null;
     this.lightPosType = [];
     this.lightColorRadius = [];
     this.lightDirCone = []; // spot direction.xyz + cos(outer angle)
@@ -598,6 +604,103 @@ function collectVolumeAlbedo(materials) {
   return found;
 }
 
+// Per-material Beer-Lambert absorption ("tinted glass done right"). Light that
+// travels a distance d INSIDE a refractive medium is attenuated per channel by
+// exp(-sigma * d): a thick slab of the same glass tints deeper than a thin one,
+// stacked thicknesses compound, and a backlit pane glows in the filtered colour
+// — none of which a flat surface tint can express. Two ways in, mirroring
+// three.js's MeshPhysicalMaterial convention:
+//
+//   1. `attenuationColor` (THREE.Color) + `attenuationDistance` (finite > 0,
+//      world units) on a material the tracer already treats as GLASS
+//      (transmission > 0, not `transparent`). attenuationColor is the colour
+//      that SURVIVES one attenuationDistance of travel, so
+//      sigma = -ln(attenuationColor) / attenuationDistance. three's own default
+//      attenuationDistance is Infinity ("no absorption"), which makes a finite
+//      value the explicit opt-in.
+//   2. `userData.rtAttenuation = { color, distance }` — the same two parameters
+//      for materials that don't HAVE the physical fields (MeshStandardMaterial
+//      and friends, given a `transmission` the tracer reads either way). `color`
+//      accepts a THREE.Color or a plain [r,g,b]; when both routes are present,
+//      userData wins.
+//
+// Colour channels are floored at 1e-4 so a pure-black attenuationColor yields a
+// large but finite sigma; a channel >= 1 would mean gain, and clamps to sigma 0.
+// A material whose every channel lands on sigma 0 (white attenuationColor) is
+// treated as non-absorbing — exactly today's behaviour, as is setting nothing.
+function absorptionSigmaFor(mat) {
+  if (!mat) return null;
+  // Only glass surfaces ever have an in-medium path length to attenuate over
+  // (the refracted entry-to-exit chord in RTLightingPass.glassRadiance), and the
+  // shader identifies the medium by the material of the interface a refracted
+  // ray lands on — so a sigma on a non-glass material could only ever tint a
+  // path through AIR. Gate it out here rather than mis-render there.
+  const isGlass = (mat.transmission ?? 0) > 0 && !mat.transparent;
+  const ud = mat.userData && mat.userData.rtAttenuation;
+  let color = null;
+  let distance = 0;
+  if (ud) {
+    const c = ud.color;
+    if (c && typeof c.r === "number") color = [c.r, c.g, c.b];
+    else if (Array.isArray(c) && c.length >= 3) color = [c[0], c[1], c[2]];
+    distance = ud.distance;
+    if (!color || !Number.isFinite(distance) || distance <= 0) {
+      console.warn(
+        "three-realtime-rt: userData.rtAttenuation needs { color: THREE.Color | [r,g,b], " +
+          "distance: finite > 0 (world units) } — ignoring this material's absorption."
+      );
+      return null;
+    }
+    if (!isGlass) {
+      console.warn(
+        "three-realtime-rt: userData.rtAttenuation is set on a material the tracer does not " +
+          "trace as glass (needs transmission > 0 and transparent: false) — absorption only " +
+          "acts along refracted in-medium paths, so it is ignored on this material."
+      );
+      return null;
+    }
+  } else {
+    if (!isGlass) return null;
+    const c = mat.attenuationColor;
+    distance = mat.attenuationDistance;
+    if (!c || typeof c.r !== "number") return null;
+    // Infinity is three's "no attenuation" default — not an opt-in, stay quiet.
+    if (!Number.isFinite(distance) || distance <= 0) return null;
+    color = [c.r, c.g, c.b];
+  }
+  const sigma = [0, 0, 0];
+  let absorbs = false;
+  for (let ch = 0; ch < 3; ch++) {
+    const s = -Math.log(Math.max(color[ch], 1e-4)) / distance;
+    sigma[ch] = s > 0 ? s : 0;
+    if (sigma[ch] > 0) absorbs = true;
+  }
+  return absorbs ? sigma : null;
+}
+
+// Build the per-material absorption table from the DEDUPED material list, so
+// index i here is exactly the matIndex the BVH per-vertex attribute stores and
+// the lighting pass fetches. Returns { sigma: Float32Array(materials.length*3),
+// count } when at least one material absorbs, else null — and null keeps row 67
+// out of the scene-data texture and the absorption code out of the lighting
+// shader (RTLightingPass.setAbsorption), the zero-cost-when-unused contract.
+function collectAbsorption(materials) {
+  let count = 0;
+  const sigma = new Float32Array(materials.length * 3);
+  for (let i = 0; i < materials.length; i++) {
+    const s = absorptionSigmaFor(materials[i]);
+    if (!s) continue;
+    sigma[i * 3 + 0] = s[0];
+    sigma[i * 3 + 1] = s[1];
+    sigma[i * 3 + 2] = s[2];
+    count++;
+  }
+  return count > 0 ? { sigma, count } : null;
+}
+
+// SCENE-DATA TEXTURE LAYOUT (RGBA32F, NEAREST, texelFetch only). Every consumer
+// (RTLightingPass, GIReservoirPass, RestirPass, VolumetricPass) addresses rows
+// by ABSOLUTE row constants, so rows may only ever be APPENDED.
 // Row 0: materials, 2 texels each (albedo+rough, emissive+metal).
 // Row 1: emissive triangles for NEE, 4 texels each:
 //   [v0.xyz | area] [e1.xyz | emit.r] [e2.xyz | emit.g] [n.xyz | emit.b]
@@ -608,12 +711,25 @@ function collectVolumeAlbedo(materials) {
 //   triangle to shoot at instead of picking uniformly (a big/bright panel gets
 //   sampled proportionally more than a tiny dim strip), which is the main
 //   variance lever for emissive lighting outside of ReSTIR.
+// Row 67 (OPTIONAL — present only when `absorption` is non-null): per-material
+//   Beer-Lambert absorption coefficients, 1 texel per material:
+//   [sigma.r | sigma.g | sigma.b | 0] in 1/world-unit; see collectAbsorption for
+//   the derivation. RTLightingPass reads it only when its absorption code is
+//   spliced in, which is exactly when this row exists.
+//   WHY A NEW ROW, NOT A WIDER PER-MATERIAL STRIDE: both row-0 texels are fully
+//   occupied (rgb+roughness, rgb+metalness — zero spare channels), and the *2
+//   stride arithmetic is duplicated across two shaders (fetchMaterial in
+//   RTLightingPass AND GIReservoirPass) while four passes index OTHER rows of
+//   this same texture by absolute constants. Appending a row leaves every
+//   existing fetch byte-identical; widening the stride would touch them all.
+//   The row is simply omitted when nothing absorbs, so the unused feature costs
+//   zero bytes.
 // All packed into ONE texture because the lighting pass already sits at the
 // WebGL2-guaranteed 16-sampler limit — extra samplers are not available.
-function buildSceneDataTexture(materials, emissiveTris) {
+function buildSceneDataTexture(materials, emissiveTris, absorption) {
   const bn = decodeBlueNoise();
   const width = Math.max(materials.length * 2, emissiveTris.length * 4, BLUE_NOISE_SIZE);
-  const height = 2 + BLUE_NOISE_SIZE + 1;
+  const height = 2 + BLUE_NOISE_SIZE + 1 + (absorption ? 1 : 0);
   const data = new Float32Array(width * height * 4);
   materials.forEach((mat, i) => {
     const o = i * 8;
@@ -646,6 +762,17 @@ function buildSceneDataTexture(materials, emissiveTris) {
   // Emissive power CDF (row 66). Factored out so updateDynamic can rebuild it
   // in place when a dynamic emitter's area/position changed this frame.
   writeEmissiveCdf(data, row, emissiveTris);
+  // Absorption sigma (row 67) — written only when the row was allocated. Fits by
+  // construction: width >= materials.length * 2 > materials.length texels.
+  if (absorption) {
+    const absRow = (2 + BLUE_NOISE_SIZE + 1) * row;
+    const s = absorption.sigma;
+    for (let i = 0; i < materials.length; i++) {
+      data[absRow + i * 4 + 0] = s[i * 3 + 0];
+      data[absRow + i * 4 + 1] = s[i * 3 + 1];
+      data[absRow + i * 4 + 2] = s[i * 3 + 2];
+    }
+  }
   const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
   tex.minFilter = THREE.NearestFilter;
   tex.magFilter = THREE.NearestFilter;
@@ -1002,7 +1129,11 @@ export function compileScene(scene, options = {}) {
     if (t.dyn) compiled._dynamicEmissive.push({ row: r, off: t.dynOff, emit: t.emit });
   }
   compiled.hasDynamicEmissive = compiled._dynamicEmissive.length > 0;
-  compiled.materialsTex = buildSceneDataTexture(materials, emissiveTris);
+  // Per-material Beer-Lambert absorption opt-in (attenuationColor +
+  // attenuationDistance, or userData.rtAttenuation). Resolved BEFORE the scene
+  // data texture is built because a non-null table appends row 67 to it.
+  compiled.absorption = collectAbsorption(materials);
+  compiled.materialsTex = buildSceneDataTexture(materials, emissiveTris, compiled.absorption);
   // World-space 3D-texture albedo opt-in (userData.rtVolumeAlbedo). Resolved from
   // the deduped material table so the recorded matIndex matches what the BVH
   // per-vertex attribute stores and the lighting pass reads.

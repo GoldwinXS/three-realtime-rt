@@ -55,6 +55,32 @@ export interface VolumeAlbedo {
   size: Vector3;
 }
 
+/**
+ * Per-material Beer-Lambert absorption ("tinted glass done right") — the
+ * `userData.rtAttenuation` escape hatch for materials that lack the
+ * MeshPhysicalMaterial fields. Light traversing a glass material's interior is
+ * attenuated per channel by `exp(-sigma * distance)` over the in-medium path
+ * length, so a thick slab tints deeper than a thin one and a backlit pane glows
+ * in the filtered colour.
+ *
+ * The primary route needs no userData at all: a glass material
+ * (`transmission > 0`, `transparent: false`) with three.js's own
+ * `attenuationColor` (the colour that survives one `attenuationDistance` of
+ * travel) and a **finite, positive** `attenuationDistance` opts in, and
+ * `sigma = -ln(attenuationColor) / attenuationDistance` per channel. This
+ * interface is the equivalent override for non-physical materials; when both
+ * are present, userData wins. Setting neither — or a white attenuationColor,
+ * or three's default `attenuationDistance: Infinity` — leaves the material
+ * non-absorbing and the whole feature compiled out (`compileScene()` after
+ * changes, as usual).
+ */
+export interface RTAttenuation {
+  /** Colour that survives one `distance` of in-medium travel (THREE.Color or [r,g,b], 0..1). */
+  color: Color | [number, number, number];
+  /** World-unit distance over which `color` survives; finite and > 0. */
+  distance: number;
+}
+
 /** Result of {@link RealtimeRaytracer.probeGPUTier}. */
 export interface GPUTierProbe {
   /** Chosen capability tier. */
@@ -450,6 +476,14 @@ export class CompiledScene {
   volumeAlbedo:
     | { matIndex: number; texture: Data3DTexture; origin: Vector3; size: Vector3; material: unknown }
     | null;
+  /**
+   * Per-material Beer-Lambert absorption table (see {@link RTAttenuation}), or
+   * `null` when no compiled material absorbs. `sigma` holds 3 floats per
+   * material (1/world-unit, indexed by the compiled material table); `count` is
+   * how many materials opted in. When `null`, the lighting shader compiles
+   * WITHOUT the absorption code — byte-identical to the pre-feature program.
+   */
+  absorption: { sigma: Float32Array; count: number } | null;
   /** CPU cost (ms) of the most recent dynamic-emissive refresh (0 if none). */
   lastEmissiveRefreshMs: number;
   /**

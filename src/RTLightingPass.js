@@ -193,6 +193,28 @@ void fetchMaterial(float matIndex, out vec3 albedo, out float roughness,
   metalness = t1.a;
 }
 
+// >>> RT_ABSORPTION (whole block source-spliced — see stripAbsorption below)
+// Per-material Beer-Lambert absorption for refractive media ("tinted glass done
+// right"). Row 67 of the scene-data texture carries one texel per material,
+// [sigma.rgb | 0] in 1/world-unit, derived by SceneCompiler from
+// attenuationColor / attenuationDistance (or userData.rtAttenuation — see
+// collectAbsorption there). The row exists ONLY when some material absorbs,
+// which is exactly when this code is spliced into the source, so the fetch can
+// never read a missing row. Deliberately free of new resources: no new sampler
+// (this pass sits at the WebGL2 16-sampler minimum — sigma rides the already-
+// bound scene-data texture), no new uniform, and no new traceRadiance call site
+// (see the Metal call-site budget note at the unified secondary-ray site).
+vec3 rtAbsorbSigma(float matIndex) {
+  return texelFetch(uMaterialsTex, ivec2(int(round(matIndex)), 67), 0).rgb;
+}
+// Beer-Lambert transmittance over an in-medium path of length d:
+// exp(-sigma * d) per channel. sigma == 0 gives exactly 1.0 (no change), so
+// non-absorbing materials in an absorbing scene pay only these few ALU ops.
+vec3 rtTransmittance(float matIndex, float d) {
+  return exp(-rtAbsorbSigma(matIndex) * max(d, 0.0));
+}
+
+// <<< RT_ABSORPTION
 // World-space 3D-texture albedo ("volumetric surface albedo") for the traced
 // SECONDARY rays (GI bounces + reflection/refraction), so global illumination and
 // mirror views carry the same field colours the primary G-buffer shows. Compiled
@@ -658,6 +680,29 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
     vec3 rd2 = refract(rd, xN, iorC);     // same channel-shifted ior on exit
     if (rd2 == vec3(0.0)) rd2 = reflect(rd, xN);
     refrRad = traceRadiance(xP - xN * uEps, rd2, true);
+// >>> RT_ABSORPTION
+    // BEER-LAMBERT ABSORPTION of the transmitted term. dist is the ONE
+    // in-medium path length this shader computes: entry interface (P) to exit
+    // interface along the refracted ray — how far the transmitted view path
+    // actually travelled INSIDE the glass. Everything that came back through
+    // the exit interface (surface shading behind the slab, an emissive panel's
+    // glow, the sky) rides that segment, so this single multiply tints it all:
+    // a thick slab tints deeper than a thin one, and a backlit pane glows in
+    // the filtered colour for free. The medium is identified by the EXIT
+    // interface's material (attr.w): for closed glass volumes that is the same
+    // material the ray entered (the entry surface's matIndex is not in the
+    // G-buffer — the packed word carries transmission/ior only), and for an
+    // open sheet the exit lands on some other surface whose sigma is 0
+    // (SceneCompiler only tables sigma for glass materials), so the multiply
+    // is exactly 1 — no false tinting over air. Applied ONLY to the
+    // transmitted term: the Fresnel reflection half never entered the medium.
+    // On total internal reflection (rd2 above) the entry chord was still
+    // in-medium, so attenuating remains correct; the extra post-TIR bounce
+    // inside the slab is not tracked (the documented one-layer limit). Order
+    // vs the dispersion channel mask below is irrelevant — both are
+    // per-channel scale factors.
+    refrRad *= rtTransmittance(attr.w, dist);
+// <<< RT_ABSORPTION
   } else {
     refrRad = uSkyEnabled
       ? skyColor(rd, uSunDir, uSunColor, uSkyZenith, uSkyHorizon, uSkyIntensity)
@@ -996,6 +1041,28 @@ void main() {
 }
 `;
 
+// Remove every RT_ABSORPTION-marked line span (markers included) from a shader
+// source. The absorption GLSL is written inline where it acts — readable right
+// next to the code it extends — between ">>> RT_ABSORPTION" and
+// "<<< RT_ABSORPTION" comment lines; dropping those whole lines restores the
+// pre-feature source BYTE FOR BYTE. That textual identity (not just an
+// #ifdef'd-out block, which still changes the source text and the program cache
+// key) is the zero-cost-when-unused guarantee: a scene without an absorbing
+// material compiles the exact program it compiled before the feature existed.
+// Same zero-cost intent as the RT_VOLUME_ALBEDO define gate, tightened to be
+// provable with a getShaderSource diff.
+function stripAbsorption(src) {
+  const lines = src.split("\n");
+  const out = [];
+  let drop = false;
+  for (const line of lines) {
+    if (line.includes(">>> RT_ABSORPTION")) { drop = true; continue; }
+    if (line.includes("<<< RT_ABSORPTION")) { drop = false; continue; }
+    if (!drop) out.push(line);
+  }
+  return out.join("\n");
+}
+
 /**
  * Fullscreen pass: for every G-buffer pixel, trace shadow rays to every light and
  * one cosine-weighted GI bounce against the BVH. Outputs demodulated irradiance,
@@ -1022,6 +1089,22 @@ export class RTLightingPass {
     this.specA = specMRT ? this._makeSpecTarget(width, height) : null;
     this.specB = specMRT ? this._makeSpecTarget(width, height) : null;
 
+    // Beer-Lambert absorption is compiled in by SOURCE SPLICE, not a define:
+    // the RT_ABSORPTION-marked lines are stripped whenever the compiled scene
+    // has no absorbing material, so the disabled program's source is
+    // byte-identical to the pre-feature shader (see stripAbsorption).
+    // setCompiledScene drives the swap from compiled.absorption; changing
+    // material.fragmentShader re-keys three's program cache, so this recompiles
+    // at scene-compile time, never per frame.
+    const fragFull = specMRT
+      ? rtLightingFrag
+      : rtLightingFrag.replace(
+          "layout(location = 1) out vec4 outSpecular;",
+          "vec4 outSpecular; // single-target fallback: dead store"
+        );
+    this._fragAbsorption = fragFull;
+    this._fragPlain = stripAbsorption(fragFull);
+
     this.material = new THREE.ShaderMaterial({
       // Stable program name for compile-failure self-diagnosis: this is the
       // CORE lighting megakernel — a link failure here has no fallback (see
@@ -1034,12 +1117,7 @@ export class RTLightingPass {
       // pre-feature build — same 16 samplers, same Metal translation.
       defines: {},
       vertexShader: fullscreenVert,
-      fragmentShader: specMRT
-        ? rtLightingFrag
-        : rtLightingFrag.replace(
-            "layout(location = 1) out vec4 outSpecular;",
-            "vec4 outSpecular; // single-target fallback: dead store"
-          ),
+      fragmentShader: this._fragPlain,
       uniforms: {
         bvhStatic: { value: null },
         bvhDynamic: { value: null },
@@ -1274,6 +1352,26 @@ export class RTLightingPass {
     u.uLightDirCone.value = compiled.lightDirCone;
     u.uLightCount.value = compiled.lightCount;
     u.uEmissiveCount.value = compiled.emissiveTriCount;
+    // Beer-Lambert absorption rides row 67 of the scene-data texture bound just
+    // above, so the shader variant follows the compiled scene directly — no
+    // uniform, no sampler, nothing for the caller to remember.
+    this.setAbsorption(!!compiled.absorption);
+  }
+
+  /**
+   * Splice in / strip out the per-material Beer-Lambert absorption path (tinted
+   * glass). Driven by setCompiledScene from `compiled.absorption`, which is
+   * non-null only when a material derived a non-zero sigma (attenuationColor +
+   * attenuationDistance, or userData.rtAttenuation — see SceneCompiler). The
+   * swap recompiles this megakernel, so it happens at scene-compile time, never
+   * per frame — and with absorption off the compiled source is byte-identical
+   * to the pre-feature shader (see stripAbsorption).
+   */
+  setAbsorption(on) {
+    const src = on ? this._fragAbsorption : this._fragPlain;
+    if (this.material.fragmentShader === src) return;
+    this.material.fragmentShader = src;
+    this.material.needsUpdate = true; // three re-keys the program by source hash
   }
 
   /**
