@@ -215,6 +215,83 @@ vec3 rtTransmittance(float matIndex, float d) {
 }
 
 // <<< RT_ABSORPTION
+// >>> RT_ABSORB_SHADOWS (whole block source-spliced — see stripAbsorbShadows)
+// COLOURED SHADOWS. A shadow ray that crosses absorbing glass is ATTENUATED per
+// channel instead of blocked: stained glass spills tinted light, a backlit stack
+// of translucent bodies stops rendering as a black silhouette. This is the
+// shadow-ray twin of the view-path absorption above, and it is spliced in only
+// when the scene absorbs AND rt.absorptionShadows is on — so the fast path (a
+// single any-hit ray, occluded()) survives byte-for-byte everywhere else.
+//
+// NOT an unordered any-hit signed sum. The obvious cheap trick — accumulate
+// +sigma on front faces and -sigma on back faces in any order — is wrong for
+// real geometry: a multi-body 3D-print stack legitimately contains body-to-body
+// interfaces where only ONE of the two coincident walls survives, so entry/exit
+// events do not pair up and the signed sum goes NEGATIVE (optical gain, bright
+// halos). This marches in ORDER with an explicit current-medium state instead,
+// which never produces negative optical depth no matter how unbalanced the
+// interfaces are.
+//
+// Interfaces are classified by the interpolated attribute normal (attr.xyz), not
+// a true geometric normal: traceBoth discards the BVH kernel's face normal and
+// widening its signature would edit a line the byte-identity contract forbids
+// touching. The two agree exactly on the flat-walled bodies this targets, and
+// disagree only within a smooth surface's silhouette band, where the mis-classed
+// segment is short.
+//
+// Shadow rays do NOT refract — a straight segment, the standard approximation
+// (bending them would need the light re-solved through the bent path).
+#define RT_SHADOW_EVENTS 8
+// Row 67's .w channel carries the material's TRANSMISSION, which is exactly the
+// "is glass to this tracer" flag (SceneCompiler writes it beside sigma; a
+// surface the tracer shades opaquely reads 0). Glass with no sigma still lets
+// the ray through, contributing nothing to the optical depth — clear glass casts
+// no shadow, which is the physically right answer and the one master could not
+// express.
+float rtShadowGlass(float matIndex) {
+  return texelFetch(uMaterialsTex, ivec2(int(round(matIndex)), 67), 0).w;
+}
+// Per-channel transmittance along the segment (origin, origin + dir * maxDist):
+// vec3(1) for a clear line of sight, vec3(0) for an opaque blocker, exp(-tau)
+// through glass. ONE textual call to the closest-hit kernel (traceBoth, reused
+// by the loop) — the inlined-code footprint is what WebKit's Metal translator
+// has broken on before, so this never unrolls.
+vec3 shadowTransmittance(vec3 origin, vec3 dir, float maxDist) {
+  vec3 tau = vec3(0.0);       // accumulated optical depth, per channel
+  vec3 sigmaCur = vec3(0.0);  // absorption of the medium we are currently inside
+  float tPrev = 0.0;          // distance from origin to the last INTERFACE crossed
+  float tOrig = 0.0;          // distance from origin to o (tPrev plus the eps step)
+  vec3 o = origin;
+  for (int i = 0; i < RT_SHADOW_EVENTS; i++) {
+    uvec4 fi; vec3 bary; float dist; bool isDyn;
+    if (!traceBoth(o, dir, fi, bary, dist, isDyn)) break;  // clear from here on
+    float tHit = tOrig + dist;
+    if (tHit >= maxDist - 2.0 * uEps) break;               // hit is at/behind the light
+    vec4 attr = isDyn
+      ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
+      : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
+    // The segment just crossed, measured INTERFACE to INTERFACE — not from the
+    // stepped-off origin. The two differ by the 2*eps the march skips past each
+    // hit; charging tau only from o would silently under-attenuate every body by
+    // 2*eps of its thickness, which is ~10% of a 4 cm slab and far more in a
+    // scene whose auto-scaled eps is larger (measured, then fixed).
+    tau += sigmaCur * (tHit - tPrev);
+    if (rtShadowGlass(attr.w) <= 0.0) return vec3(0.0);    // opaque: fully occluded
+    // Glass interface: front face = entering this body, back face = back to air.
+    sigmaCur = dot(attr.xyz, dir) < 0.0 ? rtAbsorbSigma(attr.w) : vec3(0.0);
+    o += dir * (dist + 2.0 * uEps);                        // step past the interface
+    tOrig = tHit + 2.0 * uEps;
+    tPrev = tHit;
+  }
+  // Tail: still inside a medium when the march ended (ran out of geometry, or
+  // ran out of events). On the event cap this assumes the medium continues to
+  // the light, which errs slightly DARK rather than pretending the ray is clear;
+  // either way the result is a transmittance, never the hard black that would
+  // reintroduce the silhouette this feature exists to remove.
+  tau += sigmaCur * max(maxDist - tPrev, 0.0);
+  return exp(-tau);
+}
+// <<< RT_ABSORB_SHADOWS
 // World-space 3D-texture albedo ("volumetric surface albedo") for the traced
 // SECONDARY rays (GI bounces + reflection/refraction), so global illumination and
 // mirror views carry the same field colours the primary G-buffer shows. Compiled
@@ -328,8 +405,22 @@ vec3 lightContribution(int i, vec3 P, vec3 N) {
   float NdotL = dot(N, L);
   if (NdotL <= 0.0) return vec3(0.0);
 
+// >>> RT_ABSORB_SHADOWS
+  // COLOURED SHADOWS (analytic lights): the per-channel transmittance march
+  // REPLACES the binary occlusion test on the line below. The splice contract
+  // only ever ADDS lines — every line that survives the strip must be
+  // byte-identical to master's — so the test is disabled by the "if (false)"
+  // rather than by editing it, and both it and the constant branch are dead
+  // before the driver's first optimisation pass.
+  vec3 rtSt = shadowTransmittance(P + N * uEps, L, maxDist);
+  if (rtSt == vec3(0.0)) return vec3(0.0);
+  if (false)
+// <<< RT_ABSORB_SHADOWS
   if (occluded(P + N * uEps, L, maxDist)) return vec3(0.0);
   vec3 li = colRad.rgb * (cone / dist2);
+// >>> RT_ABSORB_SHADOWS
+  li *= rtSt; // tint + attenuate; the highlight below inherits it for free
+// <<< RT_ABSORB_SHADOWS
   addSpec(N, L, li, NdotL); // same shadow ray shadows the highlight
   return li * NdotL;
 }
@@ -402,12 +493,24 @@ vec3 sampleEmissiveTri(vec3 P, vec3 N) {
   // abs(): double-sided emission, matching what a GI ray hitting either face sees.
   float cosL = abs(dot(t3.xyz, wi));
   if (cosS <= 0.0 || cosL < 1e-4) return vec3(0.0);
+// >>> RT_ABSORB_SHADOWS
+  // COLOURED SHADOWS (area emitters) — THE backlit-stack path: an emissive panel
+  // behind stacked translucent bodies now lights what is in front of them,
+  // filtered, instead of being blocked into a black silhouette. Same
+  // add-lines-only splice as the analytic-light site above.
+  vec3 rtSt = shadowTransmittance(P + N * uEps, wi, dist);
+  if (rtSt == vec3(0.0)) return vec3(0.0);
+  if (false)
+// <<< RT_ABSORB_SHADOWS
   if (occluded(P + N * uEps, wi, dist)) return vec3(0.0);
 
   // Pick of one tri (probability 1/invProb) + uniform point on it:
   // pdf_area = 1/(invProb·area). Solid-angle conversion gives irradiance
   // Le · cosS · cosL / (d² · pdf_area).
   vec3 e = vec3(t1.w, t2.w, t3.w) * (cosS * cosL * invProb * t0.w / max(d2, 1e-6));
+// >>> RT_ABSORB_SHADOWS
+  e *= rtSt; // filtered by every absorbing body between P and the sampled point
+// <<< RT_ABSORB_SHADOWS
 
   // Dielectric highlight from this emitter: e already folds in cosS, so the
   // specular is e * (GGX BRDF) toward the sampled point (wi).
@@ -1041,23 +1144,30 @@ void main() {
 }
 `;
 
-// Remove every RT_ABSORPTION-marked line span (markers included) from a shader
-// source. The absorption GLSL is written inline where it acts — readable right
-// next to the code it extends — between ">>> RT_ABSORPTION" and
-// "<<< RT_ABSORPTION" comment lines; dropping those whole lines restores the
-// pre-feature source BYTE FOR BYTE. That textual identity (not just an
-// #ifdef'd-out block, which still changes the source text and the program cache
-// key) is the zero-cost-when-unused guarantee: a scene without an absorbing
-// material compiles the exact program it compiled before the feature existed.
-// Same zero-cost intent as the RT_VOLUME_ALBEDO define gate, tightened to be
-// provable with a getShaderSource diff.
-function stripAbsorption(src) {
+// Remove every line span marked with `tag` (markers included) from a shader
+// source. Optional GLSL is written inline where it acts — readable right next to
+// the code it extends — between ">>> tag" and "<<< tag" comment lines; dropping
+// those whole lines restores the source without that feature BYTE FOR BYTE. That
+// textual identity (not just an #ifdef'd-out block, which still changes the
+// source text and the program cache key) is the zero-cost-when-unused guarantee:
+// a scene that does not use the feature compiles the exact program it compiled
+// before the feature existed. Same zero-cost intent as the RT_VOLUME_ALBEDO
+// define gate, tightened to be provable with a getShaderSource diff.
+//
+// Two tags, stripped independently, in a strict hierarchy:
+//   RT_ABSORPTION    — per-material Beer-Lambert absorption on the VIEW path.
+//   RT_ABSORB_SHADOWS — coloured shadows (shadowTransmittance). Depends on the
+//     absorption block's rtAbsorbSigma and on row 67 existing, so it may only be
+//     spliced in when RT_ABSORPTION is too. The tags are prefix-distinct
+//     ("RT_ABSORPTION" vs "RT_ABSORB_SHADOWS"), so neither substring test can
+//     ever match the other's markers.
+function stripMarked(src, tag) {
   const lines = src.split("\n");
   const out = [];
   let drop = false;
   for (const line of lines) {
-    if (line.includes(">>> RT_ABSORPTION")) { drop = true; continue; }
-    if (line.includes("<<< RT_ABSORPTION")) { drop = false; continue; }
+    if (line.includes(">>> " + tag)) { drop = true; continue; }
+    if (line.includes("<<< " + tag)) { drop = false; continue; }
     if (!drop) out.push(line);
   }
   return out.join("\n");
@@ -1089,21 +1199,31 @@ export class RTLightingPass {
     this.specA = specMRT ? this._makeSpecTarget(width, height) : null;
     this.specB = specMRT ? this._makeSpecTarget(width, height) : null;
 
-    // Beer-Lambert absorption is compiled in by SOURCE SPLICE, not a define:
-    // the RT_ABSORPTION-marked lines are stripped whenever the compiled scene
-    // has no absorbing material, so the disabled program's source is
-    // byte-identical to the pre-feature shader (see stripAbsorption).
-    // setCompiledScene drives the swap from compiled.absorption; changing
-    // material.fragmentShader re-keys three's program cache, so this recompiles
-    // at scene-compile time, never per frame.
+    // Beer-Lambert absorption and its coloured-shadow extension are compiled in
+    // by SOURCE SPLICE, not a define: the marked lines are stripped whenever the
+    // compiled scene has no absorbing material (or the caller turned coloured
+    // shadows off), so each disabled program's source is byte-identical to the
+    // build that predates that feature (see stripMarked). setCompiledScene drives
+    // the swap from compiled.absorption; changing material.fragmentShader re-keys
+    // three's program cache, so this recompiles at scene-compile time, never per
+    // frame. THREE variants, cached once here (the strip is pure string work, but
+    // it should not run on a toggle):
+    //   _fragPlain            no absorption at all — the pre-0.8.0 program
+    //   _fragAbsorption       view-path absorption only — the 0.8.0 program
+    //   _fragAbsorbShadows    + coloured shadows
     const fragFull = specMRT
       ? rtLightingFrag
       : rtLightingFrag.replace(
           "layout(location = 1) out vec4 outSpecular;",
           "vec4 outSpecular; // single-target fallback: dead store"
         );
-    this._fragAbsorption = fragFull;
-    this._fragPlain = stripAbsorption(fragFull);
+    this._fragAbsorbShadows = fragFull;
+    this._fragAbsorption = stripMarked(fragFull, "RT_ABSORB_SHADOWS");
+    this._fragPlain = stripMarked(this._fragAbsorption, "RT_ABSORPTION");
+    // Current splice state, so setAbsorption / setAbsorptionShadows can each set
+    // their own half without the caller re-stating the other.
+    this._absorbOn = false;
+    this._absorbShadows = true;
 
     this.material = new THREE.ShaderMaterial({
       // Stable program name for compile-failure self-diagnosis: this is the
@@ -1365,10 +1485,33 @@ export class RTLightingPass {
    * attenuationDistance, or userData.rtAttenuation — see SceneCompiler). The
    * swap recompiles this megakernel, so it happens at scene-compile time, never
    * per frame — and with absorption off the compiled source is byte-identical
-   * to the pre-feature shader (see stripAbsorption).
+   * to the pre-feature shader (see stripMarked).
    */
   setAbsorption(on) {
-    const src = on ? this._fragAbsorption : this._fragPlain;
+    this._absorbOn = !!on;
+    this._applyAbsorptionSplice();
+  }
+
+  /**
+   * Splice in / strip out COLOURED SHADOWS (shadowTransmittance at the two NEE
+   * shadow-ray sites). Only meaningful while absorption itself is spliced in —
+   * the march reads row 67 and calls rtAbsorbSigma, both of which exist exactly
+   * when the scene absorbs — so this is an AND with setAbsorption's state, and
+   * turning it off restores the byte-identical absorption-only (0.8.0) source.
+   * Recompiles the megakernel, so drive it from a UI toggle or scene compile,
+   * never per frame.
+   */
+  setAbsorptionShadows(on) {
+    this._absorbShadows = !!on;
+    this._applyAbsorptionSplice();
+  }
+
+  _applyAbsorptionSplice() {
+    const src = !this._absorbOn
+      ? this._fragPlain
+      : this._absorbShadows
+        ? this._fragAbsorbShadows
+        : this._fragAbsorption;
     if (this.material.fragmentShader === src) return;
     this.material.fragmentShader = src;
     this.material.needsUpdate = true; // three re-keys the program by source hash
