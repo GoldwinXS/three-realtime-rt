@@ -81,6 +81,49 @@ export interface RTAttenuation {
   distance: number;
 }
 
+/**
+ * Per-material **Kubelka-Munk scattering** (`userData.rtScattering`) — the
+ * opt-in that turns a translucent material into a physically-parameterized
+ * SUBSURFACE one: jade, wax, marble, soap, foliage, a lampshade, pigmented
+ * plastic. Absorption alone only ever removes light, so a pigmented body lit
+ * from the front renders as black murk; a scattering coefficient sends light
+ * back out of the surface, and the two-flux closed form turns (K, S, thickness)
+ * into both a reflectance and a transmittance.
+ *
+ * The material must be one the tracer treats as translucent
+ * (`transmission > 0`, `transparent: false`) — the march only ever steps into a
+ * body it can pass through — and its base `color` should be **white**: the
+ * computed reflectance IS the diffuse albedo, and the composite multiplies it by
+ * the material colour (the same convention cast glass already lives under). A
+ * non-white colour is warned about at compile time.
+ *
+ * The ABSORPTION half, K, is not stated here: it is the material's existing
+ * `attenuationColor` + `attenuationDistance` (or {@link RTAttenuation}), so a
+ * material describes its colour in one place. No attenuation at all is the
+ * K = 0 case — a pure white scatterer, which is a perfectly good material.
+ *
+ * Requires {@link RealtimeRaytracer.kmScattering} to be on; with it off, or with
+ * no material opted in, the lighting program is byte-identical to the build
+ * without the feature.
+ */
+export interface RTScattering {
+  /**
+   * Scattering coefficient S directly, in 1/world-unit: a number (grey), an
+   * `[r, g, b]` triple or a THREE.Color. For anyone with measured or fitted
+   * Kubelka-Munk coefficients. Wins over `color`/`distance` when both are given.
+   */
+  coefficient?: number | Color | [number, number, number];
+  /**
+   * Authoring alternative to `coefficient`: the fraction of flux that survives
+   * one `distance` of travel WITHOUT being scattered, so
+   * `S = -ln(color) / distance` per channel — the same derivation
+   * {@link RTAttenuation} uses for absorption.
+   */
+  color?: Color | [number, number, number];
+  /** World-unit distance that `color` refers to; finite and > 0. */
+  distance?: number;
+}
+
 /** Result of {@link RealtimeRaytracer.probeGPUTier}. */
 export interface GPUTierProbe {
   /** Chosen capability tier. */
@@ -230,6 +273,12 @@ export interface RealtimeRaytracerOptions {
    * for the scope limits.
    */
   absorptionShadows?: boolean;
+  /**
+   * Kubelka-Munk two-flux scattering for materials carrying
+   * {@link RTScattering}. Default `false`. See
+   * {@link RealtimeRaytracer.kmScattering} for scope and limitations.
+   */
+  kmScattering?: boolean;
   /**
    * Alpha-blended transparency: `transparent: true` meshes are primary-visible
    * and composited against the geometry behind them (weighted by `opacity`).
@@ -497,6 +546,18 @@ export class CompiledScene {
    * the pre-feature program.
    */
   absorption: { sigma: Float32Array; glass: Float32Array; count: number } | null;
+  /**
+   * Per-material Kubelka-Munk scattering table (see {@link RTScattering}), or
+   * `null` when no compiled material scatters. `sigmaS` holds 3 floats per
+   * material (the scattering coefficient S in 1/world-unit, indexed by the
+   * compiled material table); `km` holds the per-material two-flux enable flag
+   * (1 or 0, tabled for every material); `count` is how many materials opted in.
+   * A non-null table forces {@link CompiledScene.absorption} to exist too — the
+   * two-flux code reads K from the absorption table. When `null`, the lighting
+   * shader compiles WITHOUT the scattering code, byte-identical to the
+   * pre-feature program.
+   */
+  scattering: { sigmaS: Float32Array; km: Float32Array; count: number } | null;
   /** CPU cost (ms) of the most recent dynamic-emissive refresh (0 if none). */
   lastEmissiveRefreshMs: number;
   /**
@@ -639,6 +700,34 @@ export class RealtimeRaytracer {
    * (or `false`) the program is byte-identical to the build without the feature.
    */
   absorptionShadows: boolean;
+  /**
+   * **Kubelka-Munk two-flux scattering** — physically-parameterized translucent
+   * solids (jade, wax, marble, soap, foliage, lampshades, pigmented plastic).
+   * Default `false`. For materials carrying {@link RTScattering}, the view ray is
+   * marched through the real geometry, the per-medium (K, S, segment length)
+   * triples it crosses are composed with the two-flux closed form, and the
+   * resulting reflectance becomes the surface's diffuse albedo. Thickness is
+   * MEASURED per ray, not painted into a thickness map, so a sphere thins
+   * correctly toward its silhouette with no authoring. Shadow rays crossing the
+   * same media use the two-flux transmittance instead of Beer-Lambert.
+   *
+   * NOT participating-media lighting: this is transport INSIDE solid bodies, not
+   * fog, god rays or atmospheric in-scatter (that is {@link RealtimeRaytracer.volumetrics}).
+   *
+   * v1 limitations, all deliberate: **no lateral bleed** (light leaves where it
+   * entered — 1D transport along the ray, not full subsurface scattering, so
+   * there is no glow around a thin edge from light that entered elsewhere), **no
+   * in-scattering into shadow rays** (a lit body does not add light to its own
+   * shadow), and R-as-albedo is the standard approximation (the closed form
+   * assumes diffuse illumination but is lit here by N·L).
+   *
+   * Live-assignable, but it swaps the lighting megakernel's source, so treat it
+   * as a settings knob. Turning it on also enables coloured shadows in the
+   * compiled program — the two share one march. With no scattering material in
+   * the scene (or `false`) the program is byte-identical to the build without
+   * the feature.
+   */
+  kmScattering: boolean;
   /** Alpha-blended transparency: composite `transparent` meshes over the geometry behind them. */
   transparency: boolean;
   /**
@@ -717,3 +806,78 @@ export const MAX_LIGHTS: number;
 
 /** Build a {@link CompiledScene} (BVH + material/light tables) from a scene. */
 export function compileScene(scene: Scene, options?: CompileSceneOptions): CompiledScene;
+
+// --- Kubelka-Munk two-flux maths ---------------------------------------------
+// The same closed form the scattering shader evaluates, exported as plain
+// functions so an app can predict on the CPU what a given (K, S, thickness) will
+// look like — for authoring tools, tests, or fitting measured data. K and S are
+// per-channel coefficients in 1/world-unit; reflectances are linear 0..1.
+
+/** A composed stack: reflectance from above / from below, and transmittance. */
+export interface KMStack {
+  ra: number;
+  rb: number;
+  t: number;
+}
+
+/** Per-channel form of {@link KMStack}, each entry an `[r, g, b]` triple. */
+export interface KMStackRGB {
+  ra: [number, number, number];
+  rb: [number, number, number];
+  t: [number, number, number];
+}
+
+/** One layer of thickness `t` over a backing of reflectance `Rg`. */
+export function kmReflectance(K: number, S: number, t: number, Rg?: number): number;
+/** Diffuse transmittance through a layer of thickness `t`. */
+export function kmTransmittance(K: number, S: number, t: number): number;
+/** Reflectance of an infinitely thick body of this pigment (`a - b`). */
+export function kmReflectanceInfinite(K: number, S: number): number;
+/** One layer's `{ r, t }` pair: reflectance over a BLACK backing, and transmittance. */
+export function kmLayer(K: number, S: number, t: number): { r: number; t: number };
+/** The identity element of {@link kmAddBelow}: an empty stack of clear air. */
+export function kmEmptyStack(): KMStack;
+/** Stack one `{ r, t }` layer underneath an existing stack (the adding equations). */
+export function kmAddBelow(stack: KMStack, layer: { r: number; t: number }): KMStack;
+/** Compose TOP-FIRST layers over an opaque backing. */
+export function kmStack(layers: Array<{ K: number; S: number; t: number }>, backing?: number): KMStack;
+
+/** Per-channel {@link kmReflectance}. */
+export function kmReflectanceRGB(
+  K: number | [number, number, number],
+  S: number | [number, number, number],
+  t: number,
+  Rg?: number | [number, number, number]
+): [number, number, number];
+/** Per-channel {@link kmTransmittance}. */
+export function kmTransmittanceRGB(
+  K: number | [number, number, number],
+  S: number | [number, number, number],
+  t: number
+): [number, number, number];
+/** Per-channel {@link kmReflectanceInfinite}. */
+export function kmReflectanceInfiniteRGB(
+  K: number | [number, number, number],
+  S: number | [number, number, number]
+): [number, number, number];
+/**
+ * Per-channel {@link kmStack} — the exact quantity the renderer's view-path
+ * march computes per pixel, so a validation rig can compare pixels to numbers.
+ */
+export function kmStackRGB(
+  layers: Array<{
+    K: number | [number, number, number];
+    S: number | [number, number, number];
+    t: number;
+  }>,
+  backing?: number | [number, number, number]
+): KMStackRGB;
+/**
+ * `-ln(color) / distance` per channel — the library's colour + distance
+ * authoring pair turned into a coefficient, exactly as SceneCompiler does it for
+ * both {@link RTAttenuation} and {@link RTScattering}.
+ */
+export function coefficientFromColorDistance(
+  color: number | Color | [number, number, number],
+  distance: number
+): [number, number, number];

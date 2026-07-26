@@ -541,6 +541,21 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * constructor and compileScene pushes the state anyway.
      */
     this._absorptionShadows = options.absorptionShadows ?? true;
+    /**
+     * Kubelka-Munk two-flux scattering: physically-parameterized translucent
+     * solids (jade, wax, marble, soap, foliage, a lampshade, pigmented plastic)
+     * whose reflectance and transmittance are computed from a per-material
+     * absorption K and scattering S over the thickness the view ray actually
+     * travels through the real geometry. Backing field for the accessor below
+     * (which recompiles the lighting megakernel); assigned directly here for the
+     * same reason absorptionShadows is.
+     *
+     * Default OFF, unlike absorptionShadows: this one changes how opted-in
+     * materials LOOK rather than fixing a wrong result, so it stays an explicit
+     * choice. With it off — or in a scene where no material set
+     * userData.rtScattering — the compiled program is byte-identical to 0.9.0's.
+     */
+    this._kmScattering = options.kmScattering ?? false;
     /** Index of refraction used for transmissive surfaces. */
     this.ior = options.ior ?? 1.5;
     /**
@@ -1099,6 +1114,11 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // caller's flag BEFORE setCompiledScene decides the splice from
     // compiled.absorption — otherwise a recompile would silently re-enable them.
     this.rtPass.setAbsorptionShadows(this._absorptionShadows);
+    // Same ordering rule for Kubelka-Munk: push the caller's flag BEFORE
+    // setCompiledScene reads the new scene's scattering table and performs the
+    // single splice, so a recompile can neither enable nor drop the feature
+    // behind the app's back.
+    this.rtPass.setKmScattering(this._kmScattering);
     this.rtPass.setCompiledScene(this.compiled);
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
@@ -1214,6 +1234,30 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this._absorptionShadows = on;
     if (!this.supported) return;
     this.rtPass.setAbsorptionShadows(on);
+    this.resetAccumulation();
+  }
+
+  /**
+   * Kubelka-Munk two-flux scattering (see the constructor field). Live-assignable
+   * but it swaps the lighting megakernel's SOURCE, so treat it as a settings-time
+   * knob: the first frame after a change pays a shader compile. Meaningful only
+   * while the compiled scene has a material carrying `userData.rtScattering`;
+   * with none, the program is the byte-identical no-scattering one either way.
+   *
+   * Turning this on also turns on coloured shadows for the compiled program —
+   * the two-flux transmittance is evaluated inside the very same shadow march,
+   * so they are one code path, not two (`absorptionShadows` still reports what
+   * the app asked for, and takes effect again the moment this goes off).
+   */
+  get kmScattering() {
+    return this._kmScattering;
+  }
+  set kmScattering(v) {
+    const on = !!v;
+    if (on === this._kmScattering) return;
+    this._kmScattering = on;
+    if (!this.supported) return;
+    this.rtPass.setKmScattering(on);
     this.resetAccumulation();
   }
 

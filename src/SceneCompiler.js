@@ -106,6 +106,13 @@ export class CompiledScene {
     // (RTLightingPass strips it back to the byte-identical pre-feature source),
     // so an unused feature costs exactly nothing.
     this.absorption = null;
+    // Per-material Kubelka-Munk scattering (see collectScattering): { sigmaS,
+    // km, count } or null when no material opted in. null keeps row 68 out of
+    // the scene-data texture AND the two-flux code out of the lighting shader,
+    // same zero-cost-when-unused contract as absorption above. Non-null FORCES
+    // the absorption table to exist too (row 68 is addressed relative to row 67,
+    // and the KM shader variant is a superset of the absorption one).
+    this.scattering = null;
     this.lightPosType = [];
     this.lightColorRadius = [];
     this.lightDirCone = []; // spot direction.xyz + cos(outer angle)
@@ -693,7 +700,11 @@ function absorptionSigmaFor(mat) {
 // bytes and no sampler. A hit whose material reads 0 there is opaque to shadow
 // rays exactly as it was before; a glass material with sigma 0 (clear glass)
 // passes light through untinted, which master could not express.
-function collectAbsorption(materials) {
+// `force` materializes the table even when nothing absorbs. Kubelka-Munk needs
+// it: a purely scattering pigment (white, K = 0) has sigma 0 in every channel,
+// but the two-flux code reads K from this very row and the glass flag from its
+// .w, so the row has to exist whenever a KM material does.
+function collectAbsorption(materials, force = false) {
   let count = 0;
   const sigma = new Float32Array(materials.length * 3);
   const glass = new Float32Array(materials.length);
@@ -710,7 +721,132 @@ function collectAbsorption(materials) {
     sigma[i * 3 + 2] = s[2];
     count++;
   }
-  return count > 0 ? { sigma, glass, count } : null;
+  return count > 0 || force ? { sigma, glass, count } : null;
+}
+
+// Per-material KUBELKA-MUNK SCATTERING — the half of translucency absorption
+// alone cannot express. Beer-Lambert only ever REMOVES light, so a pigmented
+// solid lit from the front renders as black murk: nothing sends the light back
+// out of the surface. A scattering coefficient S does, and the two-flux closed
+// form turns (K, S, thickness) into a reflectance AND a transmittance — jade,
+// wax, marble, a lampshade, a leaf, coloured plastic. See src/kubelkaMunk.js for
+// the maths and RTLightingPass for where it is evaluated.
+//
+// Opt-in is `userData.rtScattering`, deliberately shaped like 0.8.0's
+// `userData.rtAttenuation` so the two read as one family. Two ways to state S,
+// both per channel, both in 1/world-unit:
+//
+//   1. { color, distance } — `color` is the fraction of flux that survives one
+//      `distance` of travel WITHOUT being scattered, so S = -ln(color)/distance.
+//      Identical derivation (and identical 1e-4 floor) to attenuationColor +
+//      attenuationDistance. This is the authoring-friendly route: "at 5 mm this
+//      much light is still going straight".
+//   2. { coefficient } — S directly, as a number (grey) or [r,g,b] / THREE.Color,
+//      for anyone who has measured or fitted real Kubelka-Munk coefficients.
+//      Wins if both are present.
+//
+// K comes from the material's ABSORPTION (attenuationColor + attenuationDistance
+// or userData.rtAttenuation, exactly as in 0.8.0) rather than a third parameter:
+// K is an absorption coefficient, the library already has a well-tested way to
+// author one, and reusing it means a material's colour and its opacity stay
+// described in one place. A KM material with no attenuation set is the K = 0
+// case — a pure white scatterer — which is a perfectly good material, not an
+// error.
+function scatteringSigmaFor(mat) {
+  if (!mat) return null;
+  const ud = mat.userData && mat.userData.rtScattering;
+  if (!ud) return null;
+  // Same gate as absorption, for the same reason: the view and shadow marches
+  // only ever step INTO a body the tracer treats as passable glass. A KM
+  // coefficient on an opaque surface has no interior to describe.
+  const isGlass = (mat.transmission ?? 0) > 0 && !mat.transparent;
+  if (!isGlass) {
+    console.warn(
+      "three-realtime-rt: userData.rtScattering is set on a material the tracer does not " +
+        "trace as translucent (needs transmission > 0 and transparent: false) — the " +
+        "Kubelka-Munk march never enters an opaque body, so it is ignored on this material."
+    );
+    return null;
+  }
+  const asRGB = (c) => {
+    if (typeof c === "number") return [c, c, c];
+    if (c && typeof c.r === "number") return [c.r, c.g, c.b];
+    if (Array.isArray(c) && c.length >= 3) return [c[0], c[1], c[2]];
+    return null;
+  };
+  let s = null;
+  if (ud.coefficient !== undefined) {
+    s = asRGB(ud.coefficient);
+    if (!s || !s.every((v) => Number.isFinite(v) && v >= 0)) {
+      console.warn(
+        "three-realtime-rt: userData.rtScattering.coefficient needs a non-negative number, " +
+          "[r,g,b] or THREE.Color (scattering coefficient in 1/world-unit) — ignoring this " +
+          "material's scattering."
+      );
+      return null;
+    }
+  } else {
+    const color = asRGB(ud.color);
+    const distance = ud.distance;
+    if (!color || !Number.isFinite(distance) || distance <= 0) {
+      console.warn(
+        "three-realtime-rt: userData.rtScattering needs either { coefficient } or " +
+          "{ color: THREE.Color | [r,g,b], distance: finite > 0 (world units) } — ignoring " +
+          "this material's scattering."
+      );
+      return null;
+    }
+    s = color.map((v) => {
+      const c = -Math.log(Math.max(v, 1e-4)) / distance;
+      return c > 0 ? c : 0;
+    });
+  }
+  // All-zero S is "no scattering", i.e. plain Beer-Lambert glass — exactly the
+  // 0.8.0 behaviour, and not worth compiling the two-flux path in for.
+  return s.some((v) => v > 0) ? s : null;
+}
+
+// Build the per-material scattering table from the DEDUPED material list, so
+// index i is the matIndex the BVH per-vertex attribute stores. Returns
+// { sigmaS: Float32Array(n*3), km: Float32Array(n), count } when at least one
+// material scatters, else null — and null keeps row 68 out of the scene-data
+// texture and the two-flux code out of the lighting shader.
+//
+// `km` is the per-body ENABLE FLAG (1 or 0), tabled for every material and read
+// from row 68's .w. It is what lets a scene mix plain absorbing glass and
+// scattering pigment: a march crossing an interface asks this flag whether to
+// charge the segment to Beer-Lambert or to the two-flux composition. It is a
+// separate flag rather than "S is non-zero" because a KM material may
+// legitimately have S = 0 in one channel (a pigment that scatters no blue).
+function collectScattering(materials) {
+  let count = 0;
+  const sigmaS = new Float32Array(materials.length * 3);
+  const km = new Float32Array(materials.length);
+  for (let i = 0; i < materials.length; i++) {
+    const s = scatteringSigmaFor(materials[i]);
+    if (!s) continue;
+    sigmaS[i * 3 + 0] = s[0];
+    sigmaS[i * 3 + 1] = s[1];
+    sigmaS[i * 3 + 2] = s[2];
+    km[i] = 1;
+    count++;
+    // The KM reflectance is delivered as the surface's DIFFUSE ALBEDO, and
+    // CompositePass multiplies the lighting by the G-buffer albedo — the same
+    // convention cast glass already lives under. A non-white base colour
+    // therefore tints the computed reflectance on top of the pigment's own
+    // colour, which is almost never what the author meant.
+    const c = materials[i].color;
+    if (c && (c.r < 0.999 || c.g < 0.999 || c.b < 0.999)) {
+      console.warn(
+        "three-realtime-rt: a userData.rtScattering material has a non-white base colour " +
+          `(${c.r.toFixed(3)}, ${c.g.toFixed(3)}, ${c.b.toFixed(3)}). The Kubelka-Munk ` +
+          "reflectance IS the diffuse albedo, and the composite multiplies it by this " +
+          "colour — set the material colour to white and let K and S carry the pigment, " +
+          "or accept the extra tint deliberately."
+      );
+    }
+  }
+  return count > 0 ? { sigmaS, km, count } : null;
 }
 
 // SCENE-DATA TEXTURE LAYOUT (RGBA32F, NEAREST, texelFetch only). Every consumer
@@ -742,12 +878,23 @@ function collectAbsorption(materials) {
 //   existing fetch byte-identical; widening the stride would touch them all.
 //   The row is simply omitted when nothing absorbs, so the unused feature costs
 //   zero bytes.
+// Row 68 (OPTIONAL — present only when `scattering` is non-null, which also
+//   forces row 67 to exist): per-material KUBELKA-MUNK SCATTERING, 1 texel per
+//   material: [S.r | S.g | S.b | kmEnabled] — S in 1/world-unit (see
+//   collectScattering), and .w a 1/0 flag saying whether this body's interior is
+//   evaluated with the two-flux model at all. The absorption coefficient K is
+//   NOT duplicated here: it is row 67's sigma, so a material states its colour
+//   once. The derived a = 1 + K/S and b = sqrt(a*a - 1) are deliberately NOT
+//   tabled — they would need a second row (nine floats per material, and one
+//   texel holds four), and they are ~6 ALU to recompute on the handful of
+//   fragments that actually cross a scattering body. Measured cost of the
+//   recompute is inside the noise of the march itself.
 // All packed into ONE texture because the lighting pass already sits at the
 // WebGL2-guaranteed 16-sampler limit — extra samplers are not available.
-function buildSceneDataTexture(materials, emissiveTris, absorption) {
+function buildSceneDataTexture(materials, emissiveTris, absorption, scattering) {
   const bn = decodeBlueNoise();
   const width = Math.max(materials.length * 2, emissiveTris.length * 4, BLUE_NOISE_SIZE);
-  const height = 2 + BLUE_NOISE_SIZE + 1 + (absorption ? 1 : 0);
+  const height = 2 + BLUE_NOISE_SIZE + 1 + (absorption ? 1 : 0) + (scattering ? 1 : 0);
   const data = new Float32Array(width * height * 4);
   materials.forEach((mat, i) => {
     const o = i * 8;
@@ -791,6 +938,20 @@ function buildSceneDataTexture(materials, emissiveTris, absorption) {
       data[absRow + i * 4 + 1] = s[i * 3 + 1];
       data[absRow + i * 4 + 2] = s[i * 3 + 2];
       data[absRow + i * 4 + 3] = g[i]; // transmission: the coloured-shadow glass flag
+    }
+  }
+  // Kubelka-Munk scattering (row 68). Only reachable with row 67 present — the
+  // row index is absolute, and collectScattering's contract is that a non-null
+  // table forces the absorption table to be materialized alongside it.
+  if (scattering) {
+    const kmRow = (2 + BLUE_NOISE_SIZE + 2) * row;
+    const s = scattering.sigmaS;
+    const km = scattering.km;
+    for (let i = 0; i < materials.length; i++) {
+      data[kmRow + i * 4 + 0] = s[i * 3 + 0];
+      data[kmRow + i * 4 + 1] = s[i * 3 + 1];
+      data[kmRow + i * 4 + 2] = s[i * 3 + 2];
+      data[kmRow + i * 4 + 3] = km[i]; // per-body two-flux enable
     }
   }
   const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
@@ -1152,8 +1313,18 @@ export function compileScene(scene, options = {}) {
   // Per-material Beer-Lambert absorption opt-in (attenuationColor +
   // attenuationDistance, or userData.rtAttenuation). Resolved BEFORE the scene
   // data texture is built because a non-null table appends row 67 to it.
-  compiled.absorption = collectAbsorption(materials);
-  compiled.materialsTex = buildSceneDataTexture(materials, emissiveTris, compiled.absorption);
+  // Kubelka-Munk scattering opt-in (userData.rtScattering). Resolved FIRST
+  // because a non-null table forces the absorption row to exist even when
+  // nothing absorbs — the two-flux code reads K from row 67 and the glass flag
+  // from its .w, and row 68 is addressed relative to it.
+  compiled.scattering = collectScattering(materials);
+  compiled.absorption = collectAbsorption(materials, !!compiled.scattering);
+  compiled.materialsTex = buildSceneDataTexture(
+    materials,
+    emissiveTris,
+    compiled.absorption,
+    compiled.scattering
+  );
   // World-space 3D-texture albedo opt-in (userData.rtVolumeAlbedo). Resolved from
   // the deduped material table so the recorded matIndex matches what the BVH
   // per-vertex attribute stores and the lighting pass reads.

@@ -215,6 +215,153 @@ vec3 rtTransmittance(float matIndex, float d) {
 }
 
 // <<< RT_ABSORPTION
+// >>> RT_KM (whole block source-spliced — see stripMarked below)
+// KUBELKA-MUNK TWO-FLUX SCATTERING — the arithmetic. Absorption alone can only
+// REMOVE light, so a pigmented translucent solid lit from the front renders as
+// black murk: nothing sends the light back out of the surface. Real jade, wax,
+// marble, skin, a leaf, a lampshade, coloured plastic all look like their colour
+// because light enters, SCATTERS, and leaves again on the same side. The
+// two-flux model is the closed-form solution for exactly that: one diffuse flux
+// heading in, one heading back out, coupled by an absorption coefficient K and a
+// scattering coefficient S, solved over a layer of thickness t on a backing of
+// reflectance Rg. Per channel:
+//
+//   a = 1 + K/S,  b = sqrt(a*a - 1),  x = b*S*t
+//   R(t, Rg) = (1 - Rg*(a - b*coth(x))) / (a - Rg + b*coth(x))
+//   T(t)     = b / (a*sinh(x) + b*cosh(x))
+//
+// Closed form, no volumetric march, no extra rays — which is the whole reason it
+// belongs in a real-time renderer. src/kubelkaMunk.js is the same maths in JS and
+// is what these expressions were validated against (scripts/km-selftest.mjs).
+//
+// NOTHING HERE IS WRITTEN THE TEXTBOOK WAY. coth blows up as x goes to zero,
+// sinh/cosh overflow as it grows, and a - b is a difference of two nearly equal
+// large numbers when the medium barely scatters. Every expression below is the
+// algebraically identical but numerically stable rewrite, because fp32 hits all
+// three of those corners inside one ordinary object: the centre of a sphere is a
+// long chord (x large) and its silhouette is a vanishing one (x tiny).
+#define RT_KM_EVENTS 8
+// Crossover between the series and the exponential forms. Higher than the JS
+// reference's 1e-3 because fp32 loses the exponential form to cancellation
+// sooner; the two forms agree to ~1e-8 here, orders below anything a tonemapped
+// image can show.
+#define RT_KM_SMALL_X 1e-2
+// x is clamped before exp() purely as a belt-and-braces guard: a grazing ray
+// through a dense medium can reach x in the thousands, where exp(-x) flushes to
+// zero harmlessly but exp(+x) (which no expression below uses, by design) would
+// have been an infinity.
+#define RT_KM_MAX_X 60.0
+
+// Row 68 of the scene-data texture: [S.rgb | kmEnabled] per material. K is NOT
+// duplicated here — it is row 67's absorption sigma, so a material states its
+// colour once (see collectScattering in SceneCompiler). No new sampler: this is
+// the same already-bound scene-data texture the rest of the shader reads.
+vec4 rtKmFetch(float matIndex) {
+  return texelFetch(uMaterialsTex, ivec2(int(round(matIndex)), 68), 0);
+}
+
+// The two derived parameters, plus the clamped S the caller must reuse so that
+// x = b*S*t stays consistent with them. S is floored rather than special-cased:
+// at S = 1e-6 the model is already Beer-Lambert to far better than fp32 can
+// represent (a and b both become K/S, and x collapses to K*t), so one code path
+// covers "scatters" and "does not scatter" with no branch and no discontinuity.
+void rtKmAB(vec3 K, vec3 S, out vec3 a, out vec3 b, out vec3 sUse) {
+  sUse = max(S, vec3(1e-6));
+  vec3 ks = max(K, vec3(0.0)) / sUse;
+  a = 1.0 + ks;
+  // sqrt(ks*(ks + 2)) rather than sqrt(a*a - 1): for a weakly absorbing pigment
+  // a is 1 + tiny, and a*a - 1 loses every significant bit to cancellation.
+  b = sqrt(ks * (ks + 2.0));
+}
+
+// Diffuse transmittance through a segment of length d.
+// T = 2*b*e^-x / ((a + b) + (b - a)*e^-2x), which is the textbook ratio with e^x
+// divided out of both halves: nothing overflows however thick the body gets.
+vec3 rtKmTrans(vec3 K, vec3 S, float d) {
+  if (d <= 0.0) return vec3(1.0);
+  vec3 a, b, s;
+  rtKmAB(K, S, a, b, s);
+  vec3 x = min(b * s * d, vec3(RT_KM_MAX_X));
+  vec3 st = s * d;
+  vec3 x2 = x * x;
+  // Series form, valid as b -> 0 (a non-absorbing pigment) and as d -> 0, where
+  // the ratio form is 0/0. Divide the common b out first, then expand with
+  // x/b == S*d held exact so no division by b survives. The x^4 terms are not
+  // decoration: truncating at x^2 leaves a relative error of x^2/2, which showed
+  // up as a mismatch against the reference's stack composition.
+  vec3 tSmall = 1.0 / (1.0 + a * st * (1.0 + x2 / 6.0) + 0.5 * x2 * (1.0 + x2 / 12.0));
+  vec3 e2 = exp(-2.0 * x);
+  // The denominator is (a + b) - (a - b)*e^-2x, which is >= 2*b >= 0 always; the
+  // max() only catches the exactly-zero corner (b = 0 and x = 0 together), where
+  // the numerator is zero too and the series branch is the one selected anyway.
+  vec3 den = max(a + b + (b - a) * e2, vec3(1e-12));
+  vec3 tBig = (2.0 * b * exp(-x)) / den;
+  return clamp(mix(tBig, tSmall, step(x, vec3(RT_KM_SMALL_X))), 0.0, 1.0);
+}
+
+// A single layer's (reflectance over a BLACK backing, transmittance) pair — the
+// two numbers the forward composition below needs. Taking Rg = 0 here and adding
+// the real backing at the end is what lets the march run front-to-back: the
+// textbook recursion R(t_n over R(t_n-1 over ...)) needs the layers in reverse.
+void rtKmLayer(vec3 K, vec3 S, float d, out vec3 R, out vec3 T) {
+  T = rtKmTrans(K, S, d);
+  R = vec3(0.0);
+  if (d <= 0.0) return;
+  vec3 a, b, s;
+  rtKmAB(K, S, a, b, s);
+  vec3 x = min(b * s * d, vec3(RT_KM_MAX_X));
+  vec3 st = s * d;
+  vec3 b2 = b * b;
+  vec3 e2 = exp(-2.0 * x);
+  // b*coth(x) is the only place b and the coth meet, and the product is finite
+  // even when b is 0 and coth is infinite. Large x: coth = (1 + e^-2x)/(1 - e^-2x).
+  // Small x: expand and keep x/b == S*d exact, leaving 1/(S*d) as the term that
+  // survives at K = 0.
+  vec3 bcothBig = b * ((1.0 + e2) / max(1.0 - e2, vec3(1e-12)));
+  vec3 bcothSmall = 1.0 / st + (b2 * st) / 3.0 - (b2 * b2 * st * st * st) / 45.0;
+  vec3 bcoth = mix(bcothBig, bcothSmall, step(x, vec3(RT_KM_SMALL_X)));
+  // R(t, 0) = 1 / (a + b*coth(x)). At x large this is 1/(a + b) = R_inf; at x
+  // small it is S*d/(1 + a*S*d), the classic thin-layer result.
+  R = clamp(1.0 / (a + bcoth), 0.0, 1.0);
+}
+
+// Reflectance of an infinitely thick body of this pigment (the masstone),
+// written 1/(a + b) rather than a - b to dodge the cancellation. Used as the
+// terminal backing when the march runs out of events or leaves through a hole in
+// a non-watertight mesh — "the material continues" is a far better guess there
+// than "there is black behind it".
+vec3 rtKmRInf(vec3 K, vec3 S) {
+  vec3 a, b, s;
+  rtKmAB(K, S, a, b, s);
+  return clamp(1.0 / (a + b), 0.0, 1.0);
+}
+
+// Stack one more layer UNDERNEATH the running stack — the standard "adding"
+// equations, which account for the infinite series of inter-reflections between
+// the stack and the new layer. Ra is what the stack reflects seen from above, Rb
+// what it reflects seen from below (they differ once the layers differ), Tt what
+// it transmits (equal both ways by reciprocity). An opaque backing enters as the
+// degenerate layer (lr = its albedo, lt = 0). This composition is provably
+// identical to the closed-form R(t, Rg) — that equivalence is a checked case in
+// scripts/km-selftest.mjs, and it is what licenses the cheap forward march.
+void rtKmAddBelow(inout vec3 Ra, inout vec3 Rb, inout vec3 Tt, vec3 lr, vec3 lt) {
+  // The denominator can only approach zero if two stacked layers were both
+  // perfect mirrors, which is outside the model; clamp instead of emitting an
+  // infinity that would poison the temporal history for good.
+  vec3 inv = 1.0 / max(1.0 - Rb * lr, vec3(1e-4));
+  vec3 nRa = Ra + Tt * Tt * lr * inv;
+  vec3 nRb = lr + lt * lt * Rb * inv;
+  vec3 nTt = Tt * lt * inv;
+  Ra = clamp(nRa, 0.0, 1.0);
+  Rb = clamp(nRb, 0.0, 1.0);
+  Tt = clamp(nTt, 0.0, 1.0);
+}
+
+// Set by the view march below when this pixel's primary surface turned out to be
+// a scattering body, and read once at the specular write to keep its Fresnel
+// sheen (see the note there).
+bool gKmOn;
+// <<< RT_KM
 // >>> RT_ABSORB_SHADOWS (whole block source-spliced — see stripMarked below)
 // COLOURED SHADOWS. A shadow ray that crosses absorbing glass is ATTENUATED per
 // channel instead of blocked: stained glass spills tinted light, a backlit stack
@@ -259,6 +406,18 @@ float rtShadowGlass(float matIndex) {
 vec3 shadowTransmittance(vec3 origin, vec3 dir, float maxDist) {
   vec3 tau = vec3(0.0);       // accumulated optical depth, per channel
   vec3 sigmaCur = vec3(0.0);  // absorption of the medium we are currently inside
+// >>> RT_KM
+  // SCATTERING MEDIA take a different segment law. Beer-Lambert is a sum in
+  // log space (tau), while the two-flux transmittance is not exp of anything
+  // simple, so it accumulates MULTIPLICATIVELY in its own register and is folded
+  // into tau once at the end. Entering a scattering body moves that body's
+  // absorption out of sigmaCur and into rtKmK, so the Beer-Lambert line below
+  // contributes exactly nothing for those segments — the two accumulators
+  // partition the path rather than both charging it.
+  vec3 rtKmT = vec3(1.0);     // running two-flux transmittance
+  vec3 rtKmS = vec3(0.0);     // scattering of the current medium (0 = not scattering)
+  vec3 rtKmK = vec3(0.0);     // absorption of the current medium, held out of sigmaCur
+// <<< RT_KM
   float tPrev = 0.0;          // distance from origin to the last INTERFACE crossed
   float tOrig = 0.0;          // distance from origin to o (tPrev plus the eps step)
   vec3 o = origin;
@@ -275,10 +434,29 @@ vec3 shadowTransmittance(vec3 origin, vec3 dir, float maxDist) {
     // hit; charging tau only from o would silently under-attenuate every body by
     // 2*eps of its thickness, which is ~10% of a 4 cm slab and far more in a
     // scene whose auto-scaled eps is larger (measured, then fixed).
+// >>> RT_KM
+    // The segment just crossed, when it lay inside a SCATTERING body: two-flux
+    // T() instead of exp(-sigma*d). This is what makes light through a wax or
+    // jade body read as dimmer and warmer than absorption alone predicts —
+    // scattering removes flux from the straight path that absorption would have
+    // let through, so a white pigment stops getting the free ride it does under
+    // Beer-Lambert, where a zero sigma means a perfectly clear shadow.
+    if (rtKmS != vec3(0.0)) rtKmT *= rtKmTrans(rtKmK, rtKmS, tHit - tPrev);
+// <<< RT_KM
     tau += sigmaCur * (tHit - tPrev);
     if (rtShadowGlass(attr.w) <= 0.0) return vec3(0.0);    // opaque: fully occluded
     // Glass interface: front face = entering this body, back face = back to air.
     sigmaCur = dot(attr.xyz, dir) < 0.0 ? rtAbsorbSigma(attr.w) : vec3(0.0);
+// >>> RT_KM
+    // Hand a scattering body's interior over to the two-flux accumulator. The
+    // entering test is recomputed rather than read off sigmaCur, because a
+    // pigment may legitimately have zero absorption (a pure white scatterer) and
+    // would then be indistinguishable from an exit face.
+    vec4 rtKmRow = rtKmFetch(attr.w);
+    rtKmS = (dot(attr.xyz, dir) < 0.0 && rtKmRow.w > 0.0) ? rtKmRow.rgb : vec3(0.0);
+    rtKmK = sigmaCur;
+    if (rtKmS != vec3(0.0)) sigmaCur = vec3(0.0);
+// <<< RT_KM
     o += dir * (dist + 2.0 * uEps);                        // step past the interface
     tOrig = tHit + 2.0 * uEps;
     tPrev = tHit;
@@ -288,10 +466,128 @@ vec3 shadowTransmittance(vec3 origin, vec3 dir, float maxDist) {
   // the light, which errs slightly DARK rather than pretending the ray is clear;
   // either way the result is a transmittance, never the hard black that would
   // reintroduce the silhouette this feature exists to remove.
+// >>> RT_KM
+  // Same tail rule for a scattering medium the march ended inside.
+  if (rtKmS != vec3(0.0)) rtKmT *= rtKmTrans(rtKmK, rtKmS, max(maxDist - tPrev, 0.0));
+// <<< RT_KM
   tau += sigmaCur * max(maxDist - tPrev, 0.0);
+// >>> RT_KM
+  // Fold the multiplicative two-flux factor into the optical depth so the single
+  // return below stays exactly the line the stripped source has. Guarded because
+  // the log costs three transcendentals and the overwhelming majority of shadow
+  // rays in any scene never touch a scattering body at all.
+  if (rtKmT != vec3(1.0)) tau -= log(max(rtKmT, vec3(1e-8)));
+// <<< RT_KM
   return exp(-tau);
 }
 // <<< RT_ABSORB_SHADOWS
+// >>> RT_KM
+// THE VIEW-PATH MARCH — the front-lit half, and the reason this feature exists.
+//
+// When the camera ray lands on a scattering body, march it THROUGH the geometry
+// along the view direction, collecting (K, S, segment length) for every medium it
+// crosses until an opaque body stops it or it leaves. Compose those layers with
+// the adding equations and the result is the pixel's DIFFUSE ALBEDO: the fraction
+// of incident light this stack of material sends back toward the eye. Shading
+// then proceeds exactly as it would for any diffuse surface.
+//
+// This is 1D transport along the view ray, so it is shape-agnostic by
+// construction: nothing here knows or cares whether the body is a slab, a sphere,
+// a bust or a leaf. Thickness is MEASURED per ray against the real geometry — the
+// thing games normally fake with an authored thickness map — which is why a
+// sphere thins out correctly toward its silhouette with no authoring at all.
+//
+// R AS ALBEDO IS AN APPROXIMATION, and a standard one. Kubelka-Munk derives R
+// under DIFFUSE illumination, while the renderer then lights it with N.L from
+// point sources. Using R as the diffuse albedo under direct lighting is the usual
+// engineering compromise (it is what every KM-based paint/print pipeline does);
+// it is right in the diffuse-ambient limit and slightly over-bright at grazing
+// incidence. Stated here rather than buried.
+//
+// ONE textual call to the closest-hit kernel, and a flat loop with no
+// short-circuit returns inside it that would inline a second traversal — the
+// NVIDIA C5041 budget that killed a 0.9.0 shadow-march optimisation is real and
+// this march is written to stay under it.
+//
+// Returns false when the primary surface is NOT a scattering body, leaving the
+// caller's ordinary glass path untouched; the whole march is gated on the
+// G-buffer's transmission flag before it is even entered, so opaque pixels pay
+// nothing at all.
+bool rtKmViewAlbedo(vec3 P, vec3 dir, out vec3 outAlbedo) {
+  vec3 Ra = vec3(0.0);   // stack reflectance seen from above (what the eye gets)
+  vec3 Rb = vec3(0.0);   // ... seen from below (needed by the adding equations)
+  vec3 Tt = vec3(1.0);   // stack transmittance
+  vec3 curK = vec3(0.0);
+  vec3 curS = vec3(0.0);
+  bool inMedium = false;
+  vec3 backing = vec3(0.0);
+  float tPrev = 0.0;     // distance from o to the last INTERFACE crossed
+  float tOrig = 0.0;     // distance from o to the current ray origin
+  // Start just in FRONT of the shading point so the first hit is the body's own
+  // entry face, which is what carries the material index (the G-buffer's packed
+  // word does not).
+  vec3 o = P - dir * (2.0 * uEps);
+  for (int i = 0; i < RT_KM_EVENTS; i++) {
+    uvec4 fi; vec3 bary; float dist; bool isDyn;
+    if (!traceBoth(o, dir, fi, bary, dist, isDyn)) break;  // left the geometry
+    float tHit = tOrig + dist;
+    vec4 attr = isDyn
+      ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
+      : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
+    bool entering = dot(attr.xyz, dir) < 0.0;
+    bool passable = rtShadowGlass(attr.w) > 0.0;
+    vec4 kmRow = rtKmFetch(attr.w);
+    bool isKm = kmRow.w > 0.0;
+    if (i == 0) {
+      // The first interface decides whether this pixel is ours at all.
+      if (!passable || !isKm) return false;
+      if (!entering) {
+        // The 2*eps step-back landed INSIDE the body, so the first interface is
+        // its BACK face. Happens on concave front faces and in the silhouette
+        // band of a curved body, where the interpolated normal disagrees with the
+        // true geometry. Seed the medium from it instead of dropping the pixel to
+        // the plain-glass path, which would draw a bright rim around every sphere.
+        curK = rtAbsorbSigma(attr.w);
+        curS = kmRow.rgb;
+        inMedium = true;
+      }
+    }
+    // Close the segment just crossed, INTERFACE to INTERFACE — not from the
+    // stepped-off origin, for the same reason the shadow march measures that way
+    // (the 2*eps skipped past each hit is a real fraction of a thin body).
+    if (inMedium) {
+      vec3 lr, lt;
+      rtKmLayer(curK, curS, tHit - tPrev, lr, lt);
+      rtKmAddBelow(Ra, Rb, Tt, lr, lt);
+    }
+    if (!passable) {
+      // An opaque body terminates the stack: its base colour IS the backing
+      // reflectance the two-flux solution needs. three stores material colours in
+      // the linear working space already, so no conversion is wanted here.
+      vec3 hAlbedo; float hRough; vec3 hEmissive; float hMetal;
+      fetchMaterial(attr.w, hAlbedo, hRough, hEmissive, hMetal);
+      backing = clamp(hAlbedo, 0.0, 1.0);
+      inMedium = false;
+      break;
+    }
+    curK = entering ? rtAbsorbSigma(attr.w) : vec3(0.0);
+    curS = (entering && isKm) ? kmRow.rgb : vec3(0.0);
+    inMedium = entering;
+    o += dir * (dist + 2.0 * uEps);                        // step past the interface
+    tOrig = tHit + 2.0 * uEps;
+    tPrev = tHit;
+  }
+  // Still inside a medium when the march ended: either the ray left through a
+  // hole in a non-watertight mesh, or the event cap ran out inside a dense stack.
+  // "The material continues forever" is the honest terminal answer for both — its
+  // masstone — and it degrades gracefully (a slightly too-solid body) where
+  // assuming black behind would punch a hole in the object.
+  if (inMedium) backing = rtKmRInf(curK, curS);
+  rtKmAddBelow(Ra, Rb, Tt, backing, vec3(0.0));
+  outAlbedo = Ra;
+  return true;
+}
+// <<< RT_KM
 // World-space 3D-texture albedo ("volumetric surface albedo") for the traced
 // SECONDARY rays (GI bounces + reflection/refraction), so global illumination and
 // mirror views carry the same field colours the primary G-buffer shows. Compiled
@@ -957,6 +1253,23 @@ void main() {
   }
 
   // --- traced glass: Fresnel reflection + two-interface refraction ---
+// >>> RT_KM
+  // KUBELKA-MUNK scattering takes precedence over the plain-glass path for the
+  // bodies that opted into it. sampleIrr is the surface's demodulated diffuse
+  // irradiance at this point (direct + one bounce, no albedo — the composite
+  // re-applies that), so multiplying by the marched reflectance IS "shade the
+  // stack with the normal direct-lighting path". Deliberately NOT gated on
+  // uRefrEnabled: a wax or jade body is not a window, and its look should not
+  // depend on whether the app wanted refraction. The transmission test in front
+  // of the march is the cheap gate — an opaque pixel never traces anything, and
+  // a glass pixel that turns out not to scatter falls through to the line below
+  // exactly as before.
+  vec3 rtKmAlb;
+  gKmOn = transmission > 0.001 && rtKmViewAlbedo(P, normalize(P - uCameraPos), rtKmAlb);
+  if (gKmOn) {
+    sampleIrr *= rtKmAlb;
+  } else
+// <<< RT_KM
   if (uRefrEnabled && transmission > 0.001) {
     vec3 V = normalize(P - uCameraPos);
     sampleIrr = mix(sampleIrr, glassRadiance(P, N, V, rough, ior), transmission);
@@ -993,6 +1306,13 @@ void main() {
   // radiance (see above) — their dielectric highlight is dropped, a fair trade
   // for a correct-scale see-through image.
   vec3 spec = blend ? blendBehind : gSpec * ((1.0 - metal) * (1.0 - transmission));
+// >>> RT_KM
+  // A scattering body is a dielectric SOLID, not a window. The (1 - transmission)
+  // scale above exists so a see-through pane does not double-count its highlight
+  // into the behind-image; polished jade, wax and marble have no behind-image and
+  // a very real Fresnel sheen, so it is restored here rather than scaled away.
+  if (gKmOn) spec = gSpec * (1.0 - metal);
+// <<< RT_KM
   if (any(isnan(spec)) || any(isinf(spec))) spec = vec3(0.0);
   if (!blend) {
     float specLum = dot(spec, vec3(0.299, 0.587, 0.114));
@@ -1154,13 +1474,26 @@ void main() {
 // before the feature existed. Same zero-cost intent as the RT_VOLUME_ALBEDO
 // define gate, tightened to be provable with a getShaderSource diff.
 //
-// Two tags, stripped independently, in a strict hierarchy:
+// Three tags, stripped independently, in a strict hierarchy:
 //   RT_ABSORPTION    — per-material Beer-Lambert absorption on the VIEW path.
 //   RT_ABSORB_SHADOWS — coloured shadows (shadowTransmittance). Depends on the
 //     absorption block's rtAbsorbSigma and on row 67 existing, so it may only be
 //     spliced in when RT_ABSORPTION is too. The tags are prefix-distinct
 //     ("RT_ABSORPTION" vs "RT_ABSORB_SHADOWS"), so neither substring test can
 //     ever match the other's markers.
+//   RT_KM — Kubelka-Munk two-flux scattering. A strict superset of both: it
+//     reads K from row 67 and rides the coloured-shadow march for its shadow
+//     half, so it is only ever spliced in alongside them. "RT_KM" shares no
+//     prefix with either of the others.
+//
+// STRIPPING ORDER IS NOT FREE. `drop` is a single boolean, not a stack, so a
+// NESTED block must be stripped BEFORE its parent — the RT_KM lines inside
+// shadowTransmittance sit within the RT_ABSORB_SHADOWS span, and removing the
+// parent first would see the inner "<<< RT_KM" and stop dropping early, taking
+// the tail of the parent block with it. The constructor therefore strips
+// RT_KM, then RT_ABSORB_SHADOWS, then RT_ABSORPTION — innermost outwards. (This
+// is checked, not just asserted: scripts/km-selftest.mjs hashes the three
+// pre-existing variants against the ones master's module builds.)
 function stripMarked(src, tag) {
   const lines = src.split("\n");
   const out = [];
@@ -1206,24 +1539,37 @@ export class RTLightingPass {
     // build that predates that feature (see stripMarked). setCompiledScene drives
     // the swap from compiled.absorption; changing material.fragmentShader re-keys
     // three's program cache, so this recompiles at scene-compile time, never per
-    // frame. THREE variants, cached once here (the strip is pure string work, but
-    // it should not run on a toggle):
+    // frame. FOUR variants, cached once here (the strip is pure string work, but
+    // it should not run on a toggle) — a LADDER, not a matrix: each is the next
+    // one with its outermost feature stripped off, so adding Kubelka-Munk cost
+    // one more variant rather than doubling the set.
     //   _fragPlain            no absorption at all — the pre-0.8.0 program
     //   _fragAbsorption       view-path absorption only — the 0.8.0 program
-    //   _fragAbsorbShadows    + coloured shadows
+    //   _fragAbsorbShadows    + coloured shadows — the 0.9.0 program
+    //   _fragKm               + Kubelka-Munk two-flux scattering
+    // The strips run innermost-outwards (RT_KM, then RT_ABSORB_SHADOWS, then
+    // RT_ABSORPTION) because RT_KM blocks are nested inside the coloured-shadow
+    // one — see the ordering note on stripMarked.
     const fragFull = specMRT
       ? rtLightingFrag
       : rtLightingFrag.replace(
           "layout(location = 1) out vec4 outSpecular;",
           "vec4 outSpecular; // single-target fallback: dead store"
         );
-    this._fragAbsorbShadows = fragFull;
-    this._fragAbsorption = stripMarked(fragFull, "RT_ABSORB_SHADOWS");
+    this._fragKm = fragFull;
+    this._fragAbsorbShadows = stripMarked(fragFull, "RT_KM");
+    this._fragAbsorption = stripMarked(this._fragAbsorbShadows, "RT_ABSORB_SHADOWS");
     this._fragPlain = stripMarked(this._fragAbsorption, "RT_ABSORPTION");
-    // Current splice state, so setAbsorption / setAbsorptionShadows can each set
-    // their own half without the caller re-stating the other.
+    // Current splice state, so setAbsorption / setAbsorptionShadows / setKm* can
+    // each set their own part without the caller re-stating the others.
     this._absorbOn = false;
     this._absorbShadows = true;
+    // Kubelka-Munk needs BOTH halves: scene data (a material opted in, so row 68
+    // exists) and the caller's opt-in flag. Split so a recompile cannot silently
+    // re-enable the feature and a toggle cannot enable it on a scene with no
+    // scattering material to act on.
+    this._kmData = false;
+    this._kmOn = false;
 
     this.material = new THREE.ShaderMaterial({
       // Stable program name for compile-failure self-diagnosis: this is the
@@ -1475,6 +1821,9 @@ export class RTLightingPass {
     // Beer-Lambert absorption rides row 67 of the scene-data texture bound just
     // above, so the shader variant follows the compiled scene directly — no
     // uniform, no sampler, nothing for the caller to remember.
+    // Kubelka-Munk rides row 68 of the same texture and is recorded first, so the
+    // single splice the setAbsorption call triggers already knows about it.
+    this._kmData = !!compiled.scattering;
     this.setAbsorption(!!compiled.absorption);
   }
 
@@ -1506,12 +1855,29 @@ export class RTLightingPass {
     this._applyAbsorptionSplice();
   }
 
+  /**
+   * Splice in / strip out KUBELKA-MUNK TWO-FLUX SCATTERING. Takes effect only
+   * when the compiled scene also carries a scattering table (setCompiledScene
+   * records that), so turning it on in a scene with no scattering material
+   * leaves the program byte-identical to what it was. The KM variant is a strict
+   * SUPERSET — it reads K from the absorption row and its shadow half IS the
+   * coloured-shadow march — so enabling it implies both of those, which is why
+   * the splice below reaches for _fragKm without consulting _absorbShadows.
+   * Recompiles the megakernel: a settings-time knob, not a per-frame one.
+   */
+  setKmScattering(on) {
+    this._kmOn = !!on;
+    this._applyAbsorptionSplice();
+  }
+
   _applyAbsorptionSplice() {
     const src = !this._absorbOn
       ? this._fragPlain
-      : this._absorbShadows
-        ? this._fragAbsorbShadows
-        : this._fragAbsorption;
+      : this._kmOn && this._kmData
+        ? this._fragKm
+        : this._absorbShadows
+          ? this._fragAbsorbShadows
+          : this._fragAbsorption;
     if (this.material.fragmentShader === src) return;
     this.material.fragmentShader = src;
     this.material.needsUpdate = true; // three re-keys the program by source hash
