@@ -134,6 +134,11 @@ export function buildScene() {
   // the Lumiere projection now lands) into the surfaces corner beside the
   // teapot. Its plinth is helmet-height so the knot rises clear of the
   // six-sphere bench behind it instead of cutting across the line-up.
+  // x is 9.0 rather than the 8.2 the layout first used: measured in NDC from the
+  // default camera, a plinth at 8.2 sits exactly on the bench's sixth sphere
+  // (the diamond-ior glass one) and hides it completely. At 9.0 the column
+  // clips only the sphere's right quarter, and the knot itself is open enough to
+  // see through. Further right than this and it starts eating the teapot.
   const knot = new THREE.Mesh(
     new THREE.TorusKnotGeometry(0.7, 0.23, 140, 20),
     // metalness just under 1: the traced reflection still dominates, but a
@@ -142,8 +147,8 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({ color: 0xd4af6a, roughness: 0.28, metalness: 0.85 })
   );
   knot.name = "knot-gold";
-  pedestal("pedestal-knot", 8.2, -4.2, 1.5, 0.8);
-  knot.position.set(8.2, 0, -4.2);
+  pedestal("pedestal-knot", 9.0, -4.2, 1.5, 0.75);
+  knot.position.set(9.0, 0, -4.2);
   seatOn(knot, 1.5);
   scene.add(knot);
 
@@ -416,13 +421,18 @@ export function buildScene() {
     framePiece(`frame-${side}-bottom`, 0.12, 0.12, 3.24, wx, 2.3 - 1.11, z0);
     framePiece(`frame-${side}-stile-a`, 0.12, 2.34, 0.12, wx, 2.3, z0 + 1.56);
     framePiece(`frame-${side}-stile-b`, 0.12, 2.34, 0.12, wx, 2.3, z0 - 1.56);
-    // frame back face -> wall inner face (|11.9| - |11.56| = 0.34)
+    // frame back face -> wall inner face (|11.9| - |11.56| = 0.34). The pegs sit
+    // on the STILES, two per side, rather than behind the rails: a peg hidden
+    // behind the rail it supports is a peg nobody ever sees, and the point of
+    // the mount is that the viewer can tell what holds the panel up. On the
+    // stiles they clear the frame's silhouette from any oblique view along the
+    // wall, and they cast their own little shadows onto the saturated wall.
     const inward = Math.sign(wx);            // -1 on the red wall, +1 on the teal
     const pegX = wx + inward * (0.06 + 0.17); // centre of the 0.34 bridge
     let pi = 0;
-    for (const dy of [1.11, -1.11]) {
-      for (const dz of [1.2, -1.2]) {
-        framePiece(`peg-${side}-${pi++}`, 0.34, 0.09, 0.09, pegX, 2.3 + dy, z0 + dz);
+    for (const dz of [1.56, -1.56]) {
+      for (const dy of [0.6, -0.6]) {
+        framePiece(`peg-${side}-${pi++}`, 0.34, 0.1, 0.1, pegX, 2.3 + dy, z0 + dz);
       }
     }
   }
