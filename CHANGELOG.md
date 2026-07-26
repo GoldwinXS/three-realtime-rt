@@ -1,6 +1,21 @@
 # Changelog
 
-## Unreleased — coloured shadows
+## 0.9.0 — 2026-07-26
+
+- **Museum demo reorganised into zoned galleries.** Materials pieces (sphere
+  bench, gold knot, teapot, vertex-painted ico) consolidated back-right; the
+  physics drop pad and the fox share a dynamics corner; the centre floor is
+  cleared for the new **"Lumiere"** freestanding stained-glass screen — a 3x3
+  grid of absorbing glass tiles with a projector spotlight behind it, revealed
+  by the "tinted glass" toggle. With "tinted shadows" on, the beam lays a
+  nine-tile colour quilt on the floor; off, the same beam casts a flat dark
+  rectangle — the feature's live A/B. Nothing floats: every exhibit is seated
+  or visibly wall-mounted (audited programmatically; the wall panes gained
+  bronze standoff pegs, the OPEN sign a stand, and the helmet no longer sinks
+  0.33 m into its plinth). Turning "tinted shadows" on visibly unchecks ReSTIR
+  (reservoir visibility is still binary, so the effect is invisible with it
+  on); a manual ReSTIR click always wins, and the previous state is restored
+  when the toggle goes off.
 
 - **Coloured shadows: shadow rays through absorbing glass are attenuated, not
   blocked.** A shadow ray crossing a glass material that carries a Beer-Lambert
