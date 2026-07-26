@@ -216,6 +216,14 @@ async function main() {
     emissiveNEE: false,
     reflections: false,
     refraction: false,
+    // Coloured shadows default ON in the library (they cost nothing until a
+    // material actually absorbs), but the demo starts them OFF so the museum's
+    // reveal is a real before/after: "tinted glass" brings the Lumiere screen in
+    // casting one flat dark rectangle — what a rasterizer draws — and "tinted
+    // shadows" turns that rectangle into the coloured light quilt. Boot is
+    // unaffected either way: with nothing absorbing, the megakernel uses the
+    // byte-identical no-absorption source regardless of this flag.
+    absorptionShadows: false,
     targetFps: 55,
     // Deepest governor lever: canvas scale is app-owned (we own the canvas + CSS
     // stretch), so hand the governor our setter. setCanvasScale is declared
@@ -325,14 +333,16 @@ async function main() {
       case "refraction":
         rt.refraction = on;
         break;
-      // Tinted glass (Beer-Lambert absorption): show/hide the backlit
-      // cast-glass relief on the back wall and recompile. The absorbing
-      // materials are compiled in WITH the piece, so OFF really is today's
-      // program — the lighting megakernel strips back to the byte-identical
-      // no-absorption source (see RTLightingPass.setAbsorption). That makes
-      // this toggle the feature's cost A/B: flip it and watch the fps readout.
+      // Tinted glass (Beer-Lambert absorption): show/hide the GLASS ENSEMBLE —
+      // the "Sunset" backlit relief on the red wall AND the "Lumiere" stained-
+      // glass screen on centre stage — then recompile. The absorbing materials
+      // are compiled in WITH the pieces, so OFF really is today's program: the
+      // lighting megakernel strips back to the byte-identical no-absorption
+      // source (see RTLightingPass.setAbsorption). That makes this toggle the
+      // feature's cost A/B: flip it and watch the fps readout.
       case "absorption":
         showcase.tintedArt.traverse((o) => (o.visible = on));
+        showcase.lumiere.traverse((o) => (o.visible = on));
         rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
         break;
     }
@@ -341,9 +351,24 @@ async function main() {
 
   // Spawn the physics pile on demand and rebuild the BVH with the new
   // dynamic set (a one-time hitch, same as the initial compile).
+  //
+  // The drop pad moved out of the centre floor (2.6, 2.4) — that floor is now
+  // the Lumiere projection screen — into the right-hand DYNAMICS half beside the
+  // fox platform. The 5x5 resting pyramid spans x 5.86..8.34, z -1.09..1.39, so
+  // with 0.5m props the occupied box is x 5.61..8.59 by z -1.34..1.64. That
+  // clears every static body in the corner, which matters because the plinths
+  // carry no physics colliders — a prop resting inside one would sink through
+  // the stone:
+  //   fox platform   x 5.3..7.7,  z 1.8..3.8    -> 0.16m of z clearance
+  //   teapot plinth  circle r1.035 at (9.7,-1.5) -> 0.075m of x clearance
+  //   Lumiere floor projection  x 0.2..5.0      -> 0.6m of x clearance
+  // and it stays inside the default camera frame (ndc x ~0.75) — the true
+  // back-right corner is past the right edge at 16:10 and 16:9 alike, which
+  // would hide the pile at boot. A "Drop" still jitters props +-1.5m, which can
+  // throw one onto a plinth for a moment; that was true before this move too.
   const spawnPile = () => {
     if (physics.meshes.length > 0) return;
-    physics.spawnPool(scene, 40, new THREE.Vector3(2.6, 0, 2.4));
+    physics.spawnPool(scene, 40, new THREE.Vector3(7.1, 0, 0.15));
     rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
   };
 
