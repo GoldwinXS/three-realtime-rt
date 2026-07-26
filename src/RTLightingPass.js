@@ -215,7 +215,7 @@ vec3 rtTransmittance(float matIndex, float d) {
 }
 
 // <<< RT_ABSORPTION
-// >>> RT_ABSORB_SHADOWS (whole block source-spliced — see stripAbsorbShadows)
+// >>> RT_ABSORB_SHADOWS (whole block source-spliced — see stripMarked below)
 // COLOURED SHADOWS. A shadow ray that crosses absorbing glass is ATTENUATED per
 // channel instead of blocked: stained glass spills tinted light, a backlit stack
 // of translucent bodies stops rendering as a black silhouette. This is the
