@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>three-realtime-rt — Beer-Lambert absorption (tinted glass)</title>
+  <title>three-realtime-rt — Beer-Lambert absorption + coloured shadows</title>
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
     body { display: flex; align-items: center; justify-content: center; }
@@ -30,6 +30,14 @@
       exp(&#8722;&#963;&#183;d) per channel over the in-medium path. Back row:
       a blue-on-amber stack vs. its lone slabs, and a backlit panel glowing
       through amber. Assertions run automatically (see #stats). Drag to orbit.
+    </div>
+    <div class="desc">
+      <b>Phase 2</b> (after frame 300) reveals the <b>coloured-shadow</b>
+      exhibit at the back: two overlapping slabs under a high lamp, throwing
+      amber, blue and their product onto a white floor. It runs with ReSTIR
+      off &#8212; coloured shadows act on the next-event shadow rays, not the
+      reservoir's visibility ray. Phase 3 repeats it with
+      <b>rt.absorptionShadows</b> off, the A/B control.
     </div>
     <div id="stats"></div>
   </div>
