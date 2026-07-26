@@ -1,5 +1,70 @@
 # Changelog
 
+## Unreleased
+
+- **Per-material Beer-Lambert absorption — tinted glass done right.** Light
+  crossing a glass material's interior is now attenuated `exp(−σ·d)` per RGB
+  channel over the **in-medium path length**: a thick slab of the same amber
+  tints deeper than a thin one, thickness compounds exponentially, and a
+  **backlit** pane glows in the filtered colour for free (an emissive surface
+  seen through glass rides the refracted view segment, which is exactly the
+  segment being attenuated). Games get tinted bottles, ice, stained glass and
+  display cases; the sibling 3D-print project gets translucent stack previews.
+  - **Opt-in, three.js-native.** A glass material (`transmission > 0`, not
+    `transparent`) with a **finite, positive** `attenuationDistance` and an
+    `attenuationColor` (the colour that survives one such distance) absorbs
+    with `σ = −ln(attenuationColor) / attenuationDistance` per channel
+    (channels floored at 1e-4, so pure black stays finite). three's own default
+    `attenuationDistance: Infinity` means "off", which makes the finite value
+    the explicit opt-in — nothing changes for existing scenes.
+    `userData.rtAttenuation = { color, distance }` is the identical control for
+    materials without the physical fields; it wins when both are present, and
+    warns (rather than silently mis-rendering) when malformed or set on a
+    non-glass material. Recompile after changes, like any material edit.
+  - **Where it acts.** The one place the shader already computes an in-medium
+    distance: the glass path's entry-to-exit refracted chord in the lighting
+    megakernel. The transmitted term (surface shading, emissive glow, sky —
+    whatever came back through the exit interface) is multiplied by the
+    transmittance; the Fresnel reflection half never entered the medium and is
+    untouched. The medium is identified by the **exit** interface's material,
+    correct for closed glass volumes (an open sheet's exit lands on a sigma-0
+    surface and attenuates nothing — no false tinting over air).
+  - **Zero cost when unused, provably.** σ rides a new **row 67** of the
+    existing scene-data texture (1 texel per material, appended — both row-0
+    material texels were fully packed and every consumer addresses rows by
+    absolute constants, so nothing existing moved). No new sampler (the pass
+    sits at the WebGL2 16-sampler minimum), no new uniform, and **no new
+    traceRadiance call site** (the WebKit/Metal budget). The shader code is
+    gated by **source splice, not an `#ifdef`**: when the compiled scene has no
+    absorbing material the marked lines are stripped and the program source is
+    **byte-identical** to the pre-feature build — verified with a
+    `getShaderSource` diff against a v0.7.0 checkout, plus a bit-identical
+    400-frame museum render (mean per-pixel diff 0.0). Fence-timed A/B on the
+    museum (RTX 3060, 720p canvas): absorption-on vs same-scene-absorption-off
+    measured **below the noise floor** at both lighting scales (−0.09 ms @0.5,
+    −0.34 ms @1.0, interleaved medians; spreads ±0.2/±0.4 ms).
+  - **Demo: "tinted glass" toggle + the "Sunset" cast-glass relief.** A backlit
+    shadow-box on the museum's red wall, beside the blue alpha pane (the pair
+    contrasts the out-of-BVH blend trick with real refractive glass): a warm
+    emissive panel behind a 4×4 grid of chunky cast-glass blocks whose
+    **thickness is the palette** — the same amber reads pale at 10 cm and burnt
+    orange at 24 cm. The piece and its absorbing materials compile in/out WITH
+    the toggle, so OFF really is today's program and flipping it while watching
+    the fps readout is the feature's live cost A/B. Turning it on brings
+    refraction with it.
+  - **Regression rig: `absorption.html`.** Slabs on an emissive lightbox
+    (self-lit, so the readout is `Le · exp(−σ·d)` uncontaminated by the
+    engine's opaque glass shadows): a ×2 thickness staircase must darken and
+    saturate monotonically, a blue-on-amber stack must differ from (and
+    undercut) its lone slabs, a backlit panel must glow through amber visibly
+    but tinted vs an uncovered reference, all with zero GL errors and clip-free
+    probes. Asserted automatically into `#absorption-verdict`.
+  - **Honest limits** (also on the README matrix row): tinted transmission
+    only, no scattering; closed volumes; glass still occludes shadow rays
+    fully (no coloured shadows); one in-medium layer per view path (a stack's
+    second body resolves via the single behind-trace as a lit surface); media
+    thinner than ~`2 × rt.eps` cannot resolve an exit interface.
+
 ## 0.7.0 — 2026-07-25
 
 *(0.7.0 candidate. Also carries the volumetric-albedo entry further down, which
