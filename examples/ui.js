@@ -139,6 +139,9 @@ function selectRow(labelText, options, value, onChange) {
   return row;
 }
 
+// One light's row. Returns { row, input } so callers can drive the checkbox —
+// a light whose SUBJECT is hidden (desc.gated) is dimmed + disabled until the
+// toggle that reveals the subject switches it on.
 function lightRow(desc, rt, scene) {
   const { label: name, light, color: hasColor, onToggle } = desc;
   const row = el("div", "row");
@@ -170,7 +173,7 @@ function lightRow(desc, rt, scene) {
     row.append(col);
   }
   row.append(sw);
-  return row;
+  return { row, input };
 }
 
 export function buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setWindows, setCanvasScale, canvasScale }) {
@@ -258,6 +261,28 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   );
   panel.append(rSec);
 
+  // Rows in one section sometimes have to drive rows in another (a feature
+  // toggle revealing the light that belongs to the piece it reveals). Sections
+  // are built top-down, so the dependency is registered here and consumed by
+  // whichever section is built later — every hook fires from a click, long
+  // after buildUI has finished.
+  const gateHooks = { absorption: [] };
+
+  // ReSTIR is written from two places (its own checkbox and the coloured-shadow
+  // auto-off), so its full semantics live in one function and the UI is always
+  // told what happened. `restirSavedState` holds what to restore when the
+  // coloured-shadow toggle releases it; null means it is not holding anything.
+  let restirSavedState = null;
+  const applyRestir = (v) => {
+    rt.restir = v;
+    restirT.input.checked = v;
+    if (!v) {
+      rt.stochasticLights = false;
+      fastLights.input.checked = false;
+    }
+    rt.resetAccumulation();
+  };
+
   // --- RT features: additive effects, each with a visible frame-time cost.
   // Tiered defaults leave the heavy ones off on phones — turning them on IS
   // the demo ("what does this cost on MY hardware?").
@@ -277,35 +302,53 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // Grab the refraction toggle so the tinted-glass handler can switch it on.
   const refractionT = toggle("refraction", rt.refraction, (v) => setFeature("refraction", v));
   fSec.append(refractionT.row);
-  // Tinted glass (Beer-Lambert absorption): reveals the backlit cast-glass
-  // relief on the back wall and recompiles with per-material absorption; OFF
-  // strips back to the byte-identical no-absorption program, so flipping this
-  // while watching the fps readout IS the feature's cost measurement. The
-  // effect only exists on refracted paths, so turning it on brings refraction
-  // with it (same pattern as ReSTIR unchecking fast lights below).
+  // Tinted glass (Beer-Lambert absorption): reveals the museum's GLASS ENSEMBLE
+  // — the Sunset relief on the red wall and the Lumiere stained-glass screen on
+  // centre stage — and recompiles with per-material absorption; OFF strips back
+  // to the byte-identical no-absorption program, so flipping this while watching
+  // the fps readout IS the feature's cost measurement. The effect only exists on
+  // refracted paths, so turning it on brings refraction with it (same pattern as
+  // ReSTIR unchecking fast lights below).
   // Coloured shadows, the shadow-ray half of the same feature: a shadow ray
   // crossing absorbing glass is attenuated per channel instead of blocked, so
-  // the Sunset piece's backlight spills tinted light onto the wall and frame
-  // instead of stopping at a black silhouette. Declared before "tinted glass" so
-  // that toggle can dim it (it is a no-op with no absorbing material in the
-  // scene), appended after it as an indented sub-row. It swaps the megakernel's
-  // source on its own, so flipping THIS with tinted glass already on is the
-  // isolated cost A/B of the shadow march.
-  const tintedShadows = toggle("tinted shadows", rt.absorptionShadows, (v) => {
+  // the projector's beam lands on the floor as a nine-tile light quilt instead
+  // of one flat dark rectangle. Declared before "tinted glass" so that toggle
+  // can enable it (it is a no-op with no absorbing material in the scene),
+  // appended after it as an indented sub-row.
+  const applyTintedShadows = (v) => {
     rt.absorptionShadows = v;
-  });
+    if (v) {
+      // THE COUPLING. With ReSTIR lights on, primary direct light is shaded from
+      // the reservoir's winner by ONE BINARY visibility ray — so the per-channel
+      // transmittance march never runs on a primary surface and this toggle
+      // would appear to do NOTHING on the floor. Rather than explain that in a
+      // footnote and let the user conclude the feature is broken, switch ReSTIR
+      // off for them, visibly: the checkbox below unchecks itself and the note
+      // says why. The previous state is restored when this goes back off.
+      if (restirSavedState === null) {
+        restirSavedState = { restir: rt.restir, stochasticLights: rt.stochasticLights };
+      }
+      if (rt.restir) applyRestir(false);
+    } else if (restirSavedState) {
+      const prev = restirSavedState;
+      restirSavedState = null;
+      if (prev.restir !== rt.restir) applyRestir(prev.restir);
+      if (prev.stochasticLights !== rt.stochasticLights) {
+        rt.stochasticLights = prev.stochasticLights;
+        fastLights.input.checked = prev.stochasticLights;
+      }
+    }
+    rt.resetAccumulation();
+  };
+  const tintedShadows = toggle("tinted shadows", rt.absorptionShadows, applyTintedShadows);
   tintedShadows.row.classList.add("sub", "dim");
-  // Deliberately bound to NOTHING but rt.absorptionShadows: the neighbouring
-  // toggles it depends on are named in the note instead, so flipping this one
-  // changes exactly one thing and the fps delta beside it is the shadow march's
-  // real cost. (Contrast "tinted glass" above, which does pull refraction in —
-  // there the feature is meaningless without it.)
+  tintedShadows.input.disabled = true; // meaningless until something absorbs
   const tintedNote = el("div", "note");
   tintedNote.textContent =
-    "acts on the direct + emissive shadow rays. With ReSTIR lights on, primary " +
-    "direct light is shaded by the reservoir's visibility ray, which stays binary " +
-    "in v1 — turn ReSTIR lights off, and emissive area lights on, to see the " +
-    "Sunset backlight spill onto the red wall.";
+    "acts on the direct + emissive shadow rays, so it needs them: ReSTIR shades " +
+    "primary direct light with one BINARY visibility ray, and turning this on " +
+    "unchecks “ReSTIR lights” (and “fast lights” with it) so the tint actually " +
+    "reaches the floor. Turning it off puts both back.";
   fSec.append(toggle("tinted glass", false, (v) => {
     if (v && !rt.refraction) {
       refractionT.input.checked = true;
@@ -313,7 +356,16 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
     }
     setFeature("absorption", v);
     tintedShadows.row.classList.toggle("dim", !v);
+    tintedShadows.input.disabled = !v;
     tintedNote.style.display = v ? "" : "none";
+    // Turning the ensemble off must not leave the coloured-shadow program (and
+    // its borrowed ReSTIR state) hanging around with nothing to act on.
+    if (!v && tintedShadows.input.checked) {
+      tintedShadows.input.checked = false;
+      applyTintedShadows(false); // also hands ReSTIR back
+    }
+    // Reveal / retire the Lumiere projector row in the Lights section.
+    for (const hook of gateHooks.absorption || []) hook(v);
   }).row);
   fSec.append(tintedShadows.row);
   tintedNote.style.display = "none"; // revealed with the piece
@@ -331,14 +383,13 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // Turning ReSTIR OFF must drop us onto the per-light-rays baseline, NOT the
   // flat-cost stochastic "fast lights" path — otherwise both sides scale the
   // same with light count and ReSTIR's advantage never shows up in the fps.
-  fSec.append(toggle("ReSTIR lights", rt.restir, (v) => {
-    rt.restir = v;
-    if (!v) {
-      rt.stochasticLights = false;
-      fastLights.input.checked = false;
-    }
-    rt.resetAccumulation();
-  }).row);
+  const restirT = toggle("ReSTIR lights", rt.restir, (v) => {
+    // A manual flip is the user taking the wheel back: forget any state the
+    // coloured-shadow coupling stashed, so it never overwrites this choice.
+    restirSavedState = null;
+    applyRestir(v);
+  });
+  fSec.append(restirT.row);
   fSec.append(fastLights.row);
   fSec.append(slider("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v)));
   fSec.append(slider("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v)));
@@ -349,7 +400,27 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   const lSec = el("div", "sec");
   lSec.append(el("h3", null, `${ICON.bulb} Lights`));
   for (const desc of lights) {
-    lSec.append(lightRow(desc, rt, scene));
+    const { row, input } = lightRow(desc, rt, scene);
+    lSec.append(row);
+    if (!desc.gated) continue;
+    // A gated light (the Lumiere projector) keeps its row so the panel never
+    // reflows, but reads as unavailable until its subject exists: indented,
+    // dimmed and disabled, with a note naming the toggle that brings it in.
+    row.classList.add("sub", "dim");
+    input.disabled = true;
+    const gateNote = el("div", "note");
+    gateNote.textContent = "lights the Lumiere screen — arrives with “tinted glass”.";
+    lSec.append(gateNote);
+    (gateHooks[desc.gated] || (gateHooks[desc.gated] = [])).push((on) => {
+      row.classList.toggle("dim", !on);
+      input.disabled = !on;
+      // The projector exists to shine through the screen: it comes up WITH the
+      // ensemble and goes dark with it, and the checkbox state says so.
+      input.checked = on;
+      desc.light.visible = on;
+      refreshLights();
+      rt.resetAccumulation();
+    });
   }
   // Emissive clerestory windows — each is a true sampled area light; moving
   // this recompiles the light tables (deliberate, same hitch as pile spawn).

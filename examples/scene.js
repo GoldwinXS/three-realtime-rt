@@ -11,21 +11,35 @@ const foxUrl =
   "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Fox/glTF-Binary/Fox.glb";
 
 /**
- * An indoor gallery: a Cornell-style room (saturated side walls, open top)
- * arranged as a deliberate exhibit — every renderer feature gets a staged
- * vignette with a clear sightline from the default camera:
+ * An indoor gallery: a Cornell-style room (24 x 14, saturated side walls, open
+ * top) laid out as a museum with named ZONES, so panning left-to-right walks a
+ * visitor past one staged vignette per renderer feature:
  *
- *   back-left    water pool under the emissive gallery light (deforming BVH,
- *                moving traced reflections of the glow)
- *   back-centre  DamagedHelmet hero pedestal under its own spotlight
- *                (normal/roughness maps + analytic-light glints)
- *   back-right   glossy teapot against the teal wall (GGX dielectric specular)
- *   mid-left     gold torus knot + the mirror sphere (traced reflections)
- *   mid-right    glass sphere (refraction) and the physics drop pad
- *   right wall   roughness ramp on plinths, lit by the cool light
- *   front-left   the duck in a museum vitrine (alpha-blend glass, casts no
- *                shadow onto the exhibit — exactly how game glass behaves)
- *   front        a freestanding amber pane the camera looks through
+ *   back-left     water pool + stone kerbs under the clerestory windows
+ *                 (deforming BVH, moving traced reflections of the glow)
+ *   back-centre   DamagedHelmet hero pedestal under its own spotlight
+ *                 (normal/roughness maps + analytic-light glints)
+ *   back-right    MATERIALS GALLERY — the six-sphere bench (roughness trio,
+ *                 chrome, gold, diamond-ior glass), the vertex-painted
+ *                 icosahedron, the gold torus knot and the glossy teapot:
+ *                 every "look at the surface" piece in one corner
+ *   left wall     GLASS WING — the blue alpha pane (out-of-BVH blend trick)
+ *                 beside "Sunset", the backlit cast-glass relief (real
+ *                 Beer-Lambert absorption). Same subject, two techniques.
+ *   centre stage  "Lumiere" — a freestanding stained-glass screen on bronze
+ *                 legs with its own projector spotlight. The beam crosses nine
+ *                 absorbing tiles and lands on the open floor: a plain dark
+ *                 shadow with coloured shadows off, a multicolour light quilt
+ *                 with them on. Hidden until the "tinted glass" toggle.
+ *   front-left    the duck in a museum vitrine (alpha-blend glass, casts no
+ *                 shadow onto its own exhibit) + the emissive OPEN sign
+ *   front-right   DYNAMICS CORNER — the skinned fox on its platform and the
+ *                 physics drop pad, the two things in the room that move
+ *   right wall    the amber alpha pane, hung to mirror the blue one
+ *
+ * Every object rests on something: plinths and legs reach the floor, exhibits
+ * are seated on their pedestal tops, and the wall-hung frames stand off the
+ * wall on visible bronze pegs. Nothing floats.
  *
  * GI colour bleed stays legible everywhere: red wall left, teal wall right,
  * warm-grey back, all the showcase whites in between.
@@ -50,44 +64,81 @@ export function buildScene() {
   const backGrey = new THREE.MeshStandardMaterial({ color: 0xb9b3ac, roughness: 0.85 });
   const red = new THREE.MeshStandardMaterial({ color: 0xc42f2a, roughness: 0.85 });
   const teal = new THREE.MeshStandardMaterial({ color: 0x22808f, roughness: 0.8 });
+  // Museum bronze: every frame, standoff peg, muntin, leg and stand in the room
+  // is made of this, so the hardware reads as one commissioned set.
+  const frameMat = new THREE.MeshStandardMaterial({
+    color: 0x3a3128,
+    roughness: 0.4,
+    metalness: 0.6,
+  });
 
   // Panoramic gallery: wider than deep, exhibits stationed left-to-right along
   // the back band so the natural move is to PAN along the frieze; the open
   // front half is the physics floor (pile drops there).
   const ground = new THREE.Mesh(new THREE.BoxGeometry(24, 0.2, 14), white);
   ground.position.y = -0.1;
+  ground.name = "floor";
   scene.add(ground);
 
   const backWall = new THREE.Mesh(new THREE.BoxGeometry(24, 7, 0.2), backGrey);
   backWall.position.set(0, 3.5, -7);
+  backWall.name = "wall-back";
   scene.add(backWall);
 
   const leftWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 7, 14), red);
   leftWall.position.set(-12, 3.5, 0);
+  leftWall.name = "wall-left-red";
   scene.add(leftWall);
 
   const rightWall = new THREE.Mesh(new THREE.BoxGeometry(0.2, 7, 14), teal);
   rightWall.position.set(12, 3.5, 0);
+  rightWall.name = "wall-right-teal";
   scene.add(rightWall);
 
-  function pedestal(x, z, height = 1.0, radius = 0.9) {
+  // Every plinth is a real cylinder standing ON the floor (bottom face at y=0)
+  // and reports its own top height, which is what exhibits are seated against.
+  function pedestal(name, x, z, height = 1.0, radius = 0.9) {
     const p = new THREE.Mesh(
       new THREE.CylinderGeometry(radius, radius * 1.15, height, 24),
       new THREE.MeshStandardMaterial({ color: 0x777d88, roughness: 0.55 })
     );
     p.position.set(x, height / 2, z);
+    p.name = name;
+    p.userData.museumTop = height; // read by the contact audit
     scene.add(p);
     return p;
   }
+
+  // Seat a mesh ON a support surface: measure its real bounding box (geometry
+  // may be centred, bottom-origin or anything in between — TeapotGeometry and
+  // TorusKnotGeometry disagree) and translate it so bbox.min.y lands exactly on
+  // `topY`. This is what makes the "nothing floats" rule mechanical rather than
+  // a hand-tuned constant per prop.
+  const seatOn = (obj, topY) => {
+    obj.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(obj);
+    obj.position.y += topY - box.min.y;
+    obj.updateMatrixWorld(true);
+    return obj;
+  };
 
   // --- back-centre: helmet hero pedestal (loaded async below) ------------
   // Placed at the water's edge so the pool catches its reflection; its own
   // spotlight (toggleable) rakes it from the front-right for map detail +
   // an analytic glint on the visor.
   const HELMET_POS = new THREE.Vector3(-0.6, 2.6, -4.2);
-  pedestal(HELMET_POS.x, HELMET_POS.z, 1.6);
+  const helmetPlinth = pedestal("pedestal-helmet", HELMET_POS.x, HELMET_POS.z, 1.6);
 
-  // --- mid-left: gold knot (traced reflections + glints on metal) --------
+  // --- back-right (MATERIALS GALLERY): gold knot ---------------------------
+  // Moved off the open centre floor (it used to stand at 1.4, -0.8, right where
+  // the Lumiere projection now lands) into the surfaces corner beside the
+  // teapot. Its plinth is helmet-height so the knot rises clear of the
+  // six-sphere bench behind it instead of cutting across the line-up.
+  // x is 9.0 rather than the 8.2 the layout first used: measured in NDC from the
+  // default camera, a plinth at 8.2 sits exactly on the bench's sixth sphere
+  // (the diamond-ior glass one) and hides it completely. At 9.0 the column
+  // clips only the sphere's right quarter, and the knot itself is open enough to
+  // see through. Further right than this and it starts eating the teapot.
   const knot = new THREE.Mesh(
     new THREE.TorusKnotGeometry(0.7, 0.23, 140, 20),
     // metalness just under 1: the traced reflection still dominates, but a
@@ -95,21 +146,25 @@ export function buildScene() {
     // finds the dark open ceiling — full metal read as mottled camo there.
     new THREE.MeshStandardMaterial({ color: 0xd4af6a, roughness: 0.28, metalness: 0.85 })
   );
-  pedestal(1.4, -0.8, 0.8);
-  knot.position.set(1.4, 1.7, -0.8);
+  knot.name = "knot-gold";
+  pedestal("pedestal-knot", 9.0, -4.2, 1.5, 0.75);
+  knot.position.set(9.0, 0, -4.2);
+  seatOn(knot, 1.5);
   scene.add(knot);
 
-  // --- back-right: glossy cream teapot against the teal wall (GGX star) ---
+  // --- back-right (MATERIALS GALLERY): glossy cream teapot (GGX star) ------
   const teapot = new THREE.Mesh(
     new TeapotGeometry(0.8, 10),
     new THREE.MeshStandardMaterial({ color: 0xe4dccd, roughness: 0.12, metalness: 0.0 })
   );
-  pedestal(9.7, -1.5);
-  teapot.position.set(9.7, 1.75, -1.5);
+  teapot.name = "teapot";
+  pedestal("pedestal-teapot", 9.7, -1.5);
+  teapot.position.set(9.7, 0, -1.5);
   // Spout points +x by default — straight into the teal wall from this spot.
   // Turn it to face back-left into the room (profile view from the camera),
   // and keep half a metre of air between the handle and the amber painting.
   teapot.rotation.y = 2.3;
+  seatOn(teapot, 1.0);
   scene.add(teapot);
 
   // --- back wall, right half: the MATERIALS bench --------------------------
@@ -125,6 +180,8 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({ color: 0x9aa1ab, roughness: 0.5 })
   );
   bench.position.set(5.4, 0.25, -6.2);
+  bench.name = "bench-materials";
+  bench.userData.museumTop = 0.5;
   scene.add(bench);
   const gamut = [
     new THREE.MeshStandardMaterial({ color: 0xdfe3ea, roughness: 0.05, metalness: 0 }),
@@ -146,7 +203,8 @@ export function buildScene() {
   ];
   for (let i = 0; i < gamut.length; i++) {
     const s = new THREE.Mesh(new THREE.SphereGeometry(0.45, 40, 28), gamut[i]);
-    s.position.set(2.3 + i * 1.25, 0.95, -6.2);
+    s.position.set(2.3 + i * 1.25, 0.95, -6.2); // 0.45 radius on the 0.5 bench top
+    s.name = `bench-sphere-${i}`;
     scene.add(s);
   }
 
@@ -167,9 +225,13 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.25 })
   );
   plinth.position.set(-4.8, 0.35, 0.8);
+  plinth.name = "plinth-vitrine";
+  plinth.userData.museumTop = 0.7;
   scene.add(plinth);
   const vitrine = new THREE.Group();
+  vitrine.name = "vitrine";
   const paneGeoSide = new THREE.BoxGeometry(1.56, 1.7, 0.04);
+  let vi = 0;
   for (const [dx, dz, ry] of [
     [0, 0.76, 0],
     [0, -0.76, 0],
@@ -179,10 +241,12 @@ export function buildScene() {
     const pane = new THREE.Mesh(paneGeoSide, vitrineGlass);
     pane.position.set(dx, 0, dz);
     pane.rotation.y = ry;
+    pane.name = `vitrine-pane-${vi++}`;
     vitrine.add(pane);
   }
   const lid = new THREE.Mesh(new THREE.BoxGeometry(1.56, 0.04, 1.56), vitrineGlass);
-  lid.position.y = 0.87;
+  lid.position.y = 0.87; // panes end at +0.85 — the lid rests on them
+  lid.name = "vitrine-lid";
   vitrine.add(lid);
   // Museum case lighting: a small emissive puck under the lid lights the
   // exhibit from above via NEE — and since the glass panes are out of the BVH,
@@ -195,7 +259,10 @@ export function buildScene() {
       emissiveIntensity: 5,
     })
   );
-  puck.position.y = 0.8;
+  // Mounted flush to the UNDERSIDE of the lid (lid bottom = +0.85, puck is 0.04
+  // thick) — a case light screwed to the roof, not a slab hovering inside.
+  puck.position.y = 0.83;
+  puck.name = "vitrine-puck";
   vitrine.add(puck);
   vitrine.position.set(-4.8, 1.55, 0.8);
   scene.add(vitrine);
@@ -237,11 +304,33 @@ export function buildScene() {
       side: THREE.DoubleSide,
     })
   );
-  sign.position.set(-3.2, 0.72, 1.95); // stands on the floor, front-right of the vitrine
+  sign.name = "sign-open";
+  sign.position.set(-3.2, 0.72, 1.95); // front-right of the vitrine
   sign.rotation.y = 0.55;              // angled toward the camera / open floor
   scene.add(sign);
+  // …carried by a real bronze stand. The panel used to hang in mid-air at
+  // y=0.48–0.96 with nothing under it; now a sled foot on the floor and a post
+  // reach up to its bottom edge (post top 0.50 vs panel bottom 0.48).
+  const signStand = new THREE.Group();
+  signStand.name = "sign-stand";
+  signStand.position.set(-3.2, 0, 1.95);
+  signStand.rotation.y = 0.55;
+  const signFoot = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.06, 0.3), frameMat);
+  signFoot.position.y = 0.03; // bottom face on the floor
+  signFoot.name = "sign-stand-foot";
+  signStand.add(signFoot);
+  const signPost = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.44, 0.08), frameMat);
+  signPost.position.y = 0.28; // 0.06 → 0.50, into the panel's bottom edge
+  signPost.name = "sign-stand-post";
+  signStand.add(signPost);
+  scene.add(signStand);
 
-  // --- front-left: vertex-painted icosahedron sculpture -------------------
+  // --- back-right (MATERIALS GALLERY): vertex-painted icosahedron ---------
+  // Moved out of the front-left corner (it used to stand at -8.5, 2.5, alone in
+  // the vitrine's zone) to a plinth tucked against the back wall between the
+  // helmet and the materials bench, so all four "read the surface" exhibits now
+  // share one corner. Its x is 0.65 rather than the bench's shoulder at 1.4:
+  // the plinth base is 0.67 across, which needs the clearance.
   // Its albedo comes entirely from a baked per-vertex `color` attribute (no
   // texture, no map): the hue sweeps with height so the whole form carries a
   // smooth gradient. Demonstrates geometry vertex colours multiplying into the
@@ -267,8 +356,10 @@ export function buildScene() {
     // the ray traced G-buffer reads the color attribute regardless of this flag.
     new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.0 })
   );
-  pedestal(-8.5, 2.5, 1.0, 0.6);
-  ico.position.set(-8.5, 1.4, 2.5);
+  ico.name = "icosahedron-vertexcolor";
+  pedestal("pedestal-ico", 0.65, -5.85, 1.05, 0.58);
+  ico.position.set(0.65, 0, -5.85);
+  seatOn(ico, 1.05);
   scene.add(ico);
 
   // --- glass "paintings": tinted panes hung on the side walls -------------
@@ -288,6 +379,7 @@ export function buildScene() {
   );
   paneAmber.position.set(11.45, 2.3, 0.2);
   paneAmber.rotation.y = -Math.PI / 2;
+  paneAmber.name = "pane-amber";
   scene.add(paneAmber);
 
   const paneBlue = new THREE.Mesh(
@@ -301,29 +393,48 @@ export function buildScene() {
   );
   paneBlue.position.set(-11.45, 2.3, 1.2);
   paneBlue.rotation.y = Math.PI / 2;
+  paneBlue.name = "pane-blue";
   scene.add(paneBlue);
 
   // Bronze frames turn the panes into hung artwork. The frames are OPAQUE, so
   // unlike the glass they sit in the BVH and ground the pieces with a real
   // contact shadow on the wall.
-  const frameMat = new THREE.MeshStandardMaterial({
-    color: 0x3a3128,
-    roughness: 0.4,
-    metalness: 0.6,
-  });
-  const framePiece = (w, h, d, x, y, z) => {
+  const framePiece = (name, w, h, d, x, y, z) => {
     const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMat);
     f.position.set(x, y, z);
+    f.name = name;
     scene.add(f);
+    return f;
   };
-  for (const [wx, z0] of [
-    [-11.5, 1.2],
-    [11.5, 0.2],
+  // …and STANDOFF PEGS carry the frames back to the wall. Both pieces hang 0.45m
+  // proud of their wall (that gap is what makes them read as backlit stained
+  // glass rather than paint), which previously left them hovering with no
+  // visible support. Four short bronze pegs per piece bridge the 0.34m from the
+  // frame's back face to the wall face — the same trick a real gallery uses for
+  // a floating-mount panel, and now the shadow they cast on the saturated wall
+  // reads as hardware instead of magic.
+  for (const [wx, z0, side] of [
+    [-11.5, 1.2, "blue"],
+    [11.5, 0.2, "amber"],
   ]) {
-    framePiece(0.12, 0.12, 3.24, wx, 2.3 + 1.11, z0); // top rail
-    framePiece(0.12, 0.12, 3.24, wx, 2.3 - 1.11, z0); // bottom rail
-    framePiece(0.12, 2.34, 0.12, wx, 2.3, z0 + 1.56); // stiles
-    framePiece(0.12, 2.34, 0.12, wx, 2.3, z0 - 1.56);
+    framePiece(`frame-${side}-top`, 0.12, 0.12, 3.24, wx, 2.3 + 1.11, z0);
+    framePiece(`frame-${side}-bottom`, 0.12, 0.12, 3.24, wx, 2.3 - 1.11, z0);
+    framePiece(`frame-${side}-stile-a`, 0.12, 2.34, 0.12, wx, 2.3, z0 + 1.56);
+    framePiece(`frame-${side}-stile-b`, 0.12, 2.34, 0.12, wx, 2.3, z0 - 1.56);
+    // frame back face -> wall inner face (|11.9| - |11.56| = 0.34). The pegs sit
+    // on the STILES, two per side, rather than behind the rails: a peg hidden
+    // behind the rail it supports is a peg nobody ever sees, and the point of
+    // the mount is that the viewer can tell what holds the panel up. On the
+    // stiles they clear the frame's silhouette from any oblique view along the
+    // wall, and they cast their own little shadows onto the saturated wall.
+    const inward = Math.sign(wx);            // -1 on the red wall, +1 on the teal
+    const pegX = wx + inward * (0.06 + 0.17); // centre of the 0.34 bridge
+    let pi = 0;
+    for (const dz of [1.56, -1.56]) {
+      for (const dy of [0.6, -0.6]) {
+        framePiece(`peg-${side}-${pi++}`, 0.34, 0.1, 0.1, pegX, 2.3 + dy, z0 + dz);
+      }
+    }
   }
 
   // --- red wall, beside the blue pane: "Sunset" — backlit cast-glass relief --
@@ -369,8 +480,11 @@ export function buildScene() {
   const redGlass = castGlass(0xff7a6a, 0xff2919, 0.15);
   const blueGlass = castGlass(0x9cc4ff, 0x59a6ff, 0.12);
   // Backlight: a two-triangle emissive plane (cheap in the shared 256-tri NEE
-  // budget), 4cm behind the glass backs. Mostly covered by the blocks, so its
-  // direct NEE cast into the room is just a soft rim through the joints.
+  // budget) forming the BACK PANEL of the box — the glass blocks are mounted
+  // directly onto it (6mm of clearance, enough that the coplanar faces never
+  // z-fight, close enough that the relief is carried by the panel rather than
+  // hovering in front of it). Mostly covered by the blocks, so its direct NEE
+  // cast into the room is just a soft rim through the joints.
   const backlight = new THREE.Mesh(
     new THREE.PlaneGeometry(1.62, 1.16),
     new THREE.MeshStandardMaterial({
@@ -382,8 +496,8 @@ export function buildScene() {
   );
   backlight.name = "tinted-art-backlight";
   tintedArt.add(backlight);
-  // The relief grid: 4 columns x 4 rows, backs on a common plane 4cm in front
-  // of the backlight, fronts protruding by thickness. [material, thickness].
+  // The relief grid: 4 columns x 4 rows, backs seated on the backlight panel,
+  // fronts protruding by thickness. [material, thickness].
   const AMB = (t) => [amberGlass, t];
   const RED = (t) => [redGlass, t];
   const BLU = (t) => [blueGlass, t];
@@ -396,38 +510,148 @@ export function buildScene() {
   ];
   const colX = [-0.59, -0.2, 0.2, 0.59];
   const COL_W = 0.375; // 0.015 joints between 0.39 columns
+  let gi = 0;
   for (const [cy, ch, cells] of gridRows) {
     cells.forEach(([mat, t], i) => {
       const block = new THREE.Mesh(new THREE.BoxGeometry(COL_W, ch - 0.015, t), mat);
-      block.position.set(colX[i], cy, 0.04 + t / 2);
-      block.name = "tinted-art-glass";
+      block.position.set(colX[i], cy, 0.006 + t / 2); // back face 6mm off the panel
+      block.name = `tinted-art-glass-${gi++}`;
       tintedArt.add(block);
     });
   }
   // Bronze shadow-box frame, deep enough to house the relief.
-  const artFrame = (w, h, d, x, y, z) => {
+  // The carcass is 0.40 deep against a group origin sitting 0.02 off the wall
+  // face, so its BACK edge (local z = -0.04) buries 2cm INTO the red wall: the
+  // box is physically let into the wall like a real recessed vitrine, instead of
+  // hovering in front of it. (The backlight plane keeps its 2cm standoff so it
+  // never z-fights the wall.)
+  const artFrame = (name, w, h, d, x, y, z) => {
     const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMat);
     f.position.set(x, y, z);
+    f.name = name;
     tintedArt.add(f);
   };
-  artFrame(1.9, 0.09, 0.36, 0, 0.645, 0.18);  // top rail
-  artFrame(1.9, 0.09, 0.36, 0, -0.645, 0.18); // bottom rail
-  artFrame(0.09, 1.2, 0.36, -0.905, 0, 0.18); // stiles
-  artFrame(0.09, 1.2, 0.36, 0.905, 0, 0.18);
+  artFrame("tinted-art-rail-top", 1.9, 0.09, 0.4, 0, 0.645, 0.16);
+  artFrame("tinted-art-rail-bottom", 1.9, 0.09, 0.4, 0, -0.645, 0.16);
+  artFrame("tinted-art-stile-a", 0.09, 1.2, 0.4, -0.905, 0, 0.16);
+  artFrame("tinted-art-stile-b", 0.09, 1.2, 0.4, 0.905, 0, 0.16);
   tintedArt.traverse((o) => (o.visible = false)); // revealed by "tinted glass"
   scene.add(tintedArt);
 
-  // --- front-right: the animated fox (skinned dynamic BVH) ----------------
-  // A low granite platform in the open front-right floor, clear of the pile pad
-  // (2.6, 2.4), the bench, and the teapot. The Fox (loaded async below) trots on
-  // top; its skeleton is CPU-skinned into the dynamic BVH every frame, so the
-  // warm/cool lights cast a traced shadow that moves with the gait.
+  // --- centre stage: "Lumiere" — freestanding stained-glass screen ---------
+  // The room's new hero, and the showcase for COLOURED SHADOWS. A 2.6 x 2.2m
+  // bronze screen standing on its own sled feet in the middle of the floor,
+  // glazed with a 3x3 grid of REAL absorbing glass (MeshPhysicalMaterial,
+  // transmission 1, kept OUT of `transparent` so it stays in the BVH). A
+  // dedicated projector spotlight sits behind and above it and shines THROUGH
+  // the tiles onto the open floor in front:
+  //
+  //   coloured shadows OFF -> the glass blocks the shadow ray: one flat dark
+  //                           rectangle, exactly what a rasterizer draws
+  //   coloured shadows ON  -> each shadow ray accumulates exp(-sigma*t) per
+  //                           channel through whichever tile it crossed, so the
+  //                           floor picks up a nine-panel LIGHT QUILT
+  //
+  // Thickness is the second variable: tiles run 3cm to 10cm, so the same hue
+  // reads pale where the glass is thin and saturated where it is thick. The
+  // centre row is >= 8cm so the VIEW path tints too (the tracer's entry offset
+  // is 2 x rt.eps, ~7cm in a room this size — thinner tiles still cast properly
+  // but may not visibly refract).
+  //
+  // Hidden at boot and revealed by the same "tinted glass" toggle as the Sunset
+  // relief: one ensemble, one switch, and while it is hidden nothing in the
+  // scene absorbs, so the megakernel keeps its byte-identical no-absorption
+  // program.
+  const lumiere = new THREE.Group();
+  lumiere.name = "lumiere";
+  lumiere.position.set(2.6, 0, -0.5); // local y = 0 IS the floor; faces +z
+  const addLum = (name, mesh) => { mesh.name = name; lumiere.add(mesh); return mesh; };
+  const bronze = (name, w, h, d, x, y, z) => {
+    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMat);
+    m.position.set(x, y, z);
+    return addLum(name, m);
+  };
+  // Legs first: sled feet flat on the floor, posts up into the bottom rail. The
+  // screen has to read as furniture that could actually stand there.
+  for (const sx of [-1.05, 1.05]) {
+    bronze(`lumiere-foot-${sx < 0 ? "l" : "r"}`, 0.22, 0.08, 0.9, sx, 0.04, 0);
+    bronze(`lumiere-post-${sx < 0 ? "l" : "r"}`, 0.12, 0.25, 0.16, sx, 0.195, 0);
+  }
+  // Frame: outer 2.6 x 2.2, bottom edge at y = 0.25 (on the posts), top at 2.45.
+  bronze("lumiere-rail-bottom", 2.6, 0.12, 0.16, 0, 0.31, 0);
+  bronze("lumiere-rail-top", 2.6, 0.12, 0.16, 0, 2.39, 0);
+  bronze("lumiere-stile-l", 0.12, 2.2, 0.16, -1.24, 1.35, 0);
+  bronze("lumiere-stile-r", 0.12, 2.2, 0.16, 1.24, 1.35, 0);
+  // Glazing field inside the frame: 2.36 x 1.96, three columns and three rows
+  // separated by 6cm bronze muntins.
+  const FIELD_W = 2.36, FIELD_H = 1.96, MUNTIN = 0.06;
+  const FIELD_X0 = -1.18, FIELD_Y0 = 0.37;
+  const TILE_W = (FIELD_W - 2 * MUNTIN) / 3;
+  const TILE_H = (FIELD_H - 2 * MUNTIN) / 3;
+  for (let c = 1; c <= 2; c++) {
+    bronze(`lumiere-muntin-v${c}`, MUNTIN, FIELD_H, 0.14,
+      FIELD_X0 + c * (TILE_W + MUNTIN) - MUNTIN / 2, 1.35, 0);
+  }
+  for (let r = 1; r <= 2; r++) {
+    bronze(`lumiere-muntin-h${r}`, FIELD_W, MUNTIN, 0.14,
+      0, FIELD_Y0 + r * (TILE_H + MUNTIN) - MUNTIN / 2, 0);
+  }
+  // Palette. attenuationDistance is the depth at which the transmitted colour
+  // equals attenuationColor, so it is tuned AGAINST the tile thicknesses below:
+  // roughly attDist ~ the thickness of the tiles that use it, which lands the
+  // saturated tiles near their attenuation colour without crushing to black,
+  // and leaves the thin ones a visible wash.
+  const tileGlass = (hex, attHex, attDist) =>
+    new THREE.MeshPhysicalMaterial({
+      color: hex,           // albedo fallback for secondary rays / refraction off
+      roughness: 0.04,
+      metalness: 0,
+      transmission: 1.0,    // NOT `transparent` — real refractive glass, in the BVH
+      ior: 1.5,
+      attenuationColor: new THREE.Color(attHex),
+      attenuationDistance: attDist,
+    });
+  const RUBY = tileGlass(0xff6152, 0xff2418, 0.10);
+  const COBALT = tileGlass(0x86b2ff, 0x2f6bff, 0.07);
+  const AMBER2 = tileGlass(0xffc07a, 0xff9a2e, 0.07);
+  const EMERALD = tileGlass(0x9fe8bc, 0x21c46a, 0.06);
+  const CLEAR = tileGlass(0xeef4ff, 0xdce8ff, 0.14); // the control tile
+  // [material, thickness] per cell, bottom row first. Centre row >= 8cm.
+  const tiles = [
+    [[EMERALD, 0.04], [RUBY, 0.06], [COBALT, 0.05]],
+    [[RUBY, 0.10], [AMBER2, 0.09], [EMERALD, 0.08]],
+    [[COBALT, 0.05], [CLEAR, 0.03], [AMBER2, 0.04]],
+  ];
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      const [mat, t] = tiles[r][c];
+      const tile = new THREE.Mesh(new THREE.BoxGeometry(TILE_W, TILE_H, t), mat);
+      tile.position.set(
+        FIELD_X0 + TILE_W / 2 + c * (TILE_W + MUNTIN),
+        FIELD_Y0 + TILE_H / 2 + r * (TILE_H + MUNTIN),
+        0
+      );
+      addLum(`lumiere-tile-r${r}c${c}`, tile);
+    }
+  }
+  lumiere.traverse((o) => (o.visible = false)); // revealed by "tinted glass"
+  scene.add(lumiere);
+
+  // --- front-right (DYNAMICS CORNER): the animated fox (skinned dynamic BVH) --
+  // A low granite platform sharing the right-hand dynamics half with the physics
+  // drop pad (7.1, 0.15 — see main.js spawnPile): the platform's near edge is at
+  // z = 1.8 and the pad's nearest resting prop face at 1.64, so the pile never
+  // interpenetrates it. The Fox (loaded async below) trots on top; its skeleton
+  // is CPU-skinned into the dynamic BVH every frame, so the warm/cool lights
+  // cast a traced shadow that moves with the gait.
   const FOX_POS = new THREE.Vector3(6.5, 0.3, 2.8);
   const foxPlatform = new THREE.Mesh(
     new THREE.BoxGeometry(2.4, 0.3, 2.0),
     new THREE.MeshStandardMaterial({ color: 0x6f747c, roughness: 0.6 })
   );
   foxPlatform.position.set(FOX_POS.x, 0.15, FOX_POS.z);
+  foxPlatform.name = "fox-platform";
+  foxPlatform.userData.museumTop = 0.3;
   scene.add(foxPlatform);
 
   // Handle returned to the demo; populated once the glTF resolves in `ready`.
@@ -450,9 +674,13 @@ export function buildScene() {
   water.rotation.x = -Math.PI / 2; // lie flat: local +z displacement -> world height
   water.position.set(-7.5, 0.35, -3.6);
   water.userData.rtDeforming = true; // opt in to per-frame live-geometry reads
+  water.name = "water-surface";
   scene.add(water);
-  // A slim stone kerb so the pool reads as built, not painted on the floor.
+  // A slim stone kerb so the pool reads as built, not painted on the floor. The
+  // 5.5m water plane spans exactly kerb-inner-face to kerb-inner-face, so the
+  // surface is held by the basin rather than hovering over the floor.
   const kerbMat = new THREE.MeshStandardMaterial({ color: 0x8a8478, roughness: 0.7 });
+  let ki = 0;
   for (const [w, d, dx, dz] of [
     [5.9, 0.2, 0, 2.85],
     [5.9, 0.2, 0, -2.85],
@@ -461,6 +689,7 @@ export function buildScene() {
   ]) {
     const kerb = new THREE.Mesh(new THREE.BoxGeometry(w, 0.5, d), kerbMat);
     kerb.position.set(-7.5 + dx, 0.25, -3.6 + dz);
+    kerb.name = `pool-kerb-${ki++}`;
     scene.add(kerb);
   }
 
@@ -502,13 +731,18 @@ export function buildScene() {
         emissiveIntensity: 7,
       })
     );
+    // Back face flush with the back wall's inner plane (z = -6.9): the windows
+    // are let INTO the wall, not floating in front of it.
     win.position.set(-8.75 + i * 3.5, 4.1, -6.85);
     win.visible = i < 3;
+    win.name = `clerestory-window-${i}`;
     scene.add(win);
     windows.push(win);
   }
 
-  for (const x of [-11.78, 11.78]) {
+  // Corner strips: tucked into the back corners, within 3-4cm of BOTH wall faces
+  // (x = |11.9|, z = -6.9) so they read as recessed cove lighting.
+  for (const x of [-11.81, 11.81]) {
     const strip = new THREE.Mesh(
       new THREE.BoxGeometry(0.12, 5.2, 0.12),
       new THREE.MeshStandardMaterial({
@@ -517,7 +751,8 @@ export function buildScene() {
         emissiveIntensity: 4.5,
       })
     );
-    strip.position.set(x, 2.8, -6.78);
+    strip.position.set(x, 2.8, -6.8);
+    strip.name = `corner-strip-${x < 0 ? "left" : "right"}`;
     scene.add(strip);
   }
 
@@ -546,6 +781,22 @@ export function buildScene() {
   spot.visible = false;
   scene.add(spot);
   scene.add(spot.target);
+
+  // The Lumiere projector: a crisp spot mounted behind and above the screen,
+  // aimed so its AXIS passes through the middle of the glazing (2.6, 1.35, -0.5)
+  // and lands on the open centre floor at (2.6, 0, 0.4). The cone is wide enough
+  // (0.38 rad half-angle -> ~1.95m radius at the screen, which is 1.3 x 1.1
+  // half-extents) to spill a ring of plain white light around the projection, so
+  // the coloured quilt always has an untinted reference right beside it. Small
+  // rtRadius keeps the projected tile edges crisp rather than soft-shadow mush.
+  // Hidden at boot; the UI reveals it with the rest of the Lumiere ensemble.
+  const projector = new THREE.SpotLight(0xfff2e0, 55, 0, 0.38, 0.3);
+  projector.position.set(2.6, 5.4, -3.2);
+  projector.target.position.set(2.6, 0, 0.4);
+  projector.userData.rtRadius = 0.06;
+  projector.visible = false;
+  scene.add(projector);
+  scene.add(projector.target);
 
   // Orbiting ceiling light — shows moving ray traced shadows sweeping the room.
   // Its soft-shadow radius is kept small so the sampled light points stay clear
@@ -578,7 +829,7 @@ export function buildScene() {
 
   // Fair raster comparison: when ray tracing is toggled off, the demo enables
   // shadow maps — flag everything now so that path just works.
-  for (const l of [warm, cool, spot, orbit]) {
+  for (const l of [warm, cool, spot, orbit, projector]) {
     l.castShadow = true;
     l.shadow.mapSize.set(1024, 1024);
     l.shadow.bias = -0.004;
@@ -588,11 +839,15 @@ export function buildScene() {
   });
 
   // Light descriptors for the UI (label + whether to show a colour swatch).
+  // `gated: "absorption"` marks a light whose SUBJECT is hidden until the
+  // "tinted glass" toggle reveals it — the UI keeps the row visible (so the
+  // panel never reflows) but dims and disables it until then.
   const lights = [
     { label: "warm light", light: warm, color: true },
     { label: "cool light", light: cool, color: true },
     { label: "spot light", light: spot, color: true },
     { label: "orbit light", light: orbit, color: true },
+    { label: "projector", light: projector, color: true, gated: "absorption" },
   ];
 
   // No procedural sky indoors — a low ambient fills GI rays that escape the room.
@@ -607,11 +862,20 @@ export function buildScene() {
     helmet.scene.scale.setScalar(1.4);
     helmet.scene.position.copy(HELMET_POS);
     helmet.scene.rotation.y = 0.35;
+    helmet.scene.name = "helmet";
+    // Seat it ON the plinth top rather than at a hand-picked y: the glTF is
+    // origin-centred, so the old constant sank a third of the sphere into the
+    // stone. Re-aim the hero spotlight at wherever the seated centre ended up.
+    seatOn(helmet.scene, helmetPlinth.userData.museumTop);
+    HELMET_POS.copy(helmet.scene.position);
+    spot.target.position.copy(HELMET_POS);
     scene.add(helmet.scene);
 
     duck.scene.scale.setScalar(0.75);
-    duck.scene.position.set(-4.8, 0.7, 0.8); // on the vitrine plinth
+    duck.scene.position.set(-4.8, 0, 0.8);
     duck.scene.rotation.y = -0.5;
+    duck.scene.name = "duck";
+    seatOn(duck.scene, 0.7); // the vitrine plinth top
     scene.add(duck.scene);
 
     // The Fox: a skinned/rigged glTF with "Survey", "Walk" and "Run" clips.
@@ -676,8 +940,10 @@ export function buildScene() {
     // Feature-linked scene objects the demo may want handles to.
     // orbitOrb is the orbit light's emissive bulb (a dynamic NEE area light);
     // sign is the textured (emissiveMap) emitter beside the vitrine;
-    // tintedArt is the backlit cast-glass relief (Beer-Lambert absorption),
-    // hidden until the "tinted glass" toggle reveals it.
-    showcase: { orbit, orbitOrb, sign, paneBlue, paneAmber, tintedArt },
+    // tintedArt is the backlit cast-glass relief (Beer-Lambert absorption) and
+    // lumiere is the freestanding stained-glass screen (coloured shadows) —
+    // ONE ensemble, both hidden until the "tinted glass" toggle reveals them,
+    // lit by `projector` (also hidden, and listed in `lights`).
+    showcase: { orbit, orbitOrb, sign, paneBlue, paneAmber, tintedArt, lumiere, projector },
   };
 }

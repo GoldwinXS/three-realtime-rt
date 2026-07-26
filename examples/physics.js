@@ -119,12 +119,21 @@ export class Physics {
     prop.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
   }
 
-  /** Rain the whole pool down from a height for a lively tumbling pile. */
+  /**
+   * Rain the whole pool down from a height for a lively tumbling pile.
+   *
+   * Every random-looking quantity is hashed out of the prop's home position, so
+   * a Drop is reproducible. The spin used to be the raw home coordinates, which
+   * made the scatter depend on WHERE the pad is: moving the pad from x=2.6 to
+   * x=7.1 doubled the spin and flung props across the whole room. Hash the spin
+   * too, so it stays bounded (+-3 rad/s) wherever the pad sits.
+   */
   dropWave() {
+    const hash = (v, k) => (fract(v * k) - 0.5) * 2.0; // -1..1, deterministic
     for (const prop of this.props) {
       const h = prop.home;
-      const x = h.x + (fract(h.x * 12.9898) - 0.5) * 3.0;
-      const z = h.z + (fract(h.z * 78.233) - 0.5) * 3.0;
+      const x = h.x + hash(h.x, 12.9898) * 1.5;
+      const z = h.z + hash(h.z, 78.233) * 1.5;
       const y = 5.0 + fract(h.x * 3.7 + h.z) * 3.0;
       prop.body.setTranslation({ x, y, z }, true);
       prop.body.setRotation(
@@ -134,7 +143,10 @@ export class Physics {
         true
       );
       prop.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
-      prop.body.setAngvel({ x: h.z, y: h.x, z: 1 }, true);
+      prop.body.setAngvel(
+        { x: hash(h.z, 21.17) * 3, y: hash(h.x, 33.71) * 3, z: 1 },
+        true
+      );
       prop.body.wakeUp();
     }
   }
