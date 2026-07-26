@@ -104,6 +104,7 @@ export default defineConfig({
         bench: "bench.html",
         harness: "harness.html",
         volumetricAlbedo: "volumetric-albedo.html",
+        absorption: "absorption.html",
       },
     },
   },
@@ -111,7 +112,7 @@ export default defineConfig({
   // pulls in RealTimeJSRayTracer/ (a git-ignored reference clone) whose bare
   // imports (vox-reader) aren't installed — failing dep optimization and
   // stalling the dev server.
-  optimizeDeps: { entries: ["index.html", "gallery.html", "bench.html", "harness.html", "volumetric-albedo.html"] },
+  optimizeDeps: { entries: ["index.html", "gallery.html", "bench.html", "harness.html", "volumetric-albedo.html", "absorption.html"] },
   plugins: [shotSaver(), benchSaver()],
   server: {
     host: "0.0.0.0",

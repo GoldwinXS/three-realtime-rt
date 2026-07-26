@@ -325,6 +325,16 @@ async function main() {
       case "refraction":
         rt.refraction = on;
         break;
+      // Tinted glass (Beer-Lambert absorption): show/hide the backlit
+      // cast-glass relief on the back wall and recompile. The absorbing
+      // materials are compiled in WITH the piece, so OFF really is today's
+      // program — the lighting megakernel strips back to the byte-identical
+      // no-absorption source (see RTLightingPass.setAbsorption). That makes
+      // this toggle the feature's cost A/B: flip it and watch the fps readout.
+      case "absorption":
+        showcase.tintedArt.traverse((o) => (o.visible = on));
+        rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
+        break;
     }
     rt.resetAccumulation();
   };

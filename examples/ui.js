@@ -270,7 +270,22 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   fSec.append(toggle("ReSTIR GI (exp)", rt.restirGI, (v) => { rt.restirGI = v; rt.resetAccumulation(); }).row);
   fSec.append(toggle("emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);
   fSec.append(toggle("reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
-  fSec.append(toggle("refraction", rt.refraction, (v) => setFeature("refraction", v)).row);
+  // Grab the refraction toggle so the tinted-glass handler can switch it on.
+  const refractionT = toggle("refraction", rt.refraction, (v) => setFeature("refraction", v));
+  fSec.append(refractionT.row);
+  // Tinted glass (Beer-Lambert absorption): reveals the backlit cast-glass
+  // relief on the back wall and recompiles with per-material absorption; OFF
+  // strips back to the byte-identical no-absorption program, so flipping this
+  // while watching the fps readout IS the feature's cost measurement. The
+  // effect only exists on refracted paths, so turning it on brings refraction
+  // with it (same pattern as ReSTIR unchecking fast lights below).
+  fSec.append(toggle("tinted glass", false, (v) => {
+    if (v && !rt.refraction) {
+      refractionT.input.checked = true;
+      setFeature("refraction", true);
+    }
+    setFeature("absorption", v);
+  }).row);
   // Chromatic dispersion on the refracted term — the diamond-ior glass sphere on
   // the materials bench splits white light into a rainbow. Default 0 (off): the
   // stochastic spectral sampling estimates one colour channel per glass pixel

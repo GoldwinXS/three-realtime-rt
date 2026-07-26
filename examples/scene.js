@@ -326,6 +326,97 @@ export function buildScene() {
     framePiece(0.12, 2.34, 0.12, wx, 2.3, z0 - 1.56);
   }
 
+  // --- red wall, beside the blue pane: "Sunset" — backlit cast-glass relief --
+  // The Beer-Lambert absorption showcase (the demo's "tinted glass" toggle),
+  // hung on the red wall next to the blue alpha pane — a deliberate pairing:
+  // the pane is the out-of-BVH blend trick, this is REAL refractive glass, and
+  // side by side the difference reads. A shadow-box on the wall: a warm
+  // emissive panel in the back, and in front of it a grid of chunky cast-glass
+  // blocks (transmission 1, in the BVH).
+  // Each block carries attenuationColor + attenuationDistance, so the view path
+  // through it is attenuated exp(-sigma * thickness) per channel: the SAME
+  // amber glass reads pale at 10cm and deep burnt-orange at 24cm, the sun block
+  // is 30cm of red, and the backlight comes through tinted because the glow
+  // rides the refracted view segment. Thickness IS the palette — that is the
+  // one thing a flat surface tint cannot fake, and why the blocks are chunky
+  // (they also must out-thick the tracer's entry offset, 2 x rt.eps ~ 7cm in a
+  // room this size). Thin bright joints between blocks show the raw backlight
+  // for contrast, like leading in reverse.
+  //
+  // Everything here starts INVISIBLE: the piece appears with the panel's
+  // "tinted glass" toggle, and while it is hidden no compiled material absorbs,
+  // so the lighting megakernel keeps its byte-identical no-absorption program —
+  // flipping the toggle IS the feature's cost A/B (watch the fps readout).
+  const tintedArt = new THREE.Group();
+  tintedArt.name = "tinted-art";
+  // Red wall (x = -12, inner face -11.9), 2 cm proud so the backlight plane
+  // never fights the wall face; z = -2.2 leaves a 0.9 m hang gap to the blue
+  // pane's frame (its stile ends at z = -0.36) and keeps the piece above the
+  // pool sightline. Rotated to face into the room (+x).
+  tintedArt.position.set(-11.88, 2.35, -2.2);
+  tintedArt.rotation.y = Math.PI / 2;
+  const castGlass = (hex, attHex, attDist) =>
+    new THREE.MeshPhysicalMaterial({
+      color: hex,             // albedo fallback (secondary rays, refraction off)
+      roughness: 0.06,
+      metalness: 0,
+      transmission: 1.0,
+      ior: 1.5,
+      attenuationColor: new THREE.Color(attHex),
+      attenuationDistance: attDist, // world units (metres)
+    });
+  const amberGlass = castGlass(0xffb36b, 0xffa14f, 0.12);
+  const redGlass = castGlass(0xff7a6a, 0xff2919, 0.15);
+  const blueGlass = castGlass(0x9cc4ff, 0x59a6ff, 0.12);
+  // Backlight: a two-triangle emissive plane (cheap in the shared 256-tri NEE
+  // budget), 4cm behind the glass backs. Mostly covered by the blocks, so its
+  // direct NEE cast into the room is just a soft rim through the joints.
+  const backlight = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.62, 1.16),
+    new THREE.MeshStandardMaterial({
+      color: 0x000000,
+      emissive: 0xffedd8,
+      emissiveIntensity: 6,
+      roughness: 1,
+    })
+  );
+  backlight.name = "tinted-art-backlight";
+  tintedArt.add(backlight);
+  // The relief grid: 4 columns x 4 rows, backs on a common plane 4cm in front
+  // of the backlight, fronts protruding by thickness. [material, thickness].
+  const AMB = (t) => [amberGlass, t];
+  const RED = (t) => [redGlass, t];
+  const BLU = (t) => [blueGlass, t];
+  const gridRows = [
+    // y-centre, height, cells (one per column)
+    [0.395, 0.30, [AMB(0.10), AMB(0.10), AMB(0.10), AMB(0.10)]], // pale sky
+    [0.08, 0.30, [AMB(0.16), AMB(0.16), RED(0.30), AMB(0.16)]],  // sky + the sun
+    [-0.185, 0.22, [AMB(0.24), AMB(0.24), RED(0.16), AMB(0.24)]], // horizon + glitter
+    [-0.38, 0.16, [BLU(0.12), BLU(0.22), BLU(0.12), BLU(0.22)]], // the lake
+  ];
+  const colX = [-0.59, -0.2, 0.2, 0.59];
+  const COL_W = 0.375; // 0.015 joints between 0.39 columns
+  for (const [cy, ch, cells] of gridRows) {
+    cells.forEach(([mat, t], i) => {
+      const block = new THREE.Mesh(new THREE.BoxGeometry(COL_W, ch - 0.015, t), mat);
+      block.position.set(colX[i], cy, 0.04 + t / 2);
+      block.name = "tinted-art-glass";
+      tintedArt.add(block);
+    });
+  }
+  // Bronze shadow-box frame, deep enough to house the relief.
+  const artFrame = (w, h, d, x, y, z) => {
+    const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMat);
+    f.position.set(x, y, z);
+    tintedArt.add(f);
+  };
+  artFrame(1.9, 0.09, 0.36, 0, 0.645, 0.18);  // top rail
+  artFrame(1.9, 0.09, 0.36, 0, -0.645, 0.18); // bottom rail
+  artFrame(0.09, 1.2, 0.36, -0.905, 0, 0.18); // stiles
+  artFrame(0.09, 1.2, 0.36, 0.905, 0, 0.18);
+  tintedArt.traverse((o) => (o.visible = false)); // revealed by "tinted glass"
+  scene.add(tintedArt);
+
   // --- front-right: the animated fox (skinned dynamic BVH) ----------------
   // A low granite platform in the open front-right floor, clear of the pile pad
   // (2.6, 2.4), the bench, and the teapot. The Fox (loaded async below) trots on
@@ -584,7 +675,9 @@ export function buildScene() {
     windows,
     // Feature-linked scene objects the demo may want handles to.
     // orbitOrb is the orbit light's emissive bulb (a dynamic NEE area light);
-    // sign is the textured (emissiveMap) emitter beside the vitrine.
-    showcase: { orbit, orbitOrb, sign, paneBlue, paneAmber },
+    // sign is the textured (emissiveMap) emitter beside the vitrine;
+    // tintedArt is the backlit cast-glass relief (Beer-Lambert absorption),
+    // hidden until the "tinted glass" toggle reveals it.
+    showcase: { orbit, orbitOrb, sign, paneBlue, paneAmber, tintedArt },
   };
 }
