@@ -260,15 +260,19 @@ export const SCENES = {
  */
 export const SCENE_LIST = [
   ["cornell", "Cornell box (the classic)", { galleryOnly: true }],
-  ["tokyo", "Littlest Tokyo (DRACO glTF)", { heavy: true }],
-  ["lantern", "Lantern (Khronos sample)"],
-  ["helmet", "Damaged Helmet + props"],
-  ["camera", "Antique Camera (Khronos sample)"],
+  // Curated order: the assets a three.js reader recognises on sight come first,
+  // and the one entry that needs no network at all comes last (it is the
+  // offline fallback, not a showcase — the helmet is already the museum's hero
+  // one stop upstream, so leading with it showed the same model twice).
   ["boombox", "BoomBox (Khronos sample)"],
-  ["corset", "Corset (Khronos sample)"],
+  ["tokyo", "Littlest Tokyo (DRACO glTF)", { heavy: true }],
+  ["camera", "Antique Camera (Khronos sample)"],
+  ["lantern", "Lantern (Khronos sample)"],
+  ["fox", "Fox — bind pose (Khronos sample)"],
   ["waterbottle", "Water Bottle (Khronos sample)"],
   ["toycar", "Toy Car (Khronos sample)"],
   ["iridescence", "Iridescence Lamp (Khronos sample)"],
   ["mosquito", "Mosquito in Amber (Khronos sample)"],
-  ["fox", "Fox — bind pose (Khronos sample)"],
+  ["corset", "Corset (Khronos sample)"],
+  ["helmet", "Damaged Helmet + props (bundled, works offline)", { bundled: true }],
 ];

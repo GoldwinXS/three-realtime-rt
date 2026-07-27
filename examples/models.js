@@ -33,10 +33,18 @@ const setBoot = (t) => { bootEl?.classList.remove("hidden"); if (bootMsg) bootMs
 // The picker's contents: the whole catalogue minus the entries the tour already
 // covers elsewhere (the Cornell box is stop 1, rebuilt procedurally).
 const MODELS = SCENE_LIST.filter(([, , opt]) => !(opt && opt.galleryOnly));
-// Default is the Damaged Helmet: it is one of the two models that actually live
-// in the repo, so this stop comes up even with the network down. Everything
-// heavier (Littlest Tokyo and the Khronos samples) is one pick away.
-const DEFAULT_MODEL = "helmet";
+// The stop opens on a STREAMED Khronos sample, not on a repo asset. The default
+// used to be the Damaged Helmet, which is also the museum's hero one stop
+// upstream — so the tour showed the same model twice and stop 3's "stock glTF
+// the library never met" claim landed on something the visitor had just seen.
+// BoomBox instead: a canonical Khronos sample, ~11 MB streamed from its
+// canonical host, and a dense normal/ORM-mapped asset whose speaker grille and
+// chrome trim are exactly what the G-buffer feeds the tracer.
+const DEFAULT_MODEL = "boombox";
+// The one entry that needs no network: both of its assets are committed. Used
+// as the automatic fallback when a streamed model cannot be fetched, so an
+// offline visitor gets a ray-traced scene and a reason instead of a dead page.
+const FALLBACK_MODEL = "helmet";
 
 async function main() {
   const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: PARAMS.has("pdb") });
@@ -122,14 +130,28 @@ async function main() {
   });
 
   const xSec = section(ICON.frame, "Model");
-  const note = el("div", "caption");
-  note.innerHTML =
+  const NOTE =
     "Stock glTF, unmodified — no <i>rt</i> userData, no authoring for this " +
-    "library. <b>Tinted glass</b> and <b>scattering</b> are per-material opt-ins, " +
+    "library, and every model but the last one <b>streamed from its canonical " +
+    "public host</b> (nothing but the two small .glb files is committed). " +
+    "<b>Tinted glass</b> and <b>scattering</b> are per-material opt-ins, " +
     "so on these assets they cost nothing and show nothing; the room upstream is " +
     "where they have something to act on.";
+  const note = el("div", "caption");
+  note.innerHTML = NOTE;
+  /** Say a streamed model could not be fetched, above the standing note. */
+  const offlineNote = (key, err) => {
+    const label = (MODELS.find(([k]) => k === key) || [, key])[1];
+    note.innerHTML =
+      `<b style="color:#ff9d7a">${label} could not be streamed</b> ` +
+      `(${err?.message ?? err}). Showing the bundled scene instead — it is the ` +
+      `one entry in the picker whose assets live in the repo. ` + NOTE;
+  };
   const picker = selectRow("showing", MODELS.map(([k, label]) => [label, k]), DEFAULT_MODEL,
-    (v) => switchScene(v).catch(fail));
+    (v) => {
+      note.innerHTML = NOTE; // a fresh pick clears a previous stream failure
+      switchScene(v).catch(fail);
+    });
   xSec.append(picker.row, note);
   ui.exhibits.append(xSec);
 
@@ -167,8 +189,20 @@ async function main() {
   let current = null;
   async function switchScene(key) {
     if (!SCENES[key]) key = DEFAULT_MODEL;
-    setBoot("loading scene…");
-    const def = await SCENES[key]();
+    setBoot(key === FALLBACK_MODEL ? "loading scene…" : "streaming model…");
+    let def;
+    try {
+      def = await SCENES[key]();
+    } catch (err) {
+      // Every model but one is streamed from a public host. If the fetch fails
+      // (offline, blocked, host down) fall back to the bundled scene and SAY so
+      // — the picker keeps the failed entry, it just isn't what you are looking
+      // at. Only one hop: a fallback that fails is a real error.
+      console.warn(`[three-realtime-rt models] ${key} failed to stream:`, err?.message ?? err);
+      if (key === FALLBACK_MODEL) throw err;
+      offlineNote(key, err);
+      return switchScene(FALLBACK_MODEL);
+    }
     const old = scene;
     scene = def.scene;
     current = key;
