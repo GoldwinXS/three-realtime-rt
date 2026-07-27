@@ -99,7 +99,11 @@ export default defineConfig({
     target: "esnext",
     rollupOptions: {
       input: {
+        // The guided tour: stop 1 (Cornell box) is the entry page, stop 2 the
+        // museum, stop 3 the model scenes.
         main: "index.html",
+        museum: "museum.html",
+        models: "models.html",
         gallery: "gallery.html",
         bench: "bench.html",
         harness: "harness.html",
@@ -113,7 +117,7 @@ export default defineConfig({
   // pulls in RealTimeJSRayTracer/ (a git-ignored reference clone) whose bare
   // imports (vox-reader) aren't installed — failing dep optimization and
   // stalling the dev server.
-  optimizeDeps: { entries: ["index.html", "gallery.html", "bench.html", "harness.html", "volumetric-albedo.html", "absorption.html", "scattering.html"] },
+  optimizeDeps: { entries: ["index.html", "museum.html", "models.html", "gallery.html", "bench.html", "harness.html", "volumetric-albedo.html", "absorption.html", "scattering.html"] },
   plugins: [shotSaver(), benchSaver()],
   server: {
     host: "0.0.0.0",
