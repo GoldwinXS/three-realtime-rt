@@ -303,12 +303,44 @@ export interface RealtimeRaytracerOptions {
   /** EXPERIMENTAL — temporal M-cap for the ReSTIR GI reservoir (default 20). */
   restirGIMCap?: number;
   /**
-   * EXPERIMENTAL — ReSTIR GI (v2) spatial-reuse taps per frame, taken after the
+   * EXPERIMENTAL — ReSTIR GI spatial-reuse taps per frame, taken after the
    * temporal merge from the previous frame's reservoirs (reconnection-Jacobian
    * reweighted, with a final visibility ray to prevent leaks). Clamped to 0..4;
-   * `0` reproduces v1 temporal-only behaviour. Default 2.
+   * `0` reproduces the temporal-only behaviour. Default 2 — with
+   * `restirGIChromaMean` on, a tap is folded into the resolve's chromaticity
+   * mean by its own RIS weight, so taps reduce variance rather than add it.
    */
   restirGISpatialTaps?: number;
+  /**
+   * EXPERIMENTAL — resolve the ReSTIR GI colour as the RIS-weighted MEAN
+   * chromaticity of the reservoir's candidates instead of the chromaticity of
+   * the one sample it holds. The resolve's luminance is already a running mean
+   * over the reservoir's history; its colour was a single draw, at 37% spread
+   * per pixel, which the luminance-guided à-trous filter cannot see and spreads
+   * into coarse coloured blotches. Same mean, far lower variance, no extra ray,
+   * sampler or storage. Default `true`; `false` restores the old path.
+   */
+  restirGIChromaMean?: boolean;
+  /**
+   * EXPERIMENTAL — ReSTIR GI final-visibility policy. With this on, the ray is
+   * cast only when a SPATIALLY adopted sample won the reservoir (a temporal one
+   * is visible by construction), and a rejection falls back to the pixel's
+   * temporal-only estimate instead of zeroing the pixel for the frame. Default
+   * `true`; `false` restores the old path.
+   */
+  restirGIVisFallback?: boolean;
+  /**
+   * EXPERIMENTAL — weight of the current frame in the ReSTIR GI resolve EMA.
+   * `1` (the default) disables the EMA: its partner is a reconstruction of the
+   * PREVIOUS frame's temporal-only resolve, a noisier estimator than the merged
+   * one it smooths, so it measured as a variance source.
+   */
+  restirGIResolveAlpha?: number;
+  /**
+   * EXPERIMENTAL — ReSTIR GI firefly-clamp multiplier at zero reservoir
+   * confidence, relaxing to 1 as M reaches the cap. Default 0.3.
+   */
+  restirGIConfLow?: number;
   /**
    * EXPERIMENTAL — ReSTIR GI reservoir-sample validation period. Every frame a
    * rotating 1-in-N subset of pixels re-aims its single candidate ray at the
@@ -768,10 +800,18 @@ export class RealtimeRaytracer {
   restirGI: boolean;
   /** EXPERIMENTAL — temporal M-cap for the ReSTIR GI reservoir. */
   restirGIMCap: number;
-  /** EXPERIMENTAL — ReSTIR GI (v2) spatial-reuse taps per frame (0..4, 0 = v1). */
+  /** EXPERIMENTAL — ReSTIR GI spatial-reuse taps per frame (0..4, 0 = temporal-only). */
   restirGISpatialTaps: number;
   /** EXPERIMENTAL — ReSTIR GI reservoir-sample validation period (0 = off, default 8). */
   restirGIValidate: number;
+  /** EXPERIMENTAL — resolve the ReSTIR GI colour as a RIS-weighted mean chromaticity. */
+  restirGIChromaMean: boolean;
+  /** EXPERIMENTAL — test final visibility only for spatially adopted samples, and fall back to the temporal-only estimate on a rejection. */
+  restirGIVisFallback: boolean;
+  /** EXPERIMENTAL — current-frame weight in the ReSTIR GI resolve EMA (1 = no EMA). */
+  restirGIResolveAlpha: number;
+  /** EXPERIMENTAL — ReSTIR GI firefly-clamp multiplier at zero reservoir confidence. */
+  restirGIConfLow: number;
   /** Procedural-sky state. */
   sky: SkyState;
   /** Distance-fog state. */

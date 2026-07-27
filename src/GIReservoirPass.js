@@ -624,7 +624,12 @@ void main() {
     vec3 pg = radPrev * (cosPrev / PI) * min(Wprev, 32.0);
     float pgl = rtLum(pg);
     if (pgl > uFireflyClamp) pg *= uFireflyClamp / pgl;
-    if (!any(isnan(pg)) && !any(isinf(pg))) {
+    // uResolveAlpha >= 1 means "no EMA" (the default), and the guard is exact
+    // rather than cosmetic: mix(a, b, 1.0) evaluates a + 1.0*(b - a), which is
+    // NOT b when a is orders of magnitude larger — precisely the firefly case
+    // this reconstruction can produce. Skipping the blend entirely is the only
+    // way alpha 1 provably returns the resolve untouched.
+    if (uResolveAlpha < 1.0 && !any(isnan(pg)) && !any(isinf(pg))) {
       emaPrevGi = pg;
       emaPrevOk = true;
     }
@@ -816,8 +821,10 @@ void main() {
   float gil = rtLum(gi);
   if (gil > cap) gi *= cap / gil;
   if (any(isnan(gi)) || any(isinf(gi))) gi = vec3(0.0);
-  // Resolve EMA (see the emaPrevGi note above): ~5-frame effective average.
-  // Cuts selection-churn flicker near emitters ~5x for ~5 frames of lag.
+  // Resolve EMA (see the emaPrevGi note above). OFF at the default alpha 1 —
+  // emaPrevOk is only ever set when alpha < 1, so this whole blend is dead code
+  // in the shipped configuration. It was added to damp near-emitter selection
+  // churn, which the chromaticity mean above now removes at the source.
   if (emaPrevOk) gi = mix(emaPrevGi, gi, uResolveAlpha);
 
   // --- STORE the TEMPORAL-only reservoir as history (see snapshot note above).
