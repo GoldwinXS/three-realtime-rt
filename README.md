@@ -641,7 +641,10 @@ naming the object (see *[Diagnostics](#diagnostics-statuswarnings)*).
 | `kmScattering` | `false` | **Translucent solids** (jade, wax, marble, foliage, lampshades): Kubelka-Munk two-flux scattering over the thickness the view ray actually travels through the real geometry, instead of an authored thickness map. Opt in per material with `userData.rtScattering`; needs `refraction: true`. No effect (and no cost) otherwise. Live-assignable, but it recompiles the lighting megakernel. See *[Scattering](#scattering--translucent-solids-kmscattering)*. |
 | `transparency` | `true` | Alpha-blended transparency: composite `transparent` meshes over the geometry behind them (single-layer, weighted by `opacity`, tinted by albedo). Needs the specular buffer (`specular: true`). Off = they render fully opaque. |
 | `restir` | `true` | ReSTIR direct lighting: per-pixel reservoirs with temporal + spatial reuse, one visibility ray regardless of light count. Flat cost in light count; cuts emissive area-light noise. |
-| `restirGI` | `false` | **Experimental.** ReSTIR GI (v2, fused spatiotemporal): per-pixel reservoirs reuse the 1-bounce indirect sample across frames at the reprojected same-surface point, then take `restirGISpatialTaps` spatial taps (default `2`, `0` = v1 temporal-only) of the previous frame's reservoirs — each reweighted by the reconnection solid-angle→area Jacobian and validated by a final visibility ray so light does not leak through walls. Runs in a standalone pass with its own sampler budget; the lighting pass then skips its inline GI trace and the resolved GI is added at the à-trous denoise stage — so it only takes effect when `gi` **and** `denoise` are also on. Its mean matches the inline GI path; the spatial taps cut per-frame variance. `restirGIMCap` (default `20`) tunes the temporal M-cap. `restirGIValidate` (default `8`, `0` = off) sets the reservoir-sample validation period: each frame a rotating 1-in-N subset of pixels re-aims its single candidate ray at the reservoir's stored hit and re-shades it; if the geometry moved or the re-shaded target collapsed to near-black (a light switched off) the reservoir is killed so fresh candidates rebuild, otherwise it is left untouched. This reuses the existing candidate trace (no extra bounce rays) and is what makes a switched-off light stop haunting the reservoir instead of fading slowly, while a static scene stays put. |
+| `restirGI` | `false` | **Experimental.** ReSTIR GI (v3): per-pixel reservoirs reuse the 1-bounce indirect sample across frames at the reprojected same-surface point, then take `restirGISpatialTaps` spatial taps (default `2`, `0` = temporal-only) of the previous frame's reservoirs — each reweighted by the reconnection solid-angle→area Jacobian and validated by a final visibility ray so light does not leak through walls. Runs in a standalone pass with its own sampler budget; the lighting pass then skips its inline GI trace and the resolved GI is added at the à-trous denoise stage — so it only takes effect when `gi` **and** `denoise` are also on. Its mean matches the inline GI path. **The resolve's colour is a weighted mean, not a draw** (`restirGIChromaMean`, default on) — see [ReSTIR GI: why the colour is resolved as a mean](#restir-gi-why-the-colour-is-resolved-as-a-mean). `restirGIMCap` (default `20`) tunes the temporal M-cap. `restirGIValidate` (default `8`, `0` = off) sets the reservoir-sample validation period: each frame a rotating 1-in-N subset of pixels re-aims its single candidate ray at the reservoir's stored hit and re-shades it; if the geometry moved or the re-shaded target collapsed to near-black (a light switched off) the reservoir is killed so fresh candidates rebuild, otherwise it is left untouched. This reuses the existing candidate trace (no extra bounce rays) and is what makes a switched-off light stop haunting the reservoir instead of fading slowly, while a static scene stays put. |
+| `restirGIChromaMean` | `true` | **Experimental**, `restirGI` only. Resolve the GI colour as the RIS-weighted **mean** chromaticity of the reservoir's candidates rather than the chromaticity of the one sample the reservoir happens to hold. `false` restores the pre-v3 path. See the section linked above for what it fixes and why nothing else could see it. |
+| `restirGIVisFallback` | `true` | **Experimental**, `restirGI` only. Cast the final visibility ray only when a **spatially adopted** sample won the reservoir (a temporal one is visible by construction), and on a rejection fall back to the pixel's temporal-only estimate instead of zeroing the pixel for the frame. `false` restores the pre-v3 path. |
+| `restirGIResolveAlpha` | `1` | **Experimental**, `restirGI` only. Weight of the current frame in the resolve EMA; `1` = no EMA, which is the default. Values below 1 blend against a reconstruction of the *previous* frame's temporal-only resolve, which measured as a variance **source**, not a sink. |
 | `ior` | `1.5` | **Global fallback** index of refraction for `refraction`. A `MeshPhysicalMaterial.ior` overrides it per material (fully-transmissive glass, range [1.0, 1.98]); this value applies to partial-transmission glass and as the default. |
 | `dispersion` | `0` | Chromatic dispersion for glass, `0..0.5` (clamped). Splits refracted white light into a spectrum — a diamond throws a rainbow. Uses **stochastic spectral sampling**: each frame every glass pixel estimates one colour channel (R/G/B) through a channel-shifted ior and traces the *same single* refraction path, so it costs **no extra rays** and adds no traced-ray call site (it fits the Metal call-site budget). The three per-channel estimates are blended by the temporal accumulator, so the rainbow **only converges with accumulation on** and shimmers slightly in motion. **Global control** for now: three r160's `MeshPhysicalMaterial.dispersion` is not yet read per-material (no free G-buffer channel) — per-material dispersion is future work. |
 | `volumetric` | *off* | Physically-based god rays: single-scatter fog, one BVH-shadowed light sample per lighting pixel per frame, temporally accumulated. `{ enabled, density, maxDist, zones }`, where `zones` is an optional array of up to 8 AABBs `{ min:[x,y,z], max:[x,y,z], density }` that add localized fog on top of (or instead of) the global `density`. |
@@ -662,6 +665,79 @@ Per-light: set `light.userData.rtRadius` for soft-shadow size. Set
 rasterizes and gets lit — useful for water / translucent surfaces).
 Transparent materials never act as occluders (a glass case shouldn't cast an
 opaque shadow); `alphaTest` cut-outs still do.
+
+## ReSTIR GI: why the colour is resolved as a mean
+
+`restirGI` shipped measurably *faster* than the inline GI path at flat error, and
+was still not worth turning on: the picture grew coloured blotches that no
+number in the campaign could find. Writing the resolve out in full says why.
+
+A reservoir holds one selected sample and an unbiased weight `W`. The resolve is
+`gi = selRad * selCos/PI * W` with `W = wSum / (M * rtLum(selRad) * selCos)`.
+Substitute and both `selCos` and the luminance cancel:
+
+```
+gi = chromaOf(selRad) * wSum / (PI * M)
+```
+
+So the resolve is two very different estimates multiplied together. Its
+**luminance** is `wSum/(PI*M)` — a running mean over the reservoir's whole
+M-frame history, well averaged, which is what ReSTIR is for. Its **colour** is
+the chromaticity of the *one* sample the reservoir currently holds. In a Cornell
+box that means every pixel is showing the colour of whichever wall its reservoir
+picked: the raw resolve, read straight off the GPU before the denoiser, is a
+red/green confetti field at 37% chromaticity spread per pixel.
+
+Nothing in the measurement stack could see it. `rmse` is luminance-dominated and
+the **mean** colour is correct — the estimator is unbiased, that is the whole
+point of RIS — so rmse read "free". The à-trous denoiser's edge-stopping weights
+are luminance-based too, so it cannot detect the error to stop on it; it
+averages the confetti into coarse coloured patches instead, which is the thing
+on screen. The campaign's grid statistic did twitch, but only as a second-order
+luminance consequence of a first-order colour problem, which is why it looked
+weak and unstable.
+
+The fix costs one multiply-add per merge point. Accumulate the RIS-weighted sum
+of the candidates' chromaticities beside `wSum`, and resolve the colour as
+`chromaAcc / wSum` — the expectation of the very draw the reservoir makes.
+That is Rao-Blackwellization: identical mean, strictly lower variance, and here
+it removes nearly all of the colour variance because the weights *are* the
+selection probabilities. `rtLum(chromaOf(x))` is 1 and `rtLum` is linear, so the
+mean is itself a unit-luminance chromaticity and rescaling by the resolved
+luminance leaves it bit for bit unchanged — every luminance-derived quantity in
+the pass (`p_hat`, `W`, the merge weights, the validation test) is untouched.
+The store writes the running chromaticity back into the reservoir radiance,
+whose luminance is the only part ever read out again, which makes it recursive:
+one term folds in the entire history at exactly the weight the history carries.
+
+Measured on Cornell, restirGI on, everything else equal: raw-resolve
+chromaticity spread **0.388 → 0.106**, and the coloured structure the fix
+actually targets — the block structure of the on-minus-off difference field on
+the two chromaticity planes, which contains no scene content at all —
+**1.43 → 0.89**. Error improves rather than degrades (rmse 5.83 → 5.34, now
+*better* than restirGI off at 5.39), still noise drops (0.194 → 0.178), post-
+motion ghost residual drops (2.44 → 2.12), and the speed is unchanged: 9.57 →
+9.63 ms against 11.20 ms with restirGI off.
+
+The **speed win is intact**. On the 141k-triangle tokyo scene the feature's
+headline stays where it was: 47.59 ms with `restirGI` off, 34.53 ms on —
+**−27.4%**, slightly better than the pre-fix path's −26.0%, because the
+visibility ray now fires on about half the pixels instead of all of them.
+
+How visible the artifact was scales with **how coloured the bounce is**: the
+Cornell box and the museum's red wall are the extremes, and a grey ground under
+a blue sky barely shows it (raw-resolve chromaticity spread 0.929 for the museum
+against 0.118 for the lantern scene, pre-fix).
+
+One consequence worth knowing about: this **inverts** the reasoning that set
+`restirGISpatialTaps` to 1. A tap used to *swap in* a different sample's colour,
+so each one was a fresh chance to draw the wrong one. Now a tap is folded into
+the mean by its own RIS weight, so taps are a variance **sink** — raw-resolve
+chromaticity spread runs 0.089 / 0.062 / 0.051 / 0.045 for 1 / 2 / 3 / 4 taps.
+The default is back to 2, where the curve flattens.
+
+`restirGI` remains **experimental and off by default**, and the adaptive
+governor still does not turn it on by itself.
 
 ## Edge convergence and overscan
 
@@ -1142,7 +1218,7 @@ single-attachment WebKit fallback on any machine.
 | 6d. PBR materials | ✅ | Cook-Torrance GGX dielectric specular + normal/roughness/metalness maps, alpha-blended transparency, deforming (water) meshes, overscan |
 | 6e. Skinned meshes | ✅ | Animated characters CPU-skinned into the dynamic BVH — moving traced shadows + animated raster pose |
 | 6f. Material completeness | ✅ | Vertex colors, per-material IOR, multi-material groups (clearcoat/sheen/iridescence documented as out of G-buffer budget) |
-| 6g. ReSTIR GI | 🧪 | **Experimental** (`restirGI`, off by default): temporal-only reservoir reuse of the 1-bounce indirect sample (v1 — no spatial reuse yet) |
+| 6g. ReSTIR GI | 🧪 | **Experimental** (`restirGI`, off by default): reservoir reuse of the 1-bounce indirect sample — temporal at the reprojected surface point, plus Jacobian-reweighted spatial taps, with the resolve's [colour taken as a weighted mean rather than a draw](#restir-gi-why-the-colour-is-resolved-as-a-mean) |
 | 6h. Tinted glass | ✅ | Per-material Beer-Lambert absorption on the view path, plus **coloured shadows** on the two next-event shadow rays (`absorptionShadows`) |
 | 6i. Scattering | ✅ | **Kubelka-Munk two-flux** translucent solids (`kmScattering`) — jade, wax, marble, foliage, lampshades, with the thickness measured per view ray through the real geometry instead of an authored thickness map |
 | 7. Next | — | A layered view-path march for scattering (needs register room the megakernel does not currently have — see *[Scattering](#scattering--translucent-solids-kmscattering)*); coloured shadows on the ReSTIR visibility ray + the volumetric march; DDGI irradiance probes; ReSTIR GI **spatial** reuse + sample validation; WGSL / WebGPU backend |

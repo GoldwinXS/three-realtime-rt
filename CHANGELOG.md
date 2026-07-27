@@ -2,6 +2,108 @@
 
 ## Unreleased
 
+- **ReSTIR GI: the artifact was chromatic, and now it is gone.** `restirGI`
+  shipped measurably *faster* than the inline GI path at flat rmse and was still
+  not worth turning on — the picture grew coloured blotches, worst in the gallery
+  scenes, that no number in the campaign could find. Write the resolve out in
+  full and it says why. A reservoir holds one selected sample and a weight `W`;
+  the resolve is `selRad * selCos/PI * W` with
+  `W = wSum / (M * rtLum(selRad) * selCos)`. Substitute, and the `selCos` and the
+  luminance both cancel:
+
+  ```
+  gi = chromaOf(selRad) * wSum / (PI * M)
+  ```
+
+  Two very different estimates multiplied together. The **luminance** is a
+  running mean over the reservoir's whole M-frame history — that is what ReSTIR
+  is for. The **colour** is the chromaticity of the *one* sample the reservoir
+  currently holds, so in a Cornell box every pixel shows the colour of whichever
+  wall its reservoir picked. Read straight off the GPU before the denoiser, the
+  raw resolve is a **red/green confetti field at 37% chromaticity spread per
+  pixel**.
+
+  Nothing in the measurement stack could see it. `rmse` is luminance-dominated
+  and the *mean* colour is correct — the estimator is unbiased, which is the
+  point of RIS — so rmse read "free". The à-trous denoiser's edge-stopping
+  weights are luminance-based too, so it cannot detect the error to stop on it;
+  it averages the confetti into coarse coloured patches instead. The campaign's
+  grid statistic did twitch (0.66 → 1.37), but only as a second-order luminance
+  consequence of a first-order colour problem, which is why it read weak and
+  unstable. The fix is **Rao-Blackwellization**: accumulate the RIS-weighted sum
+  of the candidates' chromaticities beside `wSum` and resolve the colour as
+  `chromaAcc / wSum` — the expectation of the very draw the reservoir makes.
+  Identical mean, strictly lower variance, one multiply-add per merge point, and
+  **no extra ray, sampler or storage** (the pass stays at its 16-sampler
+  ceiling). `rtLum(chromaOf(x))` is 1 and `rtLum` is linear, so the mean is
+  itself a unit-luminance chromaticity: rescaling by the resolved luminance
+  leaves it bit for bit unchanged, and every luminance-derived quantity in the
+  pass — `p_hat`, `W`, the merge weights, the validation test — is untouched.
+  The store writes the running chromaticity back into the reservoir radiance,
+  whose luminance is the only part ever read out again, which makes it recursive:
+  one term folds in the entire history at exactly the weight the history carries.
+  Option `restirGIChromaMean`, **default on**; `false` restores the old path.
+  - **Two smaller corrections ride along, both measured.** The final visibility
+    ray used to test the selected sample *whatever its origin* and zero the whole
+    pixel on a hit. A temporal sample is visible by construction (the pass says
+    so itself), so testing it only produces false rejections from ray epsilon;
+    and zeroing threw away a pixel's entire M-frame accumulation over one
+    neighbour's failed reconnection, in geometry-correlated patches — a
+    structured black-speckle source exactly where contact shadows live. Now only
+    a spatially adopted sample is tested (about half the pixels stop casting the
+    ray) and a rejection falls back to that pixel's temporal-only estimate
+    (`restirGIVisFallback`, default on). And the **resolve EMA is off by
+    default** (`restirGIResolveAlpha` `0.15 → 1`): its partner was a
+    reconstruction of the *previous* frame's temporal-only resolve, a noisier
+    estimator than the merged one it was smoothing, carried at 0.85 weight, so it
+    added variance — raw-resolve high-pass noise 50% of the mean at alpha 0.35
+    against 26% at alpha 1, with still noise unchanged. What it was for, the
+    selected sample's colour jumping frame to frame, is what the chromaticity
+    mean now removes at the source.
+  - **`restirGISpatialTaps` back to 2 (from 1).** The fix *inverts* the reasoning
+    that lowered it. A tap used to swap in a different sample's colour, so each
+    one was a fresh chance to draw the wrong one; now a tap is folded into the
+    mean by its own RIS weight, so taps are a variance **sink**. Raw-resolve
+    chromaticity spread runs 0.089 / 0.062 / 0.051 / 0.045 for 1 / 2 / 3 / 4
+    taps, at 8.9 / 9.0 / 9.1 / 9.2 ms; 2 is where the curve flattens.
+  - **Measured, `restirGI` on, everything else equal** (1280×720, RTX 3060,
+    `renderScale 0.5`, 2 denoise passes). Cornell: raw-resolve chromaticity
+    spread **0.388 → 0.106**; the coloured structure the fix targets — block
+    structure of the on-minus-off difference field on the two chromaticity
+    planes, which contains no scene content at all — **1.43 → 0.89**; rmse
+    **5.83 → 5.34**, now *better* than restirGI off (5.39); still noise
+    **0.194 → 0.178**; post-motion ghost residual **2.44 → 2.12**; frame time
+    9.57 → 9.63 ms against 11.20 ms with restirGI off. Museum (a red wall
+    bouncing onto a white floor — the scene where the raw resolve was worst):
+    chromaticity spread **0.929 → 0.380**, rmse **5.16 → 5.07**, again better
+    than restirGI off (5.13), ghost residual **3.31 → 2.85** and **3.35 → 2.77**
+    at 1 and 5 frames after the camera stops. Lantern (a streamed Khronos asset
+    on a sky-lit ground disc — the gallery framing the artifact was reported in,
+    and the mildest of the four because a grey ground under a blue sky has
+    almost no chromatic bounce to get wrong): chromaticity spread
+    **0.118 → 0.017**, rmse **2.13 → 2.00**, ghost residual **3.97 → 2.34**,
+    single-probe grid amplitude **0.596 → 0.386** against 0.527 with restirGI
+    off. **How bad the artifact is scales with how coloured the bounce is** —
+    Cornell and the museum are the extremes, a grey-and-sky scene barely shows
+    it.
+  - **The speed win is intact.** Tokyo (141k tris), the scene the −27% headline
+    came from: **47.59 ms off → 34.53 ms on = −27.4%**, slightly *better* than
+    the pre-fix path's −26.0%, because the visibility ray now fires on about
+    half the pixels instead of all of them. rmse **4.59 → 4.42** (off 4.68),
+    chromaticity spread **0.129 → 0.024**, ghost residual **6.53 → 5.82** and
+    **6.44 → 4.71**. Across all four scenes the fix costs between −0.7% and
+    +0.6% of frame time against the pre-fix path.
+  - **Nothing changes with `restirGI` off.** A converged 1280×720 frame rendered
+    at the campaign's reference config was byte-compared against `38cb328` with
+    only `src/` swapped: identical on both Cornell (sha256 `1d4e395f…`) and the
+    museum (`7d7e848a…`). Nothing outside `GIReservoirPass` moved, and that pass
+    is not run at all when `restirGI` is off — `test:km`'s shader-source gate
+    confirms `RTLightingPass` is still byte-identical to master in all four
+    variants.
+  - `restirGI` remains **experimental and off by default**, and the adaptive
+    governor still does not turn it on by itself — that veto is the user's to
+    lift, not a number's.
+
 - **Adaptive governor rebuilt on the quality campaign's measurements.** It now
   spends quality in a fixed, cheapest-first order: **free wins** (`giHalfRate`,
   `restirGI`, `restirMCap` 16 — settings measured *cheaper and no worse*), then

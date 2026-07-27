@@ -686,7 +686,13 @@ export function buildPanel({
         : !now.denoise || now.passes < 1
           ? "ReSTIR GI is resolved at the denoise stage: with the denoiser off (or 0 passes) it contributes nothing."
           : now.passes > 3
-            ? `ReSTIR GI at ${now.passes} denoise passes: the wide à-trous taps smear its coarse structure. 3 or fewer is the measured range.`
+            // The old wording blamed ReSTIR GI here. That was the coloured-
+            // resolve artifact, which is fixed at the source (restirGIChromaMean)
+            // — measured, the on/off gap now closes at 1 and 3 passes alike. What
+            // is left at 4+ is the DENOISER'S OWN lattice, which the campaign
+            // measured with ReSTIR GI off too, and which is why the governor caps
+            // itself at 3.
+            ? `${now.passes} denoise passes: the widest à-trous taps raise the filter's own lattice. 3 or fewer is the measured range, with or without ReSTIR GI.`
             : "";
     restirGiNote.textContent = why;
     restirGiNote.style.display = why ? "" : "none";
