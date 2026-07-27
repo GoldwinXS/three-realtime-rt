@@ -240,12 +240,25 @@ vec3 rtTransmittance(float matIndex, float d) {
 // algebraically identical but numerically stable rewrite, because fp32 hits all
 // three of those corners inside one ordinary object: the centre of a sphere is a
 // long chord (x large) and its silhouette is a vanishing one (x tiny).
-#define RT_KM_EVENTS 8
-// Crossover between the series and the exponential forms. Higher than the JS
-// reference's 1e-3 because fp32 loses the exponential form to cancellation
-// sooner; the two forms agree to ~1e-8 here, orders below anything a tonemapped
-// image can show.
-#define RT_KM_SMALL_X 1e-2
+// b is floored, and this one constant is what makes the whole feature fit.
+//
+// The textbook expressions need a SERIES branch as b*S*t goes to zero (coth
+// blows up, and T becomes 0/0 when b is exactly 0 — a pure white scatterer with
+// K = 0, which is precisely what a lampshade is). Carrying both branches and a
+// step() to pick between them costs live registers, and this shader has none to
+// spare: shadowTransmittance is inlined at roughly EIGHT effective sites (main's
+// direct loop, plus every traceRadiance call site through sampleOneAny), so
+// every vector temporary in its loop body is paid for eight times over. A
+// version that did carry both branches failed to link on NVIDIA native GL with
+// "error: too many temporaries" — the register-pressure sibling of the C5041
+// failure that killed a 0.9.0 shadow-march optimisation.
+//
+// Flooring b removes the branch instead of hiding it. Because x is computed as
+// b*(S*d) with the SAME floored b, the ratio x/b stays exactly S*d, and every
+// degenerate limit comes out right from the exponential form alone:
+// b*coth(x) -> 1/(S*d), T -> 1/(1 + S*d), R -> S*d/(1 + S*d), R_inf -> 1/(1 + b).
+// Verified against the analytic K = 0 case to 0.06% at the values the demo uses.
+#define RT_KM_MIN_B 1e-3
 // x is clamped before exp() purely as a belt-and-braces guard: a grazing ray
 // through a dense medium can reach x in the thousands, where exp(-x) flushes to
 // zero harmlessly but exp(+x) (which no expression below uses, by design) would
@@ -260,107 +273,91 @@ vec4 rtKmFetch(float matIndex) {
   return texelFetch(uMaterialsTex, ivec2(int(round(matIndex)), 68), 0);
 }
 
-// The two derived parameters, plus the clamped S the caller must reuse so that
-// x = b*S*t stays consistent with them. S is floored rather than special-cased:
-// at S = 1e-6 the model is already Beer-Lambert to far better than fp32 can
-// represent (a and b both become K/S, and x collapses to K*t), so one code path
-// covers "scatters" and "does not scatter" with no branch and no discontinuity.
-void rtKmAB(vec3 K, vec3 S, out vec3 a, out vec3 b, out vec3 sUse) {
-  sUse = max(S, vec3(1e-6));
-  vec3 ks = max(K, vec3(0.0)) / sUse;
-  a = 1.0 + ks;
-  // sqrt(ks*(ks + 2)) rather than sqrt(a*a - 1): for a weakly absorbing pigment
-  // a is 1 + tiny, and a*a - 1 loses every significant bit to cancellation.
-  b = sqrt(ks * (ks + 2.0));
+// The three derived parameters, shared by both evaluations below. S is floored
+// as well as b: at S = 1e-6 the model is already Beer-Lambert to better than
+// fp32 can represent (a and b both become K/S, and x collapses to K*d), so ONE
+// code path covers "scatters" and "does not scatter" with no branch and no
+// discontinuity — which is what lets a plain absorbing layer compose into a
+// scattering stack for free.
+void rtKmAB(vec3 K, vec3 S, float d, out vec3 a, out vec3 b, out vec3 x) {
+  vec3 s = max(S, vec3(1e-6));
+  a = 1.0 + max(K, vec3(0.0)) / s;
+  // sqrt((a - 1)*(a + 1)) rather than sqrt(a*a - 1): for a weakly absorbing
+  // pigment a is 1 + tiny, and a*a - 1 loses every significant bit to
+  // cancellation while (a - 1) is exact.
+  b = max(sqrt((a - 1.0) * (a + 1.0)), vec3(RT_KM_MIN_B));
+  x = min(b * (s * max(d, 0.0)), vec3(RT_KM_MAX_X));
 }
 
-// Diffuse transmittance through a segment of length d.
-// T = 2*b*e^-x / ((a + b) + (b - a)*e^-2x), which is the textbook ratio with e^x
-// divided out of both halves: nothing overflows however thick the body gets.
+// TRANSMITTANCE ONLY — the shadow path's half, and the one that is inlined
+// everywhere, so it is kept as small as it can possibly be.
+//
+// T = 2*b*e^-x / ((a + b) + (b - a)*e^-2x): the textbook
+// b / (a*sinh(x) + b*cosh(x)) with e^x divided out of both halves, so nothing
+// overflows however thick the body gets. exp(-x) is recovered as sqrt(e2)
+// rather than paying a second exp.
 vec3 rtKmTrans(vec3 K, vec3 S, float d) {
-  if (d <= 0.0) return vec3(1.0);
-  vec3 a, b, s;
-  rtKmAB(K, S, a, b, s);
-  vec3 x = min(b * s * d, vec3(RT_KM_MAX_X));
-  vec3 st = s * d;
-  vec3 x2 = x * x;
-  // Series form, valid as b -> 0 (a non-absorbing pigment) and as d -> 0, where
-  // the ratio form is 0/0. Divide the common b out first, then expand with
-  // x/b == S*d held exact so no division by b survives. The x^4 terms are not
-  // decoration: truncating at x^2 leaves a relative error of x^2/2, which showed
-  // up as a mismatch against the reference's stack composition.
-  vec3 tSmall = 1.0 / (1.0 + a * st * (1.0 + x2 / 6.0) + 0.5 * x2 * (1.0 + x2 / 12.0));
+  vec3 a, b, x;
+  rtKmAB(K, S, d, a, b, x);
   vec3 e2 = exp(-2.0 * x);
-  // The denominator is (a + b) - (a - b)*e^-2x, which is >= 2*b >= 0 always; the
-  // max() only catches the exactly-zero corner (b = 0 and x = 0 together), where
-  // the numerator is zero too and the series branch is the one selected anyway.
-  vec3 den = max(a + b + (b - a) * e2, vec3(1e-12));
-  vec3 tBig = (2.0 * b * exp(-x)) / den;
-  return clamp(mix(tBig, tSmall, step(x, vec3(RT_KM_SMALL_X))), 0.0, 1.0);
+  return clamp(2.0 * b * sqrt(e2) / max(a + b + (b - a) * e2, vec3(1e-9)), 0.0, 1.0);
 }
 
-// A single layer's (reflectance over a BLACK backing, transmittance) pair — the
-// two numbers the forward composition below needs. Taking Rg = 0 here and adding
-// the real backing at the end is what lets the march run front-to-back: the
-// textbook recursion R(t_n over R(t_n-1 over ...)) needs the layers in reverse.
+// BOTH of a layer's numbers: R over a black backing, and T. Used only by the
+// view march, which is inlined once, so it can afford the extra reflectance
+// term the shadow path never needs.
+//
+// Taking Rg = 0 here and adding the real backing once at the end is what lets
+// the march run front-to-back: the textbook recursion R(t_n over R(t_n-1 over
+// ...)) needs the layers in reverse order, which a marching ray does not have.
 void rtKmLayer(vec3 K, vec3 S, float d, out vec3 R, out vec3 T) {
-  T = rtKmTrans(K, S, d);
-  R = vec3(0.0);
-  if (d <= 0.0) return;
-  vec3 a, b, s;
-  rtKmAB(K, S, a, b, s);
-  vec3 x = min(b * s * d, vec3(RT_KM_MAX_X));
-  vec3 st = s * d;
-  vec3 b2 = b * b;
+  vec3 a, b, x;
+  rtKmAB(K, S, d, a, b, x);
   vec3 e2 = exp(-2.0 * x);
-  // b*coth(x) is the only place b and the coth meet, and the product is finite
-  // even when b is 0 and coth is infinite. Large x: coth = (1 + e^-2x)/(1 - e^-2x).
-  // Small x: expand and keep x/b == S*d exact, leaving 1/(S*d) as the term that
-  // survives at K = 0.
-  vec3 bcothBig = b * ((1.0 + e2) / max(1.0 - e2, vec3(1e-12)));
-  vec3 bcothSmall = 1.0 / st + (b2 * st) / 3.0 - (b2 * b2 * st * st * st) / 45.0;
-  vec3 bcoth = mix(bcothBig, bcothSmall, step(x, vec3(RT_KM_SMALL_X)));
-  // R(t, 0) = 1 / (a + b*coth(x)). At x large this is 1/(a + b) = R_inf; at x
-  // small it is S*d/(1 + a*S*d), the classic thin-layer result.
-  R = clamp(1.0 / (a + bcoth), 0.0, 1.0);
+  // b*coth(x) = b*(1 + e^-2x)/(1 - e^-2x), finite all the way down because b is
+  // floored: it tends to 1/(S*d), which is the term that survives at K = 0.
+  vec3 bc = b * (1.0 + e2) / max(1.0 - e2, vec3(1e-9));
+  // R(t, 0) = 1/(a + b*coth(x)): 1/(a + b) = R_inf at large x, and the classic
+  // S*d/(1 + a*S*d) at small.
+  R = clamp(1.0 / (a + bc), 0.0, 1.0);
+  T = clamp(2.0 * b * sqrt(e2) / max(a + b + (b - a) * e2, vec3(1e-9)), 0.0, 1.0);
 }
 
-// Reflectance of an infinitely thick body of this pigment (the masstone),
-// written 1/(a + b) rather than a - b to dodge the cancellation. Used as the
-// terminal backing when the march runs out of events or leaves through a hole in
-// a non-watertight mesh — "the material continues" is a far better guess there
-// than "there is black behind it".
-vec3 rtKmRInf(vec3 K, vec3 S) {
-  vec3 a, b, s;
-  rtKmAB(K, S, a, b, s);
-  return clamp(1.0 / (a + b), 0.0, 1.0);
-}
-
-// Stack one more layer UNDERNEATH the running stack — the standard "adding"
-// equations, which account for the infinite series of inter-reflections between
-// the stack and the new layer. Ra is what the stack reflects seen from above, Rb
-// what it reflects seen from below (they differ once the layers differ), Tt what
-// it transmits (equal both ways by reciprocity). An opaque backing enters as the
-// degenerate layer (lr = its albedo, lt = 0). This composition is provably
-// identical to the closed-form R(t, Rg) — that equivalence is a checked case in
-// scripts/km-selftest.mjs, and it is what licenses the cheap forward march.
-void rtKmAddBelow(inout vec3 Ra, inout vec3 Rb, inout vec3 Tt, vec3 lr, vec3 lt) {
-  // The denominator can only approach zero if two stacked layers were both
-  // perfect mirrors, which is outside the model; clamp instead of emitting an
-  // infinity that would poison the temporal history for good.
-  vec3 inv = 1.0 / max(1.0 - Rb * lr, vec3(1e-4));
-  vec3 nRa = Ra + Tt * Tt * lr * inv;
-  vec3 nRb = lr + lt * lt * Rb * inv;
-  vec3 nTt = Tt * lt * inv;
-  Ra = clamp(nRa, 0.0, 1.0);
-  Rb = clamp(nRb, 0.0, 1.0);
-  Tt = clamp(nTt, 0.0, 1.0);
-}
-
-// Set by the view march below when this pixel's primary surface turned out to be
-// a scattering body, and read once at the specular write to keep its Fresnel
-// sheen (see the note there).
-bool gKmOn;
+// VIEW-PATH RESULTS, handed from glassRadiance (where the in-medium chord is
+// measured) to main (where it is shaded). Globals, not return values, because
+// the function they come from has a fixed signature that the byte-identity
+// contract forbids touching.
+//
+// WHY THERE IS NO DEDICATED VIEW MARCH, which is the design decision this
+// feature turns on. The natural implementation is an ordered march along the
+// view ray, mirroring the coloured-shadow one, composing a full layered stack.
+// It was written, it works, and it CANNOT BE COMPILED: NVIDIA's native-GL
+// assembler rejects the megakernel with "error: too many temporaries" — the
+// register-pressure sibling of the C5041 failure that killed a 0.9.0
+// shadow-march optimisation. Measured, not assumed:
+//
+//   full feature, dedicated march ..... 35 319 lines of NV assembly, FAILS
+//   same, shadow-side maths removed ... 33 403 lines,                FAILS
+//   same, march compiled but uncalled . links
+//
+// So the march's own BVH traversal is the blocker, not the arithmetic around it,
+// and shrinking the arithmetic cannot buy it back. Reusing shadowTransmittance
+// for the view ray instead makes it strictly WORSE — that function is already
+// inlined at roughly eight effective sites (main's direct loop, and again inside
+// every traceRadiance call site by way of sampleOneAny), so a third explicit
+// call adds a ninth copy of a traversal.
+//
+// This shader computes exactly ONE in-medium view chord, in glassRadiance, and
+// that is where the two-flux layer is now evaluated. No new traversal, no new
+// traceRadiance call site, no new sampler. The cost is v1's honest limitation:
+// ONE medium along the view path rather than an arbitrary stack (the shadow path
+// still marches through stacks properly). The layered composition lives on in
+// src/kubelkaMunk.js, is exercised by the self-test, and is what a future pass
+// with register room to spare would use.
+bool gKmOn;      // this pixel's primary surface is a scattering body
+vec3 gKmR;       // the body's two-flux reflectance over its measured chord
+vec3 gKmT;       // ... and its transmittance
+vec3 gKmBehind;  // un-attenuated radiance arriving from behind the body
 // <<< RT_KM
 // >>> RT_ABSORB_SHADOWS (whole block source-spliced — see stripMarked below)
 // COLOURED SHADOWS. A shadow ray that crosses absorbing glass is ATTENUATED per
@@ -481,113 +478,6 @@ vec3 shadowTransmittance(vec3 origin, vec3 dir, float maxDist) {
   return exp(-tau);
 }
 // <<< RT_ABSORB_SHADOWS
-// >>> RT_KM
-// THE VIEW-PATH MARCH — the front-lit half, and the reason this feature exists.
-//
-// When the camera ray lands on a scattering body, march it THROUGH the geometry
-// along the view direction, collecting (K, S, segment length) for every medium it
-// crosses until an opaque body stops it or it leaves. Compose those layers with
-// the adding equations and the result is the pixel's DIFFUSE ALBEDO: the fraction
-// of incident light this stack of material sends back toward the eye. Shading
-// then proceeds exactly as it would for any diffuse surface.
-//
-// This is 1D transport along the view ray, so it is shape-agnostic by
-// construction: nothing here knows or cares whether the body is a slab, a sphere,
-// a bust or a leaf. Thickness is MEASURED per ray against the real geometry — the
-// thing games normally fake with an authored thickness map — which is why a
-// sphere thins out correctly toward its silhouette with no authoring at all.
-//
-// R AS ALBEDO IS AN APPROXIMATION, and a standard one. Kubelka-Munk derives R
-// under DIFFUSE illumination, while the renderer then lights it with N.L from
-// point sources. Using R as the diffuse albedo under direct lighting is the usual
-// engineering compromise (it is what every KM-based paint/print pipeline does);
-// it is right in the diffuse-ambient limit and slightly over-bright at grazing
-// incidence. Stated here rather than buried.
-//
-// ONE textual call to the closest-hit kernel, and a flat loop with no
-// short-circuit returns inside it that would inline a second traversal — the
-// NVIDIA C5041 budget that killed a 0.9.0 shadow-march optimisation is real and
-// this march is written to stay under it.
-//
-// Returns false when the primary surface is NOT a scattering body, leaving the
-// caller's ordinary glass path untouched; the whole march is gated on the
-// G-buffer's transmission flag before it is even entered, so opaque pixels pay
-// nothing at all.
-bool rtKmViewAlbedo(vec3 P, vec3 dir, out vec3 outAlbedo) {
-  vec3 Ra = vec3(0.0);   // stack reflectance seen from above (what the eye gets)
-  vec3 Rb = vec3(0.0);   // ... seen from below (needed by the adding equations)
-  vec3 Tt = vec3(1.0);   // stack transmittance
-  vec3 curK = vec3(0.0);
-  vec3 curS = vec3(0.0);
-  bool inMedium = false;
-  vec3 backing = vec3(0.0);
-  float tPrev = 0.0;     // distance from o to the last INTERFACE crossed
-  float tOrig = 0.0;     // distance from o to the current ray origin
-  // Start just in FRONT of the shading point so the first hit is the body's own
-  // entry face, which is what carries the material index (the G-buffer's packed
-  // word does not).
-  vec3 o = P - dir * (2.0 * uEps);
-  for (int i = 0; i < RT_KM_EVENTS; i++) {
-    uvec4 fi; vec3 bary; float dist; bool isDyn;
-    if (!traceBoth(o, dir, fi, bary, dist, isDyn)) break;  // left the geometry
-    float tHit = tOrig + dist;
-    vec4 attr = isDyn
-      ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
-      : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
-    bool entering = dot(attr.xyz, dir) < 0.0;
-    bool passable = rtShadowGlass(attr.w) > 0.0;
-    vec4 kmRow = rtKmFetch(attr.w);
-    bool isKm = kmRow.w > 0.0;
-    if (i == 0) {
-      // The first interface decides whether this pixel is ours at all.
-      if (!passable || !isKm) return false;
-      if (!entering) {
-        // The 2*eps step-back landed INSIDE the body, so the first interface is
-        // its BACK face. Happens on concave front faces and in the silhouette
-        // band of a curved body, where the interpolated normal disagrees with the
-        // true geometry. Seed the medium from it instead of dropping the pixel to
-        // the plain-glass path, which would draw a bright rim around every sphere.
-        curK = rtAbsorbSigma(attr.w);
-        curS = kmRow.rgb;
-        inMedium = true;
-      }
-    }
-    // Close the segment just crossed, INTERFACE to INTERFACE — not from the
-    // stepped-off origin, for the same reason the shadow march measures that way
-    // (the 2*eps skipped past each hit is a real fraction of a thin body).
-    if (inMedium) {
-      vec3 lr, lt;
-      rtKmLayer(curK, curS, tHit - tPrev, lr, lt);
-      rtKmAddBelow(Ra, Rb, Tt, lr, lt);
-    }
-    if (!passable) {
-      // An opaque body terminates the stack: its base colour IS the backing
-      // reflectance the two-flux solution needs. three stores material colours in
-      // the linear working space already, so no conversion is wanted here.
-      vec3 hAlbedo; float hRough; vec3 hEmissive; float hMetal;
-      fetchMaterial(attr.w, hAlbedo, hRough, hEmissive, hMetal);
-      backing = clamp(hAlbedo, 0.0, 1.0);
-      inMedium = false;
-      break;
-    }
-    curK = entering ? rtAbsorbSigma(attr.w) : vec3(0.0);
-    curS = (entering && isKm) ? kmRow.rgb : vec3(0.0);
-    inMedium = entering;
-    o += dir * (dist + 2.0 * uEps);                        // step past the interface
-    tOrig = tHit + 2.0 * uEps;
-    tPrev = tHit;
-  }
-  // Still inside a medium when the march ended: either the ray left through a
-  // hole in a non-watertight mesh, or the event cap ran out inside a dense stack.
-  // "The material continues forever" is the honest terminal answer for both — its
-  // masstone — and it degrades gracefully (a slightly too-solid body) where
-  // assuming black behind would punch a hole in the object.
-  if (inMedium) backing = rtKmRInf(curK, curS);
-  rtKmAddBelow(Ra, Rb, Tt, backing, vec3(0.0));
-  outAlbedo = Ra;
-  return true;
-}
-// <<< RT_KM
 // World-space 3D-texture albedo ("volumetric surface albedo") for the traced
 // SECONDARY rays (GI bounces + reflection/refraction), so global illumination and
 // mirror views carry the same field colours the primary G-buffer shows. Compiled
@@ -1079,6 +969,29 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
     vec3 rd2 = refract(rd, xN, iorC);     // same channel-shifted ior on exit
     if (rd2 == vec3(0.0)) rd2 = reflect(rd, xN);
     refrRad = traceRadiance(xP - xN * uEps, rd2, true);
+// >>> RT_KM
+    // KUBELKA-MUNK. This is the only place in the shader that measures how far a
+    // VIEW ray travels inside a body, which is exactly the quantity the two-flux
+    // model needs — so the layer is evaluated here and handed to main through
+    // globals. Placed BEFORE the Beer-Lambert line below so gKmBehind is the raw
+    // radiance from behind the body, un-attenuated: scattering media replace that
+    // model rather than stacking on top of it.
+    //
+    // THICKNESS CORRECTION. dist is measured from ro, which the line above put
+    // 2*eps INSIDE the entry surface along the normal, so it under-reports the
+    // chord by the distance from ro back to the entry plane: 2*eps / |rd.N|.
+    // That is a fixed 7 cm in a room-sized scene, i.e. HALF the wall of a cast
+    // shade — small enough to ignore for a tint, fatal for a reflectance. The
+    // correction is exact, and it deliberately does not touch the absorption
+    // line below, whose behaviour is what 0.8.0 shipped.
+    vec4 rtKmRow = rtKmFetch(attr.w);
+    gKmOn = rtKmRow.w > 0.0;
+    if (gKmOn) {
+      rtKmLayer(rtAbsorbSigma(attr.w), rtKmRow.rgb,
+        dist + 2.0 * uEps / max(abs(dot(rd, N)), 1e-3), gKmR, gKmT);
+      gKmBehind = refrRad;
+    }
+// <<< RT_KM
 // >>> RT_ABSORPTION
     // BEER-LAMBERT ABSORPTION of the transmitted term. dist is the ONE
     // in-medium path length this shader computes: entry interface (P) to exit
@@ -1170,6 +1083,11 @@ void main() {
   gSpecRough = rough;
   gWantSpec = true;
 
+// >>> RT_KM
+  // A global with no initializer is undefined in GLSL until written; this is the
+  // write, ahead of the specular output that reads it.
+  gKmOn = false;
+// <<< RT_KM
   // Reset the shadow-ray traversal-cost counter for this pixel. It accumulates
   // across every occluded() call below (direct, GI, reflection, glass) and is
   // read once at the end when uCostView is on (see the cost-heatmap branch).
@@ -1253,27 +1171,35 @@ void main() {
   }
 
   // --- traced glass: Fresnel reflection + two-interface refraction ---
-// >>> RT_KM
-  // KUBELKA-MUNK scattering takes precedence over the plain-glass path for the
-  // bodies that opted into it. sampleIrr is the surface's demodulated diffuse
-  // irradiance at this point (direct + one bounce, no albedo — the composite
-  // re-applies that), so multiplying by the marched reflectance IS "shade the
-  // stack with the normal direct-lighting path". Deliberately NOT gated on
-  // uRefrEnabled: a wax or jade body is not a window, and its look should not
-  // depend on whether the app wanted refraction. The transmission test in front
-  // of the march is the cheap gate — an opaque pixel never traces anything, and
-  // a glass pixel that turns out not to scatter falls through to the line below
-  // exactly as before.
-  vec3 rtKmAlb;
-  gKmOn = transmission > 0.001 && rtKmViewAlbedo(P, normalize(P - uCameraPos), rtKmAlb);
-  if (gKmOn) {
-    sampleIrr *= rtKmAlb;
-  } else
-// <<< RT_KM
   if (uRefrEnabled && transmission > 0.001) {
     vec3 V = normalize(P - uCameraPos);
     sampleIrr = mix(sampleIrr, glassRadiance(P, N, V, rough, ior), transmission);
   }
+// >>> RT_KM
+  // KUBELKA-MUNK. glassRadiance set these when it measured this pixel's chord
+  // through a scattering body (see the note there); a scattering body is not a
+  // window, so its result REPLACES what the glass branch just wrote rather than
+  // blending with it.
+  //
+  //   gKmR * E        light that entered the surface, scattered, and came back
+  //                   out. E = (direct + indirect) is the demodulated diffuse
+  //                   irradiance the surface would have used as any other
+  //                   diffuse material — which is precisely what "use R as the
+  //                   albedo under the normal direct-lighting path" means. The
+  //                   composite then re-applies the base colour, which is why a
+  //                   scattering material wants a white one.
+  //   gKmT * behind   what came through from the other side. For a lampshade
+  //                   with a bulb inside, "behind" IS the bulb, so this term is
+  //                   the shade glowing.
+  //
+  // The inward half of the transmitted term is not missing, it is just computed
+  // elsewhere: whatever is behind was itself lit by shadow rays that crossed
+  // this same body and were attenuated by the same two-flux T (see
+  // shadowTransmittance). What IS dropped is the inter-reflection between body
+  // and backing — a second-order brightening — and the traced Fresnel reflection
+  // (the GGX highlight below stands in for it).
+  if (gKmOn) sampleIrr = gKmR * (direct + indirect) + gKmT * gKmBehind;
+// <<< RT_KM
 
   // --- alpha blend: straight-through view continuation ---
   // A transparent surface is primary-visible in the G-buffer but was kept out of

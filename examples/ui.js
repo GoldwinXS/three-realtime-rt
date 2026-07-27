@@ -282,6 +282,33 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
     }
     rt.resetAccumulation();
   };
+  // TWO feature toggles now need ReSTIR out of the way, for the same reason:
+  // both act on the next-event shadow rays, and the reservoir path replaces
+  // those with a single BINARY visibility ray, so with ReSTIR on the effect
+  // never reaches a primary surface at all. They borrow it through ONE counted
+  // lease instead of each stashing a private copy — the first borrower saves the
+  // state, the last to hand it back restores it — because either can be switched
+  // while the other is on, and two private copies would fight over the restore.
+  const restirBorrowers = new Set();
+  const borrowRestir = (who, on) => {
+    if (on) {
+      if (restirSavedState === null) {
+        restirSavedState = { restir: rt.restir, stochasticLights: rt.stochasticLights };
+      }
+      restirBorrowers.add(who);
+      if (rt.restir) applyRestir(false);
+      return;
+    }
+    restirBorrowers.delete(who);
+    if (restirBorrowers.size > 0 || !restirSavedState) return;
+    const prev = restirSavedState;
+    restirSavedState = null;
+    if (prev.restir !== rt.restir) applyRestir(prev.restir);
+    if (prev.stochasticLights !== rt.stochasticLights) {
+      rt.stochasticLights = prev.stochasticLights;
+      fastLights.input.checked = prev.stochasticLights;
+    }
+  };
 
   // --- RT features: additive effects, each with a visible frame-time cost.
   // Tiered defaults leave the heavy ones off on phones — turning them on IS
@@ -317,27 +344,14 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // appended after it as an indented sub-row.
   const applyTintedShadows = (v) => {
     rt.absorptionShadows = v;
-    if (v) {
-      // THE COUPLING. With ReSTIR lights on, primary direct light is shaded from
-      // the reservoir's winner by ONE BINARY visibility ray — so the per-channel
-      // transmittance march never runs on a primary surface and this toggle
-      // would appear to do NOTHING on the floor. Rather than explain that in a
-      // footnote and let the user conclude the feature is broken, switch ReSTIR
-      // off for them, visibly: the checkbox below unchecks itself and the note
-      // says why. The previous state is restored when this goes back off.
-      if (restirSavedState === null) {
-        restirSavedState = { restir: rt.restir, stochasticLights: rt.stochasticLights };
-      }
-      if (rt.restir) applyRestir(false);
-    } else if (restirSavedState) {
-      const prev = restirSavedState;
-      restirSavedState = null;
-      if (prev.restir !== rt.restir) applyRestir(prev.restir);
-      if (prev.stochasticLights !== rt.stochasticLights) {
-        rt.stochasticLights = prev.stochasticLights;
-        fastLights.input.checked = prev.stochasticLights;
-      }
-    }
+    // THE COUPLING. With ReSTIR lights on, primary direct light is shaded from
+    // the reservoir's winner by ONE BINARY visibility ray — so the per-channel
+    // transmittance march never runs on a primary surface and this toggle would
+    // appear to do NOTHING on the floor. Rather than explain that in a footnote
+    // and let the user conclude the feature is broken, switch ReSTIR off for
+    // them, visibly: the checkbox below unchecks itself and the note says why.
+    // The previous state is restored when this goes back off (see borrowRestir).
+    borrowRestir("tintedShadows", v);
     rt.resetAccumulation();
   };
   const tintedShadows = toggle("tinted shadows", rt.absorptionShadows, applyTintedShadows);
@@ -378,15 +392,42 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // converges. Drag it up to see the effect; it shimmers slightly while
   // converging, so reset the accumulator on each change.
   fSec.append(slider("dispersion", 0, 0.3, 0.01, rt.dispersion, (x) => Number(x).toFixed(2), (v) => { rt.dispersion = v; rt.resetAccumulation(); }));
+  // Kubelka-Munk scattering: reveals "Alabaster" — the reading lamp whose cast-
+  // stone shade is lit from outside by the room and from inside by its own bulb,
+  // plus the two spheres that differ ONLY in whether they scatter. Absorption
+  // alone can only remove light, so the left sphere stays a dark green marble
+  // while the right becomes jade. Off strips back to the byte-identical
+  // no-scattering program, so flipping this while watching the fps readout IS
+  // the feature's cost measurement. Brings refraction with it (same pattern as
+  // "tinted glass") because the absorption-only control sphere needs the glass
+  // path to render as glass at all.
+  const kmNote = el("div", "note");
+  kmNote.textContent =
+    "the lamp's light REACHES the table through its shade, which is a shadow-ray " +
+    "effect — so this unchecks “ReSTIR lights” (and “fast lights” with it) for the " +
+    "same reason “tinted shadows” does, and puts both back when it goes off. The " +
+    "shade's own outward glow needs neither.";
+  fSec.append(toggle("scattering (Kubelka-Munk)", false, (v) => {
+    if (v && !rt.refraction) {
+      refractionT.input.checked = true;
+      setFeature("refraction", true);
+    }
+    setFeature("scattering", v);
+    kmNote.style.display = v ? "" : "none";
+    borrowRestir("kmScattering", v);
+  }).row);
+  fSec.append(kmNote);
+  kmNote.style.display = "none"; // revealed with the piece
   // Grab the fast-lights toggle first so the ReSTIR handler can uncheck it.
   const fastLights = toggle("fast lights (1 ray)", rt.stochasticLights, (v) => { rt.stochasticLights = v; rt.adaptiveQuality = false; rt.resetAccumulation(); });
   // Turning ReSTIR OFF must drop us onto the per-light-rays baseline, NOT the
   // flat-cost stochastic "fast lights" path — otherwise both sides scale the
   // same with light count and ReSTIR's advantage never shows up in the fps.
   const restirT = toggle("ReSTIR lights", rt.restir, (v) => {
-    // A manual flip is the user taking the wheel back: forget any state the
-    // coloured-shadow coupling stashed, so it never overwrites this choice.
+    // A manual flip is the user taking the wheel back: void the lease outright
+    // so no borrower can ever overwrite this choice on its way out.
     restirSavedState = null;
+    restirBorrowers.clear();
     applyRestir(v);
   });
   fSec.append(restirT.row);

@@ -345,6 +345,18 @@ async function main() {
         showcase.lumiere.traverse((o) => (o.visible = on));
         rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
         break;
+      // Kubelka-Munk scattering: show/hide "Alabaster" — the reading lamp and
+      // the absorb-vs-scatter sphere pair — then recompile, because the
+      // scattering materials only exist while the piece does. The rt flag is
+      // pushed FIRST so the recompile's single shader splice already knows about
+      // it. With the piece hidden nothing in the scene scatters, so OFF really
+      // is 0.9.0's program: the megakernel strips back to the byte-identical
+      // no-scattering source, which makes this toggle the feature's cost A/B.
+      case "scattering":
+        rt.kmScattering = on;
+        showcase.alabaster.traverse((o) => (o.visible = on));
+        rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
+        break;
     }
     rt.resetAccumulation();
   };

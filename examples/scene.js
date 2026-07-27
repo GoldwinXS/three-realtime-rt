@@ -32,7 +32,11 @@ const foxUrl =
  *                 shadow with coloured shadows off, a multicolour light quilt
  *                 with them on. Hidden until the "tinted glass" toggle.
  *   front-left    the duck in a museum vitrine (alpha-blend glass, casts no
- *                 shadow onto its own exhibit) + the emissive OPEN sign
+ *                 shadow onto its own exhibit) + the emissive OPEN sign, and
+ *                 "Alabaster": a reading lamp whose cast-stone shade is lit
+ *                 from outside by the room and from inside by its own bulb,
+ *                 beside two spheres that differ only in whether they scatter.
+ *                 Hidden until the "scattering (Kubelka-Munk)" toggle.
  *   front-right   DYNAMICS CORNER — the skinned fox on its platform and the
  *                 physics drop pad, the two things in the room that move
  *   right wall    the amber alpha pane, hung to mirror the blue one
@@ -637,6 +641,161 @@ export function buildScene() {
   lumiere.traverse((o) => (o.visible = false)); // revealed by "tinted glass"
   scene.add(lumiere);
 
+  // --- front-left: "Alabaster" — the scattering (Kubelka-Munk) exhibit ------
+  // A reading lamp on a side table, and beside it two spheres that differ in
+  // exactly one property. This is the SUBSURFACE exhibit: absorption alone can
+  // only remove light, so a pigmented translucent body lit from the front is
+  // black murk; scattering sends light back out and the material finally looks
+  // like its colour. Jade, wax, marble, soap, foliage, lampshades.
+  //
+  // The lamp carries both halves of the feature in one object:
+  //   OUTSIDE  the alabaster shade is lit by the room, and its warm glow is
+  //            the two-flux REFLECTANCE over the thickness of its own wall
+  //   THROUGH  the bulb inside is an emissive area light whose shadow rays
+  //            cross that wall, so the table below is lit through the shade by
+  //            the two-flux TRANSMITTANCE instead of being a hard black disc
+  //
+  // The pair of spheres is the controlled A/B: SAME geometry, SAME attenuation
+  // colour and distance (so identical K), and only the right-hand one carries
+  // userData.rtScattering. With the feature on, the left stays a dark green
+  // glass marble and the right becomes jade.
+  //
+  // WHY EVERYTHING IS CHUNKY. The tracer steps 2 x rt.eps past each interface it
+  // crosses, which in a room this size is about 7 cm — a body (or a shade wall)
+  // thinner than that cannot resolve its own exit face. Hence a cast-alabaster
+  // shade with a 14 cm wall rather than a fabric one, which is a real object
+  // (alabaster and onyx lamps are exactly this) rather than a fudge. The same
+  // limit is why the thin layered "filament chart" that would have gone on this
+  // table lives in the scattering.html rig instead, where the scene is small
+  // enough for a millimetre-scale epsilon.
+  //
+  // Hidden at boot, revealed by the panel's "scattering (Kubelka-Munk)" toggle:
+  // while it is hidden no compiled material scatters, so the megakernel keeps
+  // its byte-identical no-scattering program and flipping the toggle IS the
+  // feature's cost A/B.
+  const alabaster = new THREE.Group();
+  alabaster.name = "alabaster";
+  // Open front-left floor: clear of the vitrine plinth (x -5.55..-4.05), the
+  // OPEN sign stand (-3.2, 1.95), and the Lumiere floor projection (x >= 0.2).
+  alabaster.position.set(-1.6, 0, 3.3);
+  const addAla = (name, mesh) => { mesh.name = name; alabaster.add(mesh); return mesh; };
+  const alaBronze = (name, geo, x, y, z) => {
+    const m = new THREE.Mesh(geo, frameMat);
+    m.position.set(x, y, z);
+    return addAla(name, m);
+  };
+  // Side table: a turned column on a disc foot, both reaching the floor.
+  const TABLE_TOP = 0.76;
+  alaBronze("alabaster-table-foot", new THREE.CylinderGeometry(0.46, 0.5, 0.05, 28), 0, 0.025, 0);
+  alaBronze("alabaster-table-column", new THREE.CylinderGeometry(0.14, 0.16, 0.66, 20), 0, 0.38, 0);
+  const tableTop = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.78, 0.78, 0.07, 36),
+    new THREE.MeshStandardMaterial({ color: 0xcfc7ba, roughness: 0.45 })
+  );
+  tableTop.position.set(0, TABLE_TOP - 0.035, 0);
+  tableTop.userData.museumTop = TABLE_TOP;
+  addAla("alabaster-table-top", tableTop);
+
+  // Lamp hardware: base disc, stem, and the finial that the shade hangs from.
+  // The stem runs up THROUGH the shade's top opening; the finial caps it and is
+  // wider than that opening, so the shade is genuinely held rather than parked
+  // in mid-air (the same way a real harp-and-finial lamp works).
+  const SHADE_BOTTOM = 1.02;
+  const SHADE_TOP = 1.57;
+  alaBronze("alabaster-lamp-base", new THREE.CylinderGeometry(0.24, 0.26, 0.05, 24), 0, TABLE_TOP + 0.025, 0);
+  alaBronze("alabaster-lamp-stem", new THREE.CylinderGeometry(0.045, 0.045, SHADE_TOP - TABLE_TOP, 14),
+    0, (TABLE_TOP + SHADE_TOP) / 2 + 0.025, 0);
+  alaBronze("alabaster-lamp-finial", new THREE.CylinderGeometry(0.26, 0.2, 0.07, 20), 0, SHADE_TOP + 0.035, 0);
+
+  // The bulb: a small emissive sphere inside the shade. Warm and bright, but
+  // low-poly — it joins the NEE area-light table, which is a shared budget.
+  const bulb = new THREE.Mesh(
+    new THREE.IcosahedronGeometry(0.11, 1),
+    new THREE.MeshStandardMaterial({
+      color: 0x000000,
+      emissive: 0xffdcae,
+      emissiveIntensity: 9,
+      roughness: 1,
+    })
+  );
+  bulb.position.set(0, 1.26, 0);
+  addAla("alabaster-bulb", bulb);
+
+  // ALABASTER: warm off-white stone. Very high S (it scatters hard, which is
+  // what makes stone opaque-looking rather than glassy) and a gentle K that
+  // warms whatever gets through. S is given as a raw coefficient here; the jade
+  // below uses the colour + distance route, so the demo exercises both.
+  const alabasterStone = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff,        // white on purpose: K and S carry the pigment
+    roughness: 0.42,
+    metalness: 0,
+    transmission: 1.0,      // translucent to the tracer, NOT `transparent`
+    ior: 1.5,
+    attenuationColor: new THREE.Color(0xffe9d0), // the warm half — this is K
+    attenuationDistance: 0.5,
+  });
+  alabasterStone.userData.rtScattering = { coefficient: 22 };
+  // A lathed shell, not a solid cone: outer wall up, top rim in, inner wall
+  // back down, bottom rim out, closed. That gives the shade a real 14 cm wall
+  // for the march to measure — and because thickness is measured PER RAY, the
+  // shade automatically reads brighter where the wall is seen obliquely.
+  const shadeProfile = [
+    new THREE.Vector2(0.58, 0),      // outer bottom
+    new THREE.Vector2(0.34, 0.55),   // outer top
+    new THREE.Vector2(0.2, 0.55),    // top rim (the stem passes through)
+    new THREE.Vector2(0.44, 0),      // inner bottom
+    new THREE.Vector2(0.58, 0),      // close the profile
+  ];
+  const shade = new THREE.Mesh(new THREE.LatheGeometry(shadeProfile, 40), alabasterStone);
+  shade.position.set(0, SHADE_BOTTOM, 0);
+  addAla("alabaster-shade", shade);
+
+  // The A/B pair. Identical spheres, identical K, on identical mounts — the
+  // ONLY difference is the userData.rtScattering line on the right-hand one.
+  //
+  // K is given through userData.rtAttenuation rather than attenuationColor
+  // because that route takes the colour as LINEAR values, and these are chosen
+  // by working the two-flux model backwards from the reflectance wanted. For a
+  // pigment thick enough to hide its backing, R_inf = 1/(a + b), which inverts to
+  // K/S = (1 - R)^2 / (2R); at S = 20 the jade target (0.19, 0.45, 0.28) asks for
+  // K = (34, 6.7, 18.5) per metre, and exp(-K * 0.25) is the colour below. Set a
+  // target reflectance, get the coefficients — which is the point of a
+  // physically-parameterized model.
+  const marbleGeo = new THREE.SphereGeometry(0.2, 36, 24);
+  const jadeBase = () => ({
+    color: 0xffffff,
+    // Soft enough that the GGX highlight reads as polished stone rather than
+    // covering the pigment it is supposed to sit on.
+    roughness: 0.34,
+    metalness: 0,
+    transmission: 1.0,
+    ior: 1.55,
+  });
+  const jadeK = { color: [0.0002, 0.186, 0.0098], distance: 0.25 };
+  // Left: absorption only — this is 0.8.0's model, and a front-lit pigmented
+  // body under it is exactly the black murk this feature exists to fix.
+  const glassMarble = new THREE.MeshPhysicalMaterial(jadeBase());
+  glassMarble.userData.rtAttenuation = jadeK;
+  // Right: the same stone, plus scattering. S via the colour + distance route:
+  // 14% of the flux still travelling straight after 10 cm, i.e. S ~ 20.
+  const jadeStone = new THREE.MeshPhysicalMaterial(jadeBase());
+  jadeStone.userData.rtAttenuation = jadeK;
+  jadeStone.userData.rtScattering = { color: [0.14, 0.14, 0.14], distance: 0.1 };
+  const mounts = [
+    ["absorb", -0.44, 0.34, glassMarble],
+    ["scatter", 0.44, 0.34, jadeStone],
+  ];
+  for (const [tag, mx, mz, mat] of mounts) {
+    alaBronze(`alabaster-mount-${tag}`, new THREE.CylinderGeometry(0.12, 0.14, 0.06, 18),
+      mx, TABLE_TOP + 0.03, mz);
+    const ball = new THREE.Mesh(marbleGeo, mat);
+    // Seated on its mount's top face (a ball in a cup rests at one point).
+    ball.position.set(mx, TABLE_TOP + 0.06 + 0.2, mz);
+    addAla(`alabaster-ball-${tag}`, ball);
+  }
+  alabaster.traverse((o) => (o.visible = false)); // revealed by the KM toggle
+  scene.add(alabaster);
+
   // --- front-right (DYNAMICS CORNER): the animated fox (skinned dynamic BVH) --
   // A low granite platform sharing the right-hand dynamics half with the physics
   // drop pad (7.1, 0.15 — see main.js spawnPile): the platform's near edge is at
@@ -944,6 +1103,8 @@ export function buildScene() {
     // lumiere is the freestanding stained-glass screen (coloured shadows) —
     // ONE ensemble, both hidden until the "tinted glass" toggle reveals them,
     // lit by `projector` (also hidden, and listed in `lights`).
-    showcase: { orbit, orbitOrb, sign, paneBlue, paneAmber, tintedArt, lumiere, projector },
+    // alabaster is the Kubelka-Munk scattering exhibit (the reading lamp and
+    // the absorb-vs-scatter sphere pair), hidden until its own toggle.
+    showcase: { orbit, orbitOrb, sign, paneBlue, paneAmber, tintedArt, lumiere, projector, alabaster },
   };
 }
