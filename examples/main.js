@@ -22,6 +22,7 @@ import { buildScene } from "./scene.js";
 import { Physics } from "./physics.js";
 import { buildUI } from "./ui.js";
 import { createSelftest } from "./selftest.js";
+import { buildTourChrome, loadTourSettings, applyTourSettings, persistOnExit } from "./tour.js";
 
 const boot = document.getElementById("boot");
 const bootMsg = document.getElementById("boot-msg");
@@ -254,6 +255,15 @@ async function main() {
     selftest = createSelftest({ rt, renderer });
   }
 
+  // Tour stop 2. Renderer settings carried from the previous stop are copied on
+  // here BEFORE the panel is built, so its rows come up showing them; the
+  // scene-revealing features (tinted glass, tinted shadows, scattering) come
+  // back as intents and are replayed through the panel's own toggle handlers.
+  // Skipped entirely under ?selftest so the self-test always drives the
+  // documented defaults regardless of what a previous page left behind.
+  const carried = SELFTEST ? { initial: {}, canvasScale: null, rtEnabled: null }
+                           : applyTourSettings(rt, loadTourSettings());
+
   // The dynamic set = the (opt-in) physics pile PLUS the CPU-deformed water
   // pool PLUS the animated fox PLUS the orbit light's emissive orb. The water is
   // flagged rtDeforming in scene.js, so the raytracer reads its live geometry
@@ -288,7 +298,12 @@ async function main() {
   // Lights only need re-reading when they actually change, so the UI calls this
   // instead of us polling every frame.
   const refreshLights = () => rt.updateLights(scene);
-  const state = { rtEnabled: true, physicsPaused: false, waterEnabled: true, foxEnabled: true };
+  const state = {
+    rtEnabled: carried.rtEnabled ?? true,
+    physicsPaused: false,
+    waterEnabled: true,
+    foxEnabled: true,
+  };
 
   // The orbiting ceiling light is animated in the loop (below) — find it once.
   const orbitDesc = lights.find((l) => l.label === "orbit light");
@@ -449,7 +464,14 @@ async function main() {
     // CSS stretch magnifies buffer-pixel jitter into visible wobble.
     rt.taaJitterScale = s;
   };
-  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setWindows, setCanvasScale, canvasScale });
+  if (carried.canvasScale != null && carried.canvasScale !== canvasScale) {
+    setCanvasScale(carried.canvasScale);
+  }
+  const ui = buildUI({ rt, physics, lights, scene, state, refreshLights, spawnPile, setFeature, setExtraLights, setWindows, setCanvasScale, canvasScale, initial: carried.initial });
+  // Persistent tour chrome: PREV / NEXT and the prominent RT ON/OFF switch. The
+  // switch and the panel's "ray tracing" row are two faces of one state.
+  buildTourChrome({ stopId: "museum", panel: ui });
+  persistOnExit(() => ({ rt, state, canvasScale, panel: ui }));
 
   // Test/automation surface (also read by scripts/selftest.mjs). The raytracer
   // instance carries all live properties (gi, restirGI, restirGIValidate, …);
