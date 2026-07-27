@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0 — 2026-07-27
 
 - **ReSTIR GI: the artifact was chromatic, and now it is gone.** `restirGI`
   shipped measurably *faster* than the inline GI path at flat rmse and was still
