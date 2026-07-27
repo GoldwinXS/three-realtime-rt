@@ -28,7 +28,7 @@ esbuild, …) or a browser import map that resolves the bare `three` /
 `three-mesh-bvh` specifiers. MIT licensed.
 [On npm](https://www.npmjs.com/package/three-realtime-rt): `npm i three-realtime-rt three three-mesh-bvh`.
 
-### ▶ [Live demo](https://goldwinxs.github.io/three-realtime-rt/) — drag to orbit, drop the pile, toggle every feature.
+### ▶ [Live demo](https://goldwinxs.github.io/three-realtime-rt/) — a three-stop tour: a Cornell box with a one-feature-at-a-time switcher, the museum room (drop the pile), then stock glTF models. PREV / NEXT walks it; one switch A/Bs ray tracing against plain three.js on every stop.
 
 > **Support this project:** the [supporter pack on itch.io](https://goldwinxs.itch.io/three-realtime-rt-supporter-pack) gets you a ready-to-run starter template, all example scenes, and a 12-section deep-dive guide to how the whole pipeline works. The library itself is and stays MIT.
 
@@ -830,7 +830,25 @@ npm install
 npm run dev       # http://localhost:8115
 ```
 
-The demo ([`examples/`](examples/)) is a **panoramic museum gallery** — a
+The demo ([`examples/`](examples/)) is a **three-stop guided tour**, each stop its
+own page and its own deep link, all three wearing the same chrome: PREV / NEXT,
+a prominent RT ON/OFF switch outside the panel, and the full shared
+renderer/lighting panel ([`examples/panel.js`](examples/panel.js)) with a
+per-room exhibit section below it. Renderer settings follow you from stop to stop.
+
+1. [`index.html`](index.html) — a procedural **Cornell box**
+   ([`examples/cornell.js`](examples/cornell.js)), the entry page and the fastest
+   room in the repo. Its centre holds one exhibit at a time — diffuse blocks,
+   mirror sphere, glass sphere, tinted glass panes, emissive block, a
+   Kubelka-Munk stone wedge — and selecting one switches on the feature it
+   demonstrates (never overriding a toggle you moved by hand). Deep-linkable per
+   exhibit: `index.html#glass`.
+2. [`museum.html`](museum.html) — the museum room, below.
+3. [`models.html`](models.html) — stock glTF with a model picker, sharing the
+   gallery's catalogue ([`examples/gallery-scenes.js`](examples/gallery-scenes.js)).
+   Deep-linkable per model: `models.html#tokyo`.
+
+Stop 2 is a **panoramic museum gallery** — a
 Cornell-style room (saturated red/teal side walls for obvious colour bleed, open
 top) staged as an exhibit where every renderer feature gets its own vignette: a
 **deforming mirror-water pool** under the emissive gallery light, the
@@ -844,7 +862,7 @@ control panel** (starts collapsed on phones) toggles every feature, drives a
 clerestory-window light slider, and spawns the 40-body physics pile. See
 [`examples/main.js`](examples/main.js) for the full, commented integration
 (scene → physics → compile → render loop). `npm run deploy` builds and publishes
-it to GitHub Pages.
+the whole tour to GitHub Pages.
 
 ## Gallery & benchmarks
 
