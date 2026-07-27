@@ -1,5 +1,173 @@
 # Changelog
 
+## Unreleased
+
+- **Scattering: physically-parameterized translucent solids (Kubelka-Munk
+  two-flux).** Jade, wax, marble and alabaster, soap, milky plastic, foliage,
+  lampshades — the material class a real-time renderer normally fakes with an
+  authored **thickness map**, which stops being right the moment the object
+  deforms, is sliced, or is seen from a new angle. Give a material an absorption
+  coefficient **K** and a scattering coefficient **S** and the renderer measures
+  how far each view ray actually travels inside the real geometry, then solves
+  the two-flux equations for that thickness. A sphere thins correctly toward its
+  silhouette and a shell wall brightens where it is seen obliquely, with nothing
+  baked and nothing painted. New option/property `rt.kmScattering`, **default
+  off**; opt in per material with `userData.rtScattering` (`{ coefficient }` in
+  1/world-unit, or the same `{ color, distance }` pair absorption already uses).
+  K is the material's existing `attenuationColor` + `attenuationDistance`, so a
+  material still states its colour in one place.
+  - **Why it matters, concretely.** Absorption alone can only ever REMOVE light,
+    so a pigmented translucent body lit from the front renders as black murk —
+    nothing sends the light back out of the surface. Scattering does, and the
+    closed form gives both a reflectance and a transmittance. The museum's new
+    exhibit is the A/B: two spheres with identical geometry and identical K,
+    differing by one `userData` line, and a lamp whose cast-stone shade goes from
+    murky glass to warm alabaster.
+  - **It is invertible, which is the point of a physical parameterization.** For
+    a body thick enough to hide its backing, `R_inf = 1/(a + b)` rearranges to
+    `K/S = (1 - R)^2 / (2R)`: choose the colour the material should be when
+    thick, read off K/S, pick S for how fast it gets there, and the thin parts
+    follow. The maths is exported (`kmReflectance`, `kmReflectanceInfinite`,
+    `kmStackRGB`, ...) so this can be done in a tool or at build time.
+  - **NOT volumetric lighting.** Fog and god-rays are light scattering BETWEEN
+    objects (`volumetrics`); this is transport INSIDE solid bodies. Unrelated
+    features.
+  - **Zero new resources.** No new sampler (this pass is at the WebGL2
+    16-sampler minimum — S rides a new row 68 of the existing scene-data
+    texture), no new uniform, no new `traceRadiance` call site, and **no new BVH
+    traversal**.
+  - **The design the feature shipped from does not compile, and that is the
+    story.** The natural implementation is a dedicated ordered march along the
+    view ray composing an arbitrary layered stack — the same machinery coloured
+    shadows use. It was written, it works, and NVIDIA's native-GL assembler
+    rejects the megakernel with `error: too many temporaries`, the
+    register-pressure sibling of the `C5041` failure that killed a 0.9.0
+    shadow-march optimisation. Bisected on the GPU rather than guessed at:
+
+    | build | generated NV assembly | links |
+    |---|---|---|
+    | full feature, dedicated view march | 35 319 lines | no |
+    | same, shadow-side maths removed | 33 403 lines | no |
+    | same, march compiled but never called | — | yes |
+
+    So the march's own BVH traversal is the blocker and shrinking the surrounding
+    arithmetic cannot buy it back — a 5% reduction in emitted assembly moved
+    nothing. Reusing `shadowTransmittance` for the view ray is *worse*: it is
+    already inlined at roughly EIGHT effective sites (main's direct loop, and
+    again inside every `traceRadiance` site by way of `sampleOneAny`), so a third
+    explicit call adds a ninth traversal, and anything added to its loop body is
+    paid for eight times over. The shipped version evaluates the layer where the
+    shader already computes an in-medium view chord, inside `glassRadiance`.
+    Cost: **one medium along the view path** instead of an arbitrary stack (the
+    shadow path still marches through stacks correctly). The layered composition
+    survives in `src/kubelkaMunk.js` and its self-test, ready for a pass with
+    register room to spare.
+  - **An exact thickness correction the absorption path never needed.** That
+    chord is measured from a point `2 x eps` INSIDE the entry surface, so it
+    under-reports by `2 x eps / |rd.N|` — a fixed ~7 cm in a room-sized scene,
+    which is HALF the wall of a cast shade. Negligible when you are computing a
+    tint; fatal when you are computing a reflectance.
+  - **Numerics, because fp32 meets every degenerate corner inside one ordinary
+    sphere** (the centre is a long chord, the silhouette a vanishing one). `coth`
+    diverges as `b*S*t -> 0`, `sinh`/`cosh` overflow as it grows, and `a - b` is
+    a difference of two nearly-equal large numbers when the medium barely
+    scatters. Every expression is the stable rewrite: `exp(-2x)` forms instead of
+    `sinh`/`cosh`, `1/(a + b)` instead of `a - b`, `sqrt((a-1)(a+1))` instead of
+    `sqrt(a*a - 1)`. The series branches the textbook needs were removed
+    entirely by FLOORING `b` — because `x` is computed as `b*(S*d)` with the same
+    floored `b`, the ratio `x/b` stays exactly `S*d` and every limit falls out of
+    the exponential form alone. That deleted a `step()`, two branches and their
+    live registers, which is what let the feature fit at all.
+  - **Zero cost when unused, provably.** Source splice, not `#ifdef`: a third
+    marker tag `RT_KM` gives a fourth cached variant, a LADDER rather than a
+    matrix (each variant is the next with its outermost feature stripped). With
+    `kmScattering: false`, or no material carrying `userData.rtScattering`, the
+    generated fragment source is **byte-identical** to 0.9.0's — SHA-256 checked
+    against a `master` checkout by the new `npm run test:km` (plain 52 378 B
+    `sha 44d6be4e`, absorption-only 55 257 B `sha 1804cf41`, absorption +
+    coloured shadows 61 321 B `sha 13a75103`, all three matching). Stripping
+    order is now load-bearing and documented: `RT_KM` blocks nest inside the
+    coloured-shadow one, and `stripMarked` tracks a single boolean, so the
+    innermost tag must be stripped first.
+  - **`npm run test:km`** also runs 23 numeric checks on the analytic reference
+    with no GPU and no browser: the `S -> 0` degrade to Beer-Lambert, the
+    `t -> infinity` approach to `R_inf` from BOTH sides, the `coth` guard at tiny
+    `b*S*t`, `Rg = R_inf` as a fixed point, channel independence, a 1344-case
+    finiteness sweep, and the equivalence of the closed-form `R(t, Rg)` with the
+    forward "adding" composition. That last one is load-bearing and it earned its
+    place immediately — it caught a first-order truncation in the small-`x`
+    transmittance branch (1.9e-7 -> 4e-14).
+  - **Validation rig: `scattering.html`.** Pixels against the analytic model, not
+    against taste. A pigment of known K and S is divided by a white Lambert patch
+    under the same directional light, which cancels exposure, intensity and units
+    exactly and leaves `R`; contaminants are removed by construction rather than
+    corrected for (black backdrop, directional light, GI off, specular off), and
+    ACES + gamma are inverted exactly.
+
+    | slab | chord | measured R (r/g/b) | analytic R | error |
+    |---|---|---|---|---|
+    | 10 mm | 11.2 mm | 0.222 / 0.242 / 0.234 | 0.223 / 0.244 / 0.237 | −0.6 / −0.9 / −1.4% |
+    | 20 mm | 22.1 mm | 0.317 / 0.370 / 0.353 | 0.321 / 0.377 / 0.357 | −1.5 / −1.8 / −1.0% |
+    | 40 mm | 44.1 mm | 0.388 / 0.512 / 0.468 | 0.394 / 0.514 / 0.467 | −1.4 / −0.4 / +0.1% |
+    | 80 mm | 88.8 mm | 0.419 / 0.605 / 0.528 | 0.418 / 0.608 / 0.525 | +0.2 / −0.4 / +0.5% |
+    | 160 mm | 181 mm | 0.419 / 0.628 / 0.528 | 0.420 / 0.639 / 0.536 | −0.3 / −1.8 / −1.6% |
+
+    The residual is at the 8-bit readback floor (one code step is ~1–4% of a
+    linear value up there), and the CURVE SHAPE — monotone rise converging on
+    `R_inf` = 0.420 / 0.642 / 0.537 — is the assertion that cannot be faked by
+    exposure.
+  - **Curved geometry, and a finding.** Phase 2 probes a sphere centre-to-rim,
+    where the thickness is authored nowhere and is simply what the geometry gives
+    the ray. It needed its OWN, much weaker pigment, because **a refracting
+    sphere's chord does not go to zero at the rim**: grazing rays bend inward, so
+    the internal angle tops out at `asin(1/n)` and the chord floors at
+    `2R*sqrt(1 - 1/n^2)` — about 75% of the diameter at ior 1.5. The visible disc
+    spans only a 34% thickness range, and at the slab pigment's `S = 30` every
+    probe reads `R_inf`: a flat profile that would LOOK like a pass while testing
+    nothing about thickness.
+
+    | b/R | chord | measured R (r/g/b) | analytic R | error |
+    |---|---|---|---|---|
+    | 0.00 | 500 mm | 0.181 / 0.277 / 0.229 | 0.183 / 0.281 / 0.232 | −1.1 / −1.5 / −1.1% |
+    | 0.30 | 490 mm | 0.179 / 0.273 / 0.226 | 0.182 / 0.278 / 0.230 | −1.5 / −1.7 / −1.7% |
+    | 0.55 | 465 mm | 0.176 / 0.264 / 0.221 | 0.179 / 0.271 / 0.225 | −1.8 / −2.3 / −2.1% |
+    | 0.75 | 433 mm | 0.170 / 0.248 / 0.210 | 0.176 / 0.260 / 0.219 | −3.5 / −4.5 / −4.1% |
+    | 0.90 | 400 mm | 0.160 / 0.229 / 0.196 | 0.172 / 0.248 / 0.211 | −6.9 / −7.7 / −7.1% |
+
+    Monotone falloff with the chord, tracking the analytic prediction; the error
+    grows toward the rim where partial pixel coverage and the un-modelled Fresnel
+    reflection both bite. Zero blown or NaN pixels across the whole 51 529-pixel
+    silhouette scan — the guards hold at the degenerate end.
+  - **Limitations, stated because they are the difference between this and
+    subsurface scattering.** **No lateral bleed**: this is 1-D transport along
+    the ray, light leaves where it entered, so a thin edge does not glow from
+    light that entered elsewhere. **No in-scattering into shadow rays**: a lit
+    body does not add light to its own shadow. **`R` is used as a diffuse albedo
+    under `N.L`** — the standard approximation (Kubelka-Munk derives `R` under
+    diffuse illumination), exact in the ambient limit, slightly over-bright at
+    grazing incidence. **One medium along the view path** (above). **Requires
+    `refraction: true`**, for the same structural reason. **Bodies thinner than
+    `2 x eps` cannot resolve their own exit face**, which is why the demo's shade
+    is cast stone with a 14 cm wall rather than fabric.
+  - **Demo: "Alabaster".** A reading lamp on a side table in the front-left
+    gallery, hidden until the new **"scattering (Kubelka-Munk)"** toggle. One
+    object carries both halves of the feature: the shade's outside is lit by the
+    room and shows the two-flux reflectance over its own wall thickness, while
+    the bulb inside lights the table THROUGH that wall by the two-flux
+    transmittance. Beside it, two spheres identical in geometry and in K,
+    differing only by one `userData.rtScattering` line — with the feature on the
+    left stays a dark green glass marble and the right becomes jade. The toggle
+    borrows ReSTIR the same way "tinted shadows" does (the reservoir path shades
+    primary direct light with one BINARY visibility ray, so the transmitted half
+    would otherwise never reach the table); both toggles now share one COUNTED
+    lease instead of each stashing a private copy, because either can be switched
+    while the other is on.
+  - **`rt.eps` is a constructor option, not a property** — the auto-scaler is
+    armed by `options.eps == null`, so a later assignment is silently overwritten
+    on the next compile. The validation rig hit this first time out (the auto
+    value put the refraction entry point below a 10 mm slab entirely, which read
+    as a black tile); now documented at the call site and in the README.
+
 ## 0.9.0 — 2026-07-26
 
 - **Museum demo reorganised into zoned galleries.** Materials pieces (sphere
