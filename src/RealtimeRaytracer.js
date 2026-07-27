@@ -1509,11 +1509,11 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
    *                   measured scenes (now the library default; this only fires
    *                   for an app that raised it)
    *
-   * restirGI was measured as a third free win (-14.2%/-7.9%/-27.0% frame time
-   * at flat rmse) but is EXCLUDED from the governor: rmse is blind to the
-   * coarse structured artifact its own gridEnergy metric flagged (0.66->1.37),
-   * and on-device review vetoed the look (gallery scenes especially,
-   * 2026-07-27). Manual option only.
+   *   restirGI on     -14.2% / -7.9% / -27.4%, at rmse320 flat-or-better --
+   *                   a SPEED feature; briefly vetoed (2026-07-27) for a
+   *                   chromatic confetti artifact, reinstated after the
+   *                   Rao-Blackwellized chroma resolve fixed it and on-device
+   *                   review approved. Paired with the denoise cap of 3.
    *
    * Taken as ONE step (they are independent of each other and of resolution) and
    * released as one on the way back up, so the governor's state is either "free
@@ -1531,11 +1531,19 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       this.giHalfRate = true;
       took = true;
     }
-    // restirGI is deliberately NOT a governor free win. The campaign's rmse
-    // said "free", but its own gridEnergy caveat flagged the raised coarse
-    // structure, and on-device review (2026-07-27, gallery scenes especially)
-    // vetoed the look. It stays a manual option; the governor never enables
-    // a feature the user has to know to distrust.
+    // restirGI: vetoed from the free wins on 2026-07-27 (chromatic confetti,
+    // worst in colourful-bounce scenes), reinstated the same day after the
+    // Rao-Blackwellized chroma resolve fixed it and on-device review approved
+    // the look. History in docs/QUALITY_CAMPAIGN_2026-07.md.
+    if (this.gi && this.denoise && this.denoiseIterations > 0 && !this.restirGI) {
+      prev.restirGI = false;
+      this.restirGI = true;
+      took = true;
+      if (this.denoiseIterations > RealtimeRaytracer.GOVERNOR_MAX_DENOISE) {
+        prev.denoiseIterations = this.denoiseIterations;
+        this.denoiseIterations = RealtimeRaytracer.GOVERNOR_MAX_DENOISE;
+      }
+    }
     if (this.restirMCap > 16) {
       prev.restirMCap = this.restirMCap;
       this.restirMCap = 16;
