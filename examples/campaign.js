@@ -110,6 +110,30 @@ const SCENE_DEFS = {
       probe: [0.22, 0.70],    // same clean floor, 128px, for the grid probe
     },
   },
+  // Added for the ReSTIR GI artifact study (plan=restirgi): the user reported
+  // the artifact "in the gallery especially", and the gallery's streamed Khronos
+  // PBR assets sit on a big, flat, GI-lit ground disc under a sky — the largest
+  // uninterrupted indirect-light surface any of these scenes has, and therefore
+  // the clearest read on coarse GI structure.
+  lantern: {
+    tris: 6000,
+    fov: 55,
+    cam: [7, 5, 9],
+    target: [0, 3, 0],
+    build: async () => {
+      const s = await GALLERY.lantern();
+      return { scene: s.scene, sky: s.sky, env: s.env };
+    },
+    // From quality-campaign/images/recon__lantern__grid.png.
+    patches: {
+      center: [0.50, 0.50],    // the post — the model itself
+      shadow: [0.55, 0.655],   // the post's cast shadow on the ground disc
+      spec: [0.575, 0.26],     // the lantern's black metal housing
+      flat: [0.80, 0.80],      // clean ground disc, right of the lantern
+      lit: [0.20, 0.80],       // clean sunlit ground disc, left of the lantern
+      probe: [0.80, 0.80],     // same clean ground, 128px grid probe
+    },
+  },
   tokyo: {
     tris: 141000,
     fov: 55,
@@ -167,6 +191,16 @@ const BASELINE = {
   denoiseMaxStep: 0,
   denoiseStepJitter: 0,
   denoiseWideDamp: 0,
+  // ReSTIR GI knobs, all at their library defaults so every pre-existing arm
+  // renders exactly what it rendered before (restirGI is false in BASELINE, so
+  // none of them is even reachable outside the restirgi plan).
+  restirGIMCap: 20,
+  restirGISpatialTaps: 2,
+  restirGIValidate: 8,
+  restirGIResolveAlpha: 1.0,
+  restirGIConfLow: 0.3,
+  restirGIChromaMean: true,
+  restirGIVisFallback: true,
 };
 
 /** The stand-in for ground truth: full lighting resolution, long convergence. */
@@ -271,6 +305,15 @@ function sharpness(rgb, w, h) {
   return s / n;
 }
 
+/** Whole-frame luma plane (float, 0-255) from an RGBA byte frame. */
+function lumaPlane(buf, w, h) {
+  const out = new Float32Array(w * h);
+  for (let i = 0, j = 0; i < out.length; i++, j += 4) {
+    out[i] = buf[j] * LUMA[0] + buf[j + 1] * LUMA[1] + buf[j + 2] * LUMA[2];
+  }
+  return out;
+}
+
 /** Extract a luma patch (float) from an RGBA byte frame. */
 function lumaPatch(buf, w, h, px, py, ps) {
   const out = new Float32Array(ps * ps);
@@ -289,6 +332,16 @@ function std(arr) {
   let s = 0;
   for (let i = 0; i < arr.length; i++) { const d = arr[i] - m; s += d * d; }
   return Math.sqrt(s / arr.length);
+}
+/** Pearson correlation of two equal-length series (0 when either is flat). */
+function corr(a, b) {
+  const ma = mean(a), mb = mean(b);
+  let sab = 0, saa = 0, sbb = 0;
+  for (let i = 0; i < a.length; i++) {
+    const da = a[i] - ma, db = b[i] - mb;
+    sab += da * db; saa += da * da; sbb += db * db;
+  }
+  return saa > 1e-12 && sbb > 1e-12 ? sab / Math.sqrt(saa * sbb) : 0;
 }
 
 /**
@@ -422,6 +475,122 @@ function gridEnergy(patch, ps, periods) {
 }
 
 /**
+ * WHOLE-FRAME STRUCTURE SWEEP. The single 128px `probe` window is a fine place
+ * to LOOK at the a-trous lattice, but it is a poor place to MEASURE amplitude:
+ * one window holds 64 detrended tiles, and its blockStd / gridPeak swing ~2x
+ * between configs whose GI statistics differ by a few percent — the numbers are
+ * deterministic (this renderer is), but they are one arbitrary realization, and
+ * ranking configs on them ranks realizations. This tiles the WHOLE frame into
+ * overlapping windows, drops the ones that are mostly background, and averages,
+ * which is what makes the on/off ratio in the fix bar mean something.
+ *
+ * `periods` are SCREEN-pixel periods (the caller converts from a-trous texels).
+ * Returns per-period mean amplitudes plus mean block/high-pass structure, all in
+ * the same 0-255 luma units the single-window statistics use.
+ */
+function frameStructure(plane, w, h, ps, periods, block, floor = 12, gate = null) {
+  const stride = Math.round(ps / 2);
+  const acc = {};
+  for (const p of periods) acc[`sgrid${p}`] = 0;
+  let block2 = 0, hp2 = 0, n = 0;
+  const sub = (src, x0, y0) => {
+    const out = new Float32Array(ps * ps);
+    for (let y = 0; y < ps; y++) out.set(src.subarray((y0 + y) * w + x0, (y0 + y) * w + x0 + ps), y * ps);
+    return out;
+  };
+  for (let y = 0; y + ps <= h; y += stride) {
+    for (let x = 0; x + ps <= w; x += stride) {
+      const patch = sub(plane, x, y);
+      // Skip windows that are mostly letterbox / empty background: they carry no
+      // lighting, and their near-zero structure would dilute the average. For a
+      // DIFFERENCE plane (mean ~0 everywhere) the caller passes a `gate` plane —
+      // the restirGI-off luma — so the same windows are used on both sides.
+      if (mean(gate ? sub(gate, x, y) : patch) < floor) continue;
+      const sp = spatialStats(patch, ps, block);
+      const g = gridEnergy(patch, ps, periods);
+      for (const p of periods) acc[`sgrid${p}`] += g[`grid${p}`];
+      block2 += sp.blockStd;
+      hp2 += sp.hpStd;
+      n++;
+    }
+  }
+  if (!n) return { structWindows: 0 };
+  const out = { structWindows: n, structBlock: block2 / n, structHp: hp2 / n };
+  let peak = 0, peakP = 0;
+  for (const p of periods) {
+    const v = acc[`sgrid${p}`] / n;
+    out[`sgrid${p}`] = v;
+    if (v > peak) { peak = v; peakP = p; }
+  }
+  out.structGridPeak = peak;
+  out.structGridPeakPeriod = peakP;
+  return out;
+}
+
+/**
+ * CHROMATICITY STRUCTURE — the instrument the ReSTIR GI artifact actually needs.
+ *
+ * Everything above (rmse, gridEnergy, blockStd, hpStd, stillNoise) is luma or
+ * luma-dominated, and the artifact this measures is not: the ReSTIR resolve's
+ * luminance is a running mean over the reservoir's history while its COLOUR was
+ * one selected sample's chromaticity, so the error is almost purely chromatic.
+ * That is exactly why the campaign's rmse read "free" — the mean colour is
+ * right — and why its gridPeak signal was weak and unstable: it was seeing a
+ * second-order luma consequence of a first-order colour problem.
+ *
+ * Per window, r/luma and b/luma are formed (x100, so the units are percent of
+ * chromaticity), plane-detrended like every other statistic here, and reduced to
+ * a block std (coarse colour blotching), a high-pass std (colour grain) and the
+ * a-trous grid amplitudes. Dark windows are skipped: chromaticity is meaningless
+ * where there is no light, and dividing by a near-zero luma would dominate the
+ * average with noise.
+ */
+function frameChromaStructure(buf, w, h, ps, periods, block, floor = 12) {
+  const stride = Math.round(ps / 2);
+  const acc = {};
+  for (const p of periods) acc[p] = 0;
+  let blockSum = 0, hpSum = 0, n = 0;
+  for (let y = 0; y + ps <= h; y += stride) {
+    for (let x = 0; x + ps <= w; x += stride) {
+      const cr = new Float32Array(ps * ps);
+      const cb = new Float32Array(ps * ps);
+      let lsum = 0;
+      for (let py = 0; py < ps; py++) {
+        for (let px = 0; px < ps; px++) {
+          const i = ((y + py) * w + (x + px)) * 4;
+          const l = buf[i] * LUMA[0] + buf[i + 1] * LUMA[1] + buf[i + 2] * LUMA[2];
+          lsum += l;
+          const k = py * ps + px;
+          const d = Math.max(l, 1e-3);
+          cr[k] = (buf[i] / d) * 100;
+          cb[k] = (buf[i + 2] / d) * 100;
+        }
+      }
+      if (lsum / (ps * ps) < floor) continue;
+      for (const plane of [cr, cb]) {
+        const sp = spatialStats(plane, ps, block);
+        const g = gridEnergy(plane, ps, periods);
+        for (const p of periods) acc[p] += g[`grid${p}`] / 2;
+        blockSum += sp.blockStd / 2;
+        hpSum += sp.hpStd / 2;
+      }
+      n++;
+    }
+  }
+  if (!n) return { chromaWindows: 0 };
+  const out = { chromaWindows: n, chromaBlock: blockSum / n, chromaHp: hpSum / n };
+  let peak = 0, peakP = 0;
+  for (const p of periods) {
+    const v = acc[p] / n;
+    out[`cgrid${p}`] = v;
+    if (v > peak) { peak = v; peakP = p; }
+  }
+  out.chromaGridPeak = peak;
+  out.chromaGridPeakPeriod = peakP;
+  return out;
+}
+
+/**
  * Border bias: the a-trous filter drops taps that fall outside the image, so at
  * wide steps the kernel becomes one-sided near the frame edge. Measured as the
  * relative luma difference between a border ring and the interior on the
@@ -454,6 +623,125 @@ function readFrame() {
   if (capBuf.length !== capW * capH * 4) capBuf = new Uint8Array(capW * capH * 4);
   gl.readPixels(0, 0, capW, capH, gl.RGBA, gl.UNSIGNED_BYTE, capBuf);
   return capBuf;
+}
+
+// ---------------------------------------------------------------------------
+// RAW ReSTIR-GI probe (plan=restirgi)
+// ---------------------------------------------------------------------------
+/**
+ * Read GIReservoirPass attachment 2 — the resolved, demodulated GI irradiance —
+ * straight off the GPU at LIGHTING resolution, BEFORE the à-trous denoiser, the
+ * (1-metalness) weight, the composite or the tonemap have touched it.
+ *
+ * Every other instrument in this file sees the filtered, tonemapped sum, which
+ * cannot separate "the ReSTIR resolve is itself structured" from "the denoiser
+ * amplifies an otherwise fine signal" — the two live hypotheses. This can.
+ *
+ * GIReservoirPass.render() swaps its ping-pong targets and returns the OLD
+ * targetA, so after a render the just-written attachments live in targetB.
+ * Same-task rule applies exactly as it does to readFrame().
+ */
+function readGiRaw() {
+  const target = rt?.giReservoirPass?.targetB;
+  if (!target) return null;
+  const props = renderer.properties.get(target);
+  let fb = props.__webglFramebuffer;
+  if (Array.isArray(fb)) fb = fb[0];
+  if (!fb) return null;
+  const w = target.width, h = target.height;
+  const buf = new Float32Array(w * h * 4);
+  renderer.state.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.readBuffer(gl.COLOR_ATTACHMENT2);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.FLOAT, buf);
+  gl.readBuffer(gl.COLOR_ATTACHMENT0);
+  renderer.state.bindFramebuffer(gl.FRAMEBUFFER, null);
+  renderer.setRenderTarget(null);
+  return { buf, w, h };
+}
+
+/**
+ * A size x size window of a raw-GI buffer, split into a luma plane and the two
+ * CHROMATICITY planes r/luma and b/luma. The split matters: the resolve's luma
+ * is algebraically wSum/(PI*M) — an M-frame running mean — while its colour is
+ * the chromaticity of ONE stochastically selected sample, so the two planes have
+ * completely different noise characters and have to be measured apart.
+ * `frac` is (x, y-from-top) as everywhere else; the GL buffer is bottom-up.
+ */
+function giWindow(g, frac, size) {
+  const s = Math.min(size, g.w, g.h);
+  const x0 = Math.min(g.w - s, Math.max(0, Math.round(frac[0] * g.w - s / 2)));
+  const yTop = Math.min(g.h - s, Math.max(0, Math.round(frac[1] * g.h - s / 2)));
+  const y0 = g.h - s - yTop;
+  const lum = new Float32Array(s * s);
+  const cr = new Float32Array(s * s);
+  const cb = new Float32Array(s * s);
+  for (let y = 0; y < s; y++) {
+    for (let x = 0; x < s; x++) {
+      const i = ((y0 + y) * g.w + (x0 + x)) * 4;
+      const r = g.buf[i], gg = g.buf[i + 1], b = g.buf[i + 2];
+      const l = r * LUMA[0] + gg * LUMA[1] + b * LUMA[2];
+      const k = y * s + x;
+      lum[k] = l;
+      cr[k] = l > 1e-7 ? r / l : 1;
+      cb[k] = l > 1e-7 ? b / l : 1;
+    }
+  }
+  return { lum, cr, cb, size: s };
+}
+
+/**
+ * Structure statistics of one raw-GI window, in PERCENT OF THE WINDOW MEAN so
+ * scenes of different brightness are comparable. Grid periods are the à-trous
+ * tap spacings in LIGHTING texels (1,2,4,8,16,32) — this buffer IS at lighting
+ * resolution, so no renderScale conversion is needed.
+ */
+function giStats(win) {
+  const mu = mean(win.lum);
+  if (!(mu > 1e-7)) return { giMean: mu, giHp: 0, giBlock: 0, giBlotch: 0, giGridPeak: 0, giChroma: 0 };
+  const scaled = new Float32Array(win.lum.length);
+  for (let i = 0; i < scaled.length; i++) scaled[i] = (win.lum[i] * 100) / mu;
+  const sp = spatialStats(scaled, win.size, 16);
+  const g = gridEnergy(scaled, win.size, [1, 2, 4, 8, 16, 32].filter((p) => p >= 2 && p <= win.size / 2));
+  // Chromaticity spread: std of r/luma and b/luma over the window. A resolve
+  // whose colour is one held sample scatters this; a colour-averaged one does not.
+  const chroma = (std(win.cr) + std(win.cb)) / 2;
+  // Same split at BLOCK scale — coarse colour blotching specifically.
+  const nb = Math.floor(win.size / 16);
+  const cmr = [], cmb = [];
+  for (let by = 0; by < nb; by++) {
+    for (let bx = 0; bx < nb; bx++) {
+      let sr = 0, sb = 0;
+      for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+        const k = (by * 16 + y) * win.size + bx * 16 + x;
+        sr += win.cr[k]; sb += win.cb[k];
+      }
+      cmr.push(sr / 256); cmb.push(sb / 256);
+    }
+  }
+  return {
+    giMean: mu,
+    giHp: sp.hpStd,
+    giBlock: sp.blockStd,
+    giBlotch: sp.blotch,
+    giGrid: g,
+    giGridPeak: g.gridPeak,
+    giGridPeakPeriod: g.gridPeakPeriod,
+    giChroma: chroma,
+    giChromaBlock: (std(Float32Array.from(cmr)) + std(Float32Array.from(cmb))) / 2,
+  };
+}
+
+/** Encode a raw-GI buffer as a viewable RGBA byte frame at a fixed gain. */
+function giToBytes(g, gain) {
+  const out = new Uint8Array(g.w * g.h * 4);
+  for (let i = 0; i < g.w * g.h; i++) {
+    for (let c = 0; c < 3; c++) {
+      const v = Math.pow(Math.max(0, g.buf[i * 4 + c] * gain), 1 / 2.2) * 255;
+      out[i * 4 + c] = Math.min(255, Math.max(0, Math.round(v)));
+    }
+    out[i * 4 + 3] = 255;
+  }
+  return out;
 }
 
 const pngCanvas = document.createElement("canvas");
@@ -547,6 +835,13 @@ function applyConfig(cfg) {
   rt.denoiseMaxStep = cfg.denoiseMaxStep;
   rt.denoiseStepJitter = cfg.denoiseStepJitter;
   rt.denoiseWideDamp = cfg.denoiseWideDamp;
+  rt.restirGIMCap = cfg.restirGIMCap ?? 20;
+  rt.restirGISpatialTaps = cfg.restirGISpatialTaps ?? 2;
+  rt.restirGIValidate = cfg.restirGIValidate ?? 8;
+  rt.restirGIResolveAlpha = cfg.restirGIResolveAlpha ?? 1.0;
+  rt.restirGIConfLow = cfg.restirGIConfLow ?? 0.3;
+  rt.restirGIChromaMean = cfg.restirGIChromaMean ?? true;
+  rt.restirGIVisFallback = cfg.restirGIVisFallback ?? true;
   // These two are accessors that recompile the lighting megakernel — set last
   // and let the caller settle a few frames before timing.
   rt.absorptionShadows = cfg.absorptionShadows;
@@ -616,6 +911,8 @@ const CHECKPOINTS = [30, 60];
 // per-scene references (built once per scene per repeat, at REFERENCE config)
 // ---------------------------------------------------------------------------
 const refs = { still: null, stillFull: null, sharp: 0, poses: {} };
+/** restirGI-off luma frames, keyed by denoise setting (see the diff structure). */
+const offRefs = new Map();
 
 async function buildReferences(convergeRef) {
   setStatus("building references…");
@@ -756,6 +1053,72 @@ async function measure(label, cfg, opts = {}) {
   m.probeBlotch = probeStats.blotch;
   m.probeHpStd = probeStats.hpStd;
   m.probeBlockStd = probeStats.blockStd;
+  // The same statistics averaged over the WHOLE frame.
+  const uniqPeriods = [...new Set(periods)];
+  const blockPx = Math.max(8, Math.round(16 * cfg.canvasScale));
+  const convL = lumaPlane(conv, capW, capH);
+  Object.assign(m, frameStructure(convL, capW, capH, probeS, uniqPeriods, blockPx));
+  if (PLAN.startsWith("restirgi")) {
+    Object.assign(m, frameChromaStructure(conv, capW, capH, probeS, uniqPeriods, blockPx));
+  }
+
+  // --- ARTIFACT-ISOLATING structure (restirgi plans) -------------------------
+  // Absolute frame structure is dominated by the SCENE — walls, silhouettes,
+  // shading gradients — which the plane detrend only partly removes, so a
+  // whole-frame average reads 1.02x for a config with visible confetti and a
+  // single window reads whatever its one realization happens to be. Neither
+  // ranks configs. The DIFFERENCE against the restirGI-off frame at the same
+  // denoise setting has no scene content in it at all: this renderer is
+  // deterministic, so on-minus-off is exactly what swapping the inline GI path
+  // for the ReSTIR one did to the image. Its detrended block/grid structure is
+  // the artifact amplitude, full stop — and it is the same field the amplified
+  // difference crops show the eye.
+  if (PLAN.startsWith("restirgi")) {
+    const key = `dn${cfg.denoise ? cfg.denoiseIterations : 0}`;
+    const cr = new Float32Array(convL.length);
+    const cb = new Float32Array(convL.length);
+    for (let i = 0, j = 0; i < convL.length; i++, j += 4) {
+      const d = Math.max(convL[i], 1e-3);
+      cr[i] = (conv[j] / d) * 100;
+      cb[i] = (conv[j + 2] / d) * 100;
+    }
+    if (!cfg.restirGI) {
+      offRefs.set(key, { L: convL, cr, cb });
+    } else if (offRefs.has(key)) {
+      const ref = offRefs.get(key);
+      const dL = new Float32Array(convL.length);
+      const dcr = new Float32Array(convL.length);
+      const dcb = new Float32Array(convL.length);
+      let mad = 0;
+      for (let i = 0; i < dL.length; i++) {
+        dL[i] = convL[i] - ref.L[i];
+        dcr[i] = cr[i] - ref.cr[i];
+        dcb[i] = cb[i] - ref.cb[i];
+        mad += Math.abs(dL[i]);
+      }
+      m.diffMeanAbs = mad / dL.length;
+      const ds = frameStructure(dL, capW, capH, probeS, uniqPeriods, blockPx, 12, ref.L);
+      for (const [k, v] of Object.entries(ds)) {
+        m[k.startsWith("struct") ? "diff" + k.slice(6) : "d" + k] = v;
+      }
+      // ...and the same on the two CHROMATICITY planes. This is THE number: a
+      // difference field carries no scene content, and chromaticity is the axis
+      // the artifact lives on, so this is the artifact's amplitude with nothing
+      // else mixed in.
+      const a = frameStructure(dcr, capW, capH, probeS, uniqPeriods, blockPx, 12, ref.L);
+      const b = frameStructure(dcb, capW, capH, probeS, uniqPeriods, blockPx, 12, ref.L);
+      m.dChromaBlock = (a.structBlock + b.structBlock) / 2;
+      m.dChromaHp = (a.structHp + b.structHp) / 2;
+      let peak = 0, peakP = 0;
+      for (const p of uniqPeriods) {
+        const v = ((a[`sgrid${p}`] ?? 0) + (b[`sgrid${p}`] ?? 0)) / 2;
+        m[`dcgrid${p}`] = v;
+        if (v > peak) { peak = v; peakP = p; }
+      }
+      m.dChromaGridPeak = peak;
+      m.dChromaGridPeakPeriod = peakP;
+    }
+  }
 
   // --- still temporal noise: 30 frames, patch read in the render's own task ---
   const noiseFrames = 30;
@@ -798,6 +1161,38 @@ async function measure(label, cfg, opts = {}) {
   m.timingNoisy = m.timingSpread > 0.10;
 
   const files = { still: stillFile };
+
+  // --- RAW ReSTIR-GI probe: the resolve as the denoiser receives it ----------
+  // Runs on the converged, parked camera (the still-noise loop and the timing
+  // blocks above added ~190 more static frames, so the reservoir is as settled
+  // as it will ever get). Reports the resolve's own structure, its colour
+  // spread, and how much of the pattern survives 8 frames — the direct test of
+  // "quasi-static blotch the temporal filters cannot average".
+  if (PLAN.startsWith("restirgi") && cfg.restirGI) {
+    rt.render(scene, camera);
+    const g0 = readGiRaw();
+    if (g0) {
+      const frac = sceneDef.patches.probe ?? sceneDef.patches.flat;
+      const winSize = Math.max(32, Math.round(128 * cfg.renderScale));
+      const a = giWindow(g0, frac, winSize);
+      Object.assign(m, giStats(a));
+      const aBytes = giToBytes(g0, 3);
+      files.giRaw = await savePng(nameFor(label, "giraw", cfg), aBytes, g0.w, g0.h);
+      for (let k = 0; k < 8; k++) rt.render(scene, camera);
+      const g1 = readGiRaw();
+      if (g1) {
+        const b = giWindow(g1, frac, winSize);
+        m.giTemporalCorr = corr(detrend(a.lum, a.size), detrend(b.lum, b.size));
+        m.giChromaCorr = corr(detrend(a.cr, a.size), detrend(b.cr, b.size));
+        const mu = mean(a.lum);
+        let d = 0;
+        for (let i = 0; i < a.lum.length; i++) d += Math.abs(a.lum[i] - b.lum[i]);
+        m.giFrameDelta = mu > 1e-7 ? d / a.lum.length / mu : 0;
+      }
+    } else {
+      m.giProbeFailed = true;
+    }
+  }
 
   // --- moving ---------------------------------------------------------------
   if (doMoving) {
@@ -1020,6 +1415,168 @@ function ghostConfigs() {
 }
 
 /**
+ * The ReSTIR GI ARTIFACT STUDY (plan=restirgi). The main campaign found restirGI
+ * raises coarse structure through the à-trous filter (Cornell gridPeak 0.66 ->
+ * 1.37) at flat rmse, and on-device review vetoed the look. Four hypotheses,
+ * one arm each, all against the same `off`/`on` pair:
+ *
+ *  (a) RESERVOIR CORRELATION — a long M-cap freezes each pixel's selected sample
+ *      for ~M frames, so the estimate is quasi-static rather than averaged, and
+ *      spatial reuse spreads one pixel's frozen sample over a neighbourhood.
+ *      Arm: mcap-* and taps-*.
+ *  (b) STATIC TAP PATTERN — if the spatial offsets do not decorrelate per frame,
+ *      the correlation is structured at the tap radius. Arm: taps-* read against
+ *      the raw-GI grid probe (the tap radius is 4..20 lighting texels).
+ *  (c) RESOLVE EMA / CONFIDENCE CLAMP locking the blotch in. Arm: ema-*, conf-*.
+ *  (d) À-TROUS AMPLIFICATION — the filter treats the correlated add as
+ *      geometry-consistent signal and spreads it at wide steps. Arm: dn*-on vs
+ *      dn*-off (the on/off gap as a function of pass count) and dn2-on-damp.
+ *
+ * Every restirGI arm also reports the RAW resolve (readGiRaw), so "the resolve
+ * is structured" and "the denoiser amplifies it" are separately observable.
+ */
+function restirGiConfigs() {
+  const out = [];
+  const add = (label, over) => out.push({ label, cfg: { ...BASELINE, ...over } });
+  // Pinned to the PRE-FIX defaults, not to BASELINE: this ladder is the record
+  // of what the artifact was, so it must keep rendering the code that had it
+  // even though the library's defaults have since moved.
+  const on = (over) => ({
+    restirGI: true, restirGIChromaMean: false, restirGIVisFallback: false,
+    restirGIResolveAlpha: 0.15, restirGISpatialTaps: 1, restirGIMCap: 20,
+    restirGIValidate: 8, ...over,
+  });
+  add("off", {});
+  add("on", on({}));
+  // (a) temporal M-cap ladder, at the shipped 1 spatial tap.
+  for (const v of [4, 8, 12, 20]) add(`mcap-${v}`, on({ restirGIMCap: v }));
+  // (a)+(b) spatial taps at the shipped M-cap.
+  for (const v of [0, 2]) add(`taps-${v}`, on({ restirGISpatialTaps: v }));
+  add("taps0-mcap4", on({ restirGISpatialTaps: 0, restirGIMCap: 4 }));
+  // (c) resolve EMA and the confidence-weighted clamp.
+  for (const v of [0.05, 0.35, 1.0]) add(`ema-${String(v).replace(".", "")}`, on({ restirGIResolveAlpha: v }));
+  add("conf-1", on({ restirGIConfLow: 1.0 }));
+  // validation: is the 1-in-8 kill-only pass injecting its own pattern?
+  add("val-0", on({ restirGIValidate: 0 }));
+  // (d) à-trous pass count, both sides, plus the wide-pass damping option.
+  for (const it of [1, 2, 3]) {
+    add(`dn${it}-off`, { denoiseIterations: it });
+    add(`dn${it}-on`, on({ denoiseIterations: it }));
+  }
+  add("dn2-on-damp", on({ denoiseWideDamp: 1 }));
+  return out;
+}
+
+/**
+ * Round 2 of the artifact study (plan=restirgi-fix): the FIX ladder. Round 1
+ * (plan=restirgi) found the artifact in the resolve itself, not in the denoiser
+ * — the resolve's luminance is a running mean but its COLOUR was one selected
+ * sample's chromaticity, 37% spread per pixel, red/green confetti in the raw
+ * probe. This ladder A/Bs the two mechanisms that answer it, then tunes the
+ * knobs round 1 flagged (the mis-specified resolve EMA, the M-cap's averaging
+ * window, and the cost of the validation pass) on top of them.
+ *
+ * `pre` is the PRE-FIX default (both mechanisms off) — the arm every "before"
+ * number in the report comes from, measured on this same commit so the
+ * comparison carries no other differences.
+ */
+function restirGiFixConfigs() {
+  const out = [];
+  const add = (label, over) => out.push({ label, cfg: { ...BASELINE, ...over } });
+  // The pre-fix defaults in full — the library's have since moved to the fix.
+  const OLD = {
+    restirGIChromaMean: false, restirGIVisFallback: false,
+    restirGIResolveAlpha: 0.15, restirGISpatialTaps: 1, restirGIMCap: 20,
+  };
+  // Every arm starts from the PRE-FIX settings and turns things ON, so each row
+  // isolates what it names. Pinning them here (rather than inheriting BASELINE)
+  // keeps this ladder reproducing its recorded numbers now that the library's
+  // defaults have moved to the fix.
+  const on = (over) => ({ restirGI: true, ...OLD, restirGISpatialTaps: 1, ...over });
+  add("off", {});
+  add("pre", on({}));
+  // Each mechanism alone, then together.
+  add("chroma", on({ restirGIChromaMean: true }));
+  add("vis", on({ restirGIVisFallback: true }));
+  add("both", on({ restirGIChromaMean: true, restirGIVisFallback: true }));
+  const fixed = (over) => on({ restirGIChromaMean: true, restirGIVisFallback: true, ...over });
+  // The resolve EMA on top of the fix: round 1 measured alpha 1 (EMA off) as the
+  // single best structure knob, because the EMA's partner is the PREVIOUS
+  // frame's TEMPORAL-ONLY resolve — a noisier estimator than the merged one it
+  // is smoothing, weighted 0.85.
+  for (const v of [0.35, 1.0]) add(`both-ema${String(v).replace(".", "")}`, fixed({ restirGIResolveAlpha: v }));
+  // M-cap = the resolve's averaging window: luminance noise falls as
+  // 1/sqrt(2M+1), and staleness is what the validation pass is for.
+  for (const v of [32, 48]) add(`both-ema1-mcap${v}`, fixed({ restirGIResolveAlpha: 1.0, restirGIMCap: v }));
+  // Validation interval: round 1 measured the 1-in-8 pass at ~30% of the frame
+  // (8 NEE samples on the validating pixels) AND as a noise source, because each
+  // kill resets a pixel to M=0 and it takes M frames to re-converge.
+  for (const v of [16, 32]) add(`both-ema1-val${v}`, fixed({ restirGIResolveAlpha: 1.0, restirGIValidate: v }));
+  const cand = { restirGIResolveAlpha: 1.0, restirGIMCap: 48, restirGIValidate: 16 };
+  add("cand", fixed(cand));
+  add("cand-taps0", fixed({ ...cand, restirGISpatialTaps: 0 }));
+  add("cand-taps2", fixed({ ...cand, restirGISpatialTaps: 2 }));
+  // (d) re-checked on the fixed resolve: does the à-trous gap close at every
+  // pass count, or only at the shipped 2?
+  for (const it of [1, 3]) {
+    add(`dn${it}-off`, { denoiseIterations: it });
+    add(`dn${it}-cand`, fixed({ ...cand, denoiseIterations: it }));
+  }
+  return out;
+}
+
+/**
+ * Round 3 (plan=restirgi-tune): pick the shipped defaults. Round 2 established
+ * the two mechanisms; this tunes the three numbers around them, and in
+ * particular re-asks the spatial-tap question, because the fix INVERTS its
+ * answer. Before, an adopted neighbour swapped in a different sample's colour,
+ * so each tap was a variance SOURCE (round 1: taps 2 was the worst arm). Now
+ * every tap is folded into the chromaticity mean by its own RIS weight, so a
+ * tap is extra averaged evidence and taps are a variance SINK.
+ */
+function restirGiTuneConfigs() {
+  const out = [];
+  const add = (label, over) => out.push({ label, cfg: { ...BASELINE, ...over } });
+  // The pre-fix defaults in full — the library's have since moved to the fix.
+  const OLD = {
+    restirGIChromaMean: false, restirGIVisFallback: false,
+    restirGIResolveAlpha: 0.15, restirGISpatialTaps: 1, restirGIMCap: 20,
+  };
+  const C = {
+    restirGI: true, restirGIChromaMean: true, restirGIVisFallback: true,
+    restirGIResolveAlpha: 1.0, restirGIMCap: 48, restirGIValidate: 16,
+  };
+  add("off", {});
+  add("pre", { restirGI: true, ...OLD });
+  for (const t of [1, 2, 3, 4]) add(`t${t}`, { ...C, restirGISpatialTaps: t });
+  for (const v of [20, 32, 64]) add(`t2-mcap${v}`, { ...C, restirGISpatialTaps: 2, restirGIMCap: v });
+  for (const v of [8, 32]) add(`t2-val${v}`, { ...C, restirGISpatialTaps: 2, restirGIValidate: v });
+  add("t2-ema035", { ...C, restirGISpatialTaps: 2, restirGIResolveAlpha: 0.35 });
+  add("t2-conf1", { ...C, restirGISpatialTaps: 2, restirGIConfLow: 1.0 });
+  return out;
+}
+
+/**
+ * The VERDICT arm (plan=restirgi-move): the small config set the fix bar is
+ * judged on — restirGI off vs on — with the moving tests enabled, so in-motion
+ * error and churn are on the record alongside the still numbers. Run this on the
+ * SAME commit before and after the fix; the pair of results files is the
+ * before/after table.
+ */
+function restirGiVerdictConfigs() {
+  const PRE = {
+    restirGIChromaMean: false, restirGIVisFallback: false,
+    restirGIResolveAlpha: 0.15, restirGISpatialTaps: 1,
+  };
+  return [
+    { label: "off", cfg: { ...BASELINE }, moving: true },
+    { label: "pre", cfg: { ...BASELINE, restirGI: true, ...PRE }, moving: true },
+    { label: "new", cfg: { ...BASELINE, restirGI: true }, moving: true },
+    { label: "new-mcap32", cfg: { ...BASELINE, restirGI: true, restirGIMCap: 32 }, moving: true },
+  ];
+}
+
+/**
  * Ladder validation: the library's own quality ladder (_qualityFor) against
  * cost-matched rungs built from this campaign's Pareto frontier. Everything else
  * in the sweep varies ONE axis; these are the multi-axis combinations the auto
@@ -1153,6 +1710,10 @@ async function run() {
   if (PLAN === "denoise") list = denoiseStudyConfigs();
   else if (PLAN === "ghost") list = ghostConfigs();
   else if (PLAN === "ladder") list = ladderConfigs();
+  else if (PLAN === "restirgi") list = restirGiConfigs();
+  else if (PLAN === "restirgi-fix") list = restirGiFixConfigs();
+  else if (PLAN === "restirgi-tune") list = restirGiTuneConfigs();
+  else if (PLAN === "restirgi-move") list = restirGiVerdictConfigs();
   else if (PLAN === "cost") list = featureCostConfigs();
   else if (PLAN === "smoke") {
     // End-to-end validation of every code path (still + moving + ghost + PNG)
@@ -1166,18 +1727,24 @@ async function run() {
 
   log(`running ${list.length} configs…`);
   log("");
-  log("label                 ms/frame   fps   rmse320  rmseFull  still(c)  blotch  moveErr");
+  const giPlan = PLAN.startsWith("restirgi");
+  log(giPlan
+    ? "label                 ms/frame   fps   gridPk   blotch  still(c)  rmse320  giBlot  giChr  giCorr"
+    : "label                 ms/frame   fps   rmse320  rmseFull  still(c)  blotch  moveErr");
   for (let i = 0; i < list.length; i++) {
     const item = list[i];
     try {
       const r = await measure(item.label, item.cfg, { moving: item.moving, ghostStrafe: item.ghostStrafe });
       results.configs.push(r);
       const m = r.metrics;
-      log(
-        `${item.label.padEnd(20)} ${m.frameMs.toFixed(2).padStart(8)} ${m.fps.toFixed(1).padStart(6)} ` +
-        `${m.rmse320.toFixed(2).padStart(8)} ${m.rmseFull.toFixed(2).padStart(9)} ` +
-        `${m.stillNoiseCenter.toFixed(3).padStart(9)} ${m.blotch.toFixed(2).padStart(7)} ` +
-        `${(m.moveErr_orbit == null ? "-" : m.moveErr_orbit.toFixed(2)).padStart(8)}`
+      const n = (v, d = 2, w = 8) => (v == null ? "-" : v.toFixed(d)).padStart(w);
+      log(giPlan
+        ? `${item.label.padEnd(20)} ${n(m.frameMs, 2)} ${n(m.fps, 1, 6)} ` +
+          `${n(m.gridPeak, 3)} ${n(m.probeBlotch, 2, 8)} ${n(m.stillNoiseCenter, 3, 9)} ` +
+          `${n(m.rmse320, 2)} ${n(m.giBlotch, 2, 7)} ${n(m.giChroma, 3, 6)} ${n(m.giTemporalCorr, 2, 7)}`
+        : `${item.label.padEnd(20)} ${n(m.frameMs, 2)} ${n(m.fps, 1, 6)} ` +
+          `${n(m.rmse320, 2)} ${n(m.rmseFull, 2, 9)} ` +
+          `${n(m.stillNoiseCenter, 3, 9)} ${n(m.blotch, 2, 7)} ${n(m.moveErr_orbit, 2)}`
       );
     } catch (err) {
       console.error(err);
