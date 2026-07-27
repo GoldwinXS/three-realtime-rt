@@ -793,10 +793,16 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * reweighted, with a final visibility ray). Clamped to 0..4; `0` reproduces
      * the v1 temporal-only behaviour. Default 2.
      */
-    // Default 1 (not 2): each reconnection tap adds its own estimator noise;
-    // one tap keeps most of the disocclusion win at half the artifact surface
-    // (tuned on-device — raise it for scenes with heavy camera motion).
-    this.restirGISpatialTaps = options.restirGISpatialTaps ?? 1;
+    // Default 2. It was lowered to 1 because "each reconnection tap adds its own
+    // estimator noise" — true of the old resolve, where an adopted neighbour
+    // SWAPPED IN a different sample's colour, so every tap was a fresh chance to
+    // draw the wrong one. restirGIChromaMean inverts that: a tap is now folded
+    // into the resolve's chromaticity mean by its own RIS weight, so it is extra
+    // averaged evidence, and the resolve gets cleaner with every tap. Measured on
+    // Cornell (2026-07-27), raw-resolve chromaticity spread by tap count:
+    // 0.089 / 0.062 / 0.051 / 0.045 for 1 / 2 / 3 / 4 taps, at 8.9 / 9.0 / 9.1 /
+    // 9.2 ms. 2 is where the curve flattens.
+    this.restirGISpatialTaps = options.restirGISpatialTaps ?? 2;
     /**
      * EXPERIMENTAL — ReSTIR GI reservoir-sample validation period. Every frame a
      * rotating 1-in-N subset of pixels (decorrelated by a per-pixel hash) re-aims
@@ -810,6 +816,47 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * (byte-identical to before the feature); default 8.
      */
     this.restirGIValidate = options.restirGIValidate ?? 8;
+    /**
+     * EXPERIMENTAL — weight of THIS frame's resolve in the resolve EMA; 1 = no
+     * EMA, which is now the default.
+     *
+     * The EMA was added to damp near-emitter selection churn, but its partner is
+     * a reconstruction of the PREVIOUS frame's TEMPORAL-ONLY resolve — a noisier
+     * estimator than the spatially-merged one it is smoothing — carried at 0.85
+     * weight, so it added variance instead of removing it. Measured on Cornell
+     * (2026-07-27) at otherwise-identical settings, raw-resolve high-pass noise
+     * was 50% of the mean at alpha 0.35 against 26% at alpha 1, and the on-minus-
+     * off chroma artifact 0.68x against 0.60x of the pre-fix baseline, with still
+     * noise unchanged (0.178 vs 0.180). What the EMA was for — the colour of the
+     * selected sample jumping frame to frame — is what restirGIChromaMean now
+     * removes at the source, so the smoothing has nothing left to do.
+     */
+    this.restirGIResolveAlpha = options.restirGIResolveAlpha ?? 1.0;
+    /**
+     * EXPERIMENTAL — firefly-clamp multiplier at zero reservoir confidence;
+     * relaxes to 1 as M reaches the cap.
+     */
+    this.restirGIConfLow = options.restirGIConfLow ?? 0.3;
+    /**
+     * EXPERIMENTAL — Rao-Blackwellized ReSTIR GI resolve colour. The resolve's
+     * luminance is algebraically a running mean over the reservoir's whole
+     * history, but its COLOUR was the chromaticity of one stochastically
+     * selected sample — measured at 37% per-pixel spread, which the à-trous
+     * filter turns into coarse coloured blotches (and which rmse cannot see,
+     * because the mean colour is right). With this on, the resolve uses the
+     * RIS-weighted MEAN chromaticity instead: same mean, far lower variance, no
+     * extra ray, sampler or storage. Default ON; `false` restores the old path.
+     */
+    this.restirGIChromaMean = options.restirGIChromaMean ?? true;
+    /**
+     * EXPERIMENTAL — ReSTIR GI final-visibility policy. Old behaviour tested the
+     * selected sample whatever its origin and zeroed the whole pixel on a hit.
+     * With this on, only a SPATIALLY adopted sample is tested (a temporal one is
+     * visible by construction), and a rejection falls back to this pixel's
+     * temporal-only estimate instead of to black. Default ON; `false` restores
+     * the old path.
+     */
+    this.restirGIVisFallback = options.restirGIVisFallback ?? true;
     this.giReservoirPass = new GIReservoirPass(this._scaledW, this._scaledH);
     this._giMissWarned = false;
 
@@ -1913,6 +1960,10 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
           mCap: this.restirGIMCap,
           spatialTaps: Math.max(0, Math.min(4, this.restirGISpatialTaps | 0)),
           validateInterval: Math.max(0, this.restirGIValidate | 0),
+          resolveAlpha: Math.min(1, Math.max(0.01, this.restirGIResolveAlpha)),
+          confLow: Math.min(1, Math.max(0, this.restirGIConfLow)),
+          chromaMean: this.restirGIChromaMean,
+          visFallback: this.restirGIVisFallback,
           emissiveCDF: this.emissiveImportance,
           envColor: this.envColor,
           envIntensity: this.envIntensity,

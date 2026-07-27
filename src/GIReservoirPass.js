@@ -82,6 +82,18 @@ uniform float uFireflyClamp;
 uniform float uMCap;        // temporal M-cap (staleness limit)
 uniform int uSpatialTaps;   // spatial reuse taps after the temporal merge (0 = v1)
 uniform int uValidateInterval; // reservoir-sample validation period (0 = off, e.g. 8)
+// Resolve-stage tuning, exposed so the artifact study can sweep them (see the
+// resolve block at the end of main()). Defaults reproduce the shipped values:
+//   uResolveAlpha 0.15  weight of THIS frame's resolve in the resolve EMA
+//   uConfLow      0.30  firefly-clamp multiplier at zero reservoir confidence
+uniform float uResolveAlpha;
+uniform float uConfLow;
+// RAO-BLACKWELLIZED RESOLVE COLOUR (default ON; false = the pre-fix path).
+// See the "resolve colour" derivation above the resolve block in main().
+uniform bool uChromaMean;
+// VISIBILITY POLICY (default ON; false = the pre-fix path). See the final-
+// visibility block in main().
+uniform bool uVisFallback;
 
 // Validation tuning (see the reservoir-sample-validation block in main()).
 // VAL_NEE_SAMPLES: NEE samples averaged when RE-SHADING the stored hit. A single
@@ -138,6 +150,16 @@ vec4 fetchBlueNoise() {
 // to every non-raw ShaderMaterial fragment shader, and GLSL treats a second
 // (vec3) body as a redefinition — the whole program fails to compile.
 float rtLum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// CHROMATICITY: a radiance divided by its own luminance, so rtLum(chromaOf(c))
+// is exactly 1 and a weighted mean of chromaticities is again a chromaticity.
+// This is the axis the resolve's noise actually lives on — see the resolve
+// derivation in main(). Zero-luminance samples carry zero RIS weight and never
+// reach the mean, so the fallback value is arbitrary.
+vec3 chromaOf(vec3 c) {
+  float l = rtLum(c);
+  return l > 1e-8 ? c / l : vec3(1.0);
+}
 
 // ---------- reservoir .w bit-packing: M (8 bit) + oct-normal (12+12 bit) ------
 // The RGBA32F reservoir-position attachment is at the pass's hard 16-sampler
@@ -498,6 +520,12 @@ void main() {
   vec3 selPos;
   vec3 selNormal;   // n_s of the selected sample (packed into .w)
   bool killStore = false;   // validation flags the STORED reservoir for reset
+  // RIS-weight-weighted sum of the candidates' CHROMATICITIES, accumulated
+  // beside wSum at every merge point (fresh candidate, temporal history,
+  // spatial taps). chromaAcc / wSum is the expectation of the chromaticity the
+  // stochastic selection below draws — the Rao-Blackwellized resolve colour.
+  vec3 chromaAcc = vec3(0.0);
+  bool selIsSpatial = false;   // did a SPATIAL tap win the selection?
 
   if (doValidate) {
     // On a validation pixel there is NO fresh exploration candidate this frame
@@ -555,6 +583,7 @@ void main() {
     selRad = rad;
     selPos = hitPos;
     selNormal = hitNormal;
+    chromaAcc = wFresh * chromaOf(rad);
   }
 
   // --- temporal reuse: merge the (possibly radiance-refreshed, or killed)
@@ -581,6 +610,10 @@ void main() {
     float w = pHatPrev * Wprev * Mc;
     wSum += w;
     M += Mc;
+    // radPrev already carries the RUNNING chromaticity (the store below writes
+    // it back), so this one term folds the whole history into the mean with
+    // exactly the weight the history has in wSum — no extra state, no sampler.
+    chromaAcc += w * chromaOf(radPrev);
     if (w > 0.0 && rand() * wSum < w) {
       selRad = radPrev;
       selPos = hitPrev;
@@ -610,6 +643,7 @@ void main() {
   // the denoiser. taps==0 leaves selRad/M/wSum untouched, so this is a no-op there.
   vec3 selRadT = selRad; vec3 selPosT = selPos; vec3 selNormalT = selNormal;
   float wSumT = wSum; float MT = M;
+  vec3 chromaAccT = chromaAcc;
 
   // --- spatial reuse (v2): fused spatiotemporal, streamed RIS over K taps of the
   // PREVIOUS frame's reservoir textures around the reprojected UV. Each adopted
@@ -667,13 +701,24 @@ void main() {
       float w = pHatQ * J * Wr * Mc;
       wSum += w;
       M += Mc;
+      chromaAcc += w * chromaOf(Ls);
       if (w > 0.0 && rand() * wSum < w) {
         selRad = Ls;
         selPos = xS;
         selNormal = nS;
+        selIsSpatial = true;
       }
     }
   }
+
+  // --- the TEMPORAL-only resolve. It is needed twice: as the STORE's W (below,
+  // exactly as before) and as the visibility fallback (right after), so it is
+  // formed here, before the merged one. Nothing about it changed. ---
+  vec3 sdT = selPosT - P;
+  float slT = length(sdT);
+  float selCosT = slT > 1e-5 ? max(dot(N, sdT / slT), 0.0) : 0.0;
+  float pHatSelT = rtLum(selRadT) * selCosT;
+  float WT = (MT > 0.0 && pHatSelT > 0.0) ? wSumT / (MT * pHatSelT) : 0.0;
 
   // --- finalize OUTPUT: recompute p_hat(selected) at this surface from the
   // SPATIALLY-merged reservoir, form W, resolve the GI for this frame. ---
@@ -683,22 +728,38 @@ void main() {
   float pHatSel = rtLum(selRad) * selCos;
   float W = (M > 0.0 && pHatSel > 0.0) ? wSum / (M * pHatSel) : 0.0;
 
-  // --- final visibility (mandatory): ONE any-hit occlusion ray from x_q toward
-  // x_s. If the reconnection point is blocked, drop THIS FRAME's OUTPUT estimate
-  // (Wout=0) — this is what stops reused samples leaking light through walls.
-  // occluded() already trims 2*eps off maxDist to avoid self-intersecting the far
-  // surface. The STORED reservoir keeps the un-occluded W: the sample is real and
-  // may be visible to a neighbour, so each pixel re-tests visibility from its own
-  // position. Storing the zeroed W instead would bleed energy out of the reservoir
-  // over frames (spatial samples fail visibility more often than temporal ones,
-  // and the zero would propagate to neighbours), darkening the GI. ---
-  // Gated on uSpatialTaps > 0: the temporal-only path reuses at the SAME surface
-  // point, whose sample is visible by construction, so v1 (taps==0) needs no
-  // occlusion ray and stays byte-identical. Spatial reconnections to a neighbour's
-  // hit point are the ones that can pierce a wall, so they get the visibility test.
+  // --- final visibility: ONE any-hit occlusion ray from x_q toward x_s. If the
+  // reconnection point is blocked the reused sample would leak light through a
+  // wall, so it must not be shown. occluded() already trims 2*eps off maxDist to
+  // avoid self-intersecting the far surface. The STORED reservoir keeps the
+  // un-occluded W: the sample is real and may be visible to a neighbour, so each
+  // pixel re-tests visibility from its own position. Storing the zeroed W instead
+  // would bleed energy out of the reservoir over frames (spatial samples fail
+  // visibility more often than temporal ones, and the zero would propagate to
+  // neighbours), darkening the GI. ---
+  // Gated on uSpatialTaps > 0: taps==0 has no reconnection to test and stays
+  // byte-identical to v1.
+  //
+  // uVisFallback (default ON) fixes two things the original test got wrong:
+  //   1. It tested the selected sample WHATEVER its origin. A TEMPORAL sample is
+  //      visible by construction — same surface point, the ray that found it
+  //      started here — so testing it can only produce FALSE rejections from ray
+  //      epsilon at the reconnection point. Only a spatial adoption can pierce a
+  //      wall, so only that is tested now; roughly half the pixels stop casting
+  //      the ray at all, which is also where the fallback pays for itself.
+  //   2. On rejection it zeroed the WHOLE pixel's estimate for the frame. That
+  //      threw away the pixel's own ~M-frame temporal accumulation over one
+  //      neighbour's failed reconnection, and since occlusion is geometry-
+  //      correlated the zeros arrive in patches — a structured black-speckle
+  //      source right where contact shadows are. Falling back to this pixel's
+  //      TEMPORAL-only estimate rejects exactly the tainted term and keeps the
+  //      untainted one; it is what taps==0 would have shown at that pixel.
+  bool visFallback = false;
   float Wout = W;
-  if (uSpatialTaps > 0 && Wout > 0.0 && sl > 1e-5) {
-    if (occluded(P + N * uEps, sd / sl, sl)) Wout = 0.0;
+  bool testVis = uSpatialTaps > 0 && Wout > 0.0 && sl > 1e-5 &&
+    (!uVisFallback || selIsSpatial);
+  if (testVis && occluded(P + N * uEps, sd / sl, sl)) {
+    if (uVisFallback) visFallback = true; else Wout = 0.0;
   }
   // W cap: W ~ pi/cos for the cosine source pdf, so values beyond ~32 mean the
   // recomputed p_hat(selected) collapsed this frame (grazing cos after a camera
@@ -710,7 +771,40 @@ void main() {
   // GI beyond that — the standard ReSTIR trade.
   Wout = min(Wout, 32.0);
 
-  vec3 gi = selRad * (selCos / PI) * Wout;   // demodulated indirect irradiance
+  vec3 gi = visFallback
+    ? selRadT * (selCosT / PI) * min(WT, 32.0)
+    : selRad * (selCos / PI) * Wout;   // demodulated indirect irradiance
+
+  // ================= RESOLVE COLOUR (Rao-Blackwellization) =================
+  // Substituting W back into the line above collapses it exactly:
+  //     gi = selRad * selCos/PI * wSum/(M * rtLum(selRad) * selCos)
+  //        = chromaOf(selRad) * wSum / (PI * M)
+  // — the selCos cancels and the luminance cancels. So the resolve's LUMINANCE
+  // is wSum/(PI*M), a running mean over the reservoir's whole M-frame history,
+  // while its COLOUR is the chromaticity of ONE stochastically selected sample.
+  // The two halves of the estimate have wildly different variance, and the
+  // colour half is the artifact: measured at 37% chromaticity spread per pixel
+  // on a converged Cornell box, it is a red/green confetti field that the
+  // à-trous filter (whose edge-stopping weights are LUMINANCE-based, so it
+  // cannot see the error to stop on it) averages into coarse coloured blotches.
+  // rmse is blind to it — the MEAN colour is correct, which is the whole point.
+  //
+  // The fix is to replace the drawn chromaticity with its expectation under the
+  // same RIS weights, chromaAcc/wSum, which is textbook Rao-Blackwellization:
+  // identical mean, strictly lower variance, and here it removes essentially all
+  // of the colour variance because the weights are exactly the selection
+  // probabilities. It costs one vec3 multiply-add per merge point, no extra
+  // storage, no extra sampler and no extra ray. rtLum(chromaOf(x)) == 1 and
+  // rtLum is linear, so the weighted mean is itself a unit-luminance
+  // chromaticity: rescaling by rtLum(gi) below preserves the resolved LUMINANCE
+  // bit for bit, which is why every luminance-derived quantity in this pass
+  // (p_hat, W, the merge weights, the validation ratio test) is untouched.
+  if (uChromaMean) {
+    float wsRB = visFallback ? wSumT : wSum;
+    vec3 accRB = visFallback ? chromaAccT : chromaAcc;
+    float giL = rtLum(gi);
+    if (wsRB > 0.0 && giL > 0.0) gi = (accRB / wsRB) * giL;
+  }
   // Confidence-weighted firefly clamp: a young reservoir (M small — fresh
   // pixels under camera motion, where the resolve EMA has no partner yet) is
   // one raw sample, and at the full clamp it reads as motion sparkle. Tighten
@@ -718,23 +812,32 @@ void main() {
   // confidence grows; converged pixels are untouched. Trades a few frames of
   // slightly dim GI on freshly revealed surfaces for a steady image in motion.
   float conf = clamp(M / uMCap, 0.0, 1.0);
-  float cap = uFireflyClamp * mix(0.3, 1.0, conf);
+  float cap = uFireflyClamp * mix(uConfLow, 1.0, conf);
   float gil = rtLum(gi);
   if (gil > cap) gi *= cap / gil;
   if (any(isnan(gi)) || any(isinf(gi))) gi = vec3(0.0);
   // Resolve EMA (see the emaPrevGi note above): ~5-frame effective average.
   // Cuts selection-churn flicker near emitters ~5x for ~5 frames of lag.
-  if (emaPrevOk) gi = mix(emaPrevGi, gi, 0.15);
+  if (emaPrevOk) gi = mix(emaPrevGi, gi, uResolveAlpha);
 
   // --- STORE the TEMPORAL-only reservoir as history (see snapshot note above).
-  // Resolve its own W from the temporal-merged wSum/M so the stored W is valid for
-  // next frame's temporal AND spatial reuse. For taps==0 this is exactly the v1
-  // reservoir. A NaN sample is scrubbed so it can't poison the history. ---
-  vec3 sdT = selPosT - P;
-  float slT = length(sdT);
-  float selCosT = slT > 1e-5 ? max(dot(N, sdT / slT), 0.0) : 0.0;
-  float pHatSelT = rtLum(selRadT) * selCosT;
-  float WT = (MT > 0.0 && pHatSelT > 0.0) ? wSumT / (MT * pHatSelT) : 0.0;
+  // Its W (WT) was resolved above, from the temporal-merged wSum/M, so the stored
+  // W is valid for next frame's temporal AND spatial reuse. For taps==0 this is
+  // exactly the v1 reservoir. A NaN sample is scrubbed so it can't poison the
+  // history. ---
+  // Carry the RUNNING chromaticity in the stored radiance. Only rtLum(selRadT)
+  // is ever read back out of this field — by pHatPrev in the temporal merge, by
+  // pHatQ in a neighbour's spatial tap, and by the validation ratio test — and
+  // the rescale below preserves that luminance exactly, so the stored reservoir
+  // is numerically the same reservoir it was before. What changes is that the
+  // colour a neighbour or a future frame inherits is the accumulated mean rather
+  // than one draw, which is what makes the Rao-Blackwellization recursive: the
+  // single "chromaAcc += w * chromaOf(radPrev)" term above folds in the entire
+  // history at exactly the weight the history carries in wSum.
+  if (uChromaMean && wSumT > 0.0) {
+    float lT = rtLum(selRadT);
+    if (lT > 0.0) selRadT = (chromaAccT / wSumT) * lT;
+  }
   if (any(isnan(selRadT)) || any(isinf(selRadT))) { selRadT = vec3(0.0); WT = 0.0; }
 
   // Validation store policy. The DISPLAYED gi above always used the merged history
@@ -833,6 +936,10 @@ export class GIReservoirPass {
         uMCap: { value: 20 },
         uSpatialTaps: { value: 2 },
         uValidateInterval: { value: 8 },
+        uResolveAlpha: { value: 0.15 },
+        uConfLow: { value: 0.3 },
+        uChromaMean: { value: true },
+        uVisFallback: { value: true },
         uEnvColor: { value: new THREE.Color(0.03, 0.04, 0.06) },
         uEnvIntensity: { value: 1.0 },
         uSkyEnabled: { value: false },
@@ -925,6 +1032,10 @@ export class GIReservoirPass {
     u.uMCap.value = params.mCap;
     u.uSpatialTaps.value = params.spatialTaps;
     u.uValidateInterval.value = params.validateInterval;
+    u.uResolveAlpha.value = params.resolveAlpha ?? 0.15;
+    u.uConfLow.value = params.confLow ?? 0.3;
+    u.uChromaMean.value = params.chromaMean !== false;
+    u.uVisFallback.value = params.visFallback !== false;
     u.uEmissiveCDF.value = params.emissiveCDF;
     u.uEnvColor.value.copy(params.envColor);
     u.uEnvIntensity.value = params.envIntensity;
