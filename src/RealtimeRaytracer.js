@@ -1458,17 +1458,15 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
    *
    *   giHalfRate on   -9.6% cornell / -19.1% museum / -21.9% tokyo frame time,
    *                   at rmse320 -0.004 / -0.09 / +0.30 (i.e. a wash)
-   *   restirGI on     -14.2% / -7.9% / -27.0%, at rmse320 +0.41 / -0.09 / -0.12
-   *                   — a SPEED feature on real scenes despite the experimental
-   *                   label, because it replaces the lighting pass's inline GI
-   *                   trace, and the saving scales with GI ray cost
    *   restirMCap 16   ~0.3 ms, better rmse/ghosting/in-motion error in both
    *                   measured scenes (now the library default; this only fires
    *                   for an app that raised it)
    *
-   * restirGI is paired with a denoise cap of 3: it is resolved AT the à-trous
-   * stage, so its coarse structure is what the wide passes smear, and the
-   * campaign's own replacement ladder never ran it past 3 passes.
+   * restirGI was measured as a third free win (-14.2%/-7.9%/-27.0% frame time
+   * at flat rmse) but is EXCLUDED from the governor: rmse is blind to the
+   * coarse structured artifact its own gridEnergy metric flagged (0.66->1.37),
+   * and on-device review vetoed the look (gallery scenes especially,
+   * 2026-07-27). Manual option only.
    *
    * Taken as ONE step (they are independent of each other and of resolution) and
    * released as one on the way back up, so the governor's state is either "free
@@ -1486,15 +1484,11 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       this.giHalfRate = true;
       took = true;
     }
-    if (this.gi && this.denoise && this.denoiseIterations > 0 && !this.restirGI) {
-      prev.restirGI = false;
-      this.restirGI = true;
-      took = true;
-      if (this.denoiseIterations > RealtimeRaytracer.GOVERNOR_MAX_DENOISE) {
-        prev.denoiseIterations = this.denoiseIterations;
-        this.denoiseIterations = RealtimeRaytracer.GOVERNOR_MAX_DENOISE;
-      }
-    }
+    // restirGI is deliberately NOT a governor free win. The campaign's rmse
+    // said "free", but its own gridEnergy caveat flagged the raised coarse
+    // structure, and on-device review (2026-07-27, gallery scenes especially)
+    // vetoed the look. It stays a manual option; the governor never enables
+    // a feature the user has to know to distrust.
     if (this.restirMCap > 16) {
       prev.restirMCap = this.restirMCap;
       this.restirMCap = 16;

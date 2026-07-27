@@ -327,7 +327,8 @@ export function buildPanel({
   rSec.append(rtRow.row);
   // --- auto quality, and the two rows it OWNS ------------------------------
   // The governor writes renderScale, the canvas scale, denoiseIterations,
-  // stochasticLights and (when it spends its free wins) giHalfRate / restirGI.
+  // stochasticLights and (when it spends its free wins) giHalfRate. restirGI
+  // is user-vetoed from the free wins (structured artifacts, gallery scenes).
   // Every one of those has a control here, so every one of them is kept in sync
   // below and badged "auto" while the governor holds the wheel. Touching one of
   // its rows by hand switches auto quality OFF, visibly — one obvious
@@ -337,7 +338,7 @@ export function buildPanel({
   const autoNote = el("div", "note");
   autoNote.textContent =
     "the AUTO rows are the governor's. It spends its free wins first (half-rate " +
-    "GI, ReSTIR GI), then lighting res in 5% steps down to 20%, and only then " +
+    "GI), then lighting res in 5% steps down to 20%, and only then " +
     "the canvas; it also sets denoise passes and fast lights. Changing any of " +
     "those by hand switches this off.";
   rSec.append(autoNote);
