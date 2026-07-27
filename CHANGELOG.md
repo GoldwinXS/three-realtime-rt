@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+- **Adaptive governor rebuilt on the quality campaign's measurements.** It now
+  spends quality in a fixed, cheapest-first order: **free wins** (`giHalfRate`,
+  `restirGI`, `restirMCap` 16 — settings measured *cheaper and no worse*), then
+  `renderScale` in 5% steps to `0.2`, then the canvas via `canvasScaleHook`,
+  and returns them in reverse. Two measured defects fixed on the way:
+  - it **no longer raises `denoiseIterations` past 3**. The old ladder raised
+    passes as resolution fell (3 → 4 → 5) on the theory that the filter runs at
+    lighting res so extra iterations are nearly free. The frame-time half is
+    true; the image half is not. Error against a converged reference degrades
+    monotonically past 2 passes, and the coarse à-trous lattice ("plaid") rises
+    4–5× between 2 and 4 — peaking wherever the widest tap spacing reaches ~16
+    *screen* pixels, which is pass 4 at `renderScale 0.5` and pass 3 at `0.25`.
+    The old ladder was adding passes exactly there. The `denoiseIterations`
+    option keeps its full range; this is the automatic policy, not a clamp.
+  - the **canvas ladder no longer engages a rung early** (it fired at
+    `renderScale 0.25`). At matched cost, full canvas at `renderScale 0.2` beats
+    canvas `0.85` at `renderScale 0.2` by 14–22% error with ~40% more retained
+    detail, measured on both real scenes — canvas scale throws away the
+    G-buffer's edges, the one thing the tracer gets sharp for free.
+  Observed end-to-end on the tokyo scene (141k tris, 1280×720, the governor's
+  own landing state): **3.87 → 3.55 ms and 8.7% less error** than the old
+  ladder's, and at the deepest rung **9.16 → 9.12 ms for 20.8% less error**.
+- **`restirMCap` default 40 → 16.** The campaign's one unconditional win: better
+  on *every* metric in *both* measured scenes for ~0.3 ms — error 5.39 → 4.92
+  (Cornell) and 5.13 → 4.70 (museum), in-motion error 9.13 → 8.65 / 6.89 → 6.73,
+  post-motion ghost residual 1.90 → 1.25 / 2.35 → 2.13. A 40-sample reservoir is
+  simply staler than the pipeline around it. `restirMCapMoving` now defaults to
+  `restirMCap` rather than a hard 40 (they were equal before; a *Moving cap
+  longer than the parked one would be an inversion). With `adaptiveQuality`
+  off, this is the **only** rendering change in this release — verified by
+  byte-comparing a converged 1280×720 frame against the previous build with the
+  cap forced back to 40: identical, FNV `b997636a` both sides.
+- **New page: [`costs.html`](costs.html) — what each feature costs.** Per-feature
+  ms, % of frame, fps on both sides of the switch and error delta, for three
+  scenes (86 / 50k / 141k triangles), rendered from the committed measurement
+  matrix. Linked from the tour chrome and the panel. It leads with the three
+  results whose sign contradicts the feature's name: `restir` is a *speed*
+  feature (off = 34–39% slower in multi-light scenes), so is `restirGI` (−27%
+  on 141k tris, at slightly better accuracy, despite its experimental label),
+  and `giHalfRate` buys 10–22% of the frame for an error wash.
+- **Demo panel: every control the governor writes now says so.** The two
+  resolution rows carry an AUTO badge and follow the governor live (including
+  off-ladder values it steps to); `denoise passes`, `fast lights`, `half-rate
+  GI` and `ReSTIR GI` mirror it too; and touching any of them switches auto
+  quality **off** in one visible interaction instead of silently fighting you.
+  The GI modifiers are drawn as sub-rows of `global illumination` and dimmed
+  when it is off, and `ReSTIR GI` explains itself when the denoiser is off or
+  running more than 3 passes.
+- **Demo: a textured-duck exhibit in the Cornell box** — the repo's own
+  `Duck.glb` twice, as shipped (one baseColor map) and with a normal + roughness
+  map added in-page, which is what the G-buffer hands the tracer. **Stop 3 now
+  opens on a streamed Khronos BoomBox** instead of the Damaged Helmet the museum
+  already shows, the picker leads with the assets people recognise, and a model
+  that cannot be streamed falls back to the bundled scene with a note instead of
+  a dead page. No new binaries.
+- **`bench-results/` carries a README explaining that it is not a time series**,
+  and `bench.html` now dates its scene labels (`museum-2026-07`) and records
+  what each key meant. The existing files key three different rooms as `"room"`
+  and read as a 7× regression that never happened.
+
 - **Scattering: physically-parameterized translucent solids (Kubelka-Munk
   two-flux).** Jade, wax, marble and alabaster, soap, milky plastic, foliage,
   lampshades — the material class a real-time renderer normally fakes with an
