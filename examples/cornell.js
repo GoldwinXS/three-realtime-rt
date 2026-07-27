@@ -23,7 +23,9 @@
  */
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RealtimeRaytracer } from "../src/index.js";
+import duckUrl from "./assets/Duck.glb?url";
 import { buildPanel, section, el, selectRow, ICON } from "./panel.js";
 import { buildTourChrome, loadTourSettings, applyTourSettings, persistOnExit } from "./tour.js";
 
@@ -273,6 +275,127 @@ function buildExhibits() {
   return out;
 }
 
+// --- the PBR exhibit's two generated maps -----------------------------------
+// The repo's Duck.glb ships ONE texture — a baseColor map, metallicFactor 0, no
+// normal or roughness map and no tangents. So the right-hand duck's normal and
+// roughness maps are built here, in code, and the caption says so: inventing
+// them silently would be claiming the asset has maps it does not have, and the
+// point of the exhibit is the G-buffer's map PATHS, which are the same whether
+// the texels arrive from a .glb or from this function.
+//
+// Both are tangent-space/linear data, so colorSpace stays the three.js default
+// (NoColorSpace) — only the baseColor map is sRGB.
+function makeBumpMaps(size = 256) {
+  const h = (u, v) =>
+    0.5 * Math.sin(u * Math.PI * 2 * 6) * Math.sin(v * Math.PI * 2 * 6) +
+    0.25 * Math.sin(u * Math.PI * 2 * 17 + 1.7) * Math.sin(v * Math.PI * 2 * 13);
+  const nrm = new Uint8Array(size * size * 4);
+  const rgh = new Uint8Array(size * size * 4);
+  const d = 1 / size;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const u = x / size, v = y / size;
+      // Central differences of the height field -> tangent-space normal.
+      const dhdu = (h(u + d, v) - h(u - d, v)) / (2 * d);
+      const dhdv = (h(u, v + d) - h(u, v - d)) / (2 * d);
+      const s = 0.045; // bump amplitude — a texture, not a relief
+      let nx = -dhdu * s, ny = -dhdv * s, nz = 1;
+      const inv = 1 / Math.hypot(nx, ny, nz);
+      const i = (y * size + x) * 4;
+      nrm[i] = (nx * inv * 0.5 + 0.5) * 255;
+      nrm[i + 1] = (ny * inv * 0.5 + 0.5) * 255;
+      nrm[i + 2] = (nz * inv * 0.5 + 0.5) * 255;
+      nrm[i + 3] = 255;
+      // Roughness rides the GREEN channel (three's ORM convention, which the
+      // G-buffer pass follows): a vertical ramp from polished to matte, so ONE
+      // area light draws a highlight that tightens as it slides down the body.
+      const r = Math.round((0.1 + 0.85 * v) * 255);
+      rgh[i] = rgh[i + 1] = rgh[i + 2] = r;
+      rgh[i + 3] = 255;
+    }
+  }
+  const mk = (data, repeat) => {
+    const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(repeat, repeat);
+    t.minFilter = THREE.LinearMipmapLinearFilter;
+    t.magFilter = THREE.LinearFilter;
+    t.generateMipmaps = true;
+    t.needsUpdate = true;
+    return t;
+  };
+  // The bumps tile (finer than the duck's single unwrap would give); the
+  // roughness ramp must NOT — it is one gradient down the body, and repeating it
+  // would just make a stripe.
+  return { normalMap: mk(nrm, 3), roughnessMap: mk(rgh, 1) };
+}
+
+/**
+ * The PBR exhibit: the SAME textured mesh twice, once exactly as the glTF ships
+ * it and once with a normal map and a roughness map on top. It is the only
+ * exhibit here made of someone else's asset, and the only one whose subject is
+ * the G-buffer rather than a ray: albedo, normal and roughness are what the
+ * raster pass hands the tracer, and every traced shadow, bounce and highlight
+ * downstream reads them.
+ *
+ * Returns false (and adds nothing) if the model cannot be loaded, so a broken
+ * asset costs the page an exhibit rather than the whole room.
+ */
+async function buildDuckExhibit(exhibits, scene) {
+  let gltf;
+  try {
+    gltf = await new Promise((res, rej) => new GLTFLoader().load(duckUrl, res, undefined, rej));
+  } catch (err) {
+    console.warn("[three-realtime-rt cornell] duck exhibit skipped:", err?.message ?? err);
+    return false;
+  }
+  const g = new THREE.Group();
+  g.name = "exhibit-duck";
+  g.visible = false;
+
+  // Normalize to a 2.6-unit-tall duck resting on the floor, then place the pair
+  // either side of centre, turned slightly inward so both catch the ceiling
+  // panel at a grazing angle (a highlight needs an angle to appear at).
+  const src = gltf.scene;
+  const box = new THREE.Box3().setFromObject(src);
+  const span = box.getSize(new THREE.Vector3());
+  src.scale.setScalar(2.3 / Math.max(span.x, span.y, span.z));
+  box.setFromObject(src);
+  src.position.y -= box.min.y;
+  src.position.x -= (box.min.x + box.max.x) / 2;
+  src.position.z -= (box.min.z + box.max.z) / 2;
+
+  const maps = makeBumpMaps();
+  const place = (root, x, ry) => {
+    const holder = new THREE.Group();
+    holder.add(root);
+    holder.position.set(x, 0, -0.1);
+    holder.rotation.y = ry;
+    g.add(holder);
+    return holder;
+  };
+  const plain = src;
+  const mapped = src.clone(true);
+  place(plain, -1.35, 0.5);
+  place(mapped, 1.35, -0.5);
+
+  // The mapped duck gets its own material instances (a clone shares them).
+  mapped.traverse((o) => {
+    if (!o.isMesh) return;
+    const m = o.material.clone();
+    m.normalMap = maps.normalMap;
+    m.normalScale = new THREE.Vector2(1, 1);
+    m.roughnessMap = maps.roughnessMap;
+    m.roughness = 1.0; // scalar x map.g, so the map sets the whole range
+    m.needsUpdate = true;
+    o.material = m;
+  });
+
+  scene.add(g);
+  exhibits.duck = { id: "duck", group: g };
+  return true;
+}
+
 // What each exhibit asks the renderer for. Auto-enabled on selection; auto-
 // disabled again when the NEXT exhibit does not want it — unless the user has
 // flipped that row by hand, in which case it is left exactly as they left it.
@@ -284,6 +407,17 @@ const EXHIBITS = [
     caption: "<b>The reference image.</b> No add-ons: the red and green you see " +
       "on the white blocks is one bounce of global illumination carrying wall " +
       "colour across the room. Turn GI off and it goes flat grey.",
+  },
+  {
+    id: "duck", label: "textured duck (PBR maps)", needs: ["specular"],
+    caption: "<b>PBR maps on the traced paths.</b> The same glTF duck twice: on the " +
+      "left exactly as it ships — one baseColor texture, nothing else — and on the " +
+      "right with a <i>normal map</i> and a <i>roughness map</i> added. Those two " +
+      "channels are generated in this page (the asset has neither), because what " +
+      "the exhibit is about is the <b>G-buffer</b>: albedo, normal and roughness " +
+      "are what the raster pass hands the tracer, and the one ceiling panel draws " +
+      "a highlight that tightens as the roughness ramp slides down the body. Turn " +
+      "<i>PBR specular</i> off to take the GGX term away and watch both flatten.",
   },
   {
     id: "mirror", label: "mirror sphere", needs: ["specular", "reflections"],
@@ -429,6 +563,16 @@ async function main() {
   const carried = applyTourSettings(rt, loadTourSettings());
 
   const state = { rtEnabled: carried.rtEnabled ?? true };
+
+  // The one exhibit made of a file rather than of code. Awaited here — after the
+  // safe-mode branch has had its chance to bail, before the first showOnly() and
+  // the BVH build — and dropped from the picker if it cannot be loaded, so a
+  // missing asset costs the page an exhibit rather than offering a dead entry.
+  setBoot("loading duck…");
+  if (!(await buildDuckExhibit(exhibits, scene))) {
+    const i = EXHIBITS.findIndex((e) => e.id === "duck");
+    if (i >= 0) EXHIBITS.splice(i, 1);
+  }
 
   // Show exactly one exhibit. `.visible` has to be set on every MESH, not just
   // on the group: the scene compiler walks the whole tree and tests each mesh's

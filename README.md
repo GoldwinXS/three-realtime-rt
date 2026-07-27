@@ -857,8 +857,10 @@ per-room exhibit section below it. Renderer settings follow you from stop to sto
 
 1. [`index.html`](index.html) — a procedural **Cornell box**
    ([`examples/cornell.js`](examples/cornell.js)), the entry page and the fastest
-   room in the repo. Its centre holds one exhibit at a time — diffuse blocks,
-   mirror sphere, glass sphere, tinted glass panes, emissive block, a
+   room in the repo. Its centre holds one exhibit at a time — diffuse blocks, a
+   **textured duck pair** (the repo's Duck.glb as shipped vs. the same mesh with
+   a normal + roughness map, i.e. the G-buffer's map paths), mirror sphere,
+   glass sphere, tinted glass panes, emissive block, a
    Kubelka-Munk stone wedge — and selecting one switches on the feature it
    demonstrates (never overriding a toggle you moved by hand). Deep-linkable per
    exhibit: `index.html#glass`.
