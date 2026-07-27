@@ -35,6 +35,25 @@ uniform bool uBlendIsSpec;       // this instance filters the specular buffer
 uniform sampler2D uAddTex;
 uniform bool uHasAdd;
 
+// À-TROUS LATTICE JITTER (EXPERIMENTAL, 0.0 = off = byte-identical).
+// Pass i taps its 3x3 neighbourhood at a spacing of uStep lighting texels.
+// Because the edge-avoiding weights below vary from pixel to pixel, adjacent
+// output pixels blend disjoint tap sets and the filter stops being stationary:
+// a bright axis-aligned lattice of exactly that period appears on flat, dark
+// surfaces (measured — see quality-campaign/). Adding a per-frame offset to the
+// tap RADIUS moves the lattice's period every frame so TAA averages it away.
+// Radius, not translation: shifting the whole tap ring would drag the filtered
+// image sideways; scaling it keeps the kernel centred on the pixel.
+uniform float uStepJit;
+
+// COARSE-PASS DAMPING (EXPERIMENTAL, 1.0 = off = byte-identical).
+// Wavelet shrinkage, applied to the à-trous cascade: the fine passes carry
+// almost all of the noise reduction, while the wide ones contribute the lattice
+// above. Blending each wide pass's result back toward its own input attenuates
+// the artifact in proportion without removing the pass. 1.0 = take the filtered
+// value whole (what the shipped filter does).
+uniform float uPassWeight;
+
 // Named rtLum, NOT luminance: three r166+ prepends its own luminance(vec3)
 // to every non-raw ShaderMaterial fragment shader, and GLSL treats a second
 // (vec3) body as a redefinition — the whole program fails to compile.
@@ -143,7 +162,7 @@ void main() {
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       if (dx == 0 && dy == 0) continue;
-      vec2 tuv = vUv + vec2(float(dx), float(dy)) * uStep * uTexelSize;
+      vec2 tuv = vUv + vec2(float(dx), float(dy)) * (uStep + uStepJit) * uTexelSize;
       if (tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0) continue;
 
       vec4 g = texture(uGWorldPos, tuv);
@@ -164,7 +183,11 @@ void main() {
       wsum += w;
     }
   }
-  outColor = vec4(sum / wsum, center.a);
+  // Uniform branch, not a mix(): at uPassWeight 1.0 a mix would still evaluate
+  // 0.0 * center.rgb, which is NaN rather than 0 if a half-float irradiance
+  // texel ever reaches inf. The branch keeps the off-state provably untouched.
+  vec3 filtered = sum / wsum;
+  outColor = vec4(uPassWeight >= 1.0 ? filtered : mix(center.rgb, filtered, uPassWeight), center.a);
 }
 `;
 
@@ -197,6 +220,8 @@ export class DenoisePass {
         uGNormalMetal: { value: null },
         uTexelSize: { value: new THREE.Vector2() },
         uStep: { value: 1 },
+        uStepJit: { value: 0 },
+        uPassWeight: { value: 1 },
         uCameraPos: { value: new THREE.Vector3() },
         uEps: { value: 1e-3 },
         uLumSigma: { value: 0.25 },
@@ -243,8 +268,23 @@ export class DenoisePass {
    * `addTexture` (EXPERIMENTAL ReSTIR GI) is added to the input on the FIRST
    * iteration only, so the filter smooths input + GI together; pass null to
    * leave the filter byte-identical to before.
+   *
+   * `opts` (all EXPERIMENTAL, all inert at their defaults):
+   *   maxStep     cap the à-trous tap spacing in lighting texels. The default 0
+   *               keeps the doubling cascade 1,2,4,8,16,32; `8` turns a 6-pass
+   *               run into 1,2,4,8,8,8. The two widest steps are where the
+   *               lattice artifact lives, and repeating a step re-smooths at a
+   *               scale the cascade has already band-limited instead of opening
+   *               a new one.
+   *   stepJitter  0..1 scale on a per-frame tap-radius jitter (see uStepJit).
+   *   frame       frame counter driving that jitter's low-discrepancy sequence.
+   *   wideDamp    0..1 wavelet shrinkage of the COARSE passes (see uPassWeight).
+   *               0 = off. At 1 a pass at step s keeps sqrt(4/s) of its filtered
+   *               result (steps 1-4 untouched, step 8 -> 0.71, 16 -> 0.50,
+   *               32 -> 0.35), so the widest passes still smooth but contribute
+   *               proportionally less of the lattice they generate.
    */
-  render(renderer, inputTexture, gbuffer, cameraPos, eps, iterations = 3, addTexture = null) {
+  render(renderer, inputTexture, gbuffer, cameraPos, eps, iterations = 3, addTexture = null, opts = {}) {
     const u = this.material.uniforms;
     u.uGWorldPos.value = gbuffer.worldPos;
     u.uGNormalMetal.value = gbuffer.normalMetal;
@@ -253,11 +293,28 @@ export class DenoisePass {
     u.uEps.value = eps;
     u.uAddTex.value = addTexture;
 
+    const maxStep = opts.maxStep > 0 ? opts.maxStep : 0;
+    const jitter = opts.stepJitter > 0 ? Math.min(1, opts.stepJitter) : 0;
+    const damp = opts.wideDamp > 0 ? Math.min(1, opts.wideDamp) : 0;
+    const frame = opts.frame ?? 0;
+
     let read = inputTexture;
     let write = this.targetA;
     for (let i = 0; i < iterations; i++) {
       u.uIrradiance.value = read;
-      u.uStep.value = 1 << i;
+      const step = maxStep > 0 ? Math.min(1 << i, maxStep) : 1 << i;
+      u.uStep.value = step;
+      // R2 low-discrepancy sequence over (frame, pass): successive frames land
+      // on different tap radii, so no single lattice period ever accumulates.
+      // Step 1 is left alone — it is the despeckle/detail pass.
+      if (jitter > 0 && step > 1) {
+        const n = frame * 7 + i;
+        u.uStepJit.value = (((n * 0.7548776662466927) % 1) - 0.5) * step * jitter;
+      } else {
+        u.uStepJit.value = 0;
+      }
+      u.uPassWeight.value =
+        damp > 0 && step > 4 ? 1 - damp * (1 - Math.sqrt(4 / step)) : 1;
       // The GI add is applied once, on iteration 0 — later iterations read the
       // already-summed intermediate, so adding again would double it.
       u.uHasAdd.value = addTexture !== null && i === 0;

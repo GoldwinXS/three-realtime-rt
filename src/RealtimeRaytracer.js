@@ -491,6 +491,55 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.temporalReprojection = options.temporalReprojection ?? true;
     /** History length cap: higher = smoother but slower to react. */
     this.maxHistory = options.maxHistory ?? 128;
+    /**
+     * EXPERIMENTAL — MOTION-ADAPTIVE TEMPORAL RESPONSE. Default OFF, and with it
+     * off every uniform below keeps the value it had before this option existed,
+     * so the rendered frame is byte-identical to a build without the feature.
+     *
+     * The pipeline holds THREE independent temporal accumulators, and all three
+     * are tuned for a parked camera:
+     *   - the irradiance/specular EMA in RTLightingPass (capped by maxHistory)
+     *   - the TAA resolve's history blend (taaBlend)
+     *   - the ReSTIR direct-lighting reservoir (staleness cap restirMCap)
+     * Under camera motion each one keeps feeding a stale estimate into a pixel
+     * whose geometry has moved on, which is where post-motion residual comes
+     * from. `motion` (0..1, read-only, see _updateMotion) measures how far the
+     * frame moved this step; when motionAdaptive is on, each accumulator is
+     * lerped toward its *Moving counterpart by that amount, so history is short
+     * while the camera moves and long again the instant it stops.
+     */
+    this.motionAdaptive = options.motionAdaptive ?? false;
+    /** EMA history cap at full motion (motionAdaptive only). */
+    this.maxHistoryMoving = options.maxHistoryMoving ?? 6;
+    /** TAA fresh-sample weight at full motion (motionAdaptive only). */
+    this.taaBlendMoving = options.taaBlendMoving ?? 0.4;
+    /** ReSTIR reservoir staleness cap; 40 is the shipped value. */
+    this.restirMCap = options.restirMCap ?? 40;
+    /** ReSTIR reservoir staleness cap at full motion (motionAdaptive only). */
+    this.restirMCapMoving = options.restirMCapMoving ?? 40;
+    /**
+     * Screen motion (in UV) that counts as "full motion" for the lerp above.
+     * 0.015 = the frame content moved 1.5% of the screen in one step, which at
+     * 60fps is a brisk-but-normal orbit.
+     */
+    this.motionRefUv = options.motionRefUv ?? 0.015;
+    /** Read-only: this frame's normalized camera motion, 0 (still) .. 1. */
+    this.motion = 0;
+    this._vpNow = new THREE.Matrix4();
+    this._vpPrevUnjittered = new THREE.Matrix4();
+    this._motionValid = false;
+    this._mv = [new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()];
+    this._mq = new THREE.Quaternion();
+    /**
+     * EXPERIMENTAL — à-trous tap-spacing controls, both default 0 = shipped
+     * behaviour. See DenoisePass.render. `denoiseMaxStep` caps the doubling
+     * cascade; `denoiseStepJitter` (0..1) jitters the tap radius per frame so
+     * the filter's periodic lattice has no fixed phase for TAA to preserve.
+     */
+    this.denoiseMaxStep = options.denoiseMaxStep ?? 0;
+    this.denoiseStepJitter = options.denoiseStepJitter ?? 0;
+    /** EXPERIMENTAL — wavelet shrinkage of the coarse à-trous passes; 0 = off. */
+    this.denoiseWideDamp = options.denoiseWideDamp ?? 0;
     /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
     this.fireflyClamp = options.fireflyClamp ?? 4.0;
     /** 1-bounce global illumination (traced indirect). Toggle for a direct-only look. */
@@ -1451,6 +1500,54 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     );
   }
 
+  /**
+   * Normalized screen motion for this frame, 0 (parked) .. 1 (>= motionRefUv).
+   *
+   * Four world points are placed a scene-scale distance in front of the CURRENT
+   * camera and projected with both this frame's and last frame's UNJITTERED
+   * view-projection; `motion` is the largest UV displacement between the two,
+   * divided by motionRefUv. Measuring the CONTENT's screen displacement (rather
+   * than a camera position/angle delta) is what makes one number cover rotation,
+   * translation and dolly at once, and makes it scale-free: a 1-unit pan means
+   * something different in a Cornell box than in a city block, but "the image
+   * moved 2% of the screen" does not.
+   *
+   * Must be called BEFORE render() mutates camera.projectionMatrix for overscan
+   * and TAA jitter, so the sub-pixel jitter never leaks into the measurement.
+   */
+  _updateMotion(camera) {
+    this._vpNow.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    if (!this._motionValid) {
+      this._vpPrevUnjittered.copy(this._vpNow);
+      this._motionValid = true;
+      this.motion = 0;
+      return;
+    }
+    const [pos, fwd, right, up, a, b] = this._mv;
+    camera.getWorldPosition(pos);
+    camera.getWorldQuaternion(this._mq);
+    fwd.set(0, 0, -1).applyQuaternion(this._mq);
+    right.set(1, 0, 0).applyQuaternion(this._mq);
+    up.set(0, 1, 0).applyQuaternion(this._mq);
+    const d = this.compiled ? Math.max(this.compiled.sceneDiagonal * 0.35, 1e-3) : 10;
+    let maxUv = 0;
+    for (let i = 0; i < 4; i++) {
+      const sx = i & 1 ? 0.3 : -0.3;
+      const sy = i & 2 ? 0.3 : -0.3;
+      a.copy(pos).addScaledVector(fwd, d).addScaledVector(right, sx * d).addScaledVector(up, sy * d);
+      b.copy(a).applyMatrix4(this._vpPrevUnjittered); // perspective divide included
+      a.applyMatrix4(this._vpNow);
+      // Guard a point that fell behind last frame's camera (applyMatrix4 divides
+      // by a w that can go negative): treat it as full motion rather than NaN.
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      const uv = Number.isFinite(dx) && Number.isFinite(dy) ? Math.hypot(dx, dy) * 0.5 : 1;
+      if (uv > maxUv) maxUv = uv;
+    }
+    this.motion = Math.min(1, maxUv / Math.max(1e-6, this.motionRefUv));
+    this._vpPrevUnjittered.copy(this._vpNow);
+  }
+
   // Record a committed quality step and update oscillation state: two
   // consecutive steps in OPPOSITE directions mean the governor is hunting the
   // frame-time boundary (drives the wider deadband + longer cooldown above).
@@ -1506,6 +1603,10 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     const savedProj5 = proj.elements[5];
     const savedProj8 = proj.elements[8];
     const savedProj9 = proj.elements[9];
+    // Screen motion, measured on the CLEAN matrix before overscan/jitter touch
+    // it. Cheap (four point projections) and always maintained, so `rt.motion`
+    // is readable by apps even when motionAdaptive is off.
+    this._updateMotion(camera);
     // Overscan: widen the frustum so the padded image covers proportionally
     // more FOV. Scaling elements[0]/[5] (the x/y projection scale) by 1/padFactor
     // makes each axis see (1 + 2·overscan)× as much — the extra content lands in
@@ -1567,7 +1668,9 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     rtU.uCostView.value = this.outputMode === 7;
     rtU.uCostScale.value = this.costScale;
     rtU.uTemporalReprojection.value = this.temporalReprojection;
-    rtU.uMaxHistory.value = this.maxHistory;
+    // Motion-adaptive temporal response (default off -> exactly this.maxHistory).
+    const mt = this.motionAdaptive ? this.motion : 0;
+    rtU.uMaxHistory.value = this.maxHistory + (this.maxHistoryMoving - this.maxHistory) * mt;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
     rtU.uGIEnabled.value = this.gi;
     rtU.uGIHalfRate.value = this.giHalfRate;
@@ -1617,7 +1720,8 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
         this._prevViewProj,
         this._camWorldPos,
         this.frame,
-        this.eps
+        this.eps,
+        this.restirMCap + (this.restirMCapMoving - this.restirMCap) * mt
       );
     }
     // 2b. ReSTIR GI reservoirs (experimental). Runs after the lighting pass's
@@ -1668,7 +1772,13 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
         this._camWorldPos,
         this.eps,
         this.denoiseIterations,
-        giTex
+        giTex,
+        {
+          maxStep: this.denoiseMaxStep,
+          stepJitter: this.denoiseStepJitter,
+          wideDamp: this.denoiseWideDamp,
+          frame: this.frame,
+        }
       );
     }
 
@@ -1756,7 +1866,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
         this._prevViewProj, // last frame's jittered VP
         this._jitterUv,
         this._prevJitterUv,
-        this.taaBlend,
+        this.taaBlend + (this.taaBlendMoving - this.taaBlend) * mt,
         null, // outputTarget: null = screen (the final on-screen draw)
         this._crop // central-crop the padded resolve onto the canvas
       );

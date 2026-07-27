@@ -153,6 +153,20 @@ const BASELINE = {
   kmScattering: false,
   volumetric: false,
   stochasticLights: false,
+  // Temporal-response knobs. maxHistory 48 matches the demo (the library default
+  // is 128); taaBlend 0.1 is the library default. The rest are the EXPERIMENTAL
+  // mitigations this campaign added — all inert at these values, so the baseline
+  // arm renders exactly what master renders.
+  maxHistory: 48,
+  taaBlend: 0.1,
+  motionAdaptive: false,
+  maxHistoryMoving: 6,
+  taaBlendMoving: 0.4,
+  restirMCap: 40,
+  restirMCapMoving: 40,
+  denoiseMaxStep: 0,
+  denoiseStepJitter: 0,
+  denoiseWideDamp: 0,
 };
 
 /** The stand-in for ground truth: full lighting resolution, long convergence. */
@@ -523,6 +537,16 @@ function applyConfig(cfg) {
   rt.denoiseIterations = cfg.denoiseIterations;
   rt.taa = cfg.taa;
   rt.volumetric.enabled = cfg.volumetric;
+  rt.maxHistory = cfg.maxHistory;
+  rt.taaBlend = cfg.taaBlend;
+  rt.motionAdaptive = cfg.motionAdaptive;
+  rt.maxHistoryMoving = cfg.maxHistoryMoving;
+  rt.taaBlendMoving = cfg.taaBlendMoving;
+  rt.restirMCap = cfg.restirMCap;
+  rt.restirMCapMoving = cfg.restirMCapMoving;
+  rt.denoiseMaxStep = cfg.denoiseMaxStep;
+  rt.denoiseStepJitter = cfg.denoiseStepJitter;
+  rt.denoiseWideDamp = cfg.denoiseWideDamp;
   // These two are accessors that recompile the lighting megakernel — set last
   // and let the caller settle a few frames before timing.
   rt.absorptionShadows = cfg.absorptionShadows;
@@ -783,7 +807,7 @@ async function measure(label, cfg, opts = {}) {
       rt.resetAccumulation();
       await renderN(120);
 
-      let churn = 0, churnN = 0;
+      let churn = 0, churnN = 0, motionSum = 0;
       let prevDs = null;
       const errs = [];
       // ONE synchronous task per step: move the camera, render, read back.
@@ -791,6 +815,7 @@ async function measure(label, cfg, opts = {}) {
         const pose = pathPose(kind, s);
         setCam(pose.pos, pose.target);
         rt.render(scene, camera);
+        motionSum += rt.motion ?? 0;
         const ds = downsample(readFrame(), capW, capH, DS_W, DS_H);
         if (prevDs && s >= 8) { churn += meanAbs(ds, prevDs); churnN++; }
         prevDs = ds;
@@ -805,6 +830,7 @@ async function measure(label, cfg, opts = {}) {
       }
       m[`moveChurn_${kind}`] = churnN ? churn / churnN : null;
       m[`moveErr_${kind}`] = errs.length ? mean(errs) : null;
+      m[`motion_${kind}`] = motionSum / PATH_STEPS;
 
       // one frame after the motion stops — the "smear" frame
       rt.render(scene, camera);
@@ -813,8 +839,14 @@ async function measure(label, cfg, opts = {}) {
     }
 
     // --- ghost decay, bench.html-comparable -------------------------------
-    const gh = await ghostProbe(cfg);
-    Object.assign(m, gh);
+    Object.assign(m, await ghostProbe(cfg, "orbit", "ghost"));
+    // The ghosting arm also runs the strafe probe (far more disocclusion), plus
+    // a capture of the worst frame so a trail can be looked at, not just scored.
+    if (opts.ghostStrafe) {
+      Object.assign(m, await ghostProbe(cfg, "strafe", "ghostS"));
+      rt.render(scene, camera);
+      files["ghost-settle"] = await savePng(nameFor(label, "ghostSettle1", cfg), readFrame(), capW, capH);
+    }
   }
 
   for (const [kind, file] of Object.entries(files)) {
@@ -823,12 +855,33 @@ async function measure(label, cfg, opts = {}) {
   return { label, config: cfg, metrics: m, files };
 }
 
+/** 95th percentile of per-pixel |luma difference| between two float RGB buffers. */
+function p95Abs(a, b) {
+  const n = a.length / 3;
+  const d = new Float32Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    const la = a[j] * LUMA[0] + a[j + 1] * LUMA[1] + a[j + 2] * LUMA[2];
+    const lb = b[j] * LUMA[0] + b[j + 1] * LUMA[1] + b[j + 2] * LUMA[2];
+    d[i] = Math.abs(la - lb);
+  }
+  d.sort();
+  return d[Math.min(n - 1, Math.floor(n * 0.95))];
+}
+
 /**
- * bench.html-comparable ghosting: settle at B (this config) for the reference
- * patch, settle at A, sweep A->B over 24 frames, park at B and read the centered
- * 96x96 patch after 1/5/10/20/40 further frames.
+ * Ghosting probe. `orbit` reproduces bench.html exactly so the numbers stay
+ * comparable with the repo's saved history: settle at B (this config) for the
+ * reference patch, settle at A, sweep A->B over 24 frames, park at B and read
+ * the centered 96x96 patch after 1/5/10/20/40 further frames.
+ *
+ * Two additions, because a centre patch is the WRONG place to look for a trail:
+ * ghosting lives at disocclusion edges, which are spread over the frame and are
+ * a small fraction of its pixels. `ghostFull*` is the same difference over the
+ * whole frame at 320x180, and `ghostP95*` is its 95th percentile — the one that
+ * actually tracks "there is a visible smear somewhere". A `strafe` run is
+ * available too: sliding sideways disoccludes far more than orbiting does.
  */
-async function ghostProbe(cfg) {
+async function ghostProbe(cfg, kind = "orbit", prefix = "ghost") {
   const ps = Math.max(32, Math.round(96 * cfg.canvasScale));
   const gx = Math.round((capW - ps) / 2), gy = Math.round((capH - ps) / 2);
   const readG = () => {
@@ -836,24 +889,27 @@ async function ghostProbe(cfg) {
     gl.readPixels(gx, gy, ps, ps, gl.RGBA, gl.UNSIGNED_BYTE, b);
     return b;
   };
-  const poseB = pathPose("orbit", 0);
-  const poseA = pathPose("orbit", 60);
+  const poseB = pathPose(kind, 0);
+  const poseA = pathPose(kind, 60);
 
   setCam(poseB.pos, poseB.target);
   rt.resetAccumulation();
   await renderN(150);
   rt.render(scene, camera);
   const ref = readG();
+  const refFull = downsample(readFrame(), capW, capH, DS_W, DS_H);
 
   setCam(poseA.pos, poseA.target);
   rt.resetAccumulation();
   await renderN(60);
   const a = new THREE.Vector3(...poseA.pos), b = new THREE.Vector3(...poseB.pos);
-  const p = new THREE.Vector3();
+  const at = new THREE.Vector3(...poseA.target), bt = new THREE.Vector3(...poseB.target);
+  const p = new THREE.Vector3(), t = new THREE.Vector3();
   for (let s = 1; s <= 24; s++) {
     p.lerpVectors(a, b, s / 24);
+    t.lerpVectors(at, bt, s / 24);
     camera.position.copy(p);
-    camera.lookAt(poseB.target[0], poseB.target[1], poseB.target[2]);
+    camera.lookAt(t.x, t.y, t.z);
     camera.updateMatrixWorld();
     rt.render(scene, camera);
   }
@@ -864,7 +920,11 @@ async function ghostProbe(cfg) {
   let rendered = 0;
   for (const c of checkpoints) {
     while (rendered < c) { rt.render(scene, camera); rendered++; }
-    out[`ghost${c}`] = meanAbs(readG(), ref);
+    const patch = readG();
+    const full = downsample(readFrame(), capW, capH, DS_W, DS_H);
+    out[`${prefix}${c}`] = meanAbs(patch, ref);
+    out[`${prefix}Full${c}`] = meanAbs(full, refFull);
+    out[`${prefix}P95_${c}`] = p95Abs(full, refFull);
     await nextFrame();
   }
   return out;
@@ -909,17 +969,73 @@ function featureCostConfigs() {
   return out;
 }
 
+/**
+ * The 4+ pass artifact study. Two lighting resolutions, because the à-trous tap
+ * spacing is measured in LIGHTING texels and lands on screen at texels /
+ * renderScale — halving the resolution doubles the artifact's screen period, and
+ * the adaptive governor happens to raise the pass count exactly as it lowers the
+ * resolution (_qualityFor: <=0.45 -> 4 passes, <=0.3 -> 5). Arms:
+ *   dn-        the shipped filter, 0..6 passes (the control)
+ *   dnfixCap-  denoiseMaxStep 8: cascade 1,2,4,8,8,8 instead of ...,16,32
+ *   dnfixJit-  denoiseStepJitter 1: per-frame tap-radius jitter
+ */
 function denoiseStudyConfigs() {
   const out = [];
+  const add = (label, over) => out.push({ label, cfg: { ...BASELINE, ...over }, moving: true });
   for (const rs of [0.25, 0.5]) {
+    const t = String(rs).replace(".", "");
     for (const it of [0, 1, 2, 3, 4, 5, 6]) {
-      out.push({
-        label: `dnstudy-rs${String(rs).replace(".", "")}-p${it}`,
-        cfg: { ...BASELINE, renderScale: rs, denoiseIterations: it, denoise: it > 0 },
-        moving: true,
-      });
+      add(`dn-rs${t}-p${it}`, { renderScale: rs, denoiseIterations: it, denoise: it > 0 });
+    }
+    for (const it of [4, 5, 6]) {
+      // maxStep 8 is a no-op at 4 passes (the cascade already stops at 8).
+      if (it > 4) add(`dnfixCap-rs${t}-p${it}`, { renderScale: rs, denoiseIterations: it, denoiseMaxStep: 8 });
+      add(`dnfixJit-rs${t}-p${it}`, { renderScale: rs, denoiseIterations: it, denoiseStepJitter: 1 });
+      add(`dnfixDamp-rs${t}-p${it}`, { renderScale: rs, denoiseIterations: it, denoiseWideDamp: 1 });
     }
   }
+  return out;
+}
+
+/**
+ * The ghosting arm. First half isolates WHICH temporal store carries the stale
+ * signal by varying one store at a time; second half A/Bs the motion-adaptive
+ * mitigation for each store, and all of them together.
+ */
+function ghostConfigs() {
+  const out = [];
+  const add = (label, over) => out.push({ label, cfg: { ...BASELINE, ...over }, moving: true, ghostStrafe: true });
+  add("gh-base", {});
+  for (const v of [8, 16, 128]) add(`gh-maxhist-${v}`, { maxHistory: v });
+  for (const v of [0.05, 0.25, 0.5]) add(`gh-taablend-${String(v).replace(".", "")}`, { taaBlend: v });
+  for (const v of [6, 16]) add(`gh-mcap-${v}`, { restirMCap: v });
+  add("gh-taa-off", { taa: false });
+  add("gh-restir-off", { restir: false });
+  // Mitigations: each lerps ONE store toward a short-history value with motion.
+  add("gh-fixHist", { motionAdaptive: true, maxHistoryMoving: 6, taaBlendMoving: 0.1, restirMCapMoving: 40 });
+  add("gh-fixTaa", { motionAdaptive: true, maxHistoryMoving: 48, taaBlendMoving: 0.4, restirMCapMoving: 40 });
+  add("gh-fixMcap", { motionAdaptive: true, maxHistoryMoving: 48, taaBlendMoving: 0.1, restirMCapMoving: 6 });
+  add("gh-fixAll", { motionAdaptive: true, maxHistoryMoving: 6, taaBlendMoving: 0.4, restirMCapMoving: 6 });
+  return out;
+}
+
+/**
+ * Ladder validation: the library's own quality ladder (_qualityFor) against
+ * cost-matched rungs built from this campaign's Pareto frontier. Everything else
+ * in the sweep varies ONE axis; these are the multi-axis combinations the auto
+ * policy would actually ship, measured rather than extrapolated.
+ */
+function ladderConfigs() {
+  const out = [];
+  const add = (label, over) => out.push({ label, cfg: { ...BASELINE, ...over }, moving: true });
+  add("lib-rs50", { renderScale: 0.5, denoiseIterations: 3, stochasticLights: false });
+  add("lib-rs375", { renderScale: 0.375, denoiseIterations: 4, stochasticLights: true });
+  add("lib-rs25", { renderScale: 0.25, denoiseIterations: 5, stochasticLights: true });
+  add("lib-rs20-cs085", { renderScale: 0.2, denoiseIterations: 5, stochasticLights: true, canvasScale: 0.85 });
+  add("new-rs50", { renderScale: 0.5, denoiseIterations: 2, giHalfRate: true, restirGI: true });
+  add("new-rs375", { renderScale: 0.375, denoiseIterations: 2, giHalfRate: true, restirGI: true });
+  add("new-rs25", { renderScale: 0.25, denoiseIterations: 3, giHalfRate: true, restirGI: true, stochasticLights: true });
+  add("new-rs20", { renderScale: 0.2, denoiseIterations: 3, giHalfRate: true, restirGI: true, stochasticLights: true });
   return out;
 }
 
@@ -991,11 +1107,47 @@ async function run() {
     return;
   }
 
+  // TIMING plan: the cheap repeat. Headline fps is the only number that is
+  // genuinely stochastic run-to-run (the image metrics are near-deterministic on
+  // a fixed scene and seed), so the repeats measure THAT and nothing else — no
+  // references, no convergence, no readbacks, no PNGs. Three fence-timed blocks
+  // per config, and the whole plan is run several times for a median of medians.
+  if (PLAN === "timing") {
+    const list = [...qualityAxisConfigs(), ...featureCostConfigs(), ...ladderConfigs()];
+    log(`timing-only: ${list.length} configs`);
+    for (const item of list) {
+      setStatus(`${SCENE_ID} r${REP} timing: ${item.label}`);
+      applyConfig(item.cfg);
+      await nextFrame();
+      setCam(sceneDef.cam, sceneDef.target);
+      await renderN(60);
+      const blocks = [];
+      for (let k = 0; k < 3; k++) { blocks.push(timeBlock(60)); await nextFrame(); }
+      blocks.sort((a, b) => a - b);
+      const frameMs = blocks[1];
+      results.configs.push({
+        label: item.label,
+        config: item.cfg,
+        metrics: { frameMs, fps: 1000 / frameMs, frameMsBlocks: blocks, timingSpread: (blocks[2] - blocks[0]) / frameMs, timingNoisy: (blocks[2] - blocks[0]) / frameMs > 0.1 },
+      });
+      log(`${item.label.padEnd(20)} ${frameMs.toFixed(2).padStart(8)} ms  ${(1000 / frameMs).toFixed(1).padStart(6)} fps  spread ${(((blocks[2] - blocks[0]) / frameMs) * 100).toFixed(1)}%`);
+      await saveJson(`results-${SCENE_ID}-${PLAN}-r${REP}`, results);
+    }
+    results.elapsedS = (performance.now() - t0) / 1000;
+    await saveJson(`results-${SCENE_ID}-${PLAN}-r${REP}`, results);
+    window.CAMPAIGN_RESULTS = results;
+    setStatus(`timing done in ${(results.elapsedS / 60).toFixed(1)} min.`);
+    window.CAMPAIGN_DONE = true;
+    return;
+  }
+
   const convergeRef = 600;
   await buildReferences(convergeRef);
 
   let list;
   if (PLAN === "denoise") list = denoiseStudyConfigs();
+  else if (PLAN === "ghost") list = ghostConfigs();
+  else if (PLAN === "ladder") list = ladderConfigs();
   else if (PLAN === "cost") list = featureCostConfigs();
   else if (PLAN === "smoke") {
     // End-to-end validation of every code path (still + moving + ghost + PNG)
@@ -1013,7 +1165,7 @@ async function run() {
   for (let i = 0; i < list.length; i++) {
     const item = list[i];
     try {
-      const r = await measure(item.label, item.cfg, { moving: item.moving });
+      const r = await measure(item.label, item.cfg, { moving: item.moving, ghostStrafe: item.ghostStrafe });
       results.configs.push(r);
       const m = r.metrics;
       log(

@@ -146,6 +146,11 @@ in vec2 vUv;
 uniform sampler2D uPrevReservoir;
 uniform sampler2D uPrevGWorldPos;
 uniform mat4 uPrevViewProj;
+// Temporal staleness cap (was the literal 40.0). 40 = the shipped behaviour;
+// lowering it makes the reservoir shed its history faster, which is the lever
+// for post-motion ghosting — the reservoir is the pipeline's SECOND temporal
+// accumulator (after the irradiance EMA) and measurably the slower one.
+uniform float uMCap;
 
 void main() {
   vec4 wp = texture(uGWorldPos, vUv);
@@ -195,7 +200,7 @@ void main() {
         vec4 h = texture(uPrevReservoir, prevUv);
         // Staleness cap; ALSO keeps total M within the 6 bits the encoding
         // stores (8 fresh + 40 history < 64).
-        float hM = min(mod(h.r, 64.0), 40.0);
+        float hM = min(mod(h.r, 64.0), uMCap);
         float hId = floor(h.r / 64.0);
         if (hM > 0.0 && h.a > 0.0) {
           // RIS weight = p̂_now · W_prev · M_prev; with p̂_prev ≈ p̂_now on a
@@ -326,6 +331,7 @@ export class RestirPass {
                 uPrevReservoir: { value: null },
                 uPrevGWorldPos: { value: null },
                 uPrevViewProj: { value: new THREE.Matrix4() },
+                uMCap: { value: 40 },
               }
             : {
                 uReservoirIn: { value: null },
@@ -396,8 +402,11 @@ export class RestirPass {
     this.spatialMaterial.uniforms.uTexelSize.value.set(1 / width, 1 / height);
   }
 
-  /** Temporal → spatial; history feeds back from the TEMPORAL stage only. */
-  render(renderer, gbuffer, prevViewProj, cameraPos, frame, eps) {
+  /**
+   * Temporal → spatial; history feeds back from the TEMPORAL stage only.
+   * `mCap` is the temporal staleness cap (default 40 = shipped behaviour).
+   */
+  render(renderer, gbuffer, prevViewProj, cameraPos, frame, eps, mCap = 40) {
     for (const m of [this.material, this.spatialMaterial]) {
       const u = m.uniforms;
       u.uGWorldPos.value = gbuffer.worldPos;
@@ -410,6 +419,7 @@ export class RestirPass {
     tu.uPrevReservoir.value = this.targetB.texture;
     tu.uPrevGWorldPos.value = gbuffer.prevWorldPos;
     tu.uPrevViewProj.value.copy(prevViewProj);
+    tu.uMCap.value = Math.max(1, mCap);
 
     this.quad.material = this.material;
     renderer.setRenderTarget(this.targetA);
