@@ -987,8 +987,14 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
     vec4 rtKmRow = rtKmFetch(attr.w);
     gKmOn = rtKmRow.w > 0.0;
     if (gKmOn) {
+      // The 0.25 floor bounds the correction at 8*eps. For real glass it never
+      // binds: refraction into a denser medium caps the internal angle at
+      // asin(1/ior), so rd.N is at least 0.745 at ior 1.5. It exists for the
+      // ior -> 1 end of the G-buffer's [1, 1.98] range, where the refracted ray
+      // approaches the view ray and can graze — there an unbounded 1/|rd.N|
+      // would invent metres of chord and read the whole silhouette as masstone.
       rtKmLayer(rtAbsorbSigma(attr.w), rtKmRow.rgb,
-        dist + 2.0 * uEps / max(abs(dot(rd, N)), 1e-3), gKmR, gKmT);
+        dist + 2.0 * uEps / max(abs(dot(rd, N)), 0.25), gKmR, gKmT);
       gKmBehind = refrRad;
     }
 // <<< RT_KM

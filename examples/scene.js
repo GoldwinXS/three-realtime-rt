@@ -757,10 +757,17 @@ export function buildScene() {
   // because that route takes the colour as LINEAR values, and these are chosen
   // by working the two-flux model backwards from the reflectance wanted. For a
   // pigment thick enough to hide its backing, R_inf = 1/(a + b), which inverts to
-  // K/S = (1 - R)^2 / (2R); at S = 20 the jade target (0.19, 0.45, 0.28) asks for
-  // K = (34, 6.7, 18.5) per metre, and exp(-K * 0.25) is the colour below. Set a
-  // target reflectance, get the coefficients — which is the point of a
-  // physically-parameterized model.
+  // K/S = (1 - R)^2 / (2R); at S = 20 the jade target (0.05, 0.45, 0.22) asks for
+  // K = (184, 6.7, 27.7) per metre, and exp(-K * distance) is the colour below.
+  // Set a target reflectance, get the coefficients — which is the point of a
+  // physically-parameterized model, and why this is a table lookup rather than a
+  // fortnight of dragging sliders.
+  //
+  // The DISTANCE is 5 cm rather than a rounder number for a real reason: colour
+  // channels are floored at 1e-4 on the way in, so the largest K any given
+  // distance can express is -ln(1e-4)/distance. At 25 cm that caps red at 36.8
+  // and the jade comes out a washed sage; at 5 cm the cap is 184, which is what
+  // this needs.
   const marbleGeo = new THREE.SphereGeometry(0.2, 36, 24);
   const jadeBase = () => ({
     color: 0xffffff,
@@ -771,7 +778,7 @@ export function buildScene() {
     transmission: 1.0,
     ior: 1.55,
   });
-  const jadeK = { color: [0.0002, 0.186, 0.0098], distance: 0.25 };
+  const jadeK = { color: [0.0001, 0.715, 0.250], distance: 0.05 };
   // Left: absorption only — this is 0.8.0's model, and a front-lit pigmented
   // body under it is exactly the black murk this feature exists to fix.
   const glassMarble = new THREE.MeshPhysicalMaterial(jadeBase());

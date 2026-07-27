@@ -468,6 +468,17 @@ kmReflectance(6, 20, 0.004, 0.85);   // 4 mm of it over an 85%-reflective backin
 
 **Why one medium on the view path.** The design this shipped from had a dedicated ordered march along the view ray, composing an arbitrary layered stack — the same machinery coloured shadows use. It works, and it cannot be compiled: NVIDIA's native-GL assembler rejects the megakernel with `error: too many temporaries`, the register-pressure sibling of the `C5041` failure that killed a shadow-march optimisation in 0.9.0. Bisected on the GPU: full feature **35 319** lines of generated assembly → fails; shadow-side maths removed, **33 403** → still fails; the march compiled but never called → links. The march's own BVH traversal is the blocker, and no amount of shrinking the surrounding arithmetic buys it back. Reusing the shadow march for the view ray is *worse* — it is already inlined at roughly eight effective sites, so a third explicit call adds a ninth traversal. The shipped version evaluates the layer where the shader already computes an in-medium view chord: no new traversal, no new sampler, no new `traceRadiance` call site.
 
+**Cost.** Almost none, because the design forced by that compile budget also turned out to be the fast one: scattering adds no rays and no BVH traversals, only arithmetic on a chord the shader was already computing. Fence-timed medians on an RTX 3060, museum scene, 1280×720 at `renderScale 0.5`, full stack, one foregrounded page at a time:
+
+| leg | `restir: true` | `restir: false` |
+|---|---|---|
+| feature branch, nothing scatters | 47.14 ms | 56.80 ms |
+| scattering material present, `kmScattering: false` + coloured shadows | 59.13 ms | 81.50 ms |
+| scattering material present, `kmScattering: true` | 59.38 ms | 81.56 ms |
+| **isolated cost of scattering** | **+0.25 ms** | **+0.06 ms** |
+
+The honest caveat is that `kmScattering: true` compiles a **superset** of coloured shadows — the two-flux transmittance is evaluated inside that very march — so if you are coming from a scene with `absorptionShadows: false`, turning scattering on hands you the [coloured-shadow cost](#coloured-shadows-absorptionshadows) (+7.6 ms / +19.9 ms here) along with it. That is the number to budget against; the scattering arithmetic itself is free.
+
 **Zero cost when unused, provably.** With `kmScattering: false`, or with no material carrying `userData.rtScattering`, the marked lines are stripped and the lighting megakernel's source is **byte-identical** to the 0.9.0 build — SHA-256 checked against a `master` checkout by `npm run test:km`, which also runs 23 numeric checks on the analytic reference (the `S → 0` degrade to Beer-Lambert, the `t → ∞` approach to `R_inf` from both sides, the `coth` guard at tiny `b·S·t`, channel independence, a 1344-case finiteness sweep, and the equivalence of the closed form with the forward composition).
 
 Validation rig: [`scattering.html`](scattering.html) renders pigments of known K and S and divides by a white Lambert patch under the same directional light — which cancels exposure and units exactly — then compares against the CPU reference. A 10/20/40/80/160 mm slab staircase agrees within **1.5%**, and a sphere probed centre-to-rim within **1–8%**, with the thickness taken from the geometry rather than authored anywhere.

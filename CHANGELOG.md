@@ -138,6 +138,32 @@
     grows toward the rim where partial pixel coverage and the un-modelled Fresnel
     reflection both bite. Zero blown or NaN pixels across the whole 51 529-pixel
     silhouette scan — the guards hold at the degenerate end.
+  - **Cost — and the surprise is that there almost isn't one.** Fence-timed
+    medians on an RTX 3060, museum scene, 1280x720 canvas at `renderScale 0.5`,
+    full stack (GI + emissive + reflections + refraction), ONE foregrounded page
+    at a time (two live WebGL contexts contend, and a backgrounded one times
+    nonsense — the 0.9.0 notes record 27 ms for work that read 71 ms in front):
+
+    | leg | `restir: true` | `restir: false` |
+    |---|---|---|
+    | (a) master baseline | 47.31 ms | 56.89 ms |
+    | (b) feature branch, nothing scatters | 47.14 ms | 56.80 ms |
+    | (c1) exhibit present, absorption only (0.8.0 program) | 51.76 ms | 61.69 ms |
+    | (c2) exhibit present, + coloured shadows (0.9.0 program) | 59.13 ms | 81.50 ms |
+    | (d) exhibit present, **scattering on** | 59.38 ms | 81.56 ms |
+    | **(b) − (a)** off-state | **−0.17 ms** | **−0.09 ms** |
+    | **(d) − (c2)** scattering, isolated | **+0.25 ms** | **+0.06 ms** |
+    | **(d) − (c1)** what a user actually pays | **+7.62 ms** | **+19.87 ms** |
+
+    The isolated cost is **inside the noise**, against a pre-registered budget of
+    +5 ms — because the design the register ceiling forced also turned out to be
+    the fast one. Scattering adds no rays and no traversals; it is arithmetic
+    hung on a chord the shader was already computing, and a handful of guarded
+    branches on the shadow march. What a user actually pays coming from a
+    non-shadowed baseline is (d) − (c1), and **that is coloured shadows**, not
+    this feature: the KM variant is a superset, so enabling it enables the
+    shadow march. (c1) − (b) is 4.6 / 4.9 ms of exhibit GEOMETRY — more
+    triangles and more glass pixels on screen — not feature cost at all.
   - **Limitations, stated because they are the difference between this and
     subsurface scattering.** **No lateral bleed**: this is 1-D transport along
     the ray, light leaves where it entered, so a thin edge does not glow from
