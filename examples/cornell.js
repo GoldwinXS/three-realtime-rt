@@ -513,11 +513,16 @@ async function main() {
   };
   if (carried.canvasScale != null && carried.canvasScale !== canvasScale) setCanvasScale(carried.canvasScale);
 
+  const HINT = "drag to orbit · scroll to zoom · switch exhibits in the panel";
   const ui = buildPanel({
     rt, state, setFeature, setCanvasScale, canvasScale,
     initial: carried.initial,
-    hint: "drag to orbit · scroll to zoom · switch exhibits in the panel",
+    hint: HINT,
   });
+  // RT OFF in THIS room is a black screen, and that is the honest answer rather
+  // than a fault: the only light here is an emissive quad, and a rasterizer has
+  // no path from one of those to a wall. Say so, so nobody reads it as a bug.
+  ui.onRtEnabled((on) => ui.setHint(on ? HINT : "ray tracing off — this room's only light is an emissive quad, and raster has no path from one to a wall"));
 
   // --- exhibit controls (this room's section, below the shared panel) -------
   const xSec = section(ICON.frame, "Exhibit");
