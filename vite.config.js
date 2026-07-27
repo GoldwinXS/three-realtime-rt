@@ -168,6 +168,9 @@ export default defineConfig({
         museum: "museum.html",
         models: "models.html",
         gallery: "gallery.html",
+        // The cost report — a static render of quality-campaign/cost-matrix.json,
+        // linked from the tour chrome and the panel.
+        costs: "costs.html",
         bench: "bench.html",
         harness: "harness.html",
         campaign: "campaign.html",
@@ -181,7 +184,7 @@ export default defineConfig({
   // pulls in RealTimeJSRayTracer/ (a git-ignored reference clone) whose bare
   // imports (vox-reader) aren't installed — failing dep optimization and
   // stalling the dev server.
-  optimizeDeps: { entries: ["index.html", "museum.html", "models.html", "gallery.html", "bench.html", "harness.html", "campaign.html", "volumetric-albedo.html", "absorption.html", "scattering.html"] },
+  optimizeDeps: { entries: ["index.html", "museum.html", "models.html", "gallery.html", "costs.html", "bench.html", "harness.html", "campaign.html", "volumetric-albedo.html", "absorption.html", "scattering.html"] },
   plugins: [shotSaver(), benchSaver(), campaignSink()],
   server: {
     host: "0.0.0.0",

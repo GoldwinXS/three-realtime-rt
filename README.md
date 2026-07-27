@@ -848,6 +848,16 @@ per-room exhibit section below it. Renderer settings follow you from stop to sto
    gallery's catalogue ([`examples/gallery-scenes.js`](examples/gallery-scenes.js)).
    Deep-linkable per model: `models.html#tokyo`.
 
+Every stop's chrome also links [`costs.html`](costs.html) — the **cost report**:
+what each switch in the panel is worth in milliseconds and fps, per scene (86 /
+50k / 141k triangles), rendered straight from the committed measurement matrix
+([`quality-campaign/cost-matrix.json`](quality-campaign/cost-matrix.json)). It is
+a report, not a benchmark: nothing on that page is measured in your browser. It
+also spells out the three results whose sign is the opposite of what the feature
+name suggests — `restir` is a *speed* feature (off = 34–39% slower in the
+multi-light scenes), `restirGI` is too (−27% on the 141k scene, at slightly
+better accuracy), and `giHalfRate` buys 10–22% of the frame for a rmse wash.
+
 Stop 2 is a **panoramic museum gallery** — a
 Cornell-style room (saturated red/teal side walls for obvious colour bleed, open
 top) staged as an exhibit where every renderer feature gets its own vignette: a

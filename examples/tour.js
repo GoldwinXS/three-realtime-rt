@@ -38,6 +38,8 @@ const NAV_ICON = {
   next: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M9 5l7 7-7 7"/></svg>',
   // A ray bouncing off a surface — the RT switch's mark.
   ray: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3l8 9 8-6"/><path d="M2 20h20"/><circle cx="11" cy="12" r="1.6" fill="currentColor" stroke="none"/></svg>',
+  // A bar chart — the cost report's mark.
+  bars: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>',
 };
 
 const CSS = `
@@ -72,10 +74,19 @@ const CSS = `
   border-left: 1px solid #26323c; border-right: 1px solid #26323c; min-width: 190px; }
 #tour .nav .stop b { color: #7ee787; font-weight: 600; letter-spacing: .4px; }
 #tour .nav .stop i { font-style: normal; color: #6b7f8c; font-size: 10px; }
-#tour .dots { display: flex; gap: 6px; }
+#tour .dots { display: flex; align-items: center; gap: 6px; }
 #tour .dots a { width: 7px; height: 7px; border-radius: 50%; background: #2f414d; transition: background .12s; }
 #tour .dots a:hover { background: #4d6472; }
 #tour .dots a.cur { background: #7ee787; }
+/* the cost report — every feature in the panel has a measured price, and this
+   is where it is written down. Sits with the dots, not in the prev/next nav:
+   it is a side door out of the tour, not a fourth stop. */
+#tour .dots a.costs { width: auto; height: auto; border-radius: 5px; background: none;
+  color: #6b7f8c; font-size: 10px; letter-spacing: .4px; text-decoration: none;
+  padding: 2px 7px; border: 1px solid #26323c; margin-left: 6px;
+  display: flex; align-items: center; gap: 5px; }
+#tour .dots a.costs svg { width: 11px; height: 11px; }
+#tour .dots a.costs:hover { color: #7ee787; border-color: #3d5260; background: rgba(14,18,24,0.86); }
 @media (max-width: 700px) {
   #tour { bottom: 8px; gap: 6px; }
   #tour .nav .stop { min-width: 120px; }
@@ -148,6 +159,12 @@ export function buildTourChrome({ stopId, panel }) {
     if (s.id === stopId) d.classList.add("cur");
     dots.append(d);
   }
+  const costs = document.createElement("a");
+  costs.className = "costs";
+  costs.href = "./costs.html";
+  costs.innerHTML = `${NAV_ICON.bars}<span>feature costs</span>`;
+  costs.title = "what each feature costs, in ms and fps, measured per scene";
+  dots.append(costs);
   root.append(dots);
 
   document.body.append(root);

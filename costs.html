@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt — what each feature costs</title>
+  <style>
+    :root {
+      --bg: #0a0f16; --panel: #0e131a; --br: #1e2a34; --ink: #cfe0ea;
+      --dim: #8298a6; --accent: #38d0e0; --good: #7ee787; --bad: #ff9d7a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); }
+    body {
+      color: var(--ink); font: 13px/1.65 ui-monospace, "SF Mono", Consolas, monospace;
+      padding: 28px 20px 80px; max-width: 1080px; margin: 0 auto;
+    }
+    a { color: var(--good); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    h1 { font-size: 19px; margin: 0 0 6px; letter-spacing: 0.3px; }
+    h1 svg { width: 18px; height: 18px; color: var(--accent); vertical-align: -3px; margin-right: 7px; }
+    h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 1.2px;
+      color: var(--dim); margin: 34px 0 10px; padding-bottom: 6px; border-bottom: 1px solid var(--br); }
+    h3 { font-size: 14px; margin: 0 0 2px; color: var(--accent); }
+    p { margin: 0 0 12px; max-width: 78ch; }
+    .sub { color: var(--dim); margin-bottom: 18px; }
+    .prov { color: var(--dim); font-size: 11px; line-height: 1.7; border-left: 2px solid var(--br); padding-left: 11px; }
+    .lede { max-width: 78ch; }
+    b, strong { color: #fff; font-weight: 600; }
+    em { color: var(--accent); font-style: normal; }
+    /* the three inversions */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 12px; }
+    .card { background: var(--panel); border: 1px solid var(--br); border-radius: 9px; padding: 13px 15px; }
+    .card .tag { font-size: 10px; letter-spacing: 1px; text-transform: uppercase;
+      color: #0c1116; background: var(--accent); border-radius: 3px; padding: 1px 6px; }
+    .card p { margin: 9px 0 0; font-size: 12px; line-height: 1.6; color: var(--ink); }
+    .card .num { color: var(--good); }
+    /* scene tables */
+    .scene { margin-top: 22px; }
+    .scene .head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+    .scene .head b { font-size: 14px; color: var(--accent); }
+    .scene .head span { color: var(--dim); font-size: 11px; }
+    .wrap { overflow-x: auto; border: 1px solid var(--br); border-radius: 9px; background: var(--panel); }
+    table { border-collapse: collapse; width: 100%; min-width: 720px; }
+    th, td { text-align: right; padding: 6px 10px; white-space: nowrap; }
+    th { color: var(--dim); font-weight: normal; font-size: 10px; text-transform: uppercase;
+      letter-spacing: 0.8px; border-bottom: 1px solid var(--br); }
+    td.name, th.name { text-align: left; white-space: normal; min-width: 210px; }
+    td.name i { display: block; font-style: normal; color: var(--dim); font-size: 11px; line-height: 1.45; }
+    tbody tr:nth-child(even) { background: rgba(255,255,255,0.018); }
+    td { font-variant-numeric: tabular-nums; border-bottom: 1px solid rgba(30,42,52,0.55); }
+    tbody tr:last-child td { border-bottom: none; }
+    .cost { color: var(--bad); }
+    .save { color: var(--good); }
+    .zero { color: var(--dim); }
+    /* the bar column */
+    td.bar { width: 190px; min-width: 190px; padding-left: 0; }
+    .track { position: relative; height: 9px; background: #131b23; border-radius: 2px; }
+    .track .mid { position: absolute; top: -3px; bottom: -3px; width: 1px; background: #46596a; }
+    .track .fill { position: absolute; top: 0; bottom: 0; border-radius: 2px; }
+    .track .fill.cost { background: linear-gradient(90deg, #7a3a2a, #ff9d7a); }
+    .track .fill.save { background: linear-gradient(270deg, #2c6b43, #7ee787); }
+    ul { max-width: 82ch; padding-left: 18px; }
+    li { margin-bottom: 7px; }
+    code { color: var(--accent); }
+    .foot { margin-top: 40px; padding-top: 14px; border-top: 1px solid var(--br); color: var(--dim); font-size: 11px; }
+    .foot a { margin-right: 14px; }
+    @media (max-width: 640px) { body { padding: 18px 12px 60px; } td.bar { display: none; } th.bar { display: none; } }
+  </style>
+</head>
+<body>
+  <h1>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+    What each feature costs
+  </h1>
+  <div class="sub">every switch in the demo panel, priced in milliseconds and frames per second — measured, per scene.</div>
+
+  <div class="lede">
+    <p>
+      This page is a report, not a benchmark: nothing here is measured in your browser. The
+      numbers are the committed output of the repo's quality campaign
+      (<code>quality-campaign/cost-matrix.json</code>), a staircase sweep that starts from one
+      baseline configuration and changes <b>one thing at a time</b>, timing each variant with
+      GPU fences and comparing its image against a converged full-resolution reference of the
+      same pose.
+    </p>
+    <p>
+      Read every row as <b>&ldquo;what turning this feature ON does&rdquo;</b>: a positive frame time
+      is what it costs you, a negative one is what it gives back. Feature cost is strongly
+      scene-dependent — that is exactly why there are three tables rather than one average.
+    </p>
+    <div class="prov" id="prov">loading measurement provenance…</div>
+  </div>
+
+  <h2>Three things the numbers say that the names do not</h2>
+  <div class="cards">
+    <div class="card">
+      <span class="tag">inversion 1</span>
+      <h3 style="margin-top:8px">ReSTIR has a negative price</h3>
+      <p>
+        <code>restir</code> is filed under &ldquo;noise reduction&rdquo;, but in a scene with more
+        than one light it is the single biggest <em>speed</em> feature in the library. Switching it
+        off makes the museum <b class="num">34% slower</b> and Littlest Tokyo
+        <b class="num">39% slower</b>, because one reservoir visibility ray replaces one shadow
+        ray per light. It is also <i>more</i> accurate. There is no scene in this campaign where
+        <code>restir: false</code> was the better choice — do not ship it.
+      </p>
+    </div>
+    <div class="card">
+      <span class="tag">inversion 2</span>
+      <h3 style="margin-top:8px">ReSTIR GI is a speed feature</h3>
+      <p>
+        <code>restirGI</code> carries an <b>experimental</b> label about its accuracy, which reads
+        like something you would pay for. On the heaviest scene here it is
+        <b class="num">27% faster</b> (47.8 → 34.9 ms) <i>and</i> slightly more accurate
+        (rmse −0.12), because it replaces the lighting pass's inline GI trace with a reservoir
+        the denoiser resolves. The saving scales with GI ray cost: it is worth −14% on 86
+        triangles and −27% on 141k.
+      </p>
+    </div>
+    <div class="card">
+      <span class="tag">inversion 3</span>
+      <h3 style="margin-top:8px">Half-rate GI is nearly free</h3>
+      <p>
+        <code>giHalfRate</code> traces the indirect bounce on alternating checkerboard parity, so
+        it buys back <b class="num">10&ndash;22%</b> of the whole frame. The accuracy column is
+        the surprise: ±0.3 rmse, a wash, because temporal accumulation converges to the same
+        answer either way. On a static scene it is the cheapest 20% you will ever find; the price
+        is paid only in how fast GI re-converges while the camera moves.
+      </p>
+    </div>
+  </div>
+
+  <h2>Per scene</h2>
+  <p class="sub" style="margin-bottom:6px">
+    Sorted by frame-time cost. <b>fps on → off</b> is the frame rate with the feature on, then
+    with it off, at that scene's baseline. <b>accuracy</b> is the change in RMSE against the
+    converged reference when the feature is ON — negative means the feature makes the image
+    <i>closer</i> to the reference.
+  </p>
+  <div id="scenes"></div>
+
+  <h2>The zero that is not a zero</h2>
+  <div class="lede">
+    <p>
+      <code>absorptionShadows</code> (&ldquo;tinted shadows&rdquo;) reads as <b>0.00 ms</b> in all
+      three tables above. That is true and it is not the whole truth: none of the three measured
+      scenes contains a material that actually absorbs, and with nothing absorbing the compiled
+      lighting megakernel is byte-identical to a build without the feature. The zero is the cost
+      of <i>carrying</i> the feature, and it is a real result — most renderers cannot say that.
+    </p>
+    <p>
+      The moment one material does absorb, the same switch replaces a bounded, early-outing
+      any-hit shadow traversal with an unbounded ordered closest-hit march, and the README's
+      measurement of the museum <i>with its glass revealed</i> puts that at
+      <b class="cost">+13.8 ms</b> with ReSTIR on and <b class="cost">+28.7 ms</b> with ReSTIR off
+      (the honest column — it is the configuration in which coloured shadows actually reach a
+      primary surface). Different scene state, different number, same feature: budget it against
+      the state you will ship, not against this page's zero.
+    </p>
+  </div>
+
+  <h2>What was measured, and what these numbers cannot tell you</h2>
+  <div class="lede">
+    <p>Baseline configuration every variant is measured against:</p>
+    <div class="prov" id="baseline">…</div>
+    <p style="margin-top:14px">The campaign's own caveats, unabridged:</p>
+    <ul id="caveats"></ul>
+  </div>
+
+  <div class="foot">
+    <a href="./index.html">← back to the tour</a>
+    <a href="./museum.html">museum</a>
+    <a href="./models.html">model scenes</a>
+    <a href="./bench.html">run the benchmark yourself</a>
+    <a href="https://github.com/GoldwinXS/three-realtime-rt" target="_blank" rel="noopener">GitHub</a>
+  </div>
+
+  <script type="module" src="/examples/costs.js"></script>
+</body>
+</html>
