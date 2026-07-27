@@ -268,10 +268,11 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // after buildUI has finished.
   const gateHooks = { absorption: [] };
 
-  // ReSTIR is written from two places (its own checkbox and the coloured-shadow
-  // auto-off), so its full semantics live in one function and the UI is always
-  // told what happened. `restirSavedState` holds what to restore when the
-  // coloured-shadow toggle releases it; null means it is not holding anything.
+  // ReSTIR is written from several places (its own checkbox, and the auto-off
+  // that the coloured-shadow and scattering toggles share), so its full
+  // semantics live in one function and the UI is always told what happened.
+  // `restirSavedState` holds what to restore when the last borrower releases it;
+  // null means nothing is being held.
   let restirSavedState = null;
   const applyRestir = (v) => {
     rt.restir = v;
