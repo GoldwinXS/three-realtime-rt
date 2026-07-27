@@ -71,6 +71,69 @@ function benchSaver() {
   };
 }
 
+/**
+ * Dev-only helper for the QUALITY CAMPAIGN (campaign.html / examples/campaign.js):
+ * a small sink so the measurement page can persist what it captures.
+ *
+ *   GET  /__campaign/env                -> { rev, date, root }
+ *   POST /__campaign/img?name=foo       -> quality-campaign/images/foo.png (body: base64 PNG)
+ *   POST /__campaign/json?name=foo      -> quality-campaign/foo.json       (body: JSON text)
+ *
+ * Images live under quality-campaign/images/ which is git-ignored (the repo stays
+ * small); the JSON summaries next to them are committed. Names are sanitised to
+ * [A-Za-z0-9._-] so a page can never write outside the campaign directory.
+ */
+function campaignSink() {
+  const clean = (s) => String(s || "out").replace(/[^A-Za-z0-9._-]/g, "");
+  const readBody = (req) =>
+    new Promise((resolve) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => resolve(body));
+    });
+  return {
+    name: "campaign-sink",
+    configureServer(server) {
+      const root = server.config.root;
+      server.middlewares.use("/__campaign", async (req, res) => {
+        const url = new URL(req.url, "http://localhost");
+        const name = clean(url.searchParams.get("name"));
+        if (url.pathname.startsWith("/env")) {
+          let rev = "nogit";
+          try {
+            rev = execSync("git rev-parse --short HEAD", { cwd: root }).toString().trim();
+          } catch {
+            /* not a git checkout — keep the "nogit" fallback */
+          }
+          res.setHeader("content-type", "application/json");
+          return res.end(JSON.stringify({ rev, date: new Date().toISOString(), root }));
+        }
+        if (req.method !== "POST") {
+          res.statusCode = 405;
+          return res.end("POST only");
+        }
+        const body = await readBody(req);
+        if (url.pathname.startsWith("/img")) {
+          const dir = path.join(root, "quality-campaign", "images");
+          fs.mkdirSync(dir, { recursive: true });
+          const file = path.join(dir, `${name}.png`);
+          fs.writeFileSync(file, Buffer.from(body, "base64"));
+          return res.end(file);
+        }
+        if (url.pathname.startsWith("/json")) {
+          const dir = path.join(root, "quality-campaign");
+          fs.mkdirSync(dir, { recursive: true });
+          const file = path.join(dir, `${name}.json`);
+          fs.writeFileSync(file, body);
+          return res.end(file);
+        }
+        res.statusCode = 404;
+        res.end("unknown campaign route");
+      });
+    },
+  };
+}
+
 // Three-version matrix hook for the render self-test (scripts/selftest.mjs): with
 // RT_THREE=latest, resolve every bare `three` (and `three/...` subpath, incl.
 // `three/addons`) import to the `three-latest` devDependency (npm:three@latest)
@@ -107,6 +170,7 @@ export default defineConfig({
         gallery: "gallery.html",
         bench: "bench.html",
         harness: "harness.html",
+        campaign: "campaign.html",
         volumetricAlbedo: "volumetric-albedo.html",
         absorption: "absorption.html",
         scattering: "scattering.html",
@@ -117,8 +181,8 @@ export default defineConfig({
   // pulls in RealTimeJSRayTracer/ (a git-ignored reference clone) whose bare
   // imports (vox-reader) aren't installed — failing dep optimization and
   // stalling the dev server.
-  optimizeDeps: { entries: ["index.html", "museum.html", "models.html", "gallery.html", "bench.html", "harness.html", "volumetric-albedo.html", "absorption.html", "scattering.html"] },
-  plugins: [shotSaver(), benchSaver()],
+  optimizeDeps: { entries: ["index.html", "museum.html", "models.html", "gallery.html", "bench.html", "harness.html", "campaign.html", "volumetric-albedo.html", "absorption.html", "scattering.html"] },
+  plugins: [shotSaver(), benchSaver(), campaignSink()],
   server: {
     host: "0.0.0.0",
     port: 8115,

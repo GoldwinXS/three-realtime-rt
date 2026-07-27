@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt — quality campaign</title>
+  <style>
+    html, body { margin: 0; min-height: 100%; background: #0a0f16; }
+    body {
+      color: #cfe0ea; font: 12px/1.55 ui-monospace, Consolas, monospace;
+      padding: 16px; box-sizing: border-box;
+    }
+    h1 { font-size: 14px; color: #7fd8c8; margin: 0 0 10px; }
+    #status { color: #8fa3b3; margin: 8px 0; min-height: 1.6em; }
+    #log {
+      white-space: pre; color: #cfe0ea; background: #0e131a;
+      border: 1px solid #26323c; border-radius: 8px; padding: 10px;
+      overflow: auto; max-height: 70vh; margin: 0;
+    }
+    /* The measured canvas is fixed-size (1280x720 * canvasScale) and must exist
+       in the drawing buffer — readPixels needs it real, so it is parked
+       off-flow but on-screen rather than display:none. */
+    #app { position: fixed; left: -20000px; top: 0; }
+  </style>
+</head>
+<body>
+  <h1>three-realtime-rt — quality campaign harness</h1>
+  <div id="status">idle. add ?scene=cornell&amp;plan=main&amp;autorun=1</div>
+  <pre id="log"></pre>
+  <div id="app"></div>
+  <script type="module" src="/examples/campaign.js"></script>
+</body>
+</html>
