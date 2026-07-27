@@ -709,6 +709,9 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * so the ascent can hand every one of them back (see _adaptQuality).
      */
     this._qFreeWins = null;
+    // Consecutive adaptations that measured "comfortably fast". Only the free-win
+    // release reads it — see _adaptQuality for why that one step needs a dwell.
+    this._qFastStreak = 0;
     /**
      * App-owned canvas-scale setter, driven by the governor as its deepest
      * lever once renderScale bottoms out. The app owns the canvas + CSS stretch,
@@ -1629,15 +1632,29 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       return;
     }
 
-    // STEP 3 (up): the free wins are the LAST thing handed back — they are the
-    // cheapest saving in quality terms, so they are the last one to surrender.
-    // Only once the canvas is whole again AND renderScale has climbed back to
-    // where it stood when they were taken (LIFO with the descent above).
+    // STEP 3 (up): the free wins are the LAST thing handed back, and the bar for
+    // handing them back is deliberately much higher than for any other step:
+    //
+    //   - the canvas is whole and renderScale is at its CEILING, so there is
+    //     nothing cheaper left to restore (LIFO with the descent), and
+    //   - the frame is running at DOUBLE the headroom an ordinary up-step needs
+    //     (ratio < 0.5, i.e. under half the target frame period), for two
+    //     consecutive adaptations.
+    //
+    // Measured, not guessed: with a plain `ratio < dbLo` test this oscillated —
+    // take, return, take, return, three cycles in twenty seconds on the tokyo
+    // scene — because giving the wins back makes the frame 10-27% slower, which
+    // lands straight back in "slow". They are cheaper AND no worse, so holding
+    // them one level too long costs nothing and churning them costs a reset
+    // every two seconds.
+    if (ratio < dbLo) this._qFastStreak = (this._qFastStreak || 0) + 1;
+    else this._qFastStreak = 0;
     if (
-      ratio < dbLo &&
+      ratio < 0.5 &&
+      this._qFastStreak >= 2 &&
       this._qFreeWins &&
       this._canvasLevelIdx === 0 &&
-      this._renderScale >= (this._qFreeWins.scale ?? 1) &&
+      this._renderScale >= 1 &&
       this._releaseFreeWins(now)
     ) {
       return;
