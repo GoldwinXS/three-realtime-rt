@@ -6,6 +6,7 @@ RealTimeJSRayTracer/
 # Quality-campaign image archive: thousands of full-frame PNGs kept on disk for
 # later inspection. The JSON results next to them ARE committed.
 quality-campaign/images/
+quality-campaign/zoom/
 
 supporter-pack/
 marketing/

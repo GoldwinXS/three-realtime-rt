@@ -1032,10 +1032,15 @@ function ladderConfigs() {
   add("lib-rs375", { renderScale: 0.375, denoiseIterations: 4, stochasticLights: true });
   add("lib-rs25", { renderScale: 0.25, denoiseIterations: 5, stochasticLights: true });
   add("lib-rs20-cs085", { renderScale: 0.2, denoiseIterations: 5, stochasticLights: true, canvasScale: 0.85 });
-  add("new-rs50", { renderScale: 0.5, denoiseIterations: 2, giHalfRate: true, restirGI: true });
-  add("new-rs375", { renderScale: 0.375, denoiseIterations: 2, giHalfRate: true, restirGI: true });
-  add("new-rs25", { renderScale: 0.25, denoiseIterations: 3, giHalfRate: true, restirGI: true, stochasticLights: true });
-  add("new-rs20", { renderScale: 0.2, denoiseIterations: 3, giHalfRate: true, restirGI: true, stochasticLights: true });
+  // The proposed rungs bundle four campaign findings: giHalfRate and restirGI
+  // are both NEGATIVE cost at equal error; the denoise pass count stops paying
+  // for itself past 3; and restirMCap 16 improved every metric in both scenes at
+  // ~0 ms. denoiseWideDamp rides along to keep 3 passes accurate.
+  const win = { giHalfRate: true, restirGI: true, restirMCap: 16, denoiseWideDamp: 1 };
+  add("new-rs50", { renderScale: 0.5, denoiseIterations: 2, ...win });
+  add("new-rs375", { renderScale: 0.375, denoiseIterations: 3, ...win });
+  add("new-rs25", { renderScale: 0.25, denoiseIterations: 3, stochasticLights: true, ...win });
+  add("new-rs20", { renderScale: 0.2, denoiseIterations: 3, stochasticLights: true, ...win });
   return out;
 }
 
