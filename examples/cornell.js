@@ -81,10 +81,15 @@ function buildRoom() {
   // off its triangles, which is why "emissive area lights" is on by default here
   // and why RT OFF renders the box nearly black (a rasterizer has no path from
   // an emissive quad to a wall).
+  // TWO triangles, facing down, not a box. Emissive NEE picks one emitting
+  // triangle per pixel per frame: a box spends five sixths of those samples on
+  // faces the ceiling occludes, which costs nothing in frame time and everything
+  // in variance. A single downward quad is the surface that actually emits.
   const lamp = new THREE.Mesh(
-    new THREE.BoxGeometry(1.9, 0.06, 1.5),
+    new THREE.PlaneGeometry(1.9, 1.5),
     new THREE.MeshStandardMaterial({ color: 0x000000, emissive: 0xffe9c4, emissiveIntensity: 16 })
   );
+  lamp.rotation.x = Math.PI / 2;   // +Z normal -> -Y: it shines into the room
   lamp.position.set(0, S - 0.04, 0);
   lamp.name = "ceiling-lamp";
   scene.add(lamp);
@@ -403,7 +408,7 @@ async function main() {
   // each is legible.
   const rt = new RealtimeRaytracer(renderer, {
     renderScale: 0.25,
-    denoiseIterations: 3,
+    denoiseIterations: 2,
     stochasticLights: false,
     adaptiveQuality: false,
     gi: true,
