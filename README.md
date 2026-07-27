@@ -624,11 +624,11 @@ naming the object (see *[Diagnostics](#diagnostics-statuswarnings)*).
 |--------|---------|------|
 | `renderScale` | `0.5` | Lighting resolution vs. the G-buffer. `1.0` = max quality. |
 | `overscan` | `0` | Render past the canvas edges and crop the centre back, so leading-edge disocclusion noise during camera motion is born off-screen. Padding fraction per edge (0–0.25); `0.1` costs 1.44× the pixels. See *Edge convergence and overscan*. |
-| `adaptiveQuality` | `true` | Governor that steers `renderScale` / `denoiseIterations` / `stochasticLights` toward `targetFps` — scales **up** on strong hardware, **down** on weak. Turn off for manual control. |
+| `adaptiveQuality` | `true` | Governor that steers quality toward `targetFps` — scales **up** on strong hardware, **down** on weak. Spends in one order: **free wins first** (`giHalfRate`, `restirGI`, `restirMCap` 16 — measured cheaper *and* no worse), then `renderScale` in 5% steps to `0.2`, then the canvas via `canvasScaleHook`; returns them in reverse. Also sets `denoiseIterations` (never above **3**) and `stochasticLights`. Turn off for manual control. |
 | `targetFps` | `55` | Frame rate the governor steers toward. |
 | `canvasScaleHook` | `null` | Callback `(scale) => void` letting the governor drive your **canvas scale** — its deepest, most valuable lever. See *[canvasScaleHook](#canvasscalehook-the-governors-deepest-lever)*. |
 | `taaJitterScale` | `1` | Scales the sub-pixel TAA jitter. Set it to your current canvas scale when you CSS-stretch a reduced drawing buffer, so the jitter stays constant in *screen* pixels instead of wobbling. |
-| `denoiseIterations` | `2` | À-trous denoise passes; the governor raises this as it lowers resolution. |
+| `denoiseIterations` | `2` | À-trous denoise passes. Measured: rmse-vs-reference degrades monotonically past 2, and the filter's coarse lattice ("plaid") rises 4–5× between 2 and 4 passes — it peaks wherever the widest tap spacing reaches ~16 *screen* pixels, so it is pass 4 at `renderScale 0.5` and pass 3 at `0.25`. The governor therefore never sets more than **3**; higher values remain available by hand. |
 | `taa` | `true` | Temporal anti-aliasing (jitter + neighbourhood clamp). |
 | `denoise` | `true` | Edge-aware à-trous denoiser. |
 | `gi` | `true` | 1-bounce global illumination (vs. direct-only). |
@@ -647,7 +647,11 @@ naming the object (see *[Diagnostics](#diagnostics-statuswarnings)*).
 | `volumetric` | *off* | Physically-based god rays: single-scatter fog, one BVH-shadowed light sample per lighting pixel per frame, temporally accumulated. `{ enabled, density, maxDist, zones }`, where `zones` is an optional array of up to 8 AABBs `{ min:[x,y,z], max:[x,y,z], density }` that add localized fog on top of (or instead of) the global `density`. |
 | `stochasticLights` | `true` | One direct shadow ray per pixel per frame (random source) instead of one per light. The governor turns it off once it has scaled resolution up on strong hardware. |
 | `temporalReprojection` | `true` | Keep samples across camera/object motion. |
-| `maxHistory` | `128` | History cap — higher is smoother, slower to react. |
+| `maxHistory` | `128` | Irradiance-EMA history cap — higher is smoother, slower to react, and it is the **dominant** ghost carrier of the pipeline's three temporal stores (measured: 48 → 16 cuts in-motion error 9.13 → 5.29 and the post-motion P95 residual 13.9 → 8.3 on the Cornell scene). Left high because that trade is a *look* decision, not a bug; lower it if your camera moves a lot. |
+| `restirMCap` | `16` | ReSTIR reservoir staleness cap — how much confidence a direct-lighting reservoir may accumulate before new candidates stop displacing it. **Lowered from 40 on measurement**: 16 was better on *every* metric in *both* measured scenes (rmse 5.39 → 4.92 / 5.13 → 4.70, in-motion error and post-motion ghost both down) for ~0.3 ms. |
+| `motionAdaptive` | `false` | **Opt-in.** Lerp all three temporal stores toward their `*Moving` counterparts (`maxHistoryMoving` `6`, `taaBlendMoving` `0.4`, `restirMCapMoving` = `restirMCap`) by the measured camera motion, so history is short while moving and long again the instant it stops. Costs no fps and no still-frame quality, and measured −46% in-motion error / −33% post-motion P95 residual on the Cornell strafe path — a *lower bound*, since the gain scales with motion and the measured paths are gentle. Off by default because it changes the temporal look of every scene; with it off every uniform keeps its pre-feature value. |
+| `denoiseWideDamp` | `0` | **Opt-in** (0 = off, 1 = full). Wavelet shrinkage of the *coarse* à-trous passes. Only relevant past 3 passes, where it recovers most of the accuracy the extra passes cost, at identical frame time and unchanged temporal noise (6 passes: rmse 5.82 → 5.48 Cornell, 6.13 → 5.77 museum; 2 passes is 5.43). It **attenuates** the lattice rather than removing it, which is why it is an option and not a fix — and why the governor, which caps itself at 3 passes, never needs it. |
+| `denoiseMaxStep` / `denoiseStepJitter` | `0` / `0` | **Opt-in, both measured and REJECTED** as artifact fixes; kept only as A/B hooks. Capping the tap cascade makes it repeat its widest step and *reinforces* that period (period-32 energy 0.67 → 1.04); jittering the tap radius cuts the lattice but doubles still-frame temporal noise (0.137 → 0.271), trading a static artifact for shimmer. |
 | `fireflyClamp` | `4.0` | Clamp on indirect luminance to suppress fireflies. |
 | `costScale` | `1/96` | BVH-cost heatmap scale for the `outputMode: 7` debug view (shadow-ray node-visit count × this, mapped through a cold→hot palette). See *Debug views*. |
 | `sky` | *off* | Procedural sky as background + GI ambient (see above). |
@@ -736,13 +740,21 @@ starting point or take manual control:
   values are echoed back in `details`. The constructor stays synchronous — this
   is a pre-construction, opt-in call.
 
-- **Adaptive quality** (`adaptiveQuality: true`, default **true**): continuous
-  dynamic resolution scaling. Watches real frame time and steers the lighting
-  resolution smoothly toward `targetFps` (in 5% steps with a cooldown), pairing
-  low resolutions with MORE denoise passes (they run at lighting res, so
-  they're nearly free exactly where they're needed) and stochastic direct
-  light. While enabled it drives `renderScale` / `stochasticLights` /
-  `denoiseIterations`; turn it off for manual control.
+- **Adaptive quality** (`adaptiveQuality: true`, default **true**): watches real
+  frame time and spends quality in a fixed order, cheapest-first, toward
+  `targetFps`:
+  1. **free wins** — `giHalfRate` on, `restirGI` on (with denoise passes held at
+     ≤ 3), `restirMCap` down to 16. Measured cheaper *and* no worse, so no
+     resolution is given up until they are spent.
+  2. **`renderScale`** in 5% steps down to `0.2`, with a cooldown.
+  3. **canvas scale**, via `canvasScaleHook` — only once `renderScale` is at its
+     floor. See below for why that order and not the reverse.
+  On the way back up it returns them in the exact reverse order. While enabled it
+  drives `renderScale` / `denoiseIterations` / `stochasticLights` / `giHalfRate` /
+  `restirGI` / `restirMCap`; turn it off for manual control. It never raises
+  `denoiseIterations` above **3** — past 2 passes accuracy degrades monotonically
+  and the à-trous lattice becomes measurable (that is a *governor* policy; the
+  option itself still takes any value you set).
 - **`stochasticLights: true`** (default false): one direct shadow ray per
   pixel per frame instead of one per light — the biggest ray-count lever for
   many-light scenes and mobile GPUs.
@@ -753,7 +765,14 @@ starting point or take manual control:
 whole drawing buffer, so every pass — the raster G-buffer, lighting, denoise,
 TAA, resolve — gets quadratically cheaper. That makes it the strongest lever the
 governor has, and the one it reaches for **first when recovering** quality and
-**last when cutting** it (once `renderScale` has bottomed out at `0.2`).
+**last when cutting** it (only once `renderScale` has bottomed out at `0.2`).
+
+Last, and by measurement: at **matched cost**, full canvas at `renderScale 0.2`
+beats canvas `0.85` at `renderScale 0.2` by **14–22% rmse** and retains ~40% more
+detail (sharpRatio 0.96 vs 0.65–0.69) on both real scenes. Shrinking the canvas
+throws away the G-buffer's *edges* — the one part of the image the tracer gets
+sharp for free from the rasterizer — so it is the last thing to give up, not the
+first.
 
 The canvas belongs to your app, not the library, so the governor cannot resize it
 itself: it calls **`canvasScaleHook(scale)`** with the next value from

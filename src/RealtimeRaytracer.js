@@ -311,14 +311,32 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   }
 
   /**
-   * Companion settings for a given lighting resolution. LOW resolution wants
-   * MORE denoise passes, not fewer — the filter runs at lighting res so extra
-   * iterations are nearly free there, and they're what makes 25% lighting look
-   * good. Stochastic lights kick in once the budget is clearly constrained.
+   * Companion settings for a given lighting resolution, and the governor's
+   * denoise-pass CAP.
+   *
+   * This used to read "LOW resolution wants MORE denoise passes" (3 / 4 / 5 as
+   * the scale fell) on the theory that the filter runs at lighting res, so extra
+   * iterations are nearly free. The frame-time half of that is true. The image
+   * half is not, and the quality campaign measured it: past 2 passes rmse-vs-
+   * reference degrades monotonically in every scene, and the coarse-period
+   * energy that reads as the plaid/lattice artifact rises 4-5x between 2 and 4
+   * passes (cornell renderScale 0.5, period-32px bin 0.25 -> 0.99). The peak
+   * lands wherever the WIDEST a-trous tap spacing reaches ~16 SCREEN pixels —
+   * pass 4 at renderScale 0.5, pass 3 at 0.25 — so the old ladder was raising
+   * the pass count exactly where the artifact is worst. The governor now never
+   * exceeds 3 (the panel slider keeps its full range; this is the automatic
+   * policy, not a clamp on the user).
+   *
+   * The stochasticLights threshold is deliberately NOT touched. The campaign
+   * measured it at 0.03-0.06 ms — nothing — but all three campaign scenes have
+   * three lights or fewer, and this switch exists for MANY-light scenes on weak
+   * GPUs, which is precisely the case the measurement cannot speak to.
    */
+  static GOVERNOR_MAX_DENOISE = 3;
+
   static _qualityFor(scale) {
     return {
-      denoiseIterations: scale <= 0.3 ? 5 : scale <= 0.45 ? 4 : 3,
+      denoiseIterations: scale > 0.45 ? 2 : RealtimeRaytracer.GOVERNOR_MAX_DENOISE,
       stochasticLights: scale <= 0.55,
     };
   }
@@ -513,10 +531,32 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.maxHistoryMoving = options.maxHistoryMoving ?? 6;
     /** TAA fresh-sample weight at full motion (motionAdaptive only). */
     this.taaBlendMoving = options.taaBlendMoving ?? 0.4;
-    /** ReSTIR reservoir staleness cap; 40 is the shipped value. */
-    this.restirMCap = options.restirMCap ?? 40;
-    /** ReSTIR reservoir staleness cap at full motion (motionAdaptive only). */
-    this.restirMCapMoving = options.restirMCapMoving ?? 40;
+    /**
+     * ReSTIR reservoir staleness cap — how many samples' worth of confidence a
+     * direct-lighting reservoir may carry before new candidates stop being able
+     * to displace it.
+     *
+     * 16, lowered from 40 on measurement. The quality campaign's ghosting arm
+     * varied one temporal store at a time and this was the only unconditional
+     * win in the whole campaign — better on EVERY metric in BOTH scenes, for
+     * ~0.3 ms (museum 42.78 -> 43.05 ms, cornell unchanged at 11.27):
+     *
+     *              rmse320      strafe in-motion err   post-motion ghost
+     *   cornell    5.39 -> 4.92      9.13 -> 8.65        1.90 -> 1.25 (10 frames)
+     *   museum     5.13 -> 4.70      6.89 -> 6.73        2.35 -> 2.13
+     *
+     * A 40-sample reservoir is simply staler than the rest of the pipeline: the
+     * irradiance EMA it feeds is re-estimated far more often than once every 40
+     * frames, so the extra "confidence" only buys resistance to change.
+     */
+    this.restirMCap = options.restirMCap ?? 16;
+    /**
+     * ReSTIR reservoir staleness cap at full motion (motionAdaptive only).
+     * Defaults to whatever restirMCap is, so this axis stays inert unless an app
+     * opts in — the two were both 40 before restirMCap moved to 16, and a
+     * *Moving value LONGER than the parked one would be an inversion.
+     */
+    this.restirMCapMoving = options.restirMCapMoving ?? this.restirMCap;
     /**
      * Screen motion (in UV) that counts as "full motion" for the lerp above.
      * 0.015 = the frame content moved 1.5% of the screen in one step, which at
@@ -661,6 +701,14 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // deadband and lengthens its cooldown to settle down (see _adaptQuality).
     this._qLastDir = 0;
     this._qOscillating = false;
+    /**
+     * The governor's FREE WINS: settings the quality campaign measured as
+     * cheaper AND no worse (usually better) than the state they replace, so they
+     * are spent BEFORE any resolution is given up. Null until taken; then it
+     * holds the previous values plus the renderScale at which they were taken,
+     * so the ascent can hand every one of them back (see _adaptQuality).
+     */
+    this._qFreeWins = null;
     /**
      * App-owned canvas-scale setter, driven by the governor as its deepest
      * lever once renderScale bottoms out. The app owns the canvas + CSS stretch,
@@ -1397,6 +1445,84 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     }
   }
 
+  /**
+   * FREE WINS — the first thing the governor spends, before a single pixel of
+   * resolution. Returns true if it changed anything.
+   *
+   * The quality campaign timed every feature per scene and found three settings
+   * that are cheaper AND no worse than the state they replace, so giving up
+   * resolution before taking them is simply leaving frame time on the table:
+   *
+   *   giHalfRate on   -9.6% cornell / -19.1% museum / -21.9% tokyo frame time,
+   *                   at rmse320 -0.004 / -0.09 / +0.30 (i.e. a wash)
+   *   restirGI on     -14.2% / -7.9% / -27.0%, at rmse320 +0.41 / -0.09 / -0.12
+   *                   — a SPEED feature on real scenes despite the experimental
+   *                   label, because it replaces the lighting pass's inline GI
+   *                   trace, and the saving scales with GI ray cost
+   *   restirMCap 16   ~0.3 ms, better rmse/ghosting/in-motion error in both
+   *                   measured scenes (now the library default; this only fires
+   *                   for an app that raised it)
+   *
+   * restirGI is paired with a denoise cap of 3: it is resolved AT the à-trous
+   * stage, so its coarse structure is what the wide passes smear, and the
+   * campaign's own replacement ladder never ran it past 3 passes.
+   *
+   * Taken as ONE step (they are independent of each other and of resolution) and
+   * released as one on the way back up, so the governor's state is either "free
+   * wins spent" or not — no half-ladder to reason about.
+   */
+  _takeFreeWins(now) {
+    if (this._qFreeWins) return false;
+    // Nothing to take in a scene without GI: giHalfRate and restirGI both act on
+    // the indirect bounce. Recorded as an empty take so the check is not redone
+    // every adaptation (and so the ascent still has something to release).
+    const prev = { scale: this._renderScale };
+    let took = false;
+    if (this.gi && !this.giHalfRate) {
+      prev.giHalfRate = false;
+      this.giHalfRate = true;
+      took = true;
+    }
+    if (this.gi && this.denoise && this.denoiseIterations > 0 && !this.restirGI) {
+      prev.restirGI = false;
+      this.restirGI = true;
+      took = true;
+      if (this.denoiseIterations > RealtimeRaytracer.GOVERNOR_MAX_DENOISE) {
+        prev.denoiseIterations = this.denoiseIterations;
+        this.denoiseIterations = RealtimeRaytracer.GOVERNOR_MAX_DENOISE;
+      }
+    }
+    if (this.restirMCap > 16) {
+      prev.restirMCap = this.restirMCap;
+      this.restirMCap = 16;
+      took = true;
+    }
+    this._qFreeWins = prev; // even when empty: the check is now settled
+    if (!took) return false;
+    this._recordChange(-1, now);
+    this._qEma = null; // cost profile changed — measure fresh
+    console.info(
+      "three-realtime-rt: adaptive quality → free wins first (" +
+        Object.keys(prev).filter((k) => k !== "scale").join(", ") +
+        "), resolution untouched"
+    );
+    return true;
+  }
+
+  /** Hand the free wins back (ascent). Returns true if it changed anything. */
+  _releaseFreeWins(now) {
+    const prev = this._qFreeWins;
+    if (!prev) return false;
+    this._qFreeWins = null;
+    const keys = Object.keys(prev).filter((k) => k !== "scale");
+    if (!keys.length) return false;
+    for (const k of keys) this[k] = prev[k];
+    this._recordChange(1, now);
+    this._qEma = null;
+    console.info(`three-realtime-rt: adaptive quality → returned ${keys.join(", ")}`);
+    return true;
+  }
+
   // ---- adaptive quality governor: continuous dynamic resolution scaling ----
   // Measures real call-to-call frame time (EMA) and steers renderScale
   // proportionally toward targetFps, in 0.05 steps with a cooldown so target
@@ -1404,6 +1530,17 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   // the correction uses a damped power of the error. Limitation: under a vsync
   // cap the frame time can't reveal headroom, so upscaling only happens when
   // frames are measurably faster than the target — it never thrashes.
+  //
+  // SPENDING ORDER (down), cheapest-in-quality first:
+  //   1. free wins            _takeFreeWins — no resolution given up at all
+  //   2. renderScale          0.05 steps to 0.2 (lighting buffer only)
+  //   3. canvasScale          the CANVAS_LEVELS ladder, quadratic on every pass
+  // and the exact reverse on the way up, so everything taken is given back.
+  // renderScale before canvas is the campaign's clearest ladder result: at
+  // MATCHED cost, renderScale 0.2 at full canvas beats canvas 0.85 at
+  // renderScale 0.2 by 14-22% rmse and ~40% detail retention (sharpRatio 0.96
+  // vs 0.65) — canvas scale throws away the G-buffer's edges, which is the one
+  // thing the tracer gets for free from the rasterizer.
   _adaptQuality() {
     // Hidden tabs are exempt: browser throttling makes every frame look
     // catastrophic, and adapting on that would drop quality for a tab nobody is
@@ -1436,6 +1573,9 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     const dbHi = this._qOscillating ? 1.24 : 1.12;
     if (ratio < dbHi && ratio > dbLo) return; // comfortable — leave it alone
 
+    // STEP 1 (down): the free wins, before any resolution is given up.
+    if (ratio > dbHi && this._takeFreeWins(now)) return;
+
     let s = this._renderScale * Math.pow(1 / ratio, 0.35);
     // Per-step clamp. Now that multi-hundred-millisecond frames feed the EMA, a
     // single very slow measurement (ratio can reach ~100 at dt 2s) would
@@ -1462,13 +1602,18 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       return;
     }
 
-    // When we're slow and renderScale has already bottomed out (clamped to its
-    // 0.2 floor while we're already near it), step DOWN the canvas ladder — the
-    // deepest, quadratic-on-every-pass lever — instead of a no-op renderScale.
+    // When we're slow and renderScale has ALREADY BOTTOMED OUT — it is at the
+    // 0.2 floor, not merely near it — step DOWN the canvas ladder, the deepest,
+    // quadratic-on-every-pass lever. The old condition fired at renderScale
+    // 0.25, one rung early; the campaign's cost-matched A/B says that rung
+    // belongs to renderScale (full canvas at renderScale 0.2 beats canvas 0.85
+    // at renderScale 0.2: rmse 9.53 vs 11.42 museum, 7.05 vs 8.98 tokyo, and
+    // sharpRatio 0.96 vs 0.65-0.69 in both), so renderScale now walks all the
+    // way to its floor before the canvas is touched at all.
     if (
       ratio > dbHi &&
       s <= 0.2 &&
-      this._renderScale <= 0.25 &&
+      this._renderScale <= 0.2 &&
       this.canvasScaleHook &&
       this._canvasLevelIdx < RealtimeRaytracer.CANVAS_LEVELS.length - 1
     ) {
@@ -1481,6 +1626,20 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
           RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx] * 100
         )}% canvas`
       );
+      return;
+    }
+
+    // STEP 3 (up): the free wins are the LAST thing handed back — they are the
+    // cheapest saving in quality terms, so they are the last one to surrender.
+    // Only once the canvas is whole again AND renderScale has climbed back to
+    // where it stood when they were taken (LIFO with the descent above).
+    if (
+      ratio < dbLo &&
+      this._qFreeWins &&
+      this._canvasLevelIdx === 0 &&
+      this._renderScale >= (this._qFreeWins.scale ?? 1) &&
+      this._releaseFreeWins(now)
+    ) {
       return;
     }
 
