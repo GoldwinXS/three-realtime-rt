@@ -18,6 +18,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "test:render": "node scripts/selftest.mjs",
+    "test:km": "node scripts/km-selftest.mjs",
     "deploy": "vite build && gh-pages -d dist -t"
   },
   "keywords": [
