@@ -22,6 +22,19 @@ import { buildScene } from "./scene.js";
 
 const W = 1280, H = 720;
 
+// SCENE LABELS CARRY A VERSION, and this is not decoration. Every result file in
+// bench-results/ before 2026-07 keys its first scene as plain "room", and that
+// label has meant three different rooms: the original Cornell-style test room,
+// the gallery redesign, and the museum. Reading those files as one time series
+// says the renderer got 7x slower, when what changed was the scene (5.8 ms then,
+// 42.6 ms now, at the same settings). A dated label makes the discontinuity
+// visible in the data instead of hiding it behind a stable key — bump the suffix
+// whenever the scene's contents change materially. See bench-results/README.md.
+const SCENES = {
+  museum: { key: "museum-2026-07", note: "examples/scene.js buildScene() — museum redesign, 2026-07" },
+  tokyo: { key: "tokyo-2026-07", note: "LittlestTokyo.glb (DRACO), streamed; framing unchanged since 2026-07" },
+};
+
 const tokyoUrl =
   "https://raw.githubusercontent.com/mrdoob/three.js/master/examples/models/gltf/LittlestTokyo.glb";
 
@@ -232,19 +245,22 @@ function renderTable(results) {
   lines.push(`resolution ${results.resolution}`);
   lines.push(`ua         ${results.userAgent}`);
   lines.push("");
-  lines.push(`scene    raster   rt-min   rt-core  rt-full   (ms/frame, lower=faster)`);
+  lines.push(`scene              raster   rt-min   rt-core  rt-full   (ms/frame, lower=faster)`);
   for (const [name, s] of Object.entries(results.scenes)) {
-    if (typeof s === "string") { lines.push(`${name.padEnd(8)} ${s}`); continue; }
+    if (typeof s === "string") { lines.push(`${name.padEnd(18)} ${s}`); continue; }
     lines.push(
-      `${name.padEnd(8)} ${fmt(s.raster).padStart(7)}  ${fmt(s.rtMin).padStart(7)}  ` +
+      `${name.padEnd(18)} ${fmt(s.raster).padStart(7)}  ${fmt(s.rtMin).padStart(7)}  ` +
       `${fmt(s.rtCore).padStart(7)}  ${fmt(s.rtFull).padStart(7)}`
     );
   }
-  const room = results.scenes.room;
+  lines.push("");
+  lines.push(`scene labels carry a DATE: the contents behind a name change, and`);
+  lines.push(`comparing across a redesign is not a regression. See bench-results/README.md.`);
+  const room = results.scenes[SCENES.museum.key];
   if (room && typeof room !== "string" && room.ghost) {
     const g = room.ghost;
     lines.push("");
-    lines.push(`ghosting (room, rt-core) — mean abs diff vs settled ref, 0-255, lower=less ghosting`);
+    lines.push(`ghosting (${SCENES.museum.key}, rt-core) — mean abs diff vs settled ref, 0-255, lower=less ghosting`);
     lines.push(`  frames   1        5        10       20       40`);
     lines.push(
       `  diff     ${fmt(g.g1).padStart(6)}   ${fmt(g.g5).padStart(6)}   ` +
@@ -262,22 +278,25 @@ async function run() {
     date: new Date().toISOString(),
     userAgent: navigator.userAgent,
     resolution: `${W}x${H}`,
+    // What each scene key MEANS in this run, so a future reader of the JSON does
+    // not have to guess which room "museum-2026-07" was.
+    sceneVersions: Object.fromEntries(Object.values(SCENES).map((s) => [s.key, s.note])),
     scenes: {},
   };
 
   try {
     // Scene A: Cornell-style room (static, no physics — compile only).
-    setStatus("room: building scene…");
+    setStatus(`${SCENES.museum.key}: building scene…`);
     const built = buildScene();
     await built.ready;
-    results.scenes.room = await benchScene(
-      "room", built.scene, built.sky,
+    results.scenes[SCENES.museum.key] = await benchScene(
+      SCENES.museum.key, built.scene, built.sky,
       { envColor: new THREE.Color(0x121821), envIntensity: 1.0, forceLightsVisible: true },
       [6, 3.8, 8], [0, 1.2, 0], true
     );
 
     // Scene B: Littlest Tokyo (network DRACO glTF). Skip cleanly if it fails.
-    setStatus("tokyo: fetching model…");
+    setStatus(`${SCENES.tokyo.key}: fetching model…`);
     try {
       const gltf = await loadGltf(tokyoUrl);
       const scene = new THREE.Scene();
@@ -296,13 +315,13 @@ async function run() {
         horizon: new THREE.Color(0.74, 0.82, 0.9),
         intensity: 1.0,
       };
-      results.scenes.tokyo = await benchScene(
-        "tokyo", scene, sky,
+      results.scenes[SCENES.tokyo.key] = await benchScene(
+        SCENES.tokyo.key, scene, sky,
         { envColor: new THREE.Color(0.35, 0.42, 0.55), envIntensity: 0.8 },
         [11, 7, 12], [0, 3.4, 0], false
       );
     } catch (err) {
-      results.scenes.tokyo = `skipped: ${err?.message ?? err}`;
+      results.scenes[SCENES.tokyo.key] = `skipped: ${err?.message ?? err}`;
     }
 
     renderTable(results);

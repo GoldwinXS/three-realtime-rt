@@ -910,6 +910,11 @@ TAA / volumetric plus lighting-resolution and auto-quality controls.
 [`bench.html?autorun=1`](bench.html) runs a matrix of feature configs with
 GPU-**fence-timed** frame costs and a temporal **ghosting metric**, writing each
 run's results to [`bench-results/`](bench-results/) for tracking regressions.
+Scene keys carry a **date** (`museum-2026-07`), and each run records what each
+key meant — the rooms behind those names get redesigned, and a comparison across
+a redesign is not a regression. The files already in that directory predate the
+museum and are **not** a time series; see
+[`bench-results/README.md`](bench-results/README.md) before quoting any of them.
 
 ### Movement-artifact harness
 
