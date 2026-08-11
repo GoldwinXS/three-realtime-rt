@@ -11,3 +11,9 @@ quality-campaign/zoom/
 supporter-pack/
 marketing/
 .rt-demo-server.log
+
+# Gemini-critic captures. The .md reviews carry the quotes we cite; the raw
+# .webm clips and .png frames are 6-8 MB each and do not delta-compress, so
+# committing them grew this repo to 508 MB, of which 465 MB was this directory.
+# Keep the captures on disk, keep them out of git.
+_reviews/

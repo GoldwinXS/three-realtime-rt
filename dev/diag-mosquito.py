@@ -13,7 +13,7 @@ async def main():
         await page.add_init_script(INIT)
         errs = []
         page.on("pageerror", lambda e: errs.append(str(e)))
-        url = f"http://127.0.0.1:{PORT}/probe-gallery-bisect.html?scene=mosquito"
+        url = f"http://127.0.0.1:{PORT}/dev/probes/probe-gallery-bisect.html?scene=mosquito"
         print("Loading:", url)
         await page.goto(url, wait_until="networkidle", timeout=90000)
         await page.wait_for_timeout(12000)

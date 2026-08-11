@@ -731,7 +731,7 @@ Every bundled knob is a live-tunable setting  -  **none of them needs a
 recompile**. Knobs that swap the lighting megakernel's source or a recompile
 (`absorptionShadows`, `kmScattering`, `textureTiles`) are deliberately excluded
 from every bundle; the values shipped are the measured winners of the v0.12.0
-evidence round (see `REPORT_PRESETS.md` for the bench table and the blind Gemini
+evidence round (see `docs/dev/REPORT_PRESETS.md` for the bench table and the blind Gemini
 video rankings).
 
 Constructor: pass `preset` and it is applied as the BASE of the options, so an

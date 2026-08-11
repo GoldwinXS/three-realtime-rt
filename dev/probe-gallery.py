@@ -22,7 +22,7 @@ async def main():
         await page.add_init_script(INIT)
         errs = []
         page.on("pageerror", lambda e: errs.append(str(e)))
-        url = f"http://127.0.0.1:{PORT}/probe-gallery-bisect.html?{params}"
+        url = f"http://127.0.0.1:{PORT}/dev/probes/probe-gallery-bisect.html?{params}"
         await page.goto(url, wait_until="load", timeout=60000)
         await page.wait_for_timeout(int(seconds * 1000))
         hud = await page.evaluate("document.getElementById('hud').textContent")
