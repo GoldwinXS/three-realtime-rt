@@ -645,6 +645,15 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * userData.rtScattering — the compiled program is byte-identical to 0.9.0's.
      */
     this._kmScattering = options.kmScattering ?? false;
+    /**
+     * Texture-tile sampling for secondary rays: when enabled AND the compiled
+     * scene has textured materials, map/emissiveMap texels are sampled at
+     * secondary hit points (through glass, reflections, GI bounces). Rides the
+     * existing scene-data texture (rows 69+). When `false` or the scene has no
+     * textured materials, the shader is byte-identical to today's.
+     * `{ size: 128, max: 16 }` or `false` to disable entirely.
+     */
+    this._textureTiles = options.textureTiles ?? false;
     /** Index of refraction used for transmissive surfaces. */
     this.ior = options.ior ?? 1.5;
     /**
@@ -1218,9 +1227,15 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // old one so an empty-scene call never destroys a good scene. Only the
     // SceneCompiler's specific "no meshes" signal is swallowed here; every other
     // compile error (bad geometry, oversized attribute) still propagates.
+    // Merge instance-level textureTiles into compileScene options so the CPU-side
+    // tile build and stride-2 layout follow the constructor setting. An explicit
+    // option passed to compileScene wins over the instance default.
+    const compileOpts = options?.textureTiles !== undefined
+      ? options
+      : { ...options, textureTiles: this._textureTiles };
     let compiled;
     try {
-      compiled = compileScene(scene, options);
+      compiled = compileScene(scene, compileOpts);
     } catch (err) {
       if (/no meshes found/.test(String(err && err.message))) {
         if (!this._emptyWarned) {
@@ -1266,6 +1281,9 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // single splice, so a recompile can neither enable nor drop the feature
     // behind the app's back.
     this.rtPass.setKmScattering(this._kmScattering);
+    // Texture tiles likewise: push the caller's flag before the splice.
+    this.rtPass.setTextureTiles(this._textureTiles);
+    this.giReservoirPass.setTextureTiles(this._textureTiles);
     this.rtPass.setCompiledScene(this.compiled);
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
@@ -1322,6 +1340,8 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   updateLights(scene) {
     if (!this.supported || !this.compiled) return;
     syncLights(scene, this.compiled);
+    this.rtPass.setTextureTiles(this._textureTiles);
+    this.giReservoirPass.setTextureTiles(this._textureTiles);
     this.rtPass.setCompiledScene(this.compiled);
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
@@ -1406,6 +1426,25 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     if (!this.supported) return;
     this.rtPass.setKmScattering(on);
     this.resetAccumulation();
+  }
+
+  /**
+   * Texture-tile sampling for secondary rays. When not `false` AND the compiled
+   * scene has textured materials, per-texel albedo and emissive colour is sampled
+   * at secondary hit points — a textured surface seen through glass, in a
+   * reflection, or via a GI bounce shows its actual texel pattern rather than an
+   * averaged flat colour. Pass `{ size: 128, max: 16 }` to configure (defaults
+   * shown), or `false` to disable entirely. Takes effect on the next
+   * `compileScene()`.
+   */
+  get textureTiles() {
+    return this._textureTiles;
+  }
+  set textureTiles(v) {
+    this._textureTiles = v !== false ? (v && typeof v === "object" ? v : { size: 128, max: 16 }) : false;
+    // Attribute-texture layout changes need a recompile; the value is read by the
+    // next compileScene() call. No live shader swap — stride-2 vs stride-1 is
+    // structural.
   }
 
   get renderScale() {

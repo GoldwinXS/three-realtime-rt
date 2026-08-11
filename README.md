@@ -483,6 +483,53 @@ The honest caveat is that `kmScattering: true` compiles a **superset** of colour
 
 Validation rig: [`scattering.html`](scattering.html) renders pigments of known K and S and divides by a white Lambert patch under the same directional light — which cancels exposure and units exactly — then compares against the CPU reference. A 10/20/40/80/160 mm slab staircase agrees within **1.5%**, and a sphere probed centre-to-rim within **1–8%**, with the thickness taken from the geometry rather than authored anywhere.
 
+## Texture maps and secondary rays *(since 0.11.0)*
+
+A textured surface seen through glass, in a reflection, or via a GI bounce used to
+collapse to its flat average colour — an emissive checkerboard viewed through a
+biconvex glass lens rendered as a featureless beige disc. That changed in 0.11.0:
+**secondary rays now sample the actual texel at the hit point's UV**, so the
+checkerboard seen through the lens is inverted and magnified.
+
+No new GPU resources were added. The lighting pass sits at the WebGL2 16-sampler
+minimum — texture tiles ride the already-bound scene-data texture:
+
+- **Per-material tile indices** at row 69: `[albedoTile, emissiveTile, 0, 0]`,
+  tile index as float, `-1.0` = no map.
+- **Tile block** starting at row 70: each unique texture image is resampled to
+  128x128 RGBA (linear colour for sRGB sources) and written as 128 consecutive
+  rows. One cache per image so a texture shared by several materials gets one
+  tile.
+
+**Tile budget.** Capped at **16 unique texture images** by default
+(`textureTiles.max`). Past the cap, further materials keep the averaged-colour
+behaviour and a one-time `console.warn` names the dropped textures. A
+non-drawable image (cross-origin canvas taint, missing image data) also falls
+back to average with a one-time warning.
+
+**What works.** The traced refraction and reflection path in the lighting
+megakernel, and GI bounce albedo in the ReSTIR GI reservoir pass — so colour
+bleeding carries the pattern. The shadow-ray path does not need maps and stays
+on the material constants.
+
+**The NEE light table and CDF keep using averaged emissive.** Importance
+sampling for emissive area lights does not need the per-texel pattern — it only
+needs to know which triangles are bright and how to distribute samples among
+them. The G-buffer (primary visibility) already renders the full per-pixel
+emissive map, so the on-screen appearance is unchanged.
+
+**Option `textureTiles`.** Pass `{ size: 128, max: 16 }` to `new RealtimeRaytracer()`
+or `compileScene()`, or set `false` to disable entirely. When `false` or the
+scene has no textured materials, the BVH attribute texture uses the original
+stride-1 layout and the shader compiles **byte-identical** to the 0.10.0 build —
+the new code lives entirely inside `RT_TEXTURE_TILES` source-splice markers. The
+option is typed in `index.d.ts`.
+
+**Probe page:** [`probe-secondary-textures.html`](probe-secondary-textures.html)
+— a glass sphere centred in front of a checkerboard, two variants toggleable by
+query param (`?mode=emissive` for an emissiveMap checkerboard, `?mode=albedo` for
+a lit albedo-map checkerboard), plus a dynamic-mesh variant (`&dynamic=1`).
+
 ## Live lighting & sky
 
 Lights can be toggled, moved, and recoloured every frame without recompiling:

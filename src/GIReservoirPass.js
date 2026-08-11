@@ -251,6 +251,42 @@ void fetchMaterial(float matIndex, out vec3 albedo, out float roughness,
   metalness = t1.a;
 }
 
+// >>> RT_TEXTURE_TILES
+uniform bool uHasTextureTiles;
+
+void fetchAttrUv(sampler2D attrTex, vec3 bary, uvec3 verts, out vec4 attr, out vec2 uv) {
+    uint width = uint(textureSize(attrTex, 0).x);
+    uint i0 = verts.x * 2u;
+    uint i1 = verts.y * 2u;
+    uint i2 = verts.z * 2u;
+    vec4 a0 = texelFetch(attrTex, ivec2(i0 % width, i0 / width), 0);
+    vec4 a1 = texelFetch(attrTex, ivec2(i1 % width, i1 / width), 0);
+    vec4 a2 = texelFetch(attrTex, ivec2(i2 % width, i2 / width), 0);
+    attr = a0 * bary.x + a1 * bary.y + a2 * bary.z;
+    vec2 uv0 = texelFetch(attrTex, ivec2((i0 + 1u) % width, (i0 + 1u) / width), 0).xy;
+    vec2 uv1 = texelFetch(attrTex, ivec2((i1 + 1u) % width, (i1 + 1u) / width), 0).xy;
+    vec2 uv2 = texelFetch(attrTex, ivec2((i2 + 1u) % width, (i2 + 1u) / width), 0).xy;
+    uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+}
+
+#define TILE 128.0
+
+vec4 tileSample(float tileIdx, vec2 st) {
+    vec2 fuv = fract(st) * TILE - 0.5;
+    vec2 f0 = floor(fuv);
+    vec2 f1 = f0 + 1.0;
+    f0 = mod(f0, TILE);
+    f1 = mod(f1, TILE);
+    float rowBase = 70.0 + tileIdx * TILE;
+    vec4 s00 = texelFetch(uMaterialsTex, ivec2(int(f0.x), int(rowBase + f0.y)), 0);
+    vec4 s10 = texelFetch(uMaterialsTex, ivec2(int(f1.x), int(rowBase + f0.y)), 0);
+    vec4 s01 = texelFetch(uMaterialsTex, ivec2(int(f0.x), int(rowBase + f1.y)), 0);
+    vec4 s11 = texelFetch(uMaterialsTex, ivec2(int(f1.x), int(rowBase + f1.y)), 0);
+    vec2 t = fuv - f0;
+    return mix(mix(s00, s10, t.x), mix(s01, s11, t.x), t.y);
+}
+// <<< RT_TEXTURE_TILES
+
 // ---------- one-light NEE at a GI-bounce hit (specular dropped) ----------
 float spotFalloff(int i, vec3 lightToP) {
   vec4 posType = uLightPosType[i];
@@ -375,8 +411,27 @@ vec3 traceRadianceGI(vec3 ro, vec3 rd, int nLight, out vec3 hitPos, out vec3 hit
   vec4 attr = isDyn
     ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
     : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
+// >>> RT_TEXTURE_TILES
+  // Re-fetch at stride 2 and get the interpolated UV for tile sampling.
+  // Branch explicitly: GLSL forbids ternaries on opaque types (samplers).
+  vec2 _tileUv;
+  if (isDyn) {
+    fetchAttrUv(uAttrDynamic, bary, fi.xyz, attr, _tileUv);
+  } else {
+    fetchAttrUv(uAttrStatic, bary, fi.xyz, attr, _tileUv);
+  }
+// <<< RT_TEXTURE_TILES
   vec3 hAlbedo; float hRough; vec3 hEmissive; float hMetal;
   fetchMaterial(attr.w, hAlbedo, hRough, hEmissive, hMetal);
+// >>> RT_TEXTURE_TILES
+  if (uHasTextureTiles) {
+    vec4 _ti = texelFetch(uMaterialsTex, ivec2(int(round(attr.w)), 69), 0);
+    float _albedoTile = _ti.x;
+    float _emissiveTile = _ti.y;
+    if (_albedoTile >= 0.0) hAlbedo *= tileSample(_albedoTile, _tileUv).rgb;
+    if (_emissiveTile >= 0.0) hEmissive *= tileSample(_emissiveTile, _tileUv).rgb;
+  }
+// <<< RT_TEXTURE_TILES
   vec3 hN = normalize(attr.xyz);
   if (dot(hN, rd) > 0.0) hN = -hN;
   vec3 hP = ro + rd * dist;
@@ -910,6 +965,23 @@ export class GIReservoirPass {
     this.targetA = this._makeTarget(width, height);
     this.targetB = this._makeTarget(width, height);
 
+    // Texture-tile variant: the giFrag source with RT_TEXTURE_TILES stripped.
+    // Cached here so the strip runs once, not on every toggle.
+    this._fragTiles = giFrag;
+    this._fragNoTiles = (function stripTag(src, tag) {
+      const lines = src.split("\n");
+      const out = [];
+      let drop = false;
+      for (const line of lines) {
+        if (line.includes(">>> " + tag)) { drop = true; continue; }
+        if (line.includes("<<< " + tag)) { drop = false; continue; }
+        if (!drop) out.push(line);
+      }
+      return out.join("\n");
+    })(giFrag, "RT_TEXTURE_TILES");
+    this._tilesData = false;
+    this._tilesOn = false;
+
     this.material = new THREE.ShaderMaterial({
       // Stable program name for compile-failure self-diagnosis; a link failure
       // disables the experimental `restirGI` feature (falls back to inline GI).
@@ -955,6 +1027,7 @@ export class GIReservoirPass {
         uSkyZenith: { value: new THREE.Color(0.18, 0.34, 0.62) },
         uSkyHorizon: { value: new THREE.Color(0.7, 0.8, 0.9) },
         uSkyIntensity: { value: 1.0 },
+        uHasTextureTiles: { value: false },
       },
       depthTest: false,
       depthWrite: false,
@@ -997,11 +1070,32 @@ export class GIReservoirPass {
     u.uLightDirCone.value = compiled.lightDirCone;
     u.uLightCount.value = compiled.lightCount;
     u.uEmissiveCount.value = compiled.emissiveTriCount;
+    this._tilesData = !!compiled.hasTextureTiles;
+    this._tileSize = compiled._tileSize || 128;
+    this._applyTilesSplice();
   }
 
   /** Emissive candidates follow the emissiveNEE toggle (set per frame). */
   setEmissiveCount(count) {
     this.material.uniforms.uEmissiveCount.value = count;
+  }
+
+  setTextureTiles(on) {
+    this._tilesOn = !!on;
+    this._applyTilesSplice();
+  }
+
+  _applyTilesSplice() {
+    const on = !!(this._tilesOn && this._tilesData);
+    let src = on ? this._fragTiles : this._fragNoTiles;
+    // Inject the actual tile size when it differs from the hardcoded default (128).
+    if (on && this._tileSize !== 128) {
+      src = src.replace("#define TILE 128.0", `#define TILE ${this._tileSize}.0`);
+    }
+    this.material.uniforms.uHasTextureTiles.value = on;
+    if (this.material.fragmentShader === src) return;
+    this.material.fragmentShader = src;
+    this.material.needsUpdate = true;
   }
 
   clearHistory(renderer) {

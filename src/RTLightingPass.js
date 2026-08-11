@@ -193,6 +193,56 @@ void fetchMaterial(float matIndex, out vec3 albedo, out float roughness,
   metalness = t1.a;
 }
 
+// >>> RT_TEXTURE_TILES (whole block source-spliced — see stripMarked below)
+// SECONDARY-RAY TEXTURE MAPS. Rides the existing scene-data texture: row 69
+// carries per-material tile indices, rows 70+ hold the tile block. The stride-2
+// attribute layout stores UVs alongside normals so hit points carry interpolated
+// texture coordinates. No new sampler (this pass sits at the WebGL2 16-sampler
+// minimum), no new uniform beyond the bool gate below. Stripped entirely when the
+// compiled scene has no textured materials, so the program is byte-identical to
+// today's.
+uniform bool uHasTextureTiles;
+
+// Stride-2 attribute fetch. textureSampleBarycoord indexes at stride 1 and would
+// read the wrong texels when the attribute texture uses the two-texel-per-vertex
+// layout, so we replicate its 1D-to-2D addressing at stride 2. The normal+matIndex
+// interpolation is bit-identical to the old stride-1 call — matIndex is uniform
+// per triangle, so lerping it gives the same value as reading from any one vertex.
+void fetchAttrUv(sampler2D attrTex, vec3 bary, uvec3 verts, out vec4 attr, out vec2 uv) {
+    uint width = uint(textureSize(attrTex, 0).x);
+    uint i0 = verts.x * 2u;
+    uint i1 = verts.y * 2u;
+    uint i2 = verts.z * 2u;
+    vec4 a0 = texelFetch(attrTex, ivec2(i0 % width, i0 / width), 0);
+    vec4 a1 = texelFetch(attrTex, ivec2(i1 % width, i1 / width), 0);
+    vec4 a2 = texelFetch(attrTex, ivec2(i2 % width, i2 / width), 0);
+    attr = a0 * bary.x + a1 * bary.y + a2 * bary.z;
+    vec2 uv0 = texelFetch(attrTex, ivec2((i0 + 1u) % width, (i0 + 1u) / width), 0).xy;
+    vec2 uv1 = texelFetch(attrTex, ivec2((i1 + 1u) % width, (i1 + 1u) / width), 0).xy;
+    vec2 uv2 = texelFetch(attrTex, ivec2((i2 + 1u) % width, (i2 + 1u) / width), 0).xy;
+    uv = uv0 * bary.x + uv1 * bary.y + uv2 * bary.z;
+}
+
+#define TILE 128.0
+
+// Manual bilinear sample from the tile block (row 70+). uv wraps with fract for
+// repeat-mode tiling; each tile is TILE x TILE texels in linear RGBA.
+vec4 tileSample(float tileIdx, vec2 st) {
+    vec2 fuv = fract(st) * TILE - 0.5;
+    vec2 f0 = floor(fuv);
+    vec2 f1 = f0 + 1.0;
+    f0 = mod(f0, TILE);
+    f1 = mod(f1, TILE);
+    float rowBase = 70.0 + tileIdx * TILE;
+    vec4 s00 = texelFetch(uMaterialsTex, ivec2(int(f0.x), int(rowBase + f0.y)), 0);
+    vec4 s10 = texelFetch(uMaterialsTex, ivec2(int(f1.x), int(rowBase + f0.y)), 0);
+    vec4 s01 = texelFetch(uMaterialsTex, ivec2(int(f0.x), int(rowBase + f1.y)), 0);
+    vec4 s11 = texelFetch(uMaterialsTex, ivec2(int(f1.x), int(rowBase + f1.y)), 0);
+    vec2 t = fuv - f0;
+    return mix(mix(s00, s10, t.x), mix(s01, s11, t.x), t.y);
+}
+// <<< RT_TEXTURE_TILES
+
 // >>> RT_ABSORPTION (whole block source-spliced — see stripAbsorption below)
 // Per-material Beer-Lambert absorption for refractive media ("tinted glass done
 // right"). Row 67 of the scene-data texture carries one texel per material,
@@ -426,6 +476,18 @@ vec3 shadowTransmittance(vec3 origin, vec3 dir, float maxDist) {
     vec4 attr = isDyn
       ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
       : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
+// >>> RT_TEXTURE_TILES
+    // Re-fetch at stride 2: the line above reads the wrong texels under the
+    // stride-2 layout. Shadow rays do not need UVs, so the uv output is discarded.
+    // GLSL forbids ternaries on opaque types (samplers), so branch explicitly.
+    if (isDyn) {
+      vec2 _tileUv;
+      fetchAttrUv(uAttrDynamic, bary, fi.xyz, attr, _tileUv);
+    } else {
+      vec2 _tileUv;
+      fetchAttrUv(uAttrStatic, bary, fi.xyz, attr, _tileUv);
+    }
+// <<< RT_TEXTURE_TILES
     // The segment just crossed, measured INTERFACE to INTERFACE — not from the
     // stepped-off origin. The two differ by the 2*eps the march skips past each
     // hit; charging tau only from o would silently under-attenuate every body by
@@ -822,6 +884,16 @@ vec3 traceRadiance(vec3 ro, vec3 rd, bool specular) {
   vec4 attr = isDyn
     ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
     : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
+// >>> RT_TEXTURE_TILES
+  // Re-fetch at stride 2 and get the interpolated UV for tile sampling.
+  // Branch explicitly: GLSL forbids ternaries on opaque types (samplers).
+  vec2 _tileUv;
+  if (isDyn) {
+    fetchAttrUv(uAttrDynamic, bary, fi.xyz, attr, _tileUv);
+  } else {
+    fetchAttrUv(uAttrStatic, bary, fi.xyz, attr, _tileUv);
+  }
+// <<< RT_TEXTURE_TILES
   vec3 hAlbedo; float hRough; vec3 hEmissive; float hMetal;
   fetchMaterial(attr.w, hAlbedo, hRough, hEmissive, hMetal);
   vec3 hN = normalize(attr.xyz);
@@ -833,6 +905,20 @@ vec3 traceRadiance(vec3 ro, vec3 rd, bool specular) {
 #ifdef RT_VOLUME_ALBEDO
   if (int(round(attr.w)) == uVolumeMatIndex) hAlbedo = sampleVolumeAlbedo(hP);
 #endif
+// >>> RT_TEXTURE_TILES
+  // Per-texel shading for secondary rays: replace the averaged table colour with
+  // the actual texel at the hit point's UV. The table colour already carries the
+  // material tint (color for albedo, emissive*intensity for emissive), so
+  // multiplying by the map texel gives the same result as three.js's compose:
+  // color * map and emissive * emissiveMap * emissiveIntensity.
+  if (uHasTextureTiles) {
+    vec4 _ti = texelFetch(uMaterialsTex, ivec2(int(round(attr.w)), 69), 0);
+    float _albedoTile = _ti.x;
+    float _emissiveTile = _ti.y;
+    if (_albedoTile >= 0.0) hAlbedo *= tileSample(_albedoTile, _tileUv).rgb;
+    if (_emissiveTile >= 0.0) hEmissive *= tileSample(_emissiveTile, _tileUv).rgb;
+  }
+// <<< RT_TEXTURE_TILES
   vec3 Ld = sampleOneAny(hP + hN * uEps, hN);
   vec3 hLe = (!specular && uEmissiveCount > 0) ? vec3(0.0) : hEmissive;
   return hLe + hAlbedo * Ld * (1.0 / PI);
@@ -963,6 +1049,17 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
     vec4 attr = isDyn
       ? textureSampleBarycoord(uAttrDynamic, bary, fi.xyz)
       : textureSampleBarycoord(uAttrStatic, bary, fi.xyz);
+// >>> RT_TEXTURE_TILES
+    // Re-fetch at stride 2 so the material index and normal are correct.
+    // Branch explicitly: GLSL forbids ternaries on opaque types (samplers).
+    if (isDyn) {
+      vec2 _tileUv;
+      fetchAttrUv(uAttrDynamic, bary, fi.xyz, attr, _tileUv);
+    } else {
+      vec2 _tileUv;
+      fetchAttrUv(uAttrStatic, bary, fi.xyz, attr, _tileUv);
+    }
+// <<< RT_TEXTURE_TILES
     vec3 xN = normalize(attr.xyz);
     if (dot(xN, rd) > 0.0) xN = -xN;
     vec3 xP = ro + rd * dist;
@@ -1482,6 +1579,10 @@ export class RTLightingPass {
     // The strips run innermost-outwards (RT_KM, then RT_ABSORB_SHADOWS, then
     // RT_ABSORPTION) because RT_KM blocks are nested inside the coloured-shadow
     // one — see the ordering note on stripMarked.
+    // RT_TEXTURE_TILES is an INDEPENDENT dimension (its blocks are not nested
+    // inside any absorption block except the shadow-ray site inside
+    // RT_ABSORB_SHADOWS). Rather than doubling the cached-variant matrix, it is
+    // stripped dynamically at splice time — a scene-compile cost, never per frame.
     const fragFull = specMRT
       ? rtLightingFrag
       : rtLightingFrag.replace(
@@ -1502,6 +1603,10 @@ export class RTLightingPass {
     // scattering material to act on.
     this._kmData = false;
     this._kmOn = false;
+    // Texture tiles: analogous to KM — needs both scene data (hasTextureTiles on
+    // the compiled scene) and the caller's opt-in (textureTiles option not false).
+    this._tilesData = false;
+    this._tilesOn = false;
 
     this.material = new THREE.ShaderMaterial({
       // Stable program name for compile-failure self-diagnosis: this is the
@@ -1554,6 +1659,7 @@ export class RTLightingPass {
         uEps: { value: 1e-3 },
         uGIEnabled: { value: true },
         uExternalGI: { value: false },
+        uHasTextureTiles: { value: false },
         uCostView: { value: false },
         uCostScale: { value: 1 / 96 },
         uSkyEnabled: { value: false },
@@ -1756,7 +1862,24 @@ export class RTLightingPass {
     // Kubelka-Munk rides row 68 of the same texture and is recorded first, so the
     // single splice the setAbsorption call triggers already knows about it.
     this._kmData = !!compiled.scattering;
+    // Texture tiles ride rows 69+ of the same texture and the stride-2 attribute
+    // layout. Recorded before the splice so the _applyAbsorptionSplice call knows
+    // whether to keep the RT_TEXTURE_TILES blocks.
+    this._tilesData = !!compiled.hasTextureTiles;
+    this._tileSize = compiled._tileSize || 128;
     this.setAbsorption(!!compiled.absorption);
+  }
+
+  /**
+   * Enable/disable texture-tile sampling for secondary rays (albedo and emissive
+   * maps visible through glass, reflections, and GI bounces). When `on` is true
+   * AND the compiled scene has tiles, the RT_TEXTURE_TILES block is kept in the
+   * shader source and the stride-2 attribute layout is active. Recompiles the
+   * megakernel: a settings-time knob, not a per-frame one.
+   */
+  setTextureTiles(on) {
+    this._tilesOn = !!on;
+    this._applyAbsorptionSplice();
   }
 
   /**
@@ -1803,13 +1926,26 @@ export class RTLightingPass {
   }
 
   _applyAbsorptionSplice() {
-    const src = !this._absorbOn
+    let src = !this._absorbOn
       ? this._fragPlain
       : this._kmOn && this._kmData
         ? this._fragKm
         : this._absorbShadows
           ? this._fragAbsorbShadows
           : this._fragAbsorption;
+    // Texture tiles are an independent dimension: when off, strip the
+    // RT_TEXTURE_TILES blocks from whichever absorption variant is active.
+    // Done dynamically (not pre-cached) because the strip is cheap string work
+    // and only runs at scene-compile time.
+    if (!(this._tilesOn && this._tilesData)) {
+      src = stripMarked(src, "RT_TEXTURE_TILES");
+    } else if (this._tileSize !== 128) {
+      // Inject the actual tile size from the compileScene option (default 128).
+      // The shader source carries `#define TILE 128.0`; replace with the real
+      // value so texelFetch coordinates match the CPU-side tile layout.
+      src = src.replace("#define TILE 128.0", `#define TILE ${this._tileSize}.0`);
+    }
+    this.material.uniforms.uHasTextureTiles.value = !!(this._tilesOn && this._tilesData);
     if (this.material.fragmentShader === src) return;
     this.material.fragmentShader = src;
     this.material.needsUpdate = true; // three re-keys the program by source hash

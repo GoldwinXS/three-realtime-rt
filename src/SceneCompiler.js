@@ -145,7 +145,7 @@ export class CompiledScene {
     if (!this.hasDynamic || this.dynamic.length === 0) return;
     const posAttr = this.dynamicMerged.getAttribute("position");
     const pos = posAttr.array;
-    const packed = this.dynamicPacked; // normal.xyz + matIndex.w per vertex
+    const packed = this.dynamicPacked; // stride-2: normal.xyz+matIndex, then uv.xy per vertex
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
@@ -154,7 +154,7 @@ export class CompiledScene {
       const m = seg.mesh.matrixWorld.elements;
       const nm = this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements;
       let o = seg.start * 3;
-      let p = seg.start * 4;
+      let p = seg.start * 8;
 
       if (seg.skinned) {
         // Animated SkinnedMesh: CPU-skin the SOURCE vertices with three's own
@@ -201,7 +201,7 @@ export class CompiledScene {
         //    (shadows/GI) only need the geometry to be right; primary visibility
         //    still gets smooth normals from the raster path. This skips
         //    CPU-skinning the normal attribute entirely.
-        let fp = seg.start * 4;
+        let fp = seg.start * 8;
         for (let i = 0; i < seg.count; i += 3) {
           const b = (seg.start + i) * 3;
           const ax = pos[b], ay = pos[b + 1], az = pos[b + 2];
@@ -212,11 +212,11 @@ export class CompiledScene {
           let nz = e1x * e2y - e1y * e2x;
           const il = 1.0 / (Math.hypot(nx, ny, nz) || 1);
           nx *= il; ny *= il; nz *= il;
-          packed[fp] = nx; packed[fp + 1] = ny; packed[fp + 2] = nz;       // v0
-          packed[fp + 4] = nx; packed[fp + 5] = ny; packed[fp + 6] = nz;   // v1
-          packed[fp + 8] = nx; packed[fp + 9] = ny; packed[fp + 10] = nz;  // v2
-          // packed[fp + 3|7|11] (matIndex) never changes
-          fp += 12;
+          packed[fp + 0] = nx; packed[fp + 1] = ny; packed[fp + 2] = nz;       // v0
+          packed[fp + 8] = nx; packed[fp + 9] = ny; packed[fp + 10] = nz;      // v1
+          packed[fp + 16] = nx; packed[fp + 17] = ny; packed[fp + 18] = nz;    // v2
+          // packed[fp+3|11|19] (matIndex) and packed[fp+4..fp+7|12..15|20..23] (uv) never change
+          fp += 24;
         }
       } else if (seg.deforming) {
         // CPU-deformed mesh (water/cloth): read the LIVE geometry every frame
@@ -260,9 +260,9 @@ export class CompiledScene {
           packed[p] = tx * il;
           packed[p + 1] = ty * il;
           packed[p + 2] = tz * il;
-          // packed[p + 3] (matIndex) never changes
+          // packed[p + 3] (matIndex) and packed[p+4..p+7] (uv) never change
           o += 3;
-          p += 4;
+          p += 8;
         }
       } else {
         // Rigid mover: transform the frozen local snapshot by the world matrix.
@@ -287,9 +287,9 @@ export class CompiledScene {
           packed[p] = tx * il;
           packed[p + 1] = ty * il;
           packed[p + 2] = tz * il;
-          // packed[p + 3] (matIndex) never changes
+          // packed[p + 3] (matIndex) and packed[p+4..p+7] (uv) never change
           o += 3;
-          p += 4;
+          p += 8;
         }
       }
     }
@@ -406,9 +406,19 @@ function extractMeshGeometry(mesh) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", src.getAttribute("position").clone());
   geo.setAttribute("normal", src.getAttribute("normal").clone());
-  geo.applyMatrix4(mesh.matrixWorld); // bake world transform
 
-  const count = geo.getAttribute("position").count;
+  const count = src.getAttribute("position").count;
+  // Preserve UVs for secondary-ray texture sampling (stride-2 attribute layout).
+  // If the source geometry has no UV attribute, fill with zeros so mergeGeometries
+  // does not drop a mismatched attribute across geometries.
+  const hasUv = src.getAttribute("uv") !== undefined;
+  if (hasUv) {
+    geo.setAttribute("uv", src.getAttribute("uv").clone());
+  } else {
+    const zeroUv = new Float32Array(count * 2);
+    geo.setAttribute("uv", new THREE.BufferAttribute(zeroUv, 2));
+  }
+  geo.applyMatrix4(mesh.matrixWorld); // bake world transform
   // The per-vertex materialIndex attribute is filled by resolveGroups (which the
   // caller runs with the shared materials table), so a multi-material mesh gets
   // its groups mapped to distinct materials rather than a single flat index.
@@ -469,6 +479,137 @@ function resolveMeshMaterials(mesh, count, registerMaterial) {
 // texture so the two collect sites (material row + NEE tris) share one solve.
 const _emissiveMapAvgCache = new Map();
 let _emissiveMapWarned = false;
+
+// Tile cache for secondary-ray texture maps: image source -> { data: Uint8ClampedArray,
+// tileIndex: int }. One tile per unique image source; a texture shared by several
+// materials gets one tile. Keyed by the texture.image so different THREE.Texture
+// instances wrapping the same image share one tile.
+const _mapTileCache = new Map();
+let _mapTileFirstTime = true; // for the one-time "tile budget exceeded" warn
+
+const DEFAULT_TILE_SIZE = 128;
+const DEFAULT_MAX_TILES = 16;
+
+// Draw a texture image into a square canvas TILE_SIZE x TILE_SIZE, convert to linear
+// if the source is sRGB, and return RGBA8 Uint8ClampedArray. Returns null if the
+// image is unreadable (CORS-tainted, missing, etc.).
+function resampleTextureToTile(texture, tileSize) {
+  try {
+    const img = texture.image;
+    const w = img && (img.width || img.videoWidth || 0);
+    const h = img && (img.height || img.videoHeight || 0);
+    if (!img || w <= 0 || h <= 0 || typeof document === "undefined") return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = tileSize;
+    canvas.height = tileSize;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(img, 0, 0, tileSize, tileSize);
+    const d = ctx.getImageData(0, 0, tileSize, tileSize).data;
+    const isSrgb = texture.colorSpace !== THREE.NoColorSpace && texture.colorSpace !== THREE.LinearSRGBColorSpace;
+    if (isSrgb) {
+      for (let i = 0; i < d.length; i += 4) {
+        d[i] = Math.round(srgbToLinear(d[i] / 255) * 255);
+        d[i + 1] = Math.round(srgbToLinear(d[i + 1] / 255) * 255);
+        d[i + 2] = Math.round(srgbToLinear(d[i + 2] / 255) * 255);
+      }
+    }
+    return d;
+  } catch (_e) {
+    return null; // CORS-tainted
+  }
+}
+
+// Collect unique texture images from materials that have `map` or `emissiveMap`.
+// Returns { tiles: [{ image, data, matIndices }], tileIndexForMat, hasTiles }.
+// Each tile has `data` (Uint8ClampedArray, RGBA8 linear), and `matIndices` lists
+// which material indices reference this tile (used to write row 69).
+function collectTextureTiles(materials, tileSize, maxTiles) {
+  const byImage = new Map(); // image -> { data, albedoMats: Set, emissiveMats: Set }
+  for (let i = 0; i < materials.length; i++) {
+    const mat = materials[i];
+    if (!mat) continue;
+    if (mat.map && mat.map.image) {
+      const img = mat.map.image;
+      let entry = byImage.get(img);
+      if (!entry) { entry = { albedoMats: new Set(), emissiveMats: new Set() }; byImage.set(img, entry); }
+      entry.albedoMats.add(i);
+    }
+    if (mat.emissiveMap && mat.emissiveMap.image) {
+      const img = mat.emissiveMap.image;
+      let entry = byImage.get(img);
+      if (!entry) { entry = { albedoMats: new Set(), emissiveMats: new Set() }; byImage.set(img, entry); }
+      entry.emissiveMats.add(i);
+    }
+  }
+  if (byImage.size === 0) return { tiles: [], tileIndexForMat: null, hasTiles: false };
+
+  // Resample each unique image to a tile, up to maxTiles.
+  const tiles = [];
+  const tileIndexForMat = new Array(materials.length);
+  for (let i = 0; i < materials.length; i++) tileIndexForMat[i] = { albedo: -1, emissive: -1 };
+
+  for (const [img, entry] of byImage) {
+    // Check cache first (different THREE.Texture instances wrapping the same image).
+    let data = _mapTileCache.get(img);
+    if (data === undefined) {
+      // Find which texture to sample from (albedo or emissive, first available).
+      let tex = null;
+      for (let i = 0; i < materials.length; i++) {
+        const mat = materials[i];
+        if (!mat) continue;
+        if (mat.map && mat.map.image === img) { tex = mat.map; break; }
+        if (mat.emissiveMap && mat.emissiveMap.image === img) { tex = mat.emissiveMap; break; }
+      }
+      data = tex ? resampleTextureToTile(tex, tileSize) : null;
+      _mapTileCache.set(img, data);
+    }
+    if (!data) {
+      if (_mapTileFirstTime) {
+        _mapTileFirstTime = false;
+        console.warn(
+          "three-realtime-rt: a texture map could not be read on the CPU (CORS-tainted " +
+          "or not yet decoded) for secondary-ray sampling — that material will use its " +
+          "averaged colour for traced rays. Serve the texture same-origin (or set " +
+          "image.crossOrigin) to enable per-texel shading through glass/reflections/GI."
+        );
+      }
+      continue; // skip this tile; materials referencing it keep tile index -1 (average)
+    }
+    if (tiles.length >= maxTiles) {
+      if (_mapTileFirstTime) {
+        _mapTileFirstTime = false;
+        const dropped = [];
+        for (const [img2] of byImage) {
+          if (!_mapTileCache.has(img2) || _mapTileCache.get(img2) === null) continue;
+          const alreadyIn = tiles.some((t) => t.image === img2);
+          if (!alreadyIn) {
+            // Find material name for the dropped texture
+            for (let i = 0; i < materials.length; i++) {
+              const m = materials[i];
+              if (!m) continue;
+              if ((m.map && m.map.image === img2) || (m.emissiveMap && m.emissiveMap.image === img2)) {
+                dropped.push(m.name || `material ${i}`);
+                break;
+              }
+            }
+          }
+        }
+        console.warn(
+          `three-realtime-rt: texture tile budget exceeded (max ${maxTiles}). ` +
+          `Dropped textures: ${dropped.join(", ") || "(unknown)"}. These materials ` +
+          `use their averaged colour for traced secondary rays.`
+        );
+      }
+      continue;
+    }
+    const tileIndex = tiles.length;
+    tiles.push({ image: img, data });
+    // Assign tile indices to materials referencing this image.
+    for (const mi of entry.albedoMats) tileIndexForMat[mi].albedo = tileIndex;
+    for (const mi of entry.emissiveMats) tileIndexForMat[mi].emissive = tileIndex;
+  }
+  return { tiles, tileIndexForMat, hasTiles: tiles.length > 0 };
+}
 
 // sRGB -> linear for one 0..1 channel (three decodes SRGBColorSpace maps this way
 // before lighting; average in linear so the cast colour matches the lit look).
@@ -889,12 +1030,31 @@ function collectScattering(materials) {
 //   texel holds four), and they are ~6 ALU to recompute on the handful of
 //   fragments that actually cross a scattering body. Measured cost of the
 //   recompute is inside the noise of the march itself.
+// Row 69 (OPTIONAL — present only when `tileData` has tiles): per-material tile
+//   indices, 1 texel per material: [albedoTile | emissiveTile | 0 | 0], tile
+//   index as float, -1.0 = no map. Allocated only when at least one registered
+//   material has a map or emissiveMap. When this row exists, rows 67 and 68 must
+//   also be materialized (even if all-zero) to keep addressing absolute.
+// Row 70+ (OPTIONAL — present only with row 69): tile block. Each unique texture
+//   image is resampled to TILE x TILE RGBA, in linear colour. Tile t lives at
+//   rows 70 + t*TILE, columns 0..TILE-1. Texture width must become max(existing, TILE).
 // All packed into ONE texture because the lighting pass already sits at the
 // WebGL2-guaranteed 16-sampler limit — extra samplers are not available.
-function buildSceneDataTexture(materials, emissiveTris, absorption, scattering) {
+function buildSceneDataTexture(materials, emissiveTris, absorption, scattering, tileData) {
   const bn = decodeBlueNoise();
-  const width = Math.max(materials.length * 2, emissiveTris.length * 4, BLUE_NOISE_SIZE);
-  const height = 2 + BLUE_NOISE_SIZE + 1 + (absorption ? 1 : 0) + (scattering ? 1 : 0);
+  const hasTiles = tileData && tileData.tiles && tileData.tiles.length > 0;
+  // When tiles exist, rows 67 and 68 must be materialised for absolute addressing.
+  const forceAbsRows = hasTiles;
+  const hasAbsorption = absorption || forceAbsRows;
+  const hasScattering = scattering || forceAbsRows;
+  const tileSize = tileData ? tileData.tileSize : DEFAULT_TILE_SIZE;
+  const numTiles = hasTiles ? tileData.tiles.length : 0;
+  const width = Math.max(materials.length * 2, emissiveTris.length * 4, BLUE_NOISE_SIZE, hasTiles ? tileSize : 1);
+  const height = 2 + BLUE_NOISE_SIZE + 1
+    + (hasAbsorption ? 1 : 0)
+    + (hasScattering ? 1 : 0)
+    + (hasTiles ? 1 : 0)         // row 69: tile indices
+    + (hasTiles ? numTiles * tileSize : 0); // tile block
   const data = new Float32Array(width * height * 4);
   materials.forEach((mat, i) => {
     const o = i * 8;
@@ -927,31 +1087,63 @@ function buildSceneDataTexture(materials, emissiveTris, absorption, scattering) 
   // Emissive power CDF (row 66). Factored out so updateDynamic can rebuild it
   // in place when a dynamic emitter's area/position changed this frame.
   writeEmissiveCdf(data, row, emissiveTris);
-  // Absorption sigma (row 67) — written only when the row was allocated. Fits by
-  // construction: width >= materials.length * 2 > materials.length texels.
-  if (absorption) {
+  // Absorption sigma (row 67) — written when any material absorbs, or when forced
+  // (tiles exist and rows 67/68 must be materialised for absolute addressing).
+  if (hasAbsorption) {
     const absRow = (2 + BLUE_NOISE_SIZE + 1) * row;
-    const s = absorption.sigma;
-    const g = absorption.glass;
-    for (let i = 0; i < materials.length; i++) {
-      data[absRow + i * 4 + 0] = s[i * 3 + 0];
-      data[absRow + i * 4 + 1] = s[i * 3 + 1];
-      data[absRow + i * 4 + 2] = s[i * 3 + 2];
-      data[absRow + i * 4 + 3] = g[i]; // transmission: the coloured-shadow glass flag
+    if (absorption) {
+      const s = absorption.sigma;
+      const g = absorption.glass;
+      for (let i = 0; i < materials.length; i++) {
+        data[absRow + i * 4 + 0] = s[i * 3 + 0];
+        data[absRow + i * 4 + 1] = s[i * 3 + 1];
+        data[absRow + i * 4 + 2] = s[i * 3 + 2];
+        data[absRow + i * 4 + 3] = g[i]; // transmission: the coloured-shadow glass flag
+      }
     }
+    // else forced: leave all zeros (no absorption)
   }
-  // Kubelka-Munk scattering (row 68). Only reachable with row 67 present — the
-  // row index is absolute, and collectScattering's contract is that a non-null
-  // table forces the absorption table to be materialized alongside it.
-  if (scattering) {
+  // Kubelka-Munk scattering (row 68). Written when any material scatters, or forced.
+  if (hasScattering) {
     const kmRow = (2 + BLUE_NOISE_SIZE + 2) * row;
-    const s = scattering.sigmaS;
-    const km = scattering.km;
+    if (scattering) {
+      const s = scattering.sigmaS;
+      const km = scattering.km;
+      for (let i = 0; i < materials.length; i++) {
+        data[kmRow + i * 4 + 0] = s[i * 3 + 0];
+        data[kmRow + i * 4 + 1] = s[i * 3 + 1];
+        data[kmRow + i * 4 + 2] = s[i * 3 + 2];
+        data[kmRow + i * 4 + 3] = km[i]; // per-body two-flux enable
+      }
+    }
+    // else forced: leave all zeros
+  }
+  // Per-material tile indices (row 69).
+  if (hasTiles) {
+    const tileIdxRow = (2 + BLUE_NOISE_SIZE + 3) * row;
     for (let i = 0; i < materials.length; i++) {
-      data[kmRow + i * 4 + 0] = s[i * 3 + 0];
-      data[kmRow + i * 4 + 1] = s[i * 3 + 1];
-      data[kmRow + i * 4 + 2] = s[i * 3 + 2];
-      data[kmRow + i * 4 + 3] = km[i]; // per-body two-flux enable
+      const ti = tileData.tileIndexForMat[i];
+      data[tileIdxRow + i * 4 + 0] = ti ? ti.albedo : -1.0;
+      data[tileIdxRow + i * 4 + 1] = ti ? ti.emissive : -1.0;
+      data[tileIdxRow + i * 4 + 2] = 0;
+      data[tileIdxRow + i * 4 + 3] = 0;
+    }
+    // Tile block starting at row 70.
+    for (let t = 0; t < numTiles; t++) {
+      const tile = tileData.tiles[t];
+      const tileBaseRow = 2 + BLUE_NOISE_SIZE + 4 + t * tileSize; // row 70 + t * TILE
+      for (let ty = 0; ty < tileSize; ty++) {
+        const o = (tileBaseRow + ty) * row;
+        const src = ty * tileSize * 4;
+        for (let tx = 0; tx < tileSize; tx++) {
+          const p = src + tx * 4;
+          // Store as floats 0..1 (same encoding as the rest of the texture).
+          data[o + tx * 4 + 0] = tile.data[p] / 255;
+          data[o + tx * 4 + 1] = tile.data[p + 1] / 255;
+          data[o + tx * 4 + 2] = tile.data[p + 2] / 255;
+          data[o + tx * 4 + 3] = tile.data[p + 3] / 255;
+        }
+      }
     }
   }
   const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
@@ -1029,36 +1221,69 @@ function degenerateGeometry() {
   geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(9), 3));
   geo.setAttribute("normal", new THREE.BufferAttribute(new Float32Array([0, 1, 0, 0, 1, 0, 0, 1, 0]), 3));
   geo.setAttribute("materialIndex", new THREE.BufferAttribute(new Float32Array(3), 1));
+  // Zero-filled UV so mergeGeometries does not drop the attribute when the
+  // non-empty level uses stride-2 (all real geometries carry uv at that point).
+  geo.setAttribute("uv", new THREE.BufferAttribute(new Float32Array(6), 2));
   return geo;
 }
 
 // Pack normal.xyz + materialIndex.w into one itemSize-4 attribute so each BVH
 // level costs a single sampler for its per-vertex data.
-function packAttributes(merged) {
+// Stride-2 attribute layout: texel 2v = normal.xyz + matIndex, texel 2v+1 = uv.xy.
+// UVs are invariant under rigid transforms and skinning, so the UV texel is
+// written once at build and never touched by updateDynamic. When the geometry has
+// no uv attribute, uv reads as (0,0) — the zero-filled attribute added above.
+// `stride2`: when true, pack two texels per vertex; when false, the original
+// stride-1 layout (for scenes without texture maps).
+function packAttributes(merged, stride2 = false) {
   const norm = merged.getAttribute("normal");
   const matIdx = merged.getAttribute("materialIndex");
   const count = norm.count;
-  const packed = new Float32Array(count * 4);
-  for (let i = 0; i < count; i++) {
-    packed[i * 4] = norm.getX(i);
-    packed[i * 4 + 1] = norm.getY(i);
-    packed[i * 4 + 2] = norm.getZ(i);
-    packed[i * 4 + 3] = matIdx.getX(i);
+  if (!stride2) {
+    const packed = new Float32Array(count * 4);
+    for (let i = 0; i < count; i++) {
+      packed[i * 4] = norm.getX(i);
+      packed[i * 4 + 1] = norm.getY(i);
+      packed[i * 4 + 2] = norm.getZ(i);
+      packed[i * 4 + 3] = matIdx.getX(i);
+    }
+    return { packed, attr: new THREE.BufferAttribute(packed, 4) };
   }
+  // Stride 2: 8 floats per vertex (two vec4 texels).
+  const packed = new Float32Array(count * 8);
+  const uvs = merged.getAttribute("uv");
+  for (let i = 0; i < count; i++) {
+    const o = i * 8;
+    packed[o + 0] = norm.getX(i);
+    packed[o + 1] = norm.getY(i);
+    packed[o + 2] = norm.getZ(i);
+    packed[o + 3] = matIdx.getX(i);
+    packed[o + 4] = uvs ? uvs.getX(i) : 0;
+    packed[o + 5] = uvs ? uvs.getY(i) : 0;
+    packed[o + 6] = 0;
+    packed[o + 7] = 0;
+  }
+  // BufferAttribute.itemSize=4 means each "item" is one vec4 texel; with stride-2
+  // we have 2*count items.
   return { packed, attr: new THREE.BufferAttribute(packed, 4) };
 }
 
 // Build one BVH level (merge geometries, upload BVH + attribute textures).
-function buildLevel(geometries, { dynamic }) {
+function buildLevel(geometries, { dynamic, stride2 = false }) {
   const merged =
     geometries.length > 0 ? mergeGeometries(geometries, false) : degenerateGeometry();
   const bvh = new MeshBVH(merged, { strategy: dynamic ? CENTER : SAH });
-  return { merged, bvh, ...packAttributes(merged) };
+  return { merged, bvh, ...packAttributes(merged, stride2) };
 }
 
 export function compileScene(scene, options = {}) {
   scene.updateMatrixWorld(true);
   const dynamicSet = options.dynamicMeshes ? new Set(options.dynamicMeshes) : null;
+  // Texture tiles: when enabled, material maps are resampled to tiles on the
+  // scene-data texture so secondary rays can sample per-texel colour at hit points.
+  const tt = options.textureTiles;
+  const tileSize = (tt && tt.size) || DEFAULT_TILE_SIZE;
+  const maxTiles = (tt && tt.max) || DEFAULT_MAX_TILES;
 
   const compiled = new CompiledScene();
   const materials = compiled.materials;
@@ -1258,15 +1483,28 @@ export function compileScene(scene, options = {}) {
     throw new Error("three-realtime-rt: no meshes found in scene");
   }
 
+  // Collect texture tiles for secondary-ray sampling. Done here (after the
+  // material table is complete from the traverse, before building the attribute
+  // textures) so the stride-2 layout decision can depend on whether tiles exist.
+  const tileData = tt === false
+    ? null
+    : collectTextureTiles(materials, tileSize, maxTiles);
+  const hasTiles = tileData && tileData.hasTiles;
+  if (tileData) tileData.tileSize = tileSize;
+  // Stride-2 attribute layout: texel 2v = normal+matIndex, texel 2v+1 = uv.xy.
+  // Only used when tiles exist (secondary rays need UVs for texture sampling);
+  // otherwise the original stride-1 layout keeps the shader byte-identical.
+  const stride2 = hasTiles;
+
   // Static level.
-  const s = buildLevel(staticGeoms, { dynamic: false });
+  const s = buildLevel(staticGeoms, { dynamic: false, stride2 });
   compiled.staticBvh = s.bvh;
   compiled.staticBvhUniform.updateFrom(s.bvh);
   compiled.staticAttrTex.updateFrom(s.attr);
 
   // Dynamic level.
   compiled.hasDynamic = dynamicGeoms.length > 0;
-  const d = buildLevel(dynamicGeoms, { dynamic: true });
+  const d = buildLevel(dynamicGeoms, { dynamic: true, stride2 });
   compiled.dynamicMerged = d.merged;
   compiled.dynamicBvh = d.bvh;
   compiled.dynamicBvhUniform.updateFrom(d.bvh);
@@ -1318,12 +1556,15 @@ export function compileScene(scene, options = {}) {
   // nothing absorbs — the two-flux code reads K from row 67 and the glass flag
   // from its .w, and row 68 is addressed relative to it.
   compiled.scattering = collectScattering(materials);
-  compiled.absorption = collectAbsorption(materials, !!compiled.scattering);
+  compiled.absorption = collectAbsorption(materials, !!(compiled.scattering || hasTiles));
+  compiled.hasTextureTiles = hasTiles;
+  compiled._tileSize = tileSize; // for shader source injection
   compiled.materialsTex = buildSceneDataTexture(
     materials,
     emissiveTris,
     compiled.absorption,
-    compiled.scattering
+    compiled.scattering,
+    hasTiles ? tileData : null
   );
   // World-space 3D-texture albedo opt-in (userData.rtVolumeAlbedo). Resolved from
   // the deduped material table so the recorded matIndex matches what the BVH

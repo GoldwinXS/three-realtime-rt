@@ -280,6 +280,15 @@ export interface RealtimeRaytracerOptions {
    */
   kmScattering?: boolean;
   /**
+   * Texture-tile sampling for secondary rays (through glass, reflections, GI
+   * bounces). When not `false` AND the scene has textured materials, per-texel
+   * albedo and emissive colour is sampled at secondary hit points. Pass
+   * `{ size: 128, max: 16 }` to configure (defaults shown), or `false` to
+   * disable entirely. The tiles ride the existing scene-data texture — no extra
+   * sampler. Takes effect on the next `compileScene()`.
+   */
+  textureTiles?: { size?: number; max?: number } | false;
+  /**
    * Alpha-blended transparency: `transparent: true` meshes are primary-visible
    * and composited against the geometry behind them (weighted by `opacity`).
    * Default true. Off = blend surfaces render fully opaque.
@@ -540,6 +549,8 @@ export interface CompileSceneOptions {
    * raster path. Budget ~10–20k skinned source verts for a sub-2 ms frame.
    */
   dynamicMeshes?: Object3D[];
+  /** Texture-tile config for secondary-ray map sampling (see {@link RealtimeRaytracer.textureTiles}). */
+  textureTiles?: { size?: number; max?: number } | false;
 }
 
 /**
@@ -590,6 +601,8 @@ export class CompiledScene {
    * pre-feature program.
    */
   scattering: { sigmaS: Float32Array; km: Float32Array; count: number } | null;
+  /** True when the compiled scene has at least one textured material whose maps were tiled. */
+  hasTextureTiles: boolean;
   /** CPU cost (ms) of the most recent dynamic-emissive refresh (0 if none). */
   lastEmissiveRefreshMs: number;
   /**
@@ -760,6 +773,12 @@ export class RealtimeRaytracer {
    * the feature.
    */
   kmScattering: boolean;
+  /**
+   * Texture-tile sampling for secondary rays. When not `false` AND the scene has
+   * textured materials, per-texel map/emissiveMap is sampled at secondary hit
+   * points. Set before `compileScene()`; changes need a recompile.
+   */
+  textureTiles: { size?: number; max?: number } | false;
   /** Alpha-blended transparency: composite `transparent` meshes over the geometry behind them. */
   transparency: boolean;
   /**

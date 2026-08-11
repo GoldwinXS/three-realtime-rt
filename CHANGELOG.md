@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.11.0 — 2026-08-10
+
+- **Secondary-ray texture maps.** A textured surface seen through glass, in a
+  reflection, or via a GI bounce no longer collapses to its average colour — the
+  actual texel at the hit point's UV is sampled, so an emissive checkerboard
+  viewed through a biconvex glass lens shows an inverted, magnified checkerboard
+  instead of a featureless beige disc. Two constraints shaped the design: the
+  lighting pass is at the WebGL2 16-sampler minimum (no new sampler), and
+  barycentric interpolation of packed data is garbage (UVs must be stored as
+  plain floats at separate texels rather than bit-packed). The result rides the
+  existing scene-data texture with no new GPU resources.
+  - **Map tiles on the scene-data texture.** Row 69 carries per-material tile
+    indices (`[albedoTile, emissiveTile, 0, 0]`, `-1.0` = no map). Rows 70+
+    hold the tile block: each unique texture image is resampled to 128x128 RGBA
+    on a canvas, converted to linear colour for sRGB sources, and written as 128
+    consecutive rows. One cache per image (`_mapTileCache`) so a texture shared
+    by several materials gets one tile. Caps at 16 unique images by default
+    (`textureTiles.max`); further materials keep the averaged-colour behaviour
+    with a one-time warning.
+  - **Stride-2 vertex attribute layout.** The per-vertex attribute texture now
+    stores two vec4 texels per vertex: texel `2v` = `[nx, ny, nz, matIndex]`
+    (unchanged content), texel `2v+1` = `[u, v, 0, 0]`. UVs are invariant under
+    rigid transforms and skinning, so the UV texel is written once at build and
+    never touched by `updateDynamic()`. Geometries without a `uv` attribute get
+    a zero-filled one before merging so `mergeGeometries` does not drop the
+    attribute. All three updateDynamic paths (rigid, deforming, skinned) were
+    audited for the stride-8 offset change.
+  - **Shader: `fetchAttrUv` replaces `textureSampleBarycoord` at all four
+    sites.** A new GLSL helper replicates `texelFetch1D`'s 1D-to-2D addressing
+    at stride 2 and does manual 3-vertex lerp. At each of the four
+    `textureSampleBarycoord` call sites (shadow march, traceRadiance, glass exit
+    in RTLightingPass; traceRadianceGI in GIReservoirPass), an RT_TEXTURE_TILES
+    block adds a `fetchAttrUv` call that overwrites the old result. When the
+    block is stripped (no maps), the old `textureSampleBarycoord` at stride 1
+    is the only reader — byte-identical shader source. `tileSample` does manual
+    bilinear (4 `texelFetch`es with wrap-mode repeat on the UV fract) from the
+    tile block in `uMaterialsTex`.
+  - **Per-texel shading at secondary hit points.** After `fetchMaterial`, if
+    `uHasTextureTiles` is true and the material's tile index is non-negative,
+    the averaged table colour is multiplied by the tile sample: `albedo *=
+    tileSample(albedoTile, uv)` and `emissive *= tileSample(emissiveTile, uv)`.
+    The table colour already carries the material tint (`color` for albedo,
+    `emissive * emissiveIntensity` for emissive), so the compose matches
+    three.js's `color * map` and `emissive * emissiveMap * emissiveIntensity`.
+    The NEE light table and CDF (rows 1 and 66) keep using averaged emissive —
+    importance sampling does not need the pattern.
+  - **New option `textureTiles`** on `RealtimeRaytracer` constructor and
+    `compileScene()`: `{ size: 128, max: 16 }`, or `false` to disable entirely.
+    Typed in `index.d.ts`. When `false` or the scene has no textured materials,
+    the shader is source-spliced to be byte-identical to the 0.10.0 build.
+  - **Probe page** `probe-secondary-textures.html`: a glass sphere in front of a
+    checkerboard, with `?mode=emissive` and `?mode=albedo` variants plus
+    `&dynamic=1` for a dynamic-mesh test.
+  - **GIReservoirPass** also receives the feature: GI bounce albedo samples
+    per-texel when tiles exist, so colour bleeding carries the pattern.
+
 ## 0.10.0 — 2026-07-27
 
 - **ReSTIR GI: the artifact was chromatic, and now it is gone.** `restirGI`

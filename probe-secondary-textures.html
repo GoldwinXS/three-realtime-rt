@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>probe-secondary-textures — three-realtime-rt v0.11.0</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #000; font-family: monospace; }
+  canvas { display: block; }
+  #hud {
+    position: absolute; top: 12px; left: 16px; color: #fff;
+    background: rgba(0,0,0,0.65); padding: 8px 14px; border-radius: 6px;
+    font-size: 14px; line-height: 1.5; pointer-events: none;
+  }
+  #status { color: #8f8; }
+  #status.fail { color: #f44; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div>probe-secondary-textures</div>
+  <div id="status">loading...</div>
+  <div id="info"></div>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./node_modules/three/build/three.module.js",
+    "three/addons/": "./node_modules/three/examples/jsm/",
+    "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { RealtimeRaytracer } from "./src/index.js";
+
+const params = new URLSearchParams(location.search);
+const mode = params.get("mode") || "emissive"; // "emissive" or "albedo"
+const dynamic = params.has("dynamic");
+
+const statusEl = document.getElementById("status");
+const infoEl = document.getElementById("info");
+
+const W = Math.min(window.innerWidth, 1024);
+const H = Math.min(window.innerHeight, 768);
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H);
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 100);
+camera.position.set(0, 1.6, 8);
+camera.lookAt(0, 0.5, 0);
+
+// --- Checkerboard plane behind the sphere ---
+const tileSize = 0.5;
+const tilesW = 12;
+const tilesH = 8;
+const canvas = document.createElement("canvas");
+canvas.width = tilesW;
+canvas.height = tilesH;
+const ctx = canvas.getContext("2d");
+for (let y = 0; y < tilesH; y++) {
+  for (let x = 0; x < tilesW; x++) {
+    ctx.fillStyle = (x + y) % 2 === 0 ? "#ffffff" : "#202020";
+    ctx.fillRect(x, y, 1, 1);
+  }
+}
+const checkerTex = new THREE.CanvasTexture(canvas);
+checkerTex.wrapS = THREE.RepeatWrapping;
+checkerTex.wrapT = THREE.RepeatWrapping;
+checkerTex.repeat.set(6, 4);
+checkerTex.colorSpace = THREE.SRGBColorSpace;
+checkerTex.needsUpdate = true;
+
+const boardGeo = new THREE.PlaneGeometry(10, 6);
+const boardMat = mode === "emissive"
+  ? new THREE.MeshStandardMaterial({
+      color: 0xffffff, roughness: 0.9, metalness: 0,
+      emissive: 0xffffff, emissiveIntensity: 2.5, emissiveMap: checkerTex,
+    })
+  : new THREE.MeshStandardMaterial({
+      color: 0xffffff, roughness: 0.5, metalness: 0, map: checkerTex,
+    });
+const board = new THREE.Mesh(boardGeo, boardMat);
+board.position.set(0, 0.4, -1.5);
+scene.add(board);
+
+// A dim point light so the albedo-mode checkerboard is lit.
+const light = new THREE.PointLight(0xffffff, 8);
+light.position.set(2, 4, 3);
+scene.add(light);
+
+// --- Glass sphere ---
+const sphereGeo = new THREE.SphereGeometry(0.8, 64, 64);
+const sphereMat = new THREE.MeshPhysicalMaterial({
+  color: 0xffffff, roughness: 0.05, metalness: 0.05,
+  transmission: 1.0, ior: 1.5, transparent: false,
+});
+const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+sphere.position.set(0, 1.0, 0.5);
+scene.add(sphere);
+
+// --- Floor ---
+const floorGeo = new THREE.PlaneGeometry(16, 16);
+const floorMat = new THREE.MeshStandardMaterial({ color: 0x404040, roughness: 0.9 });
+const floor = new THREE.Mesh(floorGeo, floorMat);
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -0.5;
+scene.add(floor);
+
+// --- Build the raytracer ---
+const rt = new RealtimeRaytracer(renderer, {
+  renderScale: 0.5,
+  gi: true,
+  reflections: true,
+  refraction: true,
+  specular: true,
+  denoiseIterations: 2,
+  textureTiles: { size: 128, max: 16 },
+});
+
+if (!rt.supported) {
+  statusEl.textContent = "UNSUPPORTED — no WebGL2 float RTs on hardware GPU";
+  statusEl.className = "fail";
+  infoEl.textContent = "This machine cannot run the ray tracer.";
+} else {
+  const dynamicMeshes = dynamic ? [sphere] : [];
+  if (dynamic) sphere.userData.rtDeforming = false; // rigid mover only: sphere translates
+
+  rt.compileScene(scene, { dynamicMeshes });
+
+  infoEl.textContent =
+    `mode=${mode} | dynamic=${dynamic} | ` +
+    `tiles=${rt.compiled.hasTextureTiles ? "YES" : "NO"} | ` +
+    `maps=${rt.compiled.hasTextureTiles ? rt.textureTiles.size || 128 : "N/A"}`;
+
+  let t0 = performance.now();
+  let frames = 0;
+
+  function loop() {
+    requestAnimationFrame(loop);
+
+    if (dynamic) {
+      // Gentle side-to-side motion.
+      sphere.position.x = Math.sin(performance.now() * 0.001) * 0.8;
+    }
+
+    rt.updateDynamic();
+    rt.render(scene, camera);
+    frames++;
+
+    if (frames === 1) {
+      t0 = performance.now();
+    }
+    if (frames === 60) {
+      const dt = (performance.now() - t0) / 60;
+      statusEl.textContent = `PASS: ${dt.toFixed(1)} ms/frame (${(1000/dt).toFixed(0)} fps)`;
+      statusEl.className = "";
+      infoEl.textContent += ` | render ~${dt.toFixed(1)}ms`;
+    }
+  }
+  loop();
+}
+</script>
+</body>
+</html>
