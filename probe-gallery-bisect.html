@@ -47,6 +47,7 @@ for (const [k, v] of q.entries()) {
 document.title = sceneKey + " " + JSON.stringify(Object.fromEntries(q));
 const rt = new RealtimeRaytracer(renderer, opts);
 window.rt = rt;
+window.probeCam = camera;
 window.probeScene = scene;
 rt.compileScene(scene);
 const db = renderer.getDrawingBufferSize(new THREE.Vector2());
