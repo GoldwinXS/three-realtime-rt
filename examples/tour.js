@@ -92,6 +92,7 @@ const CSS = `
   #tour .nav .stop { min-width: 120px; }
   #tour .nav a, #tour .nav span.stop { padding: 7px 9px; }
   #tour .rtsw { padding: 7px 13px; font-size: 11px; }
+  #tour .dots a.costs { font-size: 9px; padding: 1px 6px; }
 }
 `;
 

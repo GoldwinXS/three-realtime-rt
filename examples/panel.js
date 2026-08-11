@@ -1,14 +1,15 @@
-// The SHARED renderer/lighting control panel — one component, used unchanged by
+// The SHARED renderer/lighting control panel, one component used unchanged by
 // every stop of the demo tour (Cornell box, museum, model scenes).
 //
 // This file is the museum panel (formerly all of examples/ui.js) with the
 // room-specific sections lifted out. What stays here is everything that is a
 // property of the RENDERER rather than of a particular room: the Renderer
-// section, the RT-features section (including the two scene-revealing feature
-// toggles and the counted ReSTIR lease they share), and Atmosphere. What left is
-// everything that describes one room's contents — the museum's Lights and
-// Physics sections now live in examples/ui.js and are appended into the
-// `exhibits` container this returns, below the shared sections.
+// section and the Lighting & Atmosphere, Effects and Quality & Performance
+// groups (including the two scene-revealing feature toggles and the counted
+// ReSTIR lease they share). What left is everything that describes one room's
+// contents: the museum's Lights and Physics sections now live in examples/ui.js
+// and are appended into the `exhibits` container this returns, below the shared
+// groups.
 //
 // Pure DOM + injected CSS (no framework), SVG icons only.
 
@@ -25,16 +26,39 @@ const CSS = `
   font: 12px/1.45 ui-monospace, "SF Mono", Consolas, monospace; color: var(--ink);
   background: var(--panel-bg); border: 1px solid var(--panel-br); border-radius: 10px;
   backdrop-filter: blur(10px); box-shadow: 0 8px 30px rgba(0,0,0,0.45); user-select: none; }
-#panel::-webkit-scrollbar { width: 8px; } #panel::-webkit-scrollbar-thumb { background: #2b3a45; border-radius: 4px; }
+/* the panel is the one tall scroll surface on the page, so its scrollbar has
+   to be discoverable when several groups are open at once (webkit only, which
+   is what the demo targets) */
+#panel::-webkit-scrollbar { width: 12px; }
+#panel::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.25); }
+#panel::-webkit-scrollbar-thumb { background: #4d6472; border-radius: 6px; border: 3px solid rgba(0, 0, 0, 0.35); }
+#panel::-webkit-scrollbar-thumb:hover { background: #5e7988; }
+/* scroll-fade: sits just above the pinned footer and appears only while content
+   overflows and is not scrolled to the end, so there is always a cue that more
+   controls sit below the fold (headless captures show no native scrollbar) */
+#panel .panel-fade { position: absolute; left: 0; right: 0; height: 24px;
+  pointer-events: none; opacity: 0; transition: opacity .15s;
+  background: linear-gradient(to top, rgba(14,18,24,0.9), rgba(14,18,24,0)); }
+#panel .panel-fade.show { opacity: 1; }
 #panel .hd { display: flex; align-items: center; gap: 8px; padding: 12px 14px 8px; }
 #panel .hd svg { width: 16px; height: 16px; color: var(--accent); }
 #panel .hd b { font-size: 13px; letter-spacing: 0.3px; }
 #panel .hd .tag { margin-left: auto; font-size: 10px; color: var(--ink-dim); }
 #panel .sec { border-top: 1px solid var(--panel-br); padding: 8px 14px 12px; }
 #panel .sec h3 { display: flex; align-items: center; gap: 7px; margin: 4px 0 8px;
-  font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-dim); }
+  font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-dim);
+  cursor: pointer; user-select: none; }
 #panel .sec h3 svg { width: 13px; height: 13px; }
-#panel .row { display: flex; align-items: center; gap: 8px; min-height: 24px; margin: 3px 0; }
+/* collapsible groups: the header chevron points down while the group is open,
+   right while collapsed; the body rows hide with the group. The chevron is
+   drawn a step brighter and larger than the section icon so the header reads
+   as the click target it is. */
+#panel .sec h3 .chev { flex: none; display: flex; align-items: center; color: #a8bcc8; }
+#panel .sec h3 .chev svg { width: 15px; height: 15px; transition: transform .15s; }
+#panel .sec h3:hover .chev { color: var(--accent); }
+#panel .sec.collapsed h3 .chev svg { transform: rotate(-90deg); }
+#panel .sec.collapsed > :not(h3) { display: none; }
+#panel .row { display: flex; align-items: center; gap: 8px; min-height: 24px; margin: 5px 0; }
 #panel .row label { flex: 1; cursor: pointer; }
 #panel .row .val { color: var(--accent); font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
 /* sub-toggle: a modifier of the row above it, dimmed while its parent is off */
@@ -51,6 +75,10 @@ const CSS = `
 #panel select option.gov-val { color: var(--accent); }
 /* toggle switch */
 .sw { position: relative; width: 34px; height: 18px; flex: none; }
+/* the row rule below (#panel .row label { flex: 1 }) out-specifies .sw, which
+   would stretch the switch across half the row; pin it back to 34px so labels
+   keep the room they need and long ones do not wrap */
+#panel .row label.sw { flex: none; width: 34px; }
 .sw input { opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
 .sw .track { position: absolute; inset: 0; background: #2a3742; border-radius: 10px; transition: background .15s; pointer-events: none; }
 .sw .knob { position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%;
@@ -59,7 +87,7 @@ const CSS = `
 .sw input:checked + .track + .knob { transform: translateX(16px); background: var(--accent); }
 #panel input[type=range] { flex: 1; accent-color: var(--accent); height: 3px; }
 #panel select { background: #131a20; color: var(--ink); border: 1px solid #37474f;
-  border-radius: 5px; font: inherit; padding: 2px 5px; flex: 1; }
+  border-radius: 5px; font: inherit; padding: 2px 5px; flex: 1; min-width: 0; }
 #panel input[type=color] { width: 26px; height: 20px; padding: 0; border: 1px solid #37474f;
   border-radius: 4px; background: none; cursor: pointer; flex: none; }
 #panel .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px; }
@@ -68,8 +96,17 @@ const CSS = `
 #panel button:hover { background: #1e2d38; border-color: var(--accent); color: #fff; }
 #panel button svg { width: 13px; height: 13px; }
 #panel button.wide { grid-column: 1 / -1; }
-#panel .stats { border-top: 1px solid var(--panel-br); padding: 9px 14px; color: var(--ink-dim);
+/* the panel footer (fps readout + links) is pinned to the panel's bottom edge,
+   so the status line and the links stay visible however many groups are open */
+#panel .stats-foot { position: sticky; bottom: 0; background: rgba(14,18,24,0.96);
+  border-top: 1px solid var(--panel-br); }
+#panel .stats { padding: 9px 14px 5px; color: var(--ink-dim);
   white-space: pre; font-size: 11px; line-height: 1.5; }
+/* the footer links: a .stats bar that must WRAP. the shared .stats rule above
+   uses white-space: pre (the fps readout is multi-line), which would hold these
+   three links on one unbroken line and overflow the 268px panel. */
+#panel .stats.links { padding-top: 3px; padding-bottom: 9px;
+  white-space: normal; font-size: 10px; line-height: 1.6; }
 #panel .stats b { color: var(--accent-2); }
 #panel .stats a { color: var(--accent-2); text-decoration: none; }
 #panel .stats a:hover { text-decoration: underline; }
@@ -87,13 +124,24 @@ const CSS = `
 #panel .hd .fold:hover { color: var(--accent); background: none; border: none; }
 #panel .hd .fold svg { width: 15px; height: 15px; transition: transform .15s; }
 #panel.min .hd .fold svg { transform: rotate(180deg); }
-#panel.min .sec, #panel.min .stats { display: none; }
+#panel.min .sec, #panel.min .stats-foot { display: none; }
 /* Per-room exhibit controls: the same .sec rows, marked as "this room's" with a
    warmer rule so the shared renderer panel above reads as one block. */
 #panel .exhibits .sec { border-top: 1px solid #33454f; }
 #panel .exhibits .sec h3 { color: var(--accent-2); }
 #panel .caption { margin: 2px 0 8px; color: var(--ink-dim); font-size: 10px; line-height: 1.4; }
 #panel .caption b { color: var(--ink); font-weight: normal; }
+/* phones: the fps badge must never outrun the viewport, and the hint bar sits
+   where the tour chrome overlaps it, so it is dropped there */
+@media (max-width: 420px) {
+  #fps { max-width: calc(100vw - 28px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #hint { display: none; }
+}
+/* on phones the tour chrome (the RT switch and the prev/next bar) sits at the
+   bottom centre, so an open panel must stop short of it instead of covering it */
+@media (max-width: 700px) {
+  #panel { max-height: calc(100vh - 200px); }
+}
 `;
 
 export const ICON = {
@@ -108,6 +156,9 @@ export const ICON = {
   fog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 8h16M4 12h16M4 16h16"/></svg>',
   sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 1v3M12 20v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1 12h3M20 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>',
   chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 15l6-6 6 6"/></svg>',
+  // the section-header chevron, pointing down while the group is open (the
+  // .collapsed rule rotates it 90 deg so it points right closed)
+  chevD: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>',
   frame: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>',
 };
 
@@ -182,11 +233,35 @@ export function selectRow(labelText, options, value, onChange) {
   return { row, select: sel };
 }
 
+// A collapsible section group. The h3 header is the click target; the chevron
+// beside the title points down while the group is open, right while collapsed.
+// Every group except Renderer starts collapsed so the panel reads as a short
+// list of headers rather than one unbroken column.
+//
+// The groups are an accordion: opening one folds the others. With thirty-plus
+// controls in the panel, letting every group open at once pushes the lower ones
+// below the fold, and the panel's own scrollbar is easy to miss; one group at a
+// time keeps every control on screen.
+const allSections = [];
+function colSection(iconHtml, title, collapsed = true) {
+  const sec = el("div", "sec");
+  sec.append(el("h3", null, `<span class="chev">${ICON.chevD}</span>${iconHtml} ${title}`));
+  sec.classList.toggle("collapsed", collapsed);
+  sec.querySelector("h3").addEventListener("click", () => {
+    if (sec.classList.contains("collapsed")) {
+      for (const other of allSections) {
+        if (other !== sec) other.classList.add("collapsed");
+      }
+    }
+    sec.classList.toggle("collapsed");
+  });
+  allSections.push(sec);
+  return sec;
+}
+
 /** A per-room controls section, to be appended into the returned `exhibits`. */
 export function section(iconHtml, title) {
-  const sec = el("div", "sec");
-  sec.append(el("h3", null, `${iconHtml} ${title}`));
-  return sec;
+  return colSection(iconHtml, title, true);
 }
 
 /**
@@ -299,8 +374,7 @@ export function buildPanel({
   };
 
   // --- Renderer (core pipeline; watch the fps readout as you change these) ---
-  const rSec = el("div", "sec");
-  rSec.append(el("h3", null, `${ICON.layers} Renderer`));
+  const rSec = colSection(ICON.layers, "Renderer", false);
 
   // The canvas scale is the APP's (it owns the drawing buffer and the CSS
   // stretch), and the governor drives it through rt.canvasScaleHook — so the
@@ -444,46 +518,68 @@ export function buildPanel({
     }
   };
 
-  // --- RT features: additive effects, each with a visible frame-time cost.
-  // Tiered defaults leave the heavy ones off on phones — turning them on IS
-  // the demo ("what does this cost on MY hardware?").
-  const fSec = el("div", "sec");
-  fSec.append(el("h3", null, `${ICON.bulb} RT features`));
-  // Routed through setFeature — reflections/refraction also reveal a showcase
+  // --- Lighting & Atmosphere: the light sources and the air around them. ----
+  const laSec = colSection(ICON.bulb, "Lighting & Atmosphere", true);
+  // Routed through setFeature: emissive area lights reveal the room's second
+  // light (in the Cornell box the emissive block, in the museum the fixtures).
+  laSec.append(featureToggle("emissive", "emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);
+  // Turning ReSTIR OFF must drop us onto the per-light-rays baseline, NOT the
+  // flat-cost stochastic "fast lights" path: otherwise both sides scale the
+  // same with light count and ReSTIR's advantage never shows up in the fps.
+  const restirT = featureToggle("restir", "ReSTIR lights", rt.restir, (v) => {
+    // A manual flip is the user taking the wheel back: void the lease outright
+    // so no borrower can ever overwrite this choice on its way out.
+    restirSavedState = null;
+    restirBorrowers.clear();
+    applyRestir(v);
+  });
+  laSec.append(restirT.row);
+  // Grab the fast-lights toggle first so the ReSTIR handler can uncheck it.
+  const fastLights = featureToggle("stochasticLights", "fast lights (1 ray)", rt.stochasticLights, (v) => { rt.stochasticLights = v; setAdaptive(false); rt.resetAccumulation(); });
+  laSec.append(fastLights.row);
+  laSec.append(toggle("volumetric light", rt.volumetric.enabled, (v) => { rt.volumetric.enabled = v; rt.resetAccumulation(); }).row);
+  laSec.append(toggle("fog / haze", rt.fog.enabled, (v) => { rt.fog.enabled = v; rt.resetAccumulation(); }).row);
+  laSec.append(slider("density", 0.01, 0.12, 0.005, rt.fog.density, (x) => x.toFixed(2), (v) => (rt.fog.density = v)));
+  panel.append(laSec);
+
+  // --- Effects: additive shading results, each with a visible frame-time cost.
+  // Tiered defaults leave the heavy ones off on phones; turning them on IS the
+  // demo ("what does this cost on MY hardware?").
+  const efSec = colSection(ICON.burst, "Effects", true);
+  // Routed through setFeature: reflections/refraction also reveal a showcase
   // sphere and recompile the BVH, which the room owns. Initial state reads the
   // current rt values (all false at the museum's minimal start).
-  fSec.append(featureToggle("specular", "PBR specular", rt.specular, (v) => { rt.specular = v; rt.resetAccumulation(); }).row);
-  fSec.append(featureToggle("gi", "global illumination", rt.gi, (v) => setFeature("gi", v)).row);
+  efSec.append(featureToggle("specular", "PBR specular", rt.specular, (v) => { rt.specular = v; rt.resetAccumulation(); }).row);
+  efSec.append(featureToggle("gi", "global illumination", rt.gi, (v) => setFeature("gi", v)).row);
   // Both of the GI modifiers are no-ops without GI itself, so they are drawn as
   // sub-rows of it and dimmed while it is off (the same "this modifies the row
   // above" grammar as tinted shadows). Both are also FREE WINS the governor
   // spends before it gives up any resolution, which is why their state moves on
-  // its own while auto quality is on — see syncGovernorRows.
+  // its own while auto quality is on; see syncGovernorRows.
   const halfRateT = featureToggle("giHalfRate", "half-rate GI (fast)", rt.giHalfRate, (v) => { rt.giHalfRate = v; rt.resetAccumulation(); });
   halfRateT.row.classList.add("sub");
-  fSec.append(halfRateT.row);
+  efSec.append(halfRateT.row);
   // Experimental: reservoir reuse of the 1-bounce GI sample (temporal-only).
   // Only meaningful when global illumination is on; injected at the denoise stage.
   const restirGiT = featureToggle("restirGI", "ReSTIR GI (exp)", rt.restirGI, (v) => { rt.restirGI = v; rt.resetAccumulation(); });
   restirGiT.row.classList.add("sub");
-  fSec.append(restirGiT.row);
+  efSec.append(restirGiT.row);
   // Two conditions this row cannot satisfy on its own, both of which otherwise
   // look like "the toggle does nothing":
   //  - it is resolved AT the à-trous stage, so with GI or the denoiser off the
   //    renderer skips the pass entirely (it warns once in the console; say it here)
-  //  - past 3 denoise passes the wide taps smear its coarse structure — the
+  //  - past 3 denoise passes the wide taps smear its coarse structure: the
   //    campaign's own replacement ladder never ran it past 3, and the governor
   //    now caps itself there.
   const restirGiNote = el("div", "note");
-  fSec.append(restirGiNote);
-  fSec.append(featureToggle("emissive", "emissive area lights", rt.emissiveNEE, (v) => setFeature("emissive", v)).row);
-  fSec.append(featureToggle("reflections", "reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
+  efSec.append(restirGiNote);
+  efSec.append(featureToggle("reflections", "reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
   // Grab the refraction toggle so the tinted-glass handler can switch it on.
   const refractionT = featureToggle("refraction", "refraction", rt.refraction, (v) => setFeature("refraction", v));
-  fSec.append(refractionT.row);
-  // Tinted glass (Beer-Lambert absorption): reveals the room's absorbing piece —
-  // in the museum the Sunset relief and the Lumiere screen, in the Cornell box
-  // the leaning glass panes — and recompiles with per-material absorption; OFF
+  efSec.append(refractionT.row);
+  // Tinted glass (Beer-Lambert absorption): reveals the room's absorbing piece
+  // (in the museum the Sunset relief and the Lumiere screen, in the Cornell box
+  // the leaning glass panes) and recompiles with per-material absorption; OFF
   // strips back to the byte-identical no-absorption program, so flipping this
   // while watching the fps readout IS the feature's cost measurement. The effect
   // only exists on refracted paths, so turning it on brings refraction with it
@@ -497,7 +593,7 @@ export function buildPanel({
   const applyTintedShadows = (v) => {
     rt.absorptionShadows = v;
     // THE COUPLING. With ReSTIR lights on, primary direct light is shaded from
-    // the reservoir's winner by ONE BINARY visibility ray — so the per-channel
+    // the reservoir's winner by ONE BINARY visibility ray: so the per-channel
     // transmittance march never runs on a primary surface and this toggle would
     // appear to do NOTHING on the floor. Rather than explain that in a footnote
     // and let the user conclude the feature is broken, switch ReSTIR off for
@@ -533,21 +629,21 @@ export function buildPanel({
     // Reveal / retire the room's gated light row (museum: the Lumiere projector).
     for (const hook of gateHooks.absorption || []) hook(v);
   });
-  fSec.append(tintedGlass.row);
-  fSec.append(tintedShadows.row);
+  efSec.append(tintedGlass.row);
+  efSec.append(tintedShadows.row);
   tintedNote.style.display = "none"; // revealed with the piece
-  fSec.append(tintedNote);
-  // Chromatic dispersion on the refracted term — the diamond-ior glass sphere on
+  efSec.append(tintedNote);
+  // Chromatic dispersion on the refracted term: the diamond-ior glass sphere on
   // the materials bench splits white light into a rainbow. Default 0 (off): the
   // stochastic spectral sampling estimates one colour channel per glass pixel
   // per frame, which triples the transmitted term's variance and adds visible
   // grain on the sphere at the demo's reduced render scale before it fully
   // converges. Drag it up to see the effect; it shimmers slightly while
   // converging, so reset the accumulator on each change.
-  fSec.append(slider("dispersion", 0, 0.3, 0.01, rt.dispersion, (x) => Number(x).toFixed(2), (v) => { rt.dispersion = v; rt.resetAccumulation(); }));
-  // Kubelka-Munk scattering: reveals the room's scattering piece — in the museum
+  efSec.append(slider("dispersion", 0, 0.3, 0.01, rt.dispersion, (x) => Number(x).toFixed(2), (v) => { rt.dispersion = v; rt.resetAccumulation(); }));
+  // Kubelka-Munk scattering: reveals the room's scattering piece (in the museum
   // "Alabaster" (the reading lamp plus the two spheres that differ ONLY in
-  // whether they scatter), in the Cornell box the stepped stone wedge. Absorption
+  // whether they scatter), in the Cornell box the stepped stone wedge). Absorption
   // alone can only remove light, so without this a pigmented translucent body
   // stays dark murk. Off strips back to the byte-identical no-scattering program,
   // so flipping this while watching the fps readout IS the feature's cost
@@ -557,10 +653,10 @@ export function buildPanel({
   const kmNote = el("div", "note");
   kmNote.textContent =
     "the lamp's light REACHES the table through its shade, which is a shadow-ray " +
-    "effect — so this unchecks “ReSTIR lights” (and “fast lights” with it) for the " +
+    "effect: so this unchecks “ReSTIR lights” (and “fast lights” with it) for the " +
     "same reason “tinted shadows” does, and puts both back when it goes off. The " +
     "shade's own outward glow needs neither.";
-  fSec.append(featureToggle("scattering", "scattering (Kubelka-Munk)", !!initial.scattering, (v) => {
+  efSec.append(featureToggle("scattering", "scattering (Kubelka-Munk)", !!initial.scattering, (v) => {
     if (v && !rt.refraction) {
       refractionT.input.checked = true;
       setFeature("refraction", true);
@@ -569,55 +665,61 @@ export function buildPanel({
     kmNote.style.display = v ? "" : "none";
     borrowRestir("kmScattering", v);
   }).row);
-  fSec.append(kmNote);
+  efSec.append(kmNote);
   kmNote.style.display = "none"; // revealed with the piece
-  // Grab the fast-lights toggle first so the ReSTIR handler can uncheck it.
-  const fastLights = featureToggle("stochasticLights", "fast lights (1 ray)", rt.stochasticLights, (v) => { rt.stochasticLights = v; setAdaptive(false); rt.resetAccumulation(); });
-  // Turning ReSTIR OFF must drop us onto the per-light-rays baseline, NOT the
-  // flat-cost stochastic "fast lights" path — otherwise both sides scale the
-  // same with light count and ReSTIR's advantage never shows up in the fps.
-  const restirT = featureToggle("restir", "ReSTIR lights", rt.restir, (v) => {
-    // A manual flip is the user taking the wheel back: void the lease outright
-    // so no borrower can ever overwrite this choice on its way out.
-    restirSavedState = null;
-    restirBorrowers.clear();
-    applyRestir(v);
-  });
-  fSec.append(restirT.row);
-  fSec.append(fastLights.row);
-  fSec.append(slider("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v)));
-  fSec.append(slider("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v)));
-  // Keeps its full 0..5 range — the campaign's finding is about what the
+  panel.append(efSec);
+
+  // --- Quality & Performance: the converger's dials. -------------------------
+  const qpSec = colSection(ICON.chip, "Quality & Performance", true);
+  qpSec.append(slider("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v)));
+  qpSec.append(slider("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v)));
+  // Keeps its full 0..5 range: the campaign's finding is about what the
   // GOVERNOR should choose, not about what you may look at. 4 and 5 are where
   // the à-trous lattice is measurable, so they stay reachable by hand.
   const denoisePasses = sliderRow("denoise passes", 0, 5, 1, rt.denoiseIterations, (x) => Number(x).toFixed(0), (v) => {
     rt.denoiseIterations = v;
-    setAdaptive(false); // the governor writes this row too — dragging it takes the wheel
+    setAdaptive(false); // the governor writes this row too; dragging it takes the wheel
   });
-  fSec.append(denoisePasses.row);
-  panel.append(fSec);
-
-  // --- Atmosphere ---
-  const aSec = el("div", "sec");
-  aSec.append(el("h3", null, `${ICON.fog} Atmosphere`));
-  aSec.append(toggle("fog / haze", rt.fog.enabled, (v) => { rt.fog.enabled = v; rt.resetAccumulation(); }).row);
-  aSec.append(toggle("volumetric light", rt.volumetric.enabled, (v) => { rt.volumetric.enabled = v; rt.resetAccumulation(); }).row);
-  aSec.append(slider("density", 0.01, 0.12, 0.005, rt.fog.density, (x) => x.toFixed(2), (v) => (rt.fog.density = v)));
-  panel.append(aSec);
+  qpSec.append(denoisePasses.row);
+  panel.append(qpSec);
 
   // --- per-room exhibit controls go here, below the shared panel -------------
   const exhibits = el("div", "exhibits");
   panel.append(exhibits);
 
+  // Pinned footer: the fps readout and the links live in one sticky bar at the
+  // panel's bottom edge, so they stay in view however many groups are open.
+  const statsFoot = el("div", "stats-foot");
   const stats = el("div", "stats");
-  panel.append(stats);
-
-  const links = el("div", "stats");
+  statsFoot.append(stats);
+  const links = el("div", "stats links");
   links.innerHTML =
     `<a href="./costs.html" title="what every feature above costs, per scene, measured">Feature costs</a>` +
     ` &middot; <a href="https://github.com/GoldwinXS/three-realtime-rt" target="_blank" rel="noopener">GitHub (MIT)</a>` +
     ` &middot; <a href="https://goldwinxs.itch.io/three-realtime-rt-supporter-pack" target="_blank" rel="noopener">Supporter pack</a>`;
-  panel.append(links);
+  statsFoot.append(links);
+  panel.append(statsFoot);
+
+  // Scroll-fade cue, drawn just above the pinned footer (its bottom edge is the
+  // footer's height, measured live so wrapping links on narrow screens are fine).
+  const scrollFade = el("div", "panel-fade");
+  panel.append(scrollFade);
+  const updateFade = () => {
+    scrollFade.style.bottom = `${statsFoot.offsetHeight}px`;
+    const overflow = panel.scrollHeight - panel.clientHeight > 1;
+    const atBottom = panel.scrollTop + panel.clientHeight >= panel.scrollHeight - 1;
+    scrollFade.classList.toggle("show", overflow && !atBottom);
+  };
+  panel.addEventListener("scroll", updateFade, { passive: true });
+  // Opening or closing a group changes the overflow without a scroll event, so
+  // re-evaluate on any class change inside the panel (section toggles, badges).
+  new MutationObserver(updateFade).observe(panel, {
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class"],
+  });
+  addEventListener("resize", updateFade);
+  updateFade();
 
   document.body.append(panel);
 
