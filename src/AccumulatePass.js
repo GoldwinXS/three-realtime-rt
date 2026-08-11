@@ -280,9 +280,21 @@ export class AccumulatePass {
     this.targetA.setSize(w, h);
     this.targetB.setSize(w, h);
     this.material.uniforms.uTexSize.value.set(w, h);
+    // setSize reallocates the ping-pong textures with UNDEFINED contents. A
+    // garbage count in the history alpha makes the EMA weight ~1/garbage, so
+    // whatever brightness landed there never blends out: a renderScale step
+    // from the adaptive governor froze the frame permanently blown out
+    // (mosquito clip, 0:04). Clear on the next render, when we have the
+    // renderer. Cost: one accumulation reset per quality step, same brief
+    // reconvergence the governor already causes elsewhere.
+    this._needsClear = true;
   }
 
   render(renderer, rawIrradiance, rawSpecular, gbuffer, prevViewProj, viewProj, cameraPos, eps, maxHistory, opts = {}) {
+    if (this._needsClear) {
+      this._needsClear = false;
+      this.clearHistory(renderer);
+    }
     const u = this.material.uniforms;
     u.uRawIrradiance.value = rawIrradiance;
     u.uRawSpecular.value = rawSpecular;
@@ -314,11 +326,17 @@ export class AccumulatePass {
   }
 
   clearHistory(renderer) {
+    // Explicit zero: history rgb AND the count in alpha must both clear, so
+    // save and restore whatever clear colour the host app uses.
+    const prevColor = renderer.getClearColor(new THREE.Color());
+    const prevAlpha = renderer.getClearAlpha();
+    renderer.setClearColor(0x000000, 0);
     for (const t of [this.targetA, this.targetB]) {
       renderer.setRenderTarget(t);
       renderer.clearColor();
     }
     renderer.setRenderTarget(null);
+    renderer.setClearColor(prevColor, prevAlpha);
   }
 
   dispose() {

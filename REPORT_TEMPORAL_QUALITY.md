@@ -511,3 +511,28 @@ dark OUTSIDE of the green wall, maxHistory 256. Frame f01 after the turn:
 
 Frames: _reviews/temporal/cornell-rotate/. Also measured on arena: the same
 term cuts ghost@40 1.273 -> 1.034 (-19%) at +0.004 stillNoise.
+
+## Final fence table (architect, 2026-08-12, quiet GPU)
+
+| Fence | Target | Result | Verdict |
+|---|---|---|---|
+| Arena motion spikes | < 10 | 9 (x2 runs) | PASS |
+| Arena stillNoise | <= 0.133 | 0.126 | PASS (beats 0.127 baseline) |
+| Arena ghost@40 | <= 1.35 | 1.034 | PASS (-19% vs baseline) |
+| Arena frame-time | <= 65 ms | 61.4 / 61.7 ms | PASS (baseline 62.3) |
+| Energy shift (cornell/fox/mosquito/helmet, pinned opts) | < 3% | -1.6 / -0.0 / -0.0 / -0.1 % | PASS |
+| Gallery fps at pinned defaults | 60 | 60 all four scenes | PASS |
+| Museum boot fps | hold 45 baseline | 45.2 | PASS |
+| Cornell-rotate leak | fixed | exterior dark from f01 (evidence committed) | PASS |
+| Mosquito boiling (blind clip) | reduced | "no boiling detected" (baseline had it) | PASS |
+| Mosquito luminance drift, 300f | flat | -0.00% | PASS |
+| Moving-light tail | decay <= 5 frames | NOT ADDRESSED (ReSTIR reservoir staleness, orthogonal to accumulation; next round) | OPEN |
+
+Post-completion fixes by the architect: duplicate declaration crash repair,
+dead DenoisePass compile (undeclared uHasVar) that had frozen three A/B legs
+at a false regression, shared-count semantics restored to match the inline
+path, `splitAccum` engine option (default on, inline fallback), and the
+resize-reallocation garbage-count blowout (adaptive governor step froze the
+frame blown out; history now clears on resize). Pre-existing and unchanged:
+close-range amber overexposure under orbit (Part 1 baseline behavior, cap
+retune queued).

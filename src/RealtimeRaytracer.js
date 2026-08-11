@@ -529,6 +529,10 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // runs single-attachment (0.3.x layout): the specular buffer is disabled
     // and blend surfaces degrade to opaque — everything else keeps working.
     this.specMRTSupported = RealtimeRaytracer._specMrtSupported(renderer);
+    /** Split-accumulation pipeline (AccumulatePass). Default on; `splitAccum:
+     *  false` falls back to the megakernel's inline EMA — the escape hatch if
+     *  a platform misbehaves, and the engine-level A/B for benches. */
+    this._splitAccum = options.splitAccum ?? true;
     if (!this.specMRTSupported) {
       console.info(
         "three-realtime-rt: multi-attachment lighting buffer failed the draw probe here " +
@@ -2201,7 +2205,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // Part 2: split accumulation pipeline. Set bypassAccum=true to use the
     // old inline-EMA path for baseline comparison (mean-luminance fence).
     let irradiance, specular;
-    if (this.specMRTSupported) {
+    if (this.specMRTSupported && this._splitAccum) {
       const raw = this.rtPass.renderRaw(this.renderer, this.gbuffer, this.frame, reservoirTex);
       const acc = this.accumulatePass.render(
         this.renderer,
