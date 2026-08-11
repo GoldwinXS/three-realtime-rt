@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.12.0
+
+- **Quality presets.** A product or game can now wire in a named quality tier
+  without learning fifteen sliders: `RealtimeRaytracer.PRESETS` ships four
+  plain, inspectable bundles  -  `quality` (fidelity first), `balanced`
+  (today's defaults, captured explicitly), `performance` (fps first) and
+  `motion` (short history + a strong firefly clamp for fast camera movement)  - 
+  and `rt.applyPreset(name)` applies one to a live instance at any time. A
+  constructor `preset` option applies the bundle as the base, with explicit
+  per-option values winning. Every bundled knob is live-tunable: none swaps the
+  lighting megakernel's source or needs compileScene (knobs that would  - 
+  `absorptionShadows`, `kmScattering`, `textureTiles`  -  are deliberately
+  excluded). Because a preset sets the baseline the adaptive governor breathes
+  around, applying one re-arms the governor at that baseline. With no `preset`
+  key the constructor is byte-identical to 0.11.1 (option values asserted in
+  the render self-test, including that `applyPreset("balanced")` is a no-op on
+  a fresh instance). The shipped numbers are the measured winners of the
+  v0.12.0 evidence round  -  see `REPORT_PRESETS.md` for the bench table, the
+  blind Gemini video rankings, and the defaults recommendation (recommendation
+  only; the architect decides default changes).
+- **Game-scene benchmark page** `game-bench.html?scene=chase|stealth|arena`.
+  The presets exist for games, so the evidence runs on three deterministic
+  game scenes (chase / stealth / arena  -  fixed waypoints and event timings, no
+  unseeded randomness), each a scripted ~20s loop. `?mode=bench` fence-times
+  ms/frame, runs a ghost probe and a still-noise read per scene x preset and
+  POSTs to `/__bench`; `?mode=clip` runs the loop for video capture with the
+  adaptive governor on and an fps badge. `&tune=key:value,...` overrides knobs
+  after the preset for A/B tuning. Permanent regression asset; scenes live in
+  `examples/game-scenes.js`.
+
 ## 0.11.1
 
 - Fix: updateDynamic wrote packed attributes at stride 8 unconditionally; scenes compiled WITHOUT texture tiles (stride 4) corrupted normals on every dynamic re-bake, shredding moving meshes into radial artifacts. The re-bake stride now follows the compiled layout.

@@ -43,6 +43,10 @@ const statusEl = document.getElementById("status");
 const outEl = document.getElementById("out");
 const setStatus = (t) => { statusEl.textContent = t; };
 
+// ?presets=1: after the standard configs, run the four quality presets (+ the
+// no-preset defaults row) on the museum scene and append the table section.
+const PRESET_BENCH = new URLSearchParams(location.search).has("presets");
+
 // --- renderer (fixed size, no MSAA, no pixel-ratio scaling) ------------------
 const renderer = new THREE.WebGLRenderer({ antialias: false });
 renderer.setPixelRatio(1);
@@ -158,9 +162,13 @@ const nextFrame = () =>
  * reference at pose B, then approach B from pose A and measure the residual
  * ghost energy vs. the reference after 1/5/10/20/40 settled frames.
  * Lower = history reconverges faster = less ghosting.
+ *
+ * `cfg` defaults to CONFIGS.rtCore (the bench's historical settings). Pass
+ * `null` when the rt is ALREADY at the settings to measure (the preset legs) so
+ * the probe does not re-configure it.
  */
-async function ghostTest(rt, scene) {
-  applyConfig(rt, CONFIGS.rtCore);
+async function ghostTest(rt, scene, cfg = CONFIGS.rtCore) {
+  if (cfg) applyConfig(rt, cfg);
   const look = [0, 1.4, 0];
   const poseB = [4.2, 3.2, 6.5];
   const poseA = [7.5, 4.2, 9.5];
@@ -235,6 +243,36 @@ async function benchScene(label, scene, sky, opts, camPos, camLook, withGhost) {
   return result;
 }
 
+// --- quality presets (bench.html?presets=1) ---------------------------------
+const PRESET_NAMES = ["quality", "balanced", "performance", "motion"];
+
+/**
+ * Time ONE named preset on the museum scene, plus its ghost probe, at the
+ * preset's own settings. `presetName === null` is the DEFAULT row: a fresh
+ * constructor with NO preset option, which is the byte-identity baseline that
+ * `balanced` must reproduce.
+ */
+async function benchPreset(scene, presetName) {
+  const rt = new RealtimeRaytracer(renderer, {
+    sky: { enabled: false },
+    envColor: new THREE.Color(0x121821),
+    envIntensity: 1.0,
+    adaptiveQuality: false,
+    overloadProtection: false,
+    ...(presetName === null ? {} : { preset: presetName }),
+  });
+  rt.compileScene(scene);
+  scene.traverse((o) => { if (o.isLight) o.visible = true; });
+  rt.updateLights(scene);
+  setCam([6, 3.8, 8], [0, 1.2, 0]);
+  const ms = timeConfig(() => rt.render(scene, camera));
+  setCam([6, 3.8, 8], [0, 1.2, 0]); // timeConfig's warmup moved nothing, but re-pin
+  const ghost = await ghostTest(rt, scene, null); // rt already at the preset
+  const fps = 1000 / ms;
+  rt.dispose();
+  return { ms, fps, ghost };
+}
+
 // --- table rendering ---------------------------------------------------------
 const fmt = (n) => (typeof n === "number" ? n.toFixed(2) : String(n));
 
@@ -267,6 +305,18 @@ function renderTable(results) {
       `${fmt(g.g10).padStart(6)}   ${fmt(g.g20).padStart(6)}   ${fmt(g.g40).padStart(6)}`
     );
   }
+  if (results.presets) {
+    lines.push("");
+    lines.push(`quality presets (${SCENES.museum.key}, 1280x720, adaptiveQuality OFF, ghost probe at preset settings)`);
+    lines.push(`  preset        ms/frame   fps     ghost@1  ghost@10`);
+    for (const row of results.presets) {
+      const g = row.ghost;
+      lines.push(
+        `  ${row.name.padEnd(13)} ${fmt(row.ms).padStart(7)}  ${fmt(row.fps).padStart(6)}  ` +
+        `${fmt(g.g1).padStart(7)}  ${fmt(g.g10).padStart(8)}`
+      );
+    }
+  }
   outEl.textContent = lines.join("\n");
 }
 
@@ -294,6 +344,21 @@ async function run() {
       { envColor: new THREE.Color(0x121821), envIntensity: 1.0, forceLightsVisible: true },
       [6, 3.8, 8], [0, 1.2, 0], true
     );
+
+    // Quality-presets row: time + ghost each preset (and the no-preset defaults)
+    // on the SAME museum scene. Uses a fresh constructor per preset so the
+    // `preset` option path itself is exercised, not just applyPreset.
+    if (PRESET_BENCH) {
+      setStatus("quality presets: timing + ghost per preset…");
+      results.presets = [];
+      for (const name of [null, ...PRESET_NAMES]) {
+        setStatus(`quality presets: ${name === null ? "defaults" : name}…`);
+        await nextFrame();
+        const r = await benchPreset(built.scene, name);
+        results.presets.push({ name: name === null ? "defaults" : name, ...r });
+      }
+      setStatus("quality presets done.");
+    }
 
     // Scene B: Littlest Tokyo (network DRACO glTF). Skip cleanly if it fails.
     setStatus(`${SCENES.tokyo.key}: fetching model…`);

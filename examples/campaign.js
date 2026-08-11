@@ -835,6 +835,7 @@ function applyConfig(cfg) {
   rt.denoiseMaxStep = cfg.denoiseMaxStep;
   rt.denoiseStepJitter = cfg.denoiseStepJitter;
   rt.denoiseWideDamp = cfg.denoiseWideDamp;
+  rt.fireflyClamp = cfg.fireflyClamp ?? 4.0;
   rt.restirGIMCap = cfg.restirGIMCap ?? 20;
   rt.restirGISpatialTaps = cfg.restirGISpatialTaps ?? 2;
   rt.restirGIValidate = cfg.restirGIValidate ?? 8;
@@ -1601,6 +1602,51 @@ function ladderConfigs() {
   return out;
 }
 
+/**
+ * Quality-presets tuning arm (plan=presets). The library's OWN defaults — NOT
+ * the campaign BASELINE (which pins maxHistory 48, restirMCap 40 and
+ * stochasticLights false for a different comparison). The presets round ships
+ * the four named bundles with MEASURED winners, so this ladder runs the
+ * candidates for the two decisions each preset leaves open, plus the balanced
+ * reference row:
+ *
+ *   quality      renderScale 0.75, denoiseIterations 2 vs 3 (campaign says >2
+ *                degrades; confirm here), maxHistory 128 vs 256 (long).
+ *   performance  renderScale 0.375 vs 0.5 at giHalfRate+stochasticLights on.
+ *   motion       maxHistory 32 / 48 / 64 (shorter = less ghosting, more noise)
+ *                and fireflyClamp 2.0 vs 2.5 (tighter than the 4.0 default).
+ */
+function presetTuningConfigs() {
+  // The library's defaults, captured from the 0.11.1 constructor.
+  const BASE = {
+    renderScale: 0.5, canvasScale: 1.0, denoise: true, denoiseIterations: 2,
+    taa: true, giHalfRate: false, restir: true, restirGI: false, gi: true,
+    emissiveNEE: true, reflections: true, refraction: true, specular: true,
+    transparency: true, absorptionShadows: true, kmScattering: false,
+    volumetric: false, stochasticLights: true, maxHistory: 128, taaBlend: 0.1,
+    motionAdaptive: false, maxHistoryMoving: 6, taaBlendMoving: 0.4,
+    restirMCap: 16, restirMCapMoving: 16, denoiseMaxStep: 0,
+    denoiseStepJitter: 0, denoiseWideDamp: 0, fireflyClamp: 4.0,
+  };
+  const out = [];
+  // `moving: false` configs skip the expensive moving/ghost arms (their answers
+  // are timing + still quality only); the ones that decide a ghosting question
+  // run the full arm.
+  const add = (label, over, moving) =>
+    out.push({ label, cfg: { ...BASE, ...over }, moving, ghostStrafe: moving });
+  add("balanced", {}, true);
+  add("q-rs75-dn2-mh256", { renderScale: 0.75, denoiseIterations: 2, maxHistory: 256 }, true);
+  add("q-rs75-dn2-mh128", { renderScale: 0.75, denoiseIterations: 2, maxHistory: 128 }, false);
+  add("q-rs75-dn3-mh256", { renderScale: 0.75, denoiseIterations: 3, maxHistory: 256 }, false);
+  add("p-rs375", { renderScale: 0.375, denoiseIterations: 3, giHalfRate: true, stochasticLights: true }, true);
+  add("p-rs5", { renderScale: 0.5, denoiseIterations: 3, giHalfRate: true, stochasticLights: true }, false);
+  add("m-mh32-fc25", { maxHistory: 32, fireflyClamp: 2.5 }, true);
+  add("m-mh48-fc25", { maxHistory: 48, fireflyClamp: 2.5 }, true);
+  add("m-mh64-fc25", { maxHistory: 64, fireflyClamp: 2.5 }, false);
+  add("m-mh32-fc20", { maxHistory: 32, fireflyClamp: 2.0 }, false);
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // driver
 // ---------------------------------------------------------------------------
@@ -1710,6 +1756,7 @@ async function run() {
   if (PLAN === "denoise") list = denoiseStudyConfigs();
   else if (PLAN === "ghost") list = ghostConfigs();
   else if (PLAN === "ladder") list = ladderConfigs();
+  else if (PLAN === "presets") list = presetTuningConfigs();
   else if (PLAN === "restirgi") list = restirGiConfigs();
   else if (PLAN === "restirgi-fix") list = restirGiFixConfigs();
   else if (PLAN === "restirgi-tune") list = restirGiTuneConfigs();

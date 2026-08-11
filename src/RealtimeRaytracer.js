@@ -380,6 +380,68 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   // frame now that 100ms-2s frames feed the EMA; see _adaptQuality.
   static MAX_SCALE_STEP = 0.25;
 
+  /**
+   * Named quality presets: flat maps of EXISTING option values, for an app that
+   * wants "quality", "balanced", "performance" or "motion" without understanding
+   * fifteen sliders. Four presets, each a plain, inspectable object:
+   *
+   *   quality     fidelity first: high lighting resolution, long history.
+   *   balanced    today's defaults, captured explicitly. Applying it to a fresh
+   *               instance is a no-op (asserted in the render self-test); a
+   *               constructor with no `preset` key is byte-identical to the
+   *               build without the feature.
+   *   performance fps first: low lighting resolution, more denoise passes
+   *               (cheap at low res), half-rate GI, stochastic lights.
+   *   motion      fast camera/gameplay: short history + a stronger firefly
+   *               clamp to cut ghosting, accepting a little extra noise.
+   *
+   * EVERY bundled knob is a live-tunable setting: none of them swaps the
+   * lighting megakernel's source or needs a recompile (renderScale reallocates
+   * lighting targets, which the renderer carries history across; the rest are
+   * uniforms or pass toggles read per frame). Knobs that WOULD require
+   * compileScene  -  absorptionShadows, kmScattering, textureTiles  -  are
+   * deliberately excluded from all bundles.
+   *
+   * The exact numbers below are the MEASURED winners from the v0.12.0 quality
+   * presets round (see REPORT_PRESETS.md), not guesses.
+   */
+  static PRESETS = {
+    quality: {
+      renderScale: 0.75,
+      denoiseIterations: 2,
+      maxHistory: 256,
+      taa: true,
+      restir: true,
+      giHalfRate: false,
+      specular: true,
+    },
+    balanced: {
+      renderScale: 0.5,
+      denoiseIterations: 2,
+      maxHistory: 128,
+      taa: true,
+      restir: true,
+      giHalfRate: false,
+      specular: true,
+      volumetric: { enabled: false },
+      stochasticLights: true,
+      fireflyClamp: 4.0,
+    },
+    performance: {
+      renderScale: 0.375,
+      denoiseIterations: 3,
+      giHalfRate: true,
+      volumetric: { enabled: false },
+      stochasticLights: true,
+    },
+    motion: {
+      maxHistory: 32,
+      fireflyClamp: 2.5,
+      taa: true,
+      restir: true,
+    },
+  };
+
   constructor(renderer, options = {}) {
     this.renderer = renderer;
 
@@ -404,6 +466,25 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       this.status = { ok: false, disabled: [], coreFailure: null, warnings: [] };
       this._diagDone = true;
       return;
+    }
+
+    // Quality presets (see PRESETS): a named bundle applied as the BASE of the
+    // constructor options, so an explicit option always wins over the preset.
+    // With no `preset` key this is the identity  -  the constructor then behaves
+    // exactly as it did before the feature (byte-identical option values and
+    // shader source, guarded by the render self-test's option-object equality).
+    if (options.preset !== undefined) {
+      const presetName = options.preset;
+      if (
+        typeof presetName !== "string" ||
+        !Object.prototype.hasOwnProperty.call(RealtimeRaytracer.PRESETS, presetName)
+      ) {
+        throw new Error(
+          `three-realtime-rt: unknown preset "${presetName}". ` +
+            `Valid presets: ${Object.keys(RealtimeRaytracer.PRESETS).join(", ")}.`
+        );
+      }
+      options = { ...RealtimeRaytracer.PRESETS[presetName], ...options };
     }
 
     const size = renderer.getSize(new THREE.Vector2());
@@ -722,6 +803,13 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // release reads it — see _adaptQuality for why that one step needs a dwell.
     this._qFastStreak = 0;
     /**
+     * Name of the quality preset governing this instance (constructor `preset`
+     * option, or the last applyPreset() call). "custom" = no named preset has
+     * been applied; a fresh instance's VALUES equal `balanced`, but that name
+     * only sticks once the preset is applied. See the `preset` getter.
+     */
+    this._presetName = options.preset !== undefined ? String(options.preset) : "custom";
+    /**
      * App-owned canvas-scale setter, driven by the governor as its deepest
      * lever once renderScale bottoms out. The app owns the canvas + CSS stretch,
      * so it must apply the buffer resize itself; null disables this level.
@@ -951,6 +1039,85 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this._staleDone = false; // nothing left worth scanning
     this._staleWarnings = 0; // stale reports emitted (capped)
     this._implicitCompileWarned = false;
+  }
+
+  /**
+   * Name of the preset governing this instance. Returns the LAST preset name
+   * applied (constructor `preset` option, or applyPreset()), or "custom" when no
+   * named preset has been applied. Deliberately LAST-APPLIED-NAME only: a knob
+   * the adaptive governor or a manual assignment changes afterwards does not
+   * flip this back to "custom" (a preset sets the baseline the governor breathes
+   * around, so its own moves are not "customizing"). See REPORT_PRESETS.md.
+   */
+  get preset() {
+    return this._presetName;
+  }
+
+  /**
+   * Apply a named quality preset (see {@link PRESETS}) to this LIVE instance.
+   * Every bundled knob is live-tunable  -  none needs compileScene  -  so this is
+   * safe to call at any time, including mid-frame. Because a preset changes the
+   * cost profile AND the baseline the adaptive governor breathes around, it
+   * re-arms the governor at the new baseline (its EMA, cooldown and free-win
+   * state are reset so it measures the new settings fresh). Explicit per-option
+   * constructor values always win over a constructor `preset`; there is no
+   * equivalent per-knob override here  -  the preset IS the bundle, apply it and
+   * then assign the knob you want to differ.
+   *
+   * @param {string} name one of the keys of {@link PRESETS}
+   * @returns {this} for chaining
+   * @throws {Error} for an unknown name, listing the valid presets.
+   */
+  applyPreset(name) {
+    const preset = RealtimeRaytracer.PRESETS[name];
+    if (!preset) {
+      throw new Error(
+        `three-realtime-rt: unknown preset "${name}". ` +
+          `Valid presets: ${Object.keys(RealtimeRaytracer.PRESETS).join(", ")}.`
+      );
+    }
+    for (const key of Object.keys(preset)) {
+      const value = preset[key];
+      // A preset may carry a PARTIAL object (e.g. performance sets only
+      // `volumetric.enabled`). Merge into the live object so the untouched
+      // fields (density, maxDist, zones) survive; scalar knobs assign directly
+      // (renderScale's setter reallocates lighting targets, carrying history).
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        this[key] &&
+        typeof this[key] === "object"
+      ) {
+        Object.assign(this[key], value);
+      } else {
+        this[key] = value;
+      }
+    }
+    this._presetName = name;
+    this._rearmGovernor();
+    return this;
+  }
+
+  // Re-arm the adaptive governor: a preset changes the cost profile AND the
+  // baseline the governor breathes around, so the EMA / cooldown / free-win
+  // state accumulated under the OLD baseline is stale. Reset it so the next
+  // adaptation measures the new settings fresh instead of comparing them to an
+  // average from before the switch.
+  _rearmGovernor() {
+    this._qEma = null;
+    this._qLastT = null;
+    this._qLastChange = 0;
+    this._qLastDir = 0;
+    this._qOscillating = false;
+    this._qFastStreak = 0;
+    this._qFreeWins = null;
+    if (this.adaptiveQuality) {
+      console.info(
+        `three-realtime-rt: preset "${this._presetName}" applied  -  ` +
+          "adaptive quality re-armed at this baseline."
+      );
+    }
   }
 
   // Classify an rt:* pass program by how a LINK failure degrades. CORE passes

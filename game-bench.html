@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt · game benchmark</title>
+  <style>
+    html, body { margin: 0; min-height: 100%; background: #0a0f16; }
+    body {
+      color: #cfe0ea; font: 13px/1.6 ui-monospace, Consolas, monospace;
+      padding: 20px; box-sizing: border-box;
+    }
+    h1 { font-size: 15px; color: #7fd8c8; margin: 0 0 6px; }
+    #meta { color: #8fa3b3; margin: 0 0 12px; }
+    #status { color: #8fa3b3; margin: 12px 0; min-height: 1.6em; }
+    #out {
+      white-space: pre; color: #cfe0ea; background: #0e131a;
+      border: 1px solid #26323c; border-radius: 8px; padding: 12px;
+      overflow-x: auto; margin: 0;
+    }
+    /* The canvas fills the viewport by default (CLIP mode, where a video
+       capture records the on-screen page). BENCH mode moves #app off-screen in
+       JS (readPixels needs the drawing buffer real, not display:none). */
+    #app { position: fixed; inset: 0; }
+    #app.offscreen { left: -20000px; inset: auto; top: 0; }
+    #badge, #label {
+      position: fixed; z-index: 20; color: #eef4f8;
+      font: 11px/1.5 ui-monospace, Consolas, monospace;
+      background: rgba(14,18,24,0.78); border: 1px solid #26323c;
+      border-radius: 6px; padding: 6px 10px; white-space: pre;
+      pointer-events: none;
+    }
+    #badge { left: 12px; top: 10px; }
+    #label { right: 14px; top: 12px; border-color: #38d0e0; font-weight: bold; }
+    /* CLIP mode hides the bench chrome (title/meta/status/out) so the recording
+       is just the scene + the two badges. */
+    body.clip h1, body.clip #meta, body.clip #status, body.clip #out { display: none; }
+  </style>
+</head>
+<body>
+  <h1>three-realtime-rt  -  game benchmark</h1>
+  <p id="meta"></p>
+  <div id="status">idle.</div>
+  <pre id="out"></pre>
+  <div id="app"></div>
+  <div id="badge"></div>
+  <div id="label"></div>
+  <script type="module" src="/examples/game-bench.js"></script>
+</body>
+</html>

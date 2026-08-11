@@ -90,3 +90,36 @@ and `REPORT_PRESETS.md`: the preset value tables, the bench table, the
 critic's blind rankings (quote them), the throttled-leg observations, your
 defaults recommendation with reasoning, and honest caveats. Stop there; the
 architect gates, decides on defaults, and releases.
+
+## Part B upgrade (owner directive): tune against GAME scenes, not gallery orbits
+
+The presets exist for games. A museum orbit is the wrong benchmark. Build a
+permanent game-scene benchmark page, `game-bench.html?scene=<name>`, with
+THREE deterministic scenes, each a scripted ~20 second loop (fixed camera
+path and fixed event timings, so clips are frame-comparable across presets):
+
+1. `chase`: a third-person camera following a fast-moving prop through
+   corridors/around large occluders. Stresses disocclusion ghosting: the
+   thing the motion preset exists for. Camera translates AND turns.
+2. `stealth`: Umbral-flavored. A dark room, two moving SpotLight cones
+   sweeping, a player-proxy box sneaking between crates, one flickering
+   emissive. Stresses noise-in-darkness and light-motion churn: dark-scene
+   noise is where viewers judge RT hardest.
+3. `arena`: combat-flavored chaos. 15-20 dynamic props, a mid-clip scatter
+   impulse (the explode pattern from the demo), two emissive projectiles
+   flying, a light toggling mid-clip. Stresses dynamic BVH re-bake, NEE
+   churn, and firefly control.
+
+Reuse existing repo assets and patterns (museum geometry, Rapier or scripted
+kinematics, SpotLight rigs). Deterministic means NO unseeded randomness: fixed
+arrays of waypoints/timings.
+
+Part B's evidence then runs per scene x per preset x both hardware legs:
+bench numbers AND blind Gemini rankings (clips labeled A/B/C/D per scene).
+The report's preset value tables must cite which scene drove each tuning
+choice. The bench page ships in the repo as a permanent regression asset;
+document it in the README's development section.
+
+Note for the report only (do not act): the owner asked about testing presets
+inside the real Umbral game; Umbral pins engine 0.3.0, nine versions back, so
+that is a separate upgrade project. The stealth scene here is its stand-in.
