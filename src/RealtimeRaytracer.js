@@ -619,6 +619,51 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.motionAdaptive = options.motionAdaptive ?? false;
     /** EMA history cap at full motion (motionAdaptive only). */
     this.maxHistoryMoving = options.maxHistoryMoving ?? 6;
+    /**
+     * LIGHT-MOTION TEMPORAL RESPONSE. Default ON, because unlike camera motion
+     * there is no case where keeping the stale result is correct.
+     *
+     * Every temporal validation the engine performs asks a geometric question:
+     * is this pixel still the same surface (plane distance, normal agreement,
+     * reprojection). A parked camera looking at a static wall answers "yes" to
+     * all of them, so the EMA happily averages across a light that MOVED, and
+     * keeps serving light that is no longer there. Measured on the
+     * probe-lightghost bench (a light jumping A to B, camera and geometry
+     * static): at maxHistory 48 the frame is still 47x the noise floor away
+     * from correct 40 frames after the jump. That is the wispy tail behind a
+     * moving light.
+     *
+     * updateLights() is the only way light data reaches the GPU (render() does
+     * not re-read the scene's lights), which makes it the exact place to notice
+     * the change. It measures how far the lights moved relative to the scene
+     * size and how much their colour changed, and drives `lightMotion` (0..1)
+     * from that, decaying over the following frames. The three temporal
+     * accumulators are then lerped toward their *Moving counterparts by the
+     * larger of camera motion and light motion, so a swept spotlight keeps a
+     * short, responsive history and a parked scene keeps a long, quiet one.
+     */
+    this.lightAdaptive = options.lightAdaptive ?? true;
+    /**
+     * Light motion that counts as "full" response, as a fraction of the scene
+     * diagonal moved since the previous updateLights call. 0.01 (1 percent of
+     * the scene per update) is deliberately small: a swept spotlight crossing a
+     * room in two seconds moves ~0.8 percent per frame, and that should already
+     * read as fully moving.
+     */
+    this.lightMotionRef = options.lightMotionRef ?? 0.01;
+    /** Per-frame decay of lightMotion once the lights stop changing. */
+    this.lightMotionDecay = options.lightMotionDecay ?? 0.72;
+    /**
+     * Temporal-gradient rejection threshold, in standard deviations of the
+     * pixel's own accumulated luminance. Only consulted while lightMotion > 0.
+     * Lower = more eager to drop history when the light changes (faster
+     * response, more noise); higher = more conservative.
+     */
+    this.lightGradK = options.lightGradK ?? 3.0;
+    /** Normalized light motion, 0 (lights parked) .. 1. Read-only. */
+    this.lightMotion = 0;
+    this._lightSig = null;
+    this._mt = 0;
     /** TAA fresh-sample weight at full motion (motionAdaptive only). */
     this.taaBlendMoving = options.taaBlendMoving ?? 0.4;
     /**
@@ -1516,6 +1561,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   updateLights(scene) {
     if (!this.supported || !this.compiled) return;
     syncLights(scene, this.compiled);
+    this._measureLightMotion();
     this.rtPass.setTextureTiles(this._textureTiles);
     this.giReservoirPass.setTextureTiles(this._textureTiles);
     this.rtPass.setCompiledScene(this.compiled);
@@ -1528,6 +1574,91 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     if (!this.supported) return;
     this._needsClear = true;
     if (this.taaPass) this.taaPass.reset();
+  }
+
+  /**
+   * Compare the freshly synced light arrays against the previous ones and
+   * update `lightMotion`. Called from updateLights, so it costs a few dozen
+   * float compares per light on the frames the app already decided to re-upload
+   * lights, and nothing at all otherwise.
+   *
+   * The signature is the flat uniform data itself (world position + type in
+   * lightPosType, colour * intensity + radius in lightColorRadius), so it
+   * catches everything the shader can see: movement, recolouring, dimming,
+   * switching a light off, and a spot changing its cone. Position deltas are
+   * normalized by the scene diagonal so the same code behaves the same in a
+   * doll house and a city block; colour deltas are relative to the brighter of
+   * the two values so a dim light changing by half counts as much as a bright
+   * one doing the same.
+   */
+  _measureLightMotion() {
+    const c = this.compiled;
+    if (!c) return;
+    const pos = c.lightPosType;
+    const col = c.lightColorRadius;
+    // Spotlight AIM lives in its own array. A swept spotlight is the single
+    // most common animated light there is, and it usually rotates from a fixed
+    // mount: position and colour never change, so a signature without this
+    // reads a sweeping searchlight as perfectly still. (Measured: the stealth
+    // game scene, whose whole premise is sweeping spotlights, reported light
+    // motion 0.0000 at every percentile until this was added.)
+    const dir = c.lightDirCone;
+    const prev = this._lightSig;
+    // Store a copy, not a reference: syncLights mutates these arrays in place.
+    this._lightSig = {
+      pos: Float32Array.from(pos),
+      col: Float32Array.from(col),
+      dir: Float32Array.from(dir),
+    };
+    if (!this.lightAdaptive) { this.lightMotion = 0; return; }
+    // First sync, or the light SET changed (added, removed, switched off). No
+    // per-light correspondence to compare, so treat it as a full change.
+    if (!prev || prev.pos.length !== pos.length || prev.dir.length !== dir.length) {
+      if (prev) this.lightMotion = 1;
+      return;
+    }
+    const diag = c.sceneDiagonal > 0 ? c.sceneDiagonal : 1;
+    let worst = 0;
+    for (let i = 0; i < pos.length; i += 4) {
+      const dx = pos[i] - prev.pos[i];
+      const dy = pos[i + 1] - prev.pos[i + 1];
+      const dz = pos[i + 2] - prev.pos[i + 2];
+      // pos.w carries the type and, for spots, the inner-cone cosine, so a
+      // cone that narrows registers here too.
+      const dw = Math.abs(pos[i + 3] - prev.pos[i + 3]);
+      const moved = Math.sqrt(dx * dx + dy * dy + dz * dz) / diag;
+      worst = Math.max(worst, moved / this.lightMotionRef, dw);
+      // Aim change. For a unit direction the chord length is the rotation angle
+      // in radians for small angles, and a beam rotating by theta sweeps its
+      // pool across the floor by roughly theta times the throw distance. Taking
+      // the throw as about half the scene, theta/2 is the equivalent
+      // fraction-of-scene motion, which puts it on the same scale as the
+      // positional term above and lets one reference constant serve both.
+      // dirCone.w is cos(outer angle), so a cone opening or closing lands here.
+      const ddx = dir[i] - prev.dir[i];
+      const ddy = dir[i + 1] - prev.dir[i + 1];
+      const ddz = dir[i + 2] - prev.dir[i + 2];
+      const aimed = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) * 0.5;
+      const dCone = Math.abs(dir[i + 3] - prev.dir[i + 3]);
+      worst = Math.max(worst, aimed / this.lightMotionRef, dCone);
+      for (let k = 0; k < 3; k++) {
+        const a = col[i + k], b = prev.col[i + k];
+        const scale = Math.max(Math.abs(a), Math.abs(b), 1e-4);
+        worst = Math.max(worst, Math.abs(a - b) / scale);
+      }
+    }
+    this.lightMotion = Math.max(this.lightMotion, Math.min(1, worst));
+  }
+
+  /**
+   * The temporal-response blend factor for this frame: how "moving" the image
+   * is, 0 (nothing changing) to 1. Camera motion only counts when the app opted
+   * into motionAdaptive; light motion always counts, since stale lighting is
+   * never the right answer.
+   */
+  _temporalMotion() {
+    const cam = this.motionAdaptive ? this.motion : 0;
+    return Math.max(cam, this.lightAdaptive ? this.lightMotion : 0);
   }
 
   // Padded/canvas size ratio per axis: 1 + 2×overscan (padding is per edge).
@@ -2110,8 +2241,21 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     rtU.uCostView.value = this.outputMode === 7;
     rtU.uCostScale.value = this.costScale;
     rtU.uTemporalReprojection.value = this.temporalReprojection;
-    // Motion-adaptive temporal response (default off -> exactly this.maxHistory).
-    const mt = this.motionAdaptive ? this.motion : 0;
+    // Motion-adaptive temporal response. Camera motion is opt-in
+    // (motionAdaptive, default off); light motion is always counted, because
+    // history that describes lights which have since moved is simply wrong.
+    // With the camera opt-out and the lights parked this is exactly
+    // this.maxHistory, i.e. byte-identical to the pre-feature build.
+    const mt = this._temporalMotion();
+    this._mt = mt;
+    // Decay after sampling, so THIS frame gets the full response and the next
+    // one gets less. An app that moves lights every frame re-raises it in
+    // updateLights (which takes the max), so a swept spotlight sits at its
+    // motion level and a one-off jump fades back to a long history over about
+    // ten frames. Camera motion is not decayed here: _updateMotion recomputes
+    // it from scratch every frame.
+    this.lightMotion *= this.lightMotionDecay;
+    if (this.lightMotion < 1e-3) this.lightMotion = 0;
     rtU.uMaxHistory.value = this.maxHistory + (this.maxHistoryMoving - this.maxHistory) * mt;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
     rtU.uGIEnabled.value = this.gi;
@@ -2216,8 +2360,16 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
         this._jitteredViewProj,
         this._camWorldPos,
         this.eps,
-        this.maxHistory,
-        { preFireflyClamp: 0.0, historyClampK: 0.0 }
+        // Same motion-adaptive cap the inline path applies above: the split
+        // pipeline owns the EMA now, so it must honour it too or a moving
+        // light keeps its tail on every device that has MRT.
+        this.maxHistory + (this.maxHistoryMoving - this.maxHistory) * this._mt,
+        {
+          preFireflyClamp: 0.0,
+          historyClampK: 0.0,
+          lightMotion: this.lightAdaptive ? this.lightMotion : 0,
+          gradK: this.lightGradK,
+        }
       );
       irradiance = acc.irradiance;
       specular = acc.specular;

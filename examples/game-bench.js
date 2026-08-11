@@ -443,7 +443,13 @@ function runClip() {
     for (const l of lights) {
       if (l.last !== l.light.visible) { l.last = l.light.visible; lightChanged = true; }
     }
-    if (def.dynamicLights || lightChanged) rt.updateLights(scene);
+    // `dynamicLights` lives on the BUILT scene, not on the registry entry
+    // (GAME_SCENES[name] is just {name, label, build}), so `def.dynamicLights`
+    // was always undefined and stealth's sweeping spotlights were never synced
+    // to the tracer at all: the rasterized scene graph moved them while the
+    // traced lighting stayed frozen at their t=0 pose. Every stealth bench
+    // number and video clip before this fix was measured with static lighting.
+    if (built.dynamicLights || lightChanged) rt.updateLights(scene);
 
     rt.updateDynamic(); // props + projectiles moved this frame
     camera.updateMatrixWorld();

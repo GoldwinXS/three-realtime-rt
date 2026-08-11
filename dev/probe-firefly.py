@@ -8,11 +8,11 @@ Usage:
 
 Requires a dev server on PORT (default 8127).
 """
-import asyncio, sys, json, time
+import asyncio, sys, json, time, os
 from pathlib import Path
 from playwright.async_api import async_playwright
 
-PORT = 8127
+PORT = int(os.environ.get("RT_PORT", "8127"))
 INIT = ("Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });"
         " Object.defineProperty(document, 'hidden', { get: () => false });")
 WARM = 90
