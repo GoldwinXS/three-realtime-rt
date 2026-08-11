@@ -56,6 +56,7 @@ uniform vec3 uCameraPos;
 uniform float uMaxHistory;
 uniform bool uTemporalReprojection;
 uniform float uFireflyClamp;
+uniform float uGlassClampScale; // glass firefly cap, in uFireflyClamp units (0 = off)
 uniform bool uRawOutput; // when true: skip EMA, write raw sampleIrr for AccumulatePass
 
 uniform vec4 uLightPosType[MAX_LIGHTS];     // xyz pos|dir, w: 0 point, 1 directional, >=2 spot (w-2 = cosInner)
@@ -1145,7 +1146,27 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
   }
   // Mask ONLY the transmitted term to the chosen channel (full colour when
   // dispersion is off); the reflection term is never masked.
-  return mix(refrRad * chanMask, reflRad, fres);
+  vec3 glass = mix(refrRad * chanMask, reflRad, fres);
+
+  // THE GLASS PATH'S OWN FIREFLY CLAMP. Every other radiance in this shader is
+  // bounded before it can reach the accumulator: indirect by uFireflyClamp,
+  // emissive NEE and the ReSTIR shade by 2x that, specular by 4x. Glass had
+  // nothing. main() composes it as mix(direct + indirect, glassRadiance,
+  // transmission), and a solid dielectric decodes to transmission == 1.0
+  // exactly, so that mix DISCARDS the clamped terms entirely and hands the
+  // accumulator whatever this function returned, unbounded except by half-float
+  // saturation. (The specular cap cannot help: it is applied to the specular
+  // attachment, which a full-transmission pixel scales by 1 - transmission =
+  // 0.) A near-mirror dielectric that catches the sky's sun disc through its
+  // Fresnel lobe therefore writes a value tens of times the clamp budget, the
+  // EMA carries it, and the amber exhibit blows out to white on close orbit.
+  //
+  // Same budget as the specular path, for the same reason: a narrow lobe on a
+  // smooth dielectric is exactly as spiky as one on a metal.
+  float glassCap = uFireflyClamp * uGlassClampScale;
+  float glassLum = dot(glass, vec3(0.299, 0.587, 0.114));
+  if (uGlassClampScale > 0.0 && glassLum > glassCap) glass *= glassCap / glassLum;
+  return glass;
 }
 
 // Compact cold->hot ramp for the BVH-cost heatmap. Piecewise mix of five
@@ -1669,6 +1690,7 @@ export class RTLightingPass {
         uTemporalReprojection: { value: true },
         uRawOutput: { value: false },
         uFireflyClamp: { value: 4.0 },
+        uGlassClampScale: { value: 4.0 },
         uLightPosType: { value: [] },
         uLightColorRadius: { value: [] },
         uLightDirCone: { value: [] },

@@ -31,6 +31,8 @@ uniform mat4 uViewProj;
 uniform float uMaxHistory;
 uniform float uPreFireflyClamp;
 uniform float uHistoryClampK;
+uniform float uLightMotion;   // 0 = lights parked, 1 = lights changed hard
+uniform float uGradK;         // temporal-gradient rejection threshold, in sigmas
 uniform vec3 uCameraPos;
 uniform float uEps;
 uniform ivec2 uTexSize;
@@ -186,6 +188,36 @@ void main() {
     }
   }
 
+  // --- TEMPORAL GRADIENT: per-pixel history rejection on a lighting change ---
+  // Every other validation in this pass asks a GEOMETRIC question, so a static
+  // wall under a light that just moved passes them all and keeps averaging
+  // light that is no longer there. This is the one test that asks a
+  // RADIOMETRIC question: does the fresh sample still look like what this pixel
+  // has been seeing?
+  //
+  // It only runs while the host reports light motion (uLightMotion > 0), which
+  // keeps it off entirely for the parked-camera, parked-lights case that the
+  // engine's noise fences measure. The threshold is noise-aware: the accumulated
+  // second moment gives this pixel's own luminance sigma, so a pixel whose GI
+  // estimate is naturally jumpy needs a bigger jump to be called changed, and a
+  // quiet pixel needs less. Without that, a 1-sample-per-pixel raw frame would
+  // trip a fixed threshold everywhere and this would just be a slow reset.
+  //
+  // Rejection is proportional to how far the lights actually moved: a swept
+  // spotlight nudges count down each frame (staying responsive without dumping
+  // the accumulation), while a hard cut drops the affected pixels to a fresh
+  // sample and lets count regrow from 1, which converges at the optimal 1/n
+  // rate instead of the EMA's fixed-cap rate.
+  if (uLightMotion > 0.0 && count > 2.0) {
+    float m1 = histMom.r;
+    float sigma = sqrt(max(histMom.g - m1 * m1, 0.0));
+    float d = abs(rtLum(clampedIrr) - m1);
+    // The relative floor keeps near-black pixels (sigma ~ 0, m1 ~ 0) from
+    // tripping on quantization alone.
+    float thresh = uGradK * sigma + 0.05 * max(m1, 0.02);
+    if (d > thresh) count = mix(count, 1.0, uLightMotion);
+  }
+
   // --- HISTORY-RELATIVE SOFT CLAMP (k*sigma from temporal moments) ---
   vec3 finalIrr = clampedIrr;
   if (uHistoryClampK > 0.0 && count > 1.0) {
@@ -257,6 +289,8 @@ export class AccumulatePass {
         uViewProj: { value: new THREE.Matrix4() },
         uMaxHistory: { value: 48 },
         uPreFireflyClamp: { value: 0.0 },
+        uLightMotion: { value: 0.0 },
+        uGradK: { value: 3.0 },
         uHistoryClampK: { value: 0.0 },
         uCameraPos: { value: new THREE.Vector3() },
         uEps: { value: 1e-3 },
@@ -308,6 +342,8 @@ export class AccumulatePass {
     u.uViewProj.value.copy(viewProj);
     u.uMaxHistory.value = maxHistory;
     u.uPreFireflyClamp.value = opts.preFireflyClamp ?? 0.0;
+    u.uLightMotion.value = opts.lightMotion ?? 0.0;
+    u.uGradK.value = opts.gradK ?? 3.0;
     u.uHistoryClampK.value = opts.historyClampK ?? 0.0;
     u.uCameraPos.value.copy(cameraPos);
     u.uEps.value = eps;

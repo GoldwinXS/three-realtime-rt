@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.14.0
+
+- **Moving lights no longer drag a tail.** Every temporal validation in the
+  engine asked a geometric question, so a static surface under a light that had
+  just moved passed all of them and kept averaging light that was no longer
+  there. `updateLights()` now measures how far the lights actually moved
+  (position, colour, intensity, spot aim, cone angle, relative to scene size)
+  and drives a `lightMotion` signal into the existing motion-adaptive temporal
+  response, which until now only ever saw camera motion. AccumulatePass gains a
+  temporal-gradient test that drops history per-pixel where the fresh sample
+  disagrees with the accumulated mean by more than `lightGradK` sigmas, using
+  the pixel's own accumulated variance so a noisy GI pixel is not mistaken for
+  a changed one. New bench `probe-lightghost.html` (light jumps A to B, camera
+  and geometry static): mean abs diff 40 frames after the jump falls from 31.4
+  to 3.6 against a 0.27 noise floor, an 89 percent cut. New options
+  `lightAdaptive` (default on), `lightMotionRef`, `lightMotionDecay`,
+  `lightGradK`. With lights parked every new branch is skipped and the arena
+  fences are unmoved (9 spikes, stillNoise 0.126, ghost@40 1.034, 61-62ms).
+
+- **The adaptive governor no longer decides from shader-compile frames.** Its
+  EMA seeded from a SINGLE sample and its change cooldown initialised to zero,
+  so the first decision of every page load was made from one frame that
+  typically contained compileScene and the megakernel link. On a vsync-capped
+  display that decision permanently enabled the "free wins" (giHalfRate and
+  restirGI), because their release gate requires a refresh above 110Hz.
+  Measured on the shipped gallery: both were on by frame 3 of every load and
+  still on, unreleasable, at frame 476. The governor now observes
+  `GOVERNOR_WARMUP_FRAMES` (60) before it may change anything; after the fix
+  the same page sits at giHalfRate false / restirGI false indefinitely. The
+  emergency overload brake is unaffected and still reacts from the first frame.
+
+- **The traced glass path is bounded.** Indirect radiance was capped by
+  `fireflyClamp`, emissive NEE and the ReSTIR shade at 2x that, specular at 4x;
+  glass had no cap at all. Because a solid dielectric decodes to transmission
+  exactly 1.0, `mix(direct + indirect, glassRadiance, transmission)` discarded
+  every clamped term and handed the accumulator an unbounded value. New option
+  `glassClampScale` (default 4, in `fireflyClamp` units; 0 restores the old
+  behaviour). Measured energy shift on mosquito, helmet, fox and cornell at
+  pinned options: 0.00 percent. This closes a real hole but is NOT the fix for
+  the gallery's close-orbit brightness, which is an exposure question (the
+  studio sky alone sits near display white before the subject is considered).
+
+- **ReSTIR GI is no longer added to glass.** The inline GI bounce is scaled by
+  (1 - transmission) where it is composed, but the external ReSTIR GI add in
+  DenoisePass was gated only by metalness, double-counting indirect light onto
+  the pixels least able to receive it.
+
+- Demo fix: game-bench read `dynamicLights` off the scene registry entry rather
+  than the built scene, so it was always undefined and the stealth scene's
+  sweeping spotlights were never synced to the tracer. Its traced lighting had
+  been frozen at the t=0 pose in every bench number and video clip taken of it.
+
+- `docs/SPEC_GOVERNOR_REWORK.md`: the full audited specification for replacing
+  the governor's control law, including the verified finding that under a vsync
+  cap the current law is a one-way ratchet (input quantized to multiples of the
+  refresh period; smallest possible correction is a 19 percent renderScale cut;
+  no up-step is reachable below a 68.75Hz refresh). Not yet implemented.
+
+
 ## 0.13.0
 
 - **Temporal quality campaign: split accumulation pipeline (all fences PASS,

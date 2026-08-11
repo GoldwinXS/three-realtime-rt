@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>light-ghost probe</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<script type="module">
+/*
+ * lightGhost: the moving-light analogue of the camera ghost@N metric.
+ *
+ * The camera never moves and the geometry never moves, so every temporal
+ * validation the engine has (plane distance, normal agreement, reprojection)
+ * says "reuse everything". Only the LIGHT moves. Whatever fraction of the old
+ * lighting survives is exactly the wispy tail the owner reported.
+ *
+ * Protocol, mirroring game-bench's ghost phase so numbers read the same way:
+ *   1. park the light at pose B, settle, keep that frame as the reference
+ *   2. park the light at pose A, settle
+ *   3. jump the light A -> B in one frame
+ *   4. sample mean abs diff vs the reference at 1/2/5/10/20/40 frames after
+ * Lower is faster convergence. A perfect renderer would read ~0 at frame 1.
+ */
+import * as THREE from "three";
+import { RealtimeRaytracer } from "/src/index.js";
+
+const q = new URLSearchParams(location.search);
+const num = (k, d) => (q.has(k) ? parseFloat(q.get(k)) : d);
+const W = 640, H = 480;
+
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+// A plain box room with a floor, so a moving light writes an unambiguous,
+// high-contrast pool of light that any staleness smears.
+const scene = new THREE.Scene();
+const white = new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.9 });
+const box = (w, h, d, x, y, z) => {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), white);
+  m.position.set(x, y, z); scene.add(m); return m;
+};
+box(12, 0.2, 12, 0, -0.1, 0);      // floor
+box(12, 0.2, 12, 0, 6.1, 0);       // ceiling
+box(12, 6, 0.2, 0, 3, -6.1);       // back
+box(0.2, 6, 12, -6.1, 3, 0);       // left
+box(0.2, 6, 12, 6.1, 3, 0);        // right
+// Two blockers, so the light also drags hard shadow edges across the floor.
+box(1.2, 2.4, 1.2, -2.0, 1.2, 1.0).rotation.y = 0.4;
+box(1.2, 1.2, 1.2, 2.2, 0.6, -1.0).rotation.y = -0.3;
+
+const light = new THREE.PointLight(0xfff0dd, 40);
+light.userData.rtRadius = 0.25;
+scene.add(light);
+const POSE_A = [-3.6, 4.2, 2.6];
+const POSE_B = [3.6, 4.2, -2.2];
+
+const camera = new THREE.PerspectiveCamera(55, W / H, 0.05, 100);
+camera.position.set(0, 4.4, 9.2);
+camera.lookAt(0, 1.6, 0);
+
+const opts = {
+  renderScale: 0.5,
+  denoiseIterations: 3,
+  maxHistory: 48,
+  adaptiveQuality: false,
+};
+// Generic passthrough, same convention as probe-gallery-bisect: any query key
+// becomes an engine option, so a sweep can reach knobs this page never named.
+for (const [k, v] of q.entries()) {
+  if (k === "x") continue;
+  if (v === "0" || v === "false") opts[k] = false;
+  else if (v === "1" || v === "true") opts[k] = true;
+  else if (!Number.isNaN(parseFloat(v))) opts[k] = parseFloat(v);
+  else opts[k] = v;
+}
+const rt = new RealtimeRaytracer(renderer, opts);
+rt.compileScene(scene);
+rt.setSize(W, H);
+
+// Light data is uploaded from the scene by updateLights(), NOT re-read per
+// frame by render(). Moving light.position alone changes nothing in the traced
+// scene, which is exactly how the first version of this probe measured a
+// perfect zero and looked like good news.
+const setLight = (p) => { light.position.set(...p); rt.updateLights(scene); };
+const frame = () => rt.render(scene, camera);
+const settle = (n) => { for (let i = 0; i < n; i++) frame(); };
+const grab = () => {
+  const px = new Uint8Array(W * H * 4);
+  const gl = renderer.getContext();
+  gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  return px;
+};
+const meanAbsDiff = (a, b) => {
+  let s = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    s += Math.abs(a[i] - b[i]) + Math.abs(a[i + 1] - b[i + 1]) + Math.abs(a[i + 2] - b[i + 2]);
+  }
+  return s / ((a.length / 4) * 3);
+};
+
+const SETTLE = num("settle", 220);
+const TAPS = [1, 2, 5, 10, 20, 40];
+
+async function run() {
+  // 1. reference: light already at B, fully settled
+  setLight(POSE_B); settle(SETTLE);
+  const ref = grab();
+  // 2. light at A, fully settled (history now entirely describes pose A)
+  setLight(POSE_A); settle(SETTLE);
+  // 3+4. jump to B and sample the decay
+  setLight(POSE_B);
+  const out = {};
+  let n = 0;
+  for (const tap of TAPS) {
+    while (n < tap) { frame(); n++; }
+    out["g" + tap] = +meanAbsDiff(grab(), ref).toFixed(4);
+  }
+  // Settled floor: the residual difference once fully converged again, which
+  // is just sampling noise. Any tap above this is genuine staleness.
+  settle(SETTLE);
+  out.floor = +meanAbsDiff(grab(), ref).toFixed(4);
+  out.config = {
+    renderScale: rt.renderScale, maxHistory: rt.maxHistory,
+    gi: rt.gi, restir: rt.restir, splitAccum: rt._splitAccum !== false,
+  };
+  out.config.lightAdaptive = rt.lightAdaptive; out.config.lightGradK = rt.lightGradK;
+  window.LIGHTGHOST = out;
+  document.title = "done";
+}
+run();
+</script>
+</body>
+</html>
