@@ -24,7 +24,7 @@
  * Frame rate is derived from the ms columns instead, where the meaning is
  * unambiguous.
  */
-import matrix from "../quality-campaign/cost-matrix.json";
+import matrix from "./data/cost-matrix.json";
 
 const el = (tag, cls, html) => {
   const e = document.createElement(tag);
