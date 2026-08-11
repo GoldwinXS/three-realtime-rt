@@ -53,7 +53,7 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // The shared renderer panel — identical on every stop of the tour.
   const ui = buildPanel({
     rt, state, setFeature, setCanvasScale, canvasScale, initial,
-    hint: "drag to orbit · scroll to zoom · try Drop / Explode",
+    hint: "",
   });
   const { gateHooks, exhibits } = ui;
 

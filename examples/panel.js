@@ -18,8 +18,8 @@
 import { version } from "../package.json";
 
 const CSS = `
-:root { --panel-bg: rgba(14,18,24,0.82); --panel-br: #26323c; --ink: #d7e0e6;
-  --ink-dim: #8298a6; --accent: #38d0e0; --accent-2: #7ee787; }
+:root { --panel-bg: rgba(14,18,24,0.95); --panel-br: #26323c; --ink: #d7e0e6;
+  --ink-dim: #97aab9; --accent: #38d0e0; --accent-2: #7ee787; }
 * { box-sizing: border-box; }
 #panel { position: fixed; top: 14px; right: 14px; z-index: 20; width: 268px;
   max-height: calc(100vh - 28px); overflow-y: auto;
@@ -40,14 +40,17 @@ const CSS = `
   pointer-events: none; opacity: 0; transition: opacity .15s;
   background: linear-gradient(to top, rgba(14,18,24,0.9), rgba(14,18,24,0)); }
 #panel .panel-fade.show { opacity: 1; }
-#panel .hd { display: flex; align-items: center; gap: 8px; padding: 12px 14px 8px; }
+#panel .hd { display: flex; align-items: center; gap: 9px; padding: 12px 14px 9px; }
 #panel .hd svg { width: 16px; height: 16px; color: var(--accent); }
 #panel .hd b { font-size: 13px; letter-spacing: 0.3px; }
 #panel .hd .tag { margin-left: auto; font-size: 10px; color: var(--ink-dim); }
-#panel .sec { border-top: 1px solid var(--panel-br); padding: 8px 14px 12px; }
-#panel .sec h3 { display: flex; align-items: center; gap: 7px; margin: 4px 0 8px;
-  font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--ink-dim);
-  cursor: pointer; user-select: none; }
+#panel .sec { border-top: 1px solid var(--panel-br); padding: 9px 14px 13px; }
+#panel .sec h3 { display: flex; align-items: center; gap: 7px; margin: 4px -8px 9px;
+  padding: 6px 8px; font-size: 13px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.8px; color: #a5b8c6; cursor: pointer; user-select: none;
+  border-radius: 5px; background: rgba(255,255,255,0.035); }
+#panel .sec h3:hover { background: rgba(255,255,255,0.06); }
+#panel .sec.collapsed h3 { color: #aebfcc; }
 #panel .sec h3 svg { width: 13px; height: 13px; }
 /* collapsible groups: the header chevron points down while the group is open,
    right while collapsed; the body rows hide with the group. The chevron is
@@ -58,7 +61,7 @@ const CSS = `
 #panel .sec h3:hover .chev { color: var(--accent); }
 #panel .sec.collapsed h3 .chev svg { transform: rotate(-90deg); }
 #panel .sec.collapsed > :not(h3) { display: none; }
-#panel .row { display: flex; align-items: center; gap: 8px; min-height: 24px; margin: 5px 0; }
+#panel .row { display: flex; align-items: center; gap: 8px; min-height: 24px; margin: 6px 0; }
 #panel .row label { flex: 1; cursor: pointer; }
 #panel .row .val { color: var(--accent); font-variant-numeric: tabular-nums; min-width: 34px; text-align: right; }
 /* sub-toggle: a modifier of the row above it, dimmed while its parent is off */
@@ -110,26 +113,29 @@ const CSS = `
 #panel .stats b { color: var(--accent-2); }
 #panel .stats a { color: var(--accent-2); text-decoration: none; }
 #panel .stats a:hover { text-decoration: underline; }
-#hint { position: fixed; bottom: 12px; left: 14px; z-index: 20; color: #6b7f8c;
-  font: 11px ui-monospace, Consolas, monospace; background: rgba(14,18,24,0.7);
-  border: 1px solid #26323c; border-radius: 6px; padding: 6px 10px; }
+#hint { position: fixed; bottom: 12px; left: 14px; z-index: 20; color: #a9bcc9;
+  font: 12px ui-monospace, Consolas, monospace; letter-spacing: 0.3px;
+  background: rgba(14,18,24,0.78); border: 1px solid #2c3a46; border-radius: 7px;
+  padding: 7px 11px; }
 /* fps readout — top-left, always visible even with the panel collapsed */
-#fps { position: fixed; top: 14px; left: 14px; z-index: 20; color: var(--accent-2);
+#fps { position: fixed; top: 14px; left: 14px; z-index: 20; color: #9fe3c9;
   font: 12px ui-monospace, "SF Mono", Consolas, monospace; font-variant-numeric: tabular-nums;
-  background: rgba(14,18,24,0.75); border: 1px solid #26323c; border-radius: 6px;
-  padding: 5px 9px; min-width: 58px; text-align: right; }
+  background: rgba(14,18,24,0.78); border: 1px solid #2c3a46; border-radius: 999px;
+  padding: 5px 12px; min-width: 66px; text-align: right; letter-spacing: 0.3px;
+  backdrop-filter: blur(8px); }
 /* collapsed panel: header only (the chevron in the header toggles it) */
-#panel .hd .fold { margin-left: 4px; flex: none; background: none; border: none;
-  padding: 2px; cursor: pointer; color: var(--ink-dim); display: flex; }
-#panel .hd .fold:hover { color: var(--accent); background: none; border: none; }
-#panel .hd .fold svg { width: 15px; height: 15px; transition: transform .15s; }
+#panel .hd .fold { margin-left: 4px; flex: none; background: #16202b; border: 1px solid #2c3a46;
+  border-radius: 6px; padding: 3px 7px; cursor: pointer; color: var(--ink-dim); display: flex; }
+#panel .hd .fold:hover { color: var(--accent); border-color: var(--accent); background: #1b2831; }
+#panel .hd .fold svg { width: 14px; height: 14px; transition: transform .15s; }
 #panel.min .hd .fold svg { transform: rotate(180deg); }
 #panel.min .sec, #panel.min .stats-foot { display: none; }
 /* Per-room exhibit controls: the same .sec rows, marked as "this room's" with a
-   warmer rule so the shared renderer panel above reads as one block. */
+   muted mint so the shared renderer panel above reads as one block without a
+   loud colour wash (the room's own content is the colour). */
 #panel .exhibits .sec { border-top: 1px solid #33454f; }
-#panel .exhibits .sec h3 { color: var(--accent-2); }
-#panel .caption { margin: 2px 0 8px; color: var(--ink-dim); font-size: 10px; line-height: 1.4; }
+#panel .exhibits .sec h3 { color: #93cfae; }
+#panel .caption { margin: 2px 0 8px; color: var(--ink-dim); font-size: 12px; line-height: 1.55; }
 #panel .caption b { color: var(--ink); font-weight: normal; }
 /* phones: the fps badge must never outrun the viewport, and the hint bar sits
    where the tour chrome overlaps it, so it is dropped there */
@@ -156,6 +162,9 @@ export const ICON = {
   fog: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 8h16M4 12h16M4 16h16"/></svg>',
   sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 1v3M12 20v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1 12h3M20 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>',
   chev: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 15l6-6 6 6"/></svg>',
+  // a hamburger glyph — the panel is a control surface, so the fold reads as
+  // "open the controls" rather than a status tag that happens to be clickable
+  sliders: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>',
   // the section-header chevron, pointing down while the group is open (the
   // .collapsed rule rotates it 90 deg so it points right closed)
   chevD: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>',
@@ -169,7 +178,7 @@ export function el(tag, cls, html) {
   return e;
 }
 
-export function toggle(labelText, checked, onChange) {
+export function toggle(labelText, checked, onChange, tip) {
   const row = el("div", "row");
   const lab = el("label", null, labelText);
   const sw = el("label", "sw");
@@ -182,6 +191,7 @@ export function toggle(labelText, checked, onChange) {
   lab.setAttribute("for", id);
   input.id = id;
   row.append(lab, sw);
+  if (tip) row.title = tip;
   return { row, input };
 }
 
@@ -191,7 +201,7 @@ export function toggle(labelText, checked, onChange) {
  * setFeatureState follows for toggles), so a governor-driven change shows up in
  * the control instead of leaving it lying about the renderer's state.
  */
-export function sliderRow(labelText, min, max, step, value, fmt, onInput) {
+export function sliderRow(labelText, min, max, step, value, fmt, onInput, tip) {
   const row = el("div", "row");
   const lab = el("label", null, labelText);
   const input = el("input");
@@ -203,6 +213,7 @@ export function sliderRow(labelText, min, max, step, value, fmt, onInput) {
     val.textContent = fmt(parseFloat(input.value));
   });
   row.append(lab, input, val);
+  if (tip) row.title = tip;
   return {
     row, input, val,
     set(v) {
@@ -218,7 +229,7 @@ export function slider(...args) {
   return sliderRow(...args).row;
 }
 
-export function selectRow(labelText, options, value, onChange) {
+export function selectRow(labelText, options, value, onChange, tip) {
   const row = el("div", "row");
   const lab = el("label", null, labelText);
   const sel = el("select");
@@ -230,6 +241,7 @@ export function selectRow(labelText, options, value, onChange) {
   }
   sel.addEventListener("change", () => onChange(sel.value));
   row.append(lab, sel);
+  if (tip) row.title = tip;
   return { row, select: sel };
 }
 
@@ -260,8 +272,8 @@ function colSection(iconHtml, title, collapsed = true) {
 }
 
 /** A per-room controls section, to be appended into the returned `exhibits`. */
-export function section(iconHtml, title) {
-  return colSection(iconHtml, title, true);
+export function section(iconHtml, title, open = false) {
+  return colSection(iconHtml, title, !open);
 }
 
 /**
@@ -306,8 +318,8 @@ export function buildPanel({
   const hd = el("div", "hd", `${ICON.chip}<b>three-realtime-rt</b><span class="tag">RT on</span>`);
   // Collapse chevron: on phones the panel covers most of the scene, so it also
   // starts collapsed there (the header stays as the handle to reopen it).
-  const fold = el("button", "fold", ICON.chev);
-  fold.title = "collapse / expand panel";
+  const fold = el("button", "fold", ICON.sliders);
+  fold.title = "open / close the control panel";
   fold.addEventListener("click", () => panel.classList.toggle("min"));
   hd.append(fold);
   panel.append(hd);
@@ -352,11 +364,11 @@ export function buildPanel({
   // same "the user took the wheel" rule the ReSTIR lease already follows.
   const reg = {};
   const touched = new Set();
-  const featureToggle = (name, labelText, checked, apply) => {
+  const featureToggle = (name, labelText, checked, apply, tip) => {
     const t = toggle(labelText, checked, (v) => {
       touched.add(name);
       apply(v);
-    });
+    }, tip);
     reg[name] = { input: t.input, apply };
     return t;
   };
@@ -374,7 +386,10 @@ export function buildPanel({
   };
 
   // --- Renderer (core pipeline; watch the fps readout as you change these) ---
-  const rSec = colSection(ICON.layers, "Renderer", false);
+  // Starts collapsed so a landing visitor sees a short list of headers, not a
+  // wall of sliders; every control is one click away. The room's own section
+  // (the Cornell switcher) opens in its place.
+  const rSec = colSection(ICON.layers, "Renderer", true);
 
   // The canvas scale is the APP's (it owns the drawing buffer and the CSS
   // stretch), and the governor drives it through rt.canvasScaleHook — so the
@@ -397,7 +412,8 @@ export function buildPanel({
   // The prominent RT ON/OFF switch now lives in the tour chrome (tour.js), OUTSIDE
   // the panel — this row stays as its in-panel twin and the two are kept in sync
   // through setRtEnabled/onRtEnabled below.
-  const rtRow = toggle("ray tracing", state.rtEnabled, (v) => setRtEnabled(v));
+  const rtRow = toggle("ray tracing", state.rtEnabled, (v) => setRtEnabled(v),
+    "the raytraced pipeline — toggle off for plain rasterized three.js");
   rSec.append(rtRow.row);
   // --- auto quality, and the two rows it OWNS ------------------------------
   // The governor writes renderScale, the canvas scale, denoiseIterations,
@@ -407,7 +423,8 @@ export function buildPanel({
   // below and badged "auto" while the governor holds the wheel. Touching one of
   // its rows by hand switches auto quality OFF, visibly — one obvious
   // interaction instead of a control that silently springs back.
-  const autoT = toggle("auto quality", rt.adaptiveQuality, (v) => setAdaptive(v));
+  const autoT = toggle("auto quality", rt.adaptiveQuality, (v) => setAdaptive(v),
+    "let the governor hold a frame-rate target by trading lighting res, canvas scale and denoise passes");
   rSec.append(autoT.row);
   const autoNote = el("div", "note");
   autoNote.textContent =
@@ -416,8 +433,10 @@ export function buildPanel({
     "the canvas; it also sets denoise passes and fast lights. Changing any of " +
     "those by hand switches this off.";
   rSec.append(autoNote);
-  rSec.append(toggle("denoise", rt.denoise, (v) => (rt.denoise = v)).row);
-  rSec.append(toggle("TAA (anti-alias)", rt.taa, (v) => { rt.taa = v; rt.resetAccumulation(); }).row);
+  rSec.append(toggle("denoise", rt.denoise, (v) => (rt.denoise = v),
+    "the à-trous denoiser — smooths the noisy pre-convergence frames").row);
+  rSec.append(toggle("TAA (anti-alias)", rt.taa, (v) => { rt.taa = v; rt.resetAccumulation(); },
+    "temporal anti-aliasing — accumulates across frames to settle edges").row);
   // Include the mobile preset's scales — otherwise touching this dropdown on
   // a phone locks you out of the value the page started with. Manual choice
   // takes the wheel from the adaptive governor.
@@ -427,11 +446,11 @@ export function buildPanel({
     setAdaptive(false);
     canvasScaleNow = parseFloat(v);
     setCanvasScale(canvasScaleNow);
-  });
+  }, "whole-canvas buffer scale — a browser-zoom-style lever with quadratic savings");
   const lightSel = selectRow("lighting res", [["100%", 1], ["75%", 0.75], ["50%", 0.5], ["37%", 0.375], ["25%", 0.25]], rt.renderScale, (v) => {
     setAdaptive(false);
     rt.renderScale = parseFloat(v);
-  });
+  }, "the resolution the lighting passes trace at — the first lever the governor spends");
   const govBadge = (row, title) => {
     const b = el("span", "gov hide", "auto");
     b.title = title;
@@ -447,20 +466,22 @@ export function buildPanel({
     // (0.1 → 1.44×), so it lives next to the resolution controls.
     selectRow("overscan", [["off", 0], ["5%", 0.05], ["10%", 0.1]], rt.overscan, (v) => {
       rt.overscan = parseFloat(v);
-    }).row
+    }, "render past the canvas edge and crop back, so camera-motion noise is born off-screen").row
   );
   rSec.append(
     selectRow("view", [
       ["composite", 0], ["albedo", 1], ["normals", 2],
       ["irradiance", 3], ["world pos", 4], ["emissive", 5], ["specular", 6],
       ["bvh cost", 7],
-    ], rt.outputMode, (v) => (rt.outputMode = parseInt(v, 10))).row
+    ], rt.outputMode, (v) => (rt.outputMode = parseInt(v, 10)),
+      "debug views of the G-buffer and the lighting passes").row
   );
   // BVH-cost heatmap scale: the slider is "visits to saturate" (hot/white end),
   // 32..512; rt.costScale is its reciprocal. Only affects the mode-7 view.
   rSec.append(
     slider("cost scale", 32, 512, 16, Math.round(1 / rt.costScale),
-      (x) => `${Number(x).toFixed(0)} hits`, (v) => (rt.costScale = 1 / v))
+      (x) => `${Number(x).toFixed(0)} hits`, (v) => (rt.costScale = 1 / v),
+      "BVH traversal cost heatmap saturation, for the “bvh cost” view")
   );
   panel.append(rSec);
 
@@ -549,19 +570,23 @@ export function buildPanel({
   // Routed through setFeature: reflections/refraction also reveal a showcase
   // sphere and recompile the BVH, which the room owns. Initial state reads the
   // current rt values (all false at the museum's minimal start).
-  efSec.append(featureToggle("specular", "PBR specular", rt.specular, (v) => { rt.specular = v; rt.resetAccumulation(); }).row);
-  efSec.append(featureToggle("gi", "global illumination", rt.gi, (v) => setFeature("gi", v)).row);
+  efSec.append(featureToggle("specular", "PBR specular", rt.specular, (v) => { rt.specular = v; rt.resetAccumulation(); },
+    "the GGX specular term on the traced paths").row);
+  efSec.append(featureToggle("gi", "global illumination", rt.gi, (v) => setFeature("gi", v),
+    "one-bounce colour bleed — light bounces once and carries surface colour").row);
   // Both of the GI modifiers are no-ops without GI itself, so they are drawn as
   // sub-rows of it and dimmed while it is off (the same "this modifies the row
   // above" grammar as tinted shadows). Both are also FREE WINS the governor
   // spends before it gives up any resolution, which is why their state moves on
   // its own while auto quality is on; see syncGovernorRows.
-  const halfRateT = featureToggle("giHalfRate", "half-rate GI (fast)", rt.giHalfRate, (v) => { rt.giHalfRate = v; rt.resetAccumulation(); });
+  const halfRateT = featureToggle("giHalfRate", "half-rate GI (fast)", rt.giHalfRate, (v) => { rt.giHalfRate = v; rt.resetAccumulation(); },
+    "update the GI sample on alternate frames — roughly half the GI cost");
   halfRateT.row.classList.add("sub");
   efSec.append(halfRateT.row);
   // Experimental: reservoir reuse of the 1-bounce GI sample (temporal-only).
   // Only meaningful when global illumination is on; injected at the denoise stage.
-  const restirGiT = featureToggle("restirGI", "ReSTIR GI (exp)", rt.restirGI, (v) => { rt.restirGI = v; rt.resetAccumulation(); });
+  const restirGiT = featureToggle("restirGI", "ReSTIR GI (exp)", rt.restirGI, (v) => { rt.restirGI = v; rt.resetAccumulation(); },
+    "reuse the 1-bounce GI sample across frames via reservoir resampling (experimental)");
   restirGiT.row.classList.add("sub");
   efSec.append(restirGiT.row);
   // Two conditions this row cannot satisfy on its own, both of which otherwise
@@ -573,9 +598,11 @@ export function buildPanel({
   //    now caps itself there.
   const restirGiNote = el("div", "note");
   efSec.append(restirGiNote);
-  efSec.append(featureToggle("reflections", "reflections", rt.reflections, (v) => setFeature("reflections", v)).row);
+  efSec.append(featureToggle("reflections", "reflections", rt.reflections, (v) => setFeature("reflections", v),
+    "traced specular reflections — a real ray per pixel, not an environment map").row);
   // Grab the refraction toggle so the tinted-glass handler can switch it on.
-  const refractionT = featureToggle("refraction", "refraction", rt.refraction, (v) => setFeature("refraction", v));
+  const refractionT = featureToggle("refraction", "refraction", rt.refraction, (v) => setFeature("refraction", v),
+    "traced glass paths — light bends through transmissive materials");
   efSec.append(refractionT.row);
   // Tinted glass (Beer-Lambert absorption): reveals the room's absorbing piece
   // (in the museum the Sunset relief and the Lumiere screen, in the Cornell box
@@ -640,7 +667,8 @@ export function buildPanel({
   // grain on the sphere at the demo's reduced render scale before it fully
   // converges. Drag it up to see the effect; it shimmers slightly while
   // converging, so reset the accumulator on each change.
-  efSec.append(slider("dispersion", 0, 0.3, 0.01, rt.dispersion, (x) => Number(x).toFixed(2), (v) => { rt.dispersion = v; rt.resetAccumulation(); }));
+  efSec.append(slider("dispersion", 0, 0.3, 0.01, rt.dispersion, (x) => Number(x).toFixed(2), (v) => { rt.dispersion = v; rt.resetAccumulation(); },
+    "chromatic dispersion on the refracted term — the amount white light splits into colour"));
   // Kubelka-Munk scattering: reveals the room's scattering piece (in the museum
   // "Alabaster" (the reading lamp plus the two spheres that differ ONLY in
   // whether they scatter), in the Cornell box the stepped stone wedge). Absorption
@@ -664,22 +692,24 @@ export function buildPanel({
     setFeature("scattering", v);
     kmNote.style.display = v ? "" : "none";
     borrowRestir("kmScattering", v);
-  }).row);
+  }, "Kubelka-Munk subsurface scattering — light returns from inside a pigmented body").row);
   efSec.append(kmNote);
   kmNote.style.display = "none"; // revealed with the piece
   panel.append(efSec);
 
   // --- Quality & Performance: the converger's dials. -------------------------
   const qpSec = colSection(ICON.chip, "Quality & Performance", true);
-  qpSec.append(slider("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v)));
-  qpSec.append(slider("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v)));
+  qpSec.append(slider("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v),
+    "clamp the bright speckle outliers that sparse sampling leaves behind"));
+  qpSec.append(slider("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v),
+    "how many frames of temporal history the converger keeps"));
   // Keeps its full 0..5 range: the campaign's finding is about what the
   // GOVERNOR should choose, not about what you may look at. 4 and 5 are where
   // the à-trous lattice is measurable, so they stay reachable by hand.
   const denoisePasses = sliderRow("denoise passes", 0, 5, 1, rt.denoiseIterations, (x) => Number(x).toFixed(0), (v) => {
     rt.denoiseIterations = v;
     setAdaptive(false); // the governor writes this row too; dragging it takes the wheel
-  });
+  }, "how many à-trous filter passes the denoiser runs");
   qpSec.append(denoisePasses.row);
   panel.append(qpSec);
 
@@ -726,6 +756,10 @@ export function buildPanel({
   const hintEl = el("div");
   hintEl.id = "hint";
   hintEl.textContent = hint;
+  // The persistent room hint is dropped in the glow-up — the boot hero and the
+  // transient orbit cue carry the instructions — so it is hidden unless a room
+  // has something genuinely worth saying (the Cornell box's RT-off warning).
+  if (!hint) hintEl.style.display = "none";
   document.body.append(hintEl);
 
   // --- what the governor owns, mirrored back into the controls --------------
@@ -833,7 +867,10 @@ export function buildPanel({
     setRtEnabled,
     isRtEnabled: () => !!state.rtEnabled,
     onRtEnabled: (fn) => rtListeners.push(fn),
-    setHint(text) { hintEl.textContent = text; },
+    setHint(text) {
+      hintEl.textContent = text;
+      hintEl.style.display = text ? "" : "none";
+    },
     setStats(html) {
       stats.innerHTML = html;
     },

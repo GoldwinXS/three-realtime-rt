@@ -54,9 +54,27 @@ function normalize(root, size) {
 }
 
 function groundPlane(color = 0x9aa3ac) {
+  // A radial colour falloff toward the disc edge, so the shadow-catcher fades
+  // into the dark background instead of ending on a hard circle. Opaque — the
+  // tracer keeps the full surface for shadows and contact.
+  const base = new THREE.Color(color);
+  const edge = base.clone().multiplyScalar(0.1);
+  const size = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  grad.addColorStop(0, "#" + base.getHexString());
+  grad.addColorStop(0.36, "#" + base.getHexString());
+  grad.addColorStop(0.5, "#" + edge.getHexString());
+  grad.addColorStop(1, "#" + edge.getHexString());
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, size, size);
+  const map = new THREE.CanvasTexture(canvas);
+  map.colorSpace = THREE.SRGBColorSpace;
   const g = new THREE.Mesh(
     new THREE.CylinderGeometry(14, 14, 0.3, 48),
-    new THREE.MeshStandardMaterial({ color, roughness: 0.9 })
+    new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, map })
   );
   g.position.y = -0.15;
   return g;
@@ -259,20 +277,32 @@ export const SCENES = {
  * feature switcher) but stays in the gallery's, which is the flat catalogue.
  */
 export const SCENE_LIST = [
-  ["cornell", "Cornell box (the classic)", { galleryOnly: true }],
+  ["cornell", "Cornell box (the classic)", { galleryOnly: true },
+    "The classic GI test room: one ceiling light, colour bleed, real shadows."],
   // Curated order: the assets a three.js reader recognises on sight come first,
   // and the one entry that needs no network at all comes last (it is the
   // offline fallback, not a showcase — the helmet is already the museum's hero
   // one stop upstream, so leading with it showed the same model twice).
-  ["boombox", "BoomBox (Khronos sample)"],
-  ["tokyo", "Littlest Tokyo (DRACO glTF)", { heavy: true }],
-  ["camera", "Antique Camera (Khronos sample)"],
-  ["lantern", "Lantern (Khronos sample)"],
-  ["fox", "Fox — bind pose (Khronos sample)"],
-  ["waterbottle", "Water Bottle (Khronos sample)"],
-  ["toycar", "Toy Car (Khronos sample)"],
-  ["iridescence", "Iridescence Lamp (Khronos sample)"],
-  ["mosquito", "Mosquito in Amber (Khronos sample)"],
-  ["corset", "Corset (Khronos sample)"],
-  ["helmet", "Damaged Helmet + props (bundled, works offline)", { bundled: true }],
+  ["boombox", "BoomBox (Khronos sample)", null,
+    "Chrome trim and a speaker grille that show off traced metal and texture maps."],
+  ["tokyo", "Littlest Tokyo (DRACO glTF)", { heavy: true },
+    "A full street diorama, DRACO-compressed and streamed from the three.js repo."],
+  ["camera", "Antique Camera (Khronos sample)", null,
+    "Brass and glass from the Antique Camera, a canonical Khronos sample."],
+  ["lantern", "Lantern (Khronos sample)", null,
+    "The Khronos Lantern, warm metal and glowing panes."],
+  ["fox", "Fox — bind pose (Khronos sample)", null,
+    "Fox in bind pose, a skinned Khronos model."],
+  ["waterbottle", "Water Bottle (Khronos sample)", null,
+    "Clear plastic and liquid, a refraction and transmission showcase."],
+  ["toycar", "Toy Car (Khronos sample)", null,
+    "Metallic paint and clearcoat on a sub-centimetre model, scaled up."],
+  ["iridescence", "Iridescence Lamp (Khronos sample)", null,
+    "The Iridescence Lamp, thin-film colour on glass."],
+  ["mosquito", "Mosquito in Amber (Khronos sample)", null,
+    "Mosquito in Amber, a refractive hero for the glass paths."],
+  ["corset", "Corset (Khronos sample)", null,
+    "Glossy fabric, a Khronos sample with detailed cloth."],
+  ["helmet", "Damaged Helmet + props (bundled, works offline)", { bundled: true },
+    "Damaged Helmet plus a chrome sphere and a duck, bundled and offline."],
 ];

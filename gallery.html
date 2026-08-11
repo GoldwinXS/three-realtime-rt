@@ -3,45 +3,103 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>three-realtime-rt — premade scene gallery</title>
+  <title>three-realtime-rt · the scene gallery</title>
   <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
     #app { width: 100%; height: 100%; }
-    #app canvas { display: block; }
+    #app canvas { display: block; cursor: grab; }
+    #app canvas:active { cursor: grabbing; }
     #boot {
-      position: fixed; inset: 0; display: flex; flex-direction: column;
-      align-items: center; justify-content: center; gap: 16px; z-index: 50;
-      color: #cfe0ea; font: 14px/1.5 ui-monospace, Consolas, monospace;
-      background: radial-gradient(circle at 50% 40%, #16202b, #0a0f16);
-      transition: opacity 0.5s; text-align: center; padding: 20px;
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      z-index: 50; color: #cfe0ea; font: 14px/1.5 ui-monospace, "SF Mono", Consolas, monospace;
+      background: radial-gradient(circle at 50% 40%, #17212c 0%, #0a0f16 70%);
+      transition: opacity 0.3s; text-align: center; padding: 20px;
     }
     #boot.hidden { opacity: 0; pointer-events: none; }
-    #boot .spin {
-      width: 34px; height: 34px; border: 3px solid #223240;
-      border-top-color: #38d0e0; border-radius: 50%;
-      animation: spin 0.9s linear infinite;
-    }
+    #boot .hero { display: flex; flex-direction: column; align-items: center; gap: 13px; max-width: 640px; }
+    #boot .mark { width: 44px; height: 44px; color: #38d0e0; opacity: 0.9; }
+    #boot .kicker { margin: 0; font-size: 11px; letter-spacing: 3.2px; color: #7fd8c8; text-transform: uppercase; }
+    #boot h1 { margin: 0; font-size: clamp(26px, 4.6vw, 36px); line-height: 1.14; font-weight: 600;
+      color: #eef4f8; letter-spacing: 0.2px; }
+    #boot .lede { margin: 0; font-size: 13px; line-height: 1.6; color: #a9bcc9; max-width: 500px; }
+    #boot .status { display: flex; align-items: center; gap: 11px; margin-top: 4px; color: #d7e0e6;
+      background: rgba(14,18,24,0.72); border: 1px solid #26323c; border-radius: 999px;
+      padding: 7px 16px 7px 9px; font-size: 13px; }
+    #boot .spin { width: 18px; height: 18px; border: 2px solid #223240; border-top-color: #38d0e0;
+      border-radius: 50%; animation: spin 0.9s linear infinite; }
+    #boot .bar { position: relative; width: min(300px, 66vw); height: 3px; border-radius: 2px;
+      background: rgba(56,208,224,0.13); overflow: hidden; }
+    #boot .bar i { position: absolute; top: 0; left: 0; bottom: 0; width: 38%;
+      background: linear-gradient(90deg, transparent, #38d0e0, transparent);
+      animation: sweep 1.1s ease-in-out infinite; }
+    @keyframes sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(330%); } }
+    #boot .cue { margin: 2px 0 0; font-size: 11px; letter-spacing: 0.4px; color: #6f8494; }
     #boot .err { color: #ff8a80; max-width: 520px; white-space: pre-wrap; }
+    /* scene switches show a compact status pill instead of the full hero, so the
+       viewport does not flash away between scenes */
+    #boot.compact { background: none; align-items: flex-end; padding: 0 0 30px; }
+    #boot.compact .hero { flex-direction: row; gap: 10px; max-width: none;
+      background: rgba(14,18,24,0.86); border: 1px solid #26323c; border-radius: 999px;
+      padding: 8px 15px 8px 10px; }
+    #boot.compact .hero > *:not(.status) { display: none; }
+    #boot.compact .status { margin: 0; background: none; border: none; padding: 0; }
     @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 480px) {
+      #boot .lede { font-size: 12px; }
+      #boot .kicker { letter-spacing: 2.4px; font-size: 10px; }
+    }
+    /* the scene gallery's control card, top-left */
+    #hud, #hud * { box-sizing: border-box; }
     #hud {
       position: fixed; top: 12px; left: 12px; z-index: 30;
-      display: flex; flex-direction: column; gap: 8px;
+      display: flex; flex-direction: column; gap: 9px;
       color: #cfe0ea; font: 12px/1.5 ui-monospace, Consolas, monospace;
-      background: rgba(14, 18, 24, 0.85); border: 1px solid #26323c;
-      border-radius: 8px; padding: 10px 12px; min-width: 220px;
+      background: rgba(14, 18, 24, 0.9); border: 1px solid #2c3a46;
+      border-radius: 8px; padding: 12px 14px; width: 268px; min-width: 0;
+      max-width: calc(100vw - 16px); box-shadow: 0 8px 28px rgba(0,0,0,0.4);
     }
-    #hud b { color: #7fd8c8; }
+    #hud .hud-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    #hud .hud-title b { color: #eef4f8; font-size: 13px; letter-spacing: 0.3px; }
+    #hud .hud-title span { color: #8298a6; font-size: 10px; letter-spacing: 1px; text-transform: uppercase; }
+    #hud .hud-fold { margin-left: auto; background: #16202b; border: 1px solid #2f414d;
+      border-radius: 6px; padding: 3px 7px; cursor: pointer; color: #aebfcc; display: flex; }
+    #hud .hud-fold:hover { color: #7fd8c8; border-color: #38d0e0; background: #1b2831; }
+    #hud .hud-fold svg { width: 13px; height: 13px; transition: transform 0.15s; }
+    #hud.min .hud-fold svg { transform: rotate(-90deg); }
+    /* collapsed: title + scene picker stay, the rest folds away */
+    #hud.min .hud-desc, #hud.min .hud-caption, #hud.min .hud-btns,
+    #hud.min .raster-note, #hud.min #stats, #hud.min #options { display: none; }
+    #hud .hud-desc { margin: 0; color: #9db1c0; font-size: 11px; line-height: 1.5; }
+    #hud .hud-caption { margin: 0; color: #c9ece2; font-size: 12px; line-height: 1.55; min-height: 3em; }
     #hud select, #hud button {
-      font: inherit; color: inherit; background: #16202b;
-      border: 1px solid #2c3a46; border-radius: 6px; padding: 5px 8px;
+      font: inherit; color: #e4ebf0; background: #16202b;
+      border: 1px solid #2f414d; border-radius: 8px; padding: 8px 10px;
       cursor: pointer;
     }
+    #hud select:hover, #hud button:hover { border-color: #38d0e0; background: #1b2831; }
+    #hud button:active { transform: translateY(1px); }
     #hud button.on { border-color: #38d0e0; color: #7fd8c8; }
-    #stats { white-space: pre; color: #8fa3b3; }
-    #options { border-top: 1px solid #26323c; padding-top: 8px; }
+    #hud .hud-btns { display: flex; gap: 8px; }
+    #hud .hud-btns button { flex: 1; }
+    /* the scene picker reads as a button: the wrapper carries the border and
+       background, the select is borderless inside it, and a chevron marks the
+       dropdown affordance */
+    .pick-wrap { position: relative; display: block; background: #16202b;
+      border: 1px solid #2f414d; border-radius: 8px; }
+    .pick-wrap:hover { border-color: #38d0e0; background: #1b2831; }
+    #hud .pick-wrap select { width: 100%; appearance: none; -webkit-appearance: none;
+      background: none; border: none; padding: 8px 34px 8px 10px; }
+    .pick-wrap svg { position: absolute; right: 11px; top: 50%; transform: translateY(-50%);
+      width: 16px; height: 16px; color: #7fd8c8; pointer-events: none; }
+    #stats { white-space: pre; color: #a9bcc9; font-size: 12px;
+      border-top: 1px solid #26323c; padding-top: 8px; }
+    #options { border-top: 1px solid #26323c; padding-top: 9px; }
     #options summary {
-      cursor: pointer; color: #7fd8c8; list-style: none; user-select: none;
+      cursor: pointer; color: #a9e3d6; list-style: none; user-select: none;
+      padding: 5px 10px; letter-spacing: 0.4px; display: inline-block;
+      border: 1px solid #2f414d; border-radius: 6px; background: #16202b;
     }
+    #options summary:hover { border-color: #38d0e0; background: #1b2831; }
     #options summary::-webkit-details-marker { display: none; }
     #options summary::before { content: "\25B8 "; }
     #options[open] summary::before { content: "\25BE "; }
@@ -55,28 +113,69 @@
       font: inherit; color: inherit; background: #16202b;
       border: 1px solid #2c3a46; border-radius: 6px; padding: 3px 6px; cursor: pointer;
     }
+    #hud .raster-note { margin: 0; color: #9db1c0; font-size: 10px; line-height: 1.4; }
+    /* dim the stale frame while a new scene compiles, so the compact status pill
+       does not sit on top of a frozen old scene (kept light enough to read the
+       old frame through, so the switch reads as a refresh rather than a blank) */
+    #app.dim canvas { opacity: 0.32; transition: opacity 0.35s; }
+    /* transient "drag to orbit" cue, shown once after the hero fades */
+    #gallery-cue { position: fixed; left: 50%; bottom: 36px; transform: translateX(-50%) translateY(8px);
+      z-index: 22; display: flex; align-items: center; gap: 10px; pointer-events: none;
+      font: 14px ui-monospace, Consolas, monospace; color: #eef4f8; letter-spacing: 0.4px;
+      background: rgba(14,18,24,0.9); border: 1px solid #2c3a46; border-radius: 999px;
+      padding: 11px 20px; opacity: 0; transition: opacity 0.45s, transform 0.45s;
+      box-shadow: 0 4px 16px rgba(0,0,0,0.35); }
+    #gallery-cue svg { width: 18px; height: 18px; color: #8fe0b0; }
+    #gallery-cue.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+    #gallery-cue.gone { opacity: 0; transform: translateX(-50%) translateY(8px); }
+    /* the control card stays out of the way while the hero is still on screen,
+       and dims with the viewport during scene switches so the loading state is
+       one coherent moment */
+    #hud.boot { opacity: 0; pointer-events: none; transition: opacity 0.4s; }
+    #hud.busy { opacity: 0.55; pointer-events: none; transition: opacity 0.35s; }
+    @media (max-width: 700px) {
+      #hud { top: 16px; left: 16px; padding: 12px 14px; gap: 8px;
+        width: min(calc(100vw - 32px), 248px); }
+      #hud .hud-caption { min-height: 0; }
+      #hud .hud-desc { font-size: 10px; }
+      #options { margin-bottom: 2px; }
+    }
+    @media (max-width: 480px) {
+      /* the technical readout yields the viewport on phones; the scene is the star */
+      #hud .hud-desc, #hud .raster-note, #stats { display: none; }
+    }
   </style>
 </head>
 <body>
   <div id="app"></div>
   <div id="hud">
-    <div><b>three-realtime-rt</b> — premade scenes</div>
-    <select id="scene-pick">
-      <option value="cornell">Cornell box (the classic)</option>
-      <option value="tokyo">Littlest Tokyo (DRACO glTF)</option>
-      <option value="lantern">Lantern (Khronos sample)</option>
-      <option value="helmet">Damaged Helmet + props</option>
-      <option value="camera">Antique Camera (Khronos sample)</option>
-      <option value="boombox">BoomBox (Khronos sample)</option>
-      <option value="corset">Corset (Khronos sample)</option>
-      <option value="waterbottle">Water Bottle (Khronos sample)</option>
-      <option value="toycar">Toy Car (Khronos sample)</option>
-      <option value="iridescence">Iridescence Lamp (Khronos sample)</option>
-      <option value="mosquito">Mosquito in Amber (Khronos sample)</option>
-      <option value="fox">Fox — bind pose (Khronos sample)</option>
-    </select>
-    <button id="rt-toggle" class="on">ray tracing: ON</button>
-    <button id="rt-hold">hold: raster</button>
+    <div class="hud-title"><b>three-realtime-rt</b><span>scene gallery</span>
+      <button class="hud-fold" title="collapse / expand the control card"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></button>
+    </div>
+    <p class="hud-desc">Stock glTF, unmodified, ray traced live.</p>
+    <div class="pick-wrap">
+      <select id="scene-pick">
+        <option value="cornell">Cornell box (the classic)</option>
+        <option value="tokyo">Littlest Tokyo (DRACO glTF)</option>
+        <option value="lantern">Lantern (Khronos sample)</option>
+        <option value="helmet">Damaged Helmet + props</option>
+        <option value="camera">Antique Camera (Khronos sample)</option>
+        <option value="boombox">BoomBox (Khronos sample)</option>
+        <option value="corset">Corset (Khronos sample)</option>
+        <option value="waterbottle">Water Bottle (Khronos sample)</option>
+        <option value="toycar">Toy Car (Khronos sample)</option>
+        <option value="iridescence">Iridescence Lamp (Khronos sample)</option>
+        <option value="mosquito">Mosquito in Amber (Khronos sample)</option>
+        <option value="fox">Fox — bind pose (Khronos sample)</option>
+      </select>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+    </div>
+    <div id="scene-caption" class="hud-caption"></div>
+    <div class="hud-btns">
+      <button id="rt-toggle" class="on">ray tracing: ON</button>
+      <button id="rt-hold" title="press and hold to preview plain rasterized three.js">hold: raster</button>
+    </div>
+    <p class="raster-note">hold “raster” to compare against plain three.js</p>
     <div id="stats"></div>
     <details id="options">
       <summary>options</summary>
@@ -111,9 +210,16 @@
       </label>
     </details>
   </div>
+  <div id="gallery-cue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3"/></svg><span>drag to orbit</span></div>
   <div id="boot">
-    <div class="spin"></div>
-    <div id="boot-msg">loading scene…</div>
+    <div class="hero">
+      <p class="kicker">three-realtime-rt</p>
+      <h1>The scene gallery</h1>
+      <p class="lede">Stock glTF models, unmodified, lit by path-traced light, glass and metal. Pick a scene and watch it converge.</p>
+      <div class="status"><div class="spin"></div><div id="boot-msg">preparing the scene…</div></div>
+      <div class="bar"><i></i></div>
+      <p class="cue">drag to orbit · scroll to zoom</p>
+    </div>
   </div>
   <script type="module" src="/examples/gallery.js"></script>
 </body>

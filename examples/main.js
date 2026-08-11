@@ -27,6 +27,14 @@ import { buildTourChrome, loadTourSettings, applyTourSettings, persistOnExit } f
 const boot = document.getElementById("boot");
 const bootMsg = document.getElementById("boot-msg");
 const setBoot = (t) => { if (bootMsg) bootMsg.textContent = t; };
+// The landing hero should be readable before the canvas takes over, even on a
+// fast load; the fade is delayed to a short minimum display time.
+const BOOT_MIN_MS = 700;
+const bootT0 = performance.now();
+const hideBoot = () => {
+  const wait = Math.max(0, BOOT_MIN_MS - (performance.now() - bootT0));
+  setTimeout(() => boot?.classList.add("hidden"), wait);
+};
 
 // Compatibility mode: some mobile GPUs (notably iOS Safari's watchdog) kill the
 // tab during the heavy RT shader compile or run out of texture memory. When
@@ -77,13 +85,13 @@ async function main() {
   // A Rapier physics playground drops a pool of props onto the ground. Their
   // meshes are plain three.js meshes — we'll hand them to the raytracer as the
   // "dynamic" set so their motion produces correct ray traced shadows.
-  setBoot("starting physics…");
+  setBoot("warming up the physics…");
   const physics = await Physics.create();
   physics.buildStaticColliders(bounds);
   // The prop pile is opt-in (UI "Spawn pile" button) — the default scene stays
   // clean so the hero pieces and lighting read clearly.
 
-  setBoot("loading models…");
+  setBoot("loading the models…");
   await ready; // wait for glTF hero models before compiling the BVH
 
   // 2. Renderer + raytracer. The raytracer takes over lighting; three.js still
@@ -275,7 +283,7 @@ async function main() {
 
   // 3. Compile once. `dynamicMeshes` marks meshes that move every frame — they
   //    get re-baked into the BVH on updateDynamic() (see the loop below).
-  setBoot("building BVH…");
+  setBoot("optimizing the scene…");
   const t0 = performance.now();
   rt.compileScene(scene, { dynamicMeshes: dynamicMeshes() });
   console.log(
@@ -602,7 +610,7 @@ async function main() {
       renderer.render(scene, camera);
     }
 
-    if (!booted) { booted = true; boot?.classList.add("hidden"); }
+    if (!booted) { booted = true; hideBoot(); }
 
     // Render self-test: evaluate verdicts off the drawing buffer once enough
     // frames have accumulated. No-op after the verdict is emitted.

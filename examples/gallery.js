@@ -16,11 +16,55 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { RealtimeRaytracer } from "../src/index.js";
 // The scene catalogue lives in its own module because the guided tour's model
 // stop (models.html) shows the same scenes — one definition, two pages.
-import { SCENES } from "./gallery-scenes.js";
+import { SCENES, SCENE_LIST } from "./gallery-scenes.js";
 
 const boot = document.getElementById("boot");
 const bootMsg = document.getElementById("boot-msg");
-const setBoot = (t) => { boot.classList.remove("hidden"); if (bootMsg) bootMsg.textContent = t; };
+const captionEl = document.getElementById("scene-caption");
+const appEl = document.getElementById("app");
+const hudEl = document.getElementById("hud");
+// The control card stays invisible while the hero is on screen, so the two
+// never overlap during the fade.
+hudEl.classList.add("boot");
+// Collapse / expand the card (the fold button in its title row).
+hudEl.querySelector(".hud-fold")?.addEventListener("click", () => hudEl.classList.toggle("min"));
+// Mobile first impression: Littlest Tokyo is the showpiece on a desktop, but at
+// 375px wide it opens near 6fps on mid hardware. A lighter scene makes the
+// gallery feel responsive on the first interaction; the heavy scenes stay one
+// pick away.
+const DEFAULT_SCENE = window.innerWidth < 700 ? "boombox" : "tokyo";
+// `compact` collapses the full landing hero into a small status pill, so scene
+// switches keep the viewport on screen instead of flashing the intro again.
+const setBoot = (t, compact = false) => {
+  boot.classList.remove("hidden");
+  boot.classList.toggle("compact", compact);
+  if (bootMsg) bootMsg.textContent = t;
+};
+// The landing hero deserves a moment on screen even on a fast load, so the
+// opening seconds read as an intro rather than a flash; later scene switches
+// hide it immediately.
+const BOOT_MIN_MS = 700;
+const bootT0 = performance.now();
+let firstBoot = true;
+const hideBoot = () => {
+  boot.classList.remove("compact");
+  // The canvas stays dimmed until the overlay has faded, so the scene never
+  // shows through the departing loading screen.
+  const hide = () => {
+    boot.classList.add("hidden");
+    setTimeout(() => {
+      appEl.classList.remove("dim");
+      hudEl.classList.remove("boot", "busy");
+    }, 340);
+  };
+  if (firstBoot) {
+    firstBoot = false;
+    const wait = Math.max(0, BOOT_MIN_MS - (performance.now() - bootT0));
+    setTimeout(hide, wait);
+  } else {
+    hide();
+  }
+};
 
 const statsEl = document.getElementById("stats");
 const pickEl = document.getElementById("scene-pick");
@@ -108,15 +152,25 @@ function applySettings() {
 }
 
 async function switchScene(key) {
-  setBoot("loading scene…");
+  const first = firstBoot;
+  setBoot(first ? "preparing the scene…" : "loading scene…", !first);
+  appEl.classList.add("dim");
+  if (!first) hudEl.classList.add("busy");
   if (rt) { rt.dispose(); rt = null; }
   const def = await SCENES[key]();
   scene = def.scene;
   camera.position.set(...def.cam);
   controls.target.set(...def.target);
+  // Portrait viewports frame the same position too tightly (the narrow aspect
+  // crops the model), so back the camera off along its view direction.
+  if (window.innerWidth < window.innerHeight) {
+    const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+    const dist = camera.position.distanceTo(controls.target);
+    camera.position.copy(controls.target).addScaledVector(dir, dist * 1.7);
+  }
   controls.update();
 
-  setBoot("building BVH…");
+  setBoot("optimizing the scene…", !first);
   await new Promise((r) => setTimeout(r, 30)); // let the boot message paint
   rt = new RealtimeRaytracer(renderer, {
     ...RealtimeRaytracer.recommendedOptions(RealtimeRaytracer.detectTier(renderer)),
@@ -139,10 +193,22 @@ async function switchScene(key) {
     `[gallery] ${key}: compiled ${triCount.toLocaleString()} tris in ` +
     `${Math.round(performance.now() - t0)}ms`
   );
-  boot.classList.add("hidden");
+  // Keep the picker honest: it never lied before, it just never said the scene
+  // that actually loaded (boot always started on tokyo while the dropdown sat
+  // on its first option). Deep-linking lands on the same selection too.
+  pickEl.value = key;
+  history.replaceState(null, "", `#${key}`);
+  const entry = SCENE_LIST.find(([k]) => k === key);
+  if (captionEl) captionEl.textContent = (entry && entry[3]) || "";
+  hideBoot();
 }
 
 pickEl.addEventListener("change", () => switchScene(pickEl.value).catch(fail));
+// Deep-linkable per scene, same convention as the tour's model stop.
+addEventListener("hashchange", () => {
+  const id = (location.hash || "").replace(/^#/, "");
+  if (id && id !== pickEl.value && SCENES[id]) switchScene(id).catch(fail);
+});
 rtBtn.addEventListener("click", () => {
   rtEnabled = !rtEnabled;
   rtBtn.textContent = `ray tracing: ${rtEnabled ? "ON" : "OFF"}`;
@@ -239,5 +305,29 @@ Object.defineProperties(window, {
   SCENE: { get: () => scene },
 });
 Object.assign(window, { CAMERA: camera, SWITCH: switchScene });
-switchScene("tokyo").catch(fail);
+const wanted = (location.hash || "").replace(/^#/, "");
+switchScene(SCENES[wanted] ? wanted : DEFAULT_SCENE).catch(fail);
+
+// Transient "drag to orbit" cue, revealed after the hero fades and dismissed on
+// the first pointer interaction or after a few seconds.
+const cueEl = document.getElementById("gallery-cue");
+let cueGone = false;
+const dismissCue = () => {
+  if (cueGone) return;
+  cueGone = true;
+  cueEl.classList.add("gone");
+  cueEl.classList.remove("show");
+};
+setTimeout(() => { if (!cueGone) cueEl.classList.add("show"); }, 1500);
+// Dismiss on a real orbit drag or a scroll, not on an incidental tap — the cue
+// stays until the visitor actually starts moving the camera.
+let downX = null, downY = null;
+addEventListener("pointerdown", (e) => { downX = e.clientX; downY = e.clientY; });
+addEventListener("pointermove", (e) => {
+  if (downX == null) return;
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) dismissCue();
+});
+addEventListener("wheel", dismissCue, { passive: true });
+setTimeout(dismissCue, 10000);
+
 animate();

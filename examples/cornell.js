@@ -34,6 +34,14 @@ const PARAMS = new URLSearchParams(location.search);
 const bootEl = document.getElementById("boot");
 const bootMsg = document.getElementById("boot-msg");
 const setBoot = (t) => { if (bootMsg) bootMsg.textContent = t; };
+// The landing hero should be readable before the canvas takes over, even on a
+// fast load; the fade is delayed to a short minimum display time.
+const BOOT_MIN_MS = 700;
+const bootT0 = performance.now();
+const hideBoot = () => {
+  const wait = Math.max(0, BOOT_MIN_MS - (performance.now() - bootT0));
+  setTimeout(() => bootEl?.classList.add("hidden"), wait);
+};
 
 // Compatibility mode, same contract as the museum: if the RT pipeline cannot come
 // up (GPU process killed, shader/buffer failure) reload into plain rasterized
@@ -568,7 +576,7 @@ async function main() {
   // safe-mode branch has had its chance to bail, before the first showOnly() and
   // the BVH build — and dropped from the picker if it cannot be loaded, so a
   // missing asset costs the page an exhibit rather than offering a dead entry.
-  setBoot("loading duck…");
+  setBoot("loading the duck…");
   if (!(await buildDuckExhibit(exhibits, scene))) {
     const i = EXHIBITS.findIndex((e) => e.id === "duck");
     if (i >= 0) EXHIBITS.splice(i, 1);
@@ -602,7 +610,7 @@ async function main() {
   };
   applyMaterials();
 
-  setBoot("building BVH…");
+  setBoot("optimizing the scene…");
   const t0 = performance.now();
   rt.compileScene(scene);
   console.log(
@@ -657,7 +665,7 @@ async function main() {
   };
   if (carried.canvasScale != null && carried.canvasScale !== canvasScale) setCanvasScale(carried.canvasScale);
 
-  const HINT = "drag to orbit · scroll to zoom · switch exhibits in the panel";
+  const HINT = "";
   const ui = buildPanel({
     rt, state, setFeature, setCanvasScale, canvasScale,
     initial: carried.initial,
@@ -666,10 +674,12 @@ async function main() {
   // RT OFF in THIS room is a black screen, and that is the honest answer rather
   // than a fault: the only light here is an emissive quad, and a rasterizer has
   // no path from one of those to a wall. Say so, so nobody reads it as a bug.
-  ui.onRtEnabled((on) => ui.setHint(on ? HINT : "ray tracing off — this room's only light is an emissive quad, and raster has no path from one to a wall"));
+  ui.onRtEnabled((on) => ui.setHint(on ? "" : "ray tracing off — this room's only light is an emissive quad, and raster has no path from one to a wall"));
 
   // --- exhibit controls (this room's section, below the shared panel) -------
-  const xSec = section(ICON.frame, "Exhibit");
+  // Open by default: this stop IS the switcher, so its one section stands open
+  // while the renderer groups stay collapsed behind it.
+  const xSec = section(ICON.frame, "Exhibit", true);
   const caption = el("div", "caption");
   const picker = selectRow("showing", EXHIBITS.map((e) => [e.label, e.id]), current, (v) => selectExhibit(v, true));
   xSec.append(picker.row, caption);
@@ -761,7 +771,7 @@ async function main() {
       renderer.render(scene, camera);
     }
 
-    if (!booted) { booted = true; bootEl?.classList.add("hidden"); }
+    if (!booted) { booted = true; hideBoot(); }
 
     frames++;
     const now = performance.now();

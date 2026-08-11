@@ -28,7 +28,29 @@ import { buildTourChrome, loadTourSettings, applyTourSettings, persistOnExit } f
 const PARAMS = new URLSearchParams(location.search);
 const bootEl = document.getElementById("boot");
 const bootMsg = document.getElementById("boot-msg");
-const setBoot = (t) => { bootEl?.classList.remove("hidden"); if (bootMsg) bootMsg.textContent = t; };
+// `compact` collapses the full landing hero into a small status pill, so scene
+// switches keep the viewport on screen instead of flashing the intro again.
+const setBoot = (t, compact = false) => {
+  bootEl?.classList.remove("hidden");
+  bootEl?.classList.toggle("compact", compact);
+  if (bootMsg) bootMsg.textContent = t;
+};
+// The landing hero should be readable before the canvas takes over, even on a
+// fast load; the fade is delayed to a short minimum display time. Later scene
+// switches hide it immediately.
+const BOOT_MIN_MS = 700;
+const bootT0 = performance.now();
+let firstBoot = true;
+const hideBoot = () => {
+  bootEl?.classList.remove("compact");
+  if (firstBoot) {
+    firstBoot = false;
+    const wait = Math.max(0, BOOT_MIN_MS - (performance.now() - bootT0));
+    setTimeout(() => bootEl?.classList.add("hidden"), wait);
+  } else {
+    bootEl?.classList.add("hidden");
+  }
+};
 
 // The picker's contents: the whole catalogue minus the entries the tour already
 // covers elsewhere (the Cornell box is stop 1, rebuilt procedurally).
@@ -126,7 +148,7 @@ async function main() {
   const ui = buildPanel({
     rt, state, setFeature, setCanvasScale, canvasScale,
     initial: carried.initial,
-    hint: "drag to orbit · scroll to zoom · pick a model in the panel",
+    hint: "",
   });
 
   const xSec = section(ICON.frame, "Model");
@@ -189,7 +211,8 @@ async function main() {
   let current = null;
   async function switchScene(key) {
     if (!SCENES[key]) key = DEFAULT_MODEL;
-    setBoot(key === FALLBACK_MODEL ? "loading scene…" : "streaming model…");
+    const first = firstBoot;
+    setBoot(key === FALLBACK_MODEL ? "preparing the scene…" : "streaming the model…", !first);
     let def;
     try {
       def = await SCENES[key]();
@@ -210,12 +233,19 @@ async function main() {
     history.replaceState(null, "", `#${key}`);
     camera.position.set(...def.cam);
     controls.target.set(...def.target);
+    // Portrait viewports frame the same position too tightly (the narrow aspect
+    // crops the model), so back the camera off along its view direction.
+    if (window.innerWidth < window.innerHeight) {
+      const dir = new THREE.Vector3().subVectors(camera.position, controls.target).normalize();
+      const dist = camera.position.distanceTo(controls.target);
+      camera.position.copy(controls.target).addScaledVector(dir, dist * 1.7);
+    }
     controls.update();
     applySky(def.sky);
     rt.envColor = def.env?.color ?? new THREE.Color(0x121821);
     rt.envIntensity = def.env?.intensity ?? 1.0;
 
-    setBoot("building BVH…");
+    setBoot("optimizing the scene…", !first);
     await new Promise((r) => setTimeout(r, 30)); // let the boot message paint
     const t0 = performance.now();
     rt.compileScene(scene);
@@ -226,7 +256,7 @@ async function main() {
         `${Math.round(performance.now() - t0)}ms`
     );
     if (old && old !== scene) disposeScene(old);
-    bootEl?.classList.add("hidden");
+    hideBoot();
   }
 
   const fail = (err) => {
