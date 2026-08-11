@@ -496,3 +496,18 @@ imported). `src/RTLightingPass.js` and `src/RealtimeRaytracer.js` changes
 reverted.
 
 ---
+
+## Cornell-rotate repro (architect-run, 2026-08-12)
+
+Owner repro: converge on the cornell interior, snap-turn (4 frames) to the
+dark OUTSIDE of the green wall, maxHistory 256. Frame f01 after the turn:
+
+- master (old inline path): the entire exterior face glows saturated green,
+  interior history accepted onto the flipped surface. The owner's screenshot,
+  reproduced.
+- split pipeline (this branch): exterior face correctly black from the first
+  frame. The signed normal-agreement rejection (prev-normal from the moments
+  target) kills the leak outright.
+
+Frames: _reviews/temporal/cornell-rotate/. Also measured on arena: the same
+term cuts ghost@40 1.273 -> 1.034 (-19%) at +0.004 stillNoise.
