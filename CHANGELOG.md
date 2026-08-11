@@ -1,16 +1,28 @@
 # Changelog
 
-## 0.13.0-dev
+## 0.13.0
 
-- **Temporal quality campaign — split accumulation pipeline (all core fences PASS).**
-  New `AccumulatePass` with texelFetch point sampling, per-tap-validity 4-tap
-  bilinear reprojection (SVGF standard), ungated 3x3 luminance-rank anti-firefly
-  clamp (default off), and EMA merge. Megakernel gains `uRawOutput` uniform +
-  `renderRaw()` method. Arena fence results (clamps off): motion spikes 9 (<10),
-  stillNoise 0.122 (<0.127 baseline), ghost@40 1.308 (<1.35), frame-time 62.0ms
-  (<65ms). Old inline-EMA path preserved as fallback. Temporal moments and
-  DenoisePass variance wiring deferred (3-MRT stability). See
-  `REPORT_TEMPORAL_QUALITY.md`.
+- **Temporal quality campaign: split accumulation pipeline (all fences PASS,
+  three beat baseline).** Accumulation moves out of the lighting megakernel
+  into a dedicated `AccumulatePass` at lighting resolution: texelFetch point
+  sampling, SVGF-standard per-tap-validity bilinear reprojection (two-sided
+  plane distance AND signed normal agreement against an octahedral previous
+  normal stored in a new moments target), optional NRD-style neighbourhood
+  rank clamp and history-relative k-sigma clamp (both default off; off won
+  the A/B), and the inline path's exact EMA count semantics. Measured on the
+  arena fence at a quiet GPU: motion fireflies 9 (baseline 10), stillNoise
+  0.126 (baseline 0.127), ghost@40 1.034 (baseline 1.273, -19%), frame time
+  61.4-62.2ms (baseline 62.3). Energy shift under 1.6% on every fence scene
+  at pinned options. The signed normal-agreement rejection fixes the
+  fast-rotation history leak (interior light glowing on a just-revealed
+  backface); repro evidence in `_reviews/temporal/cornell-rotate/`. Mosquito
+  amber boiling eliminated in the blind critic clip; luminance drift over 300
+  frames is flat. `splitAccum: false` falls back to the old inline path
+  (also the automatic no-MRT fallback). History clears on resize: an
+  adaptive-governor renderScale step used to reallocate the ping-pong
+  targets with undefined counts and freeze the frame blown out.
+  Full campaign record: `REPORT_TEMPORAL_QUALITY.md`.
+
 
 ## 0.12.0
 
