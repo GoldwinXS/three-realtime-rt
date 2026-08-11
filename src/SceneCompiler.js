@@ -1139,7 +1139,10 @@ function buildSceneDataTexture(materials, emissiveTris, absorption, scattering, 
       const tileBaseRow = 2 + BLUE_NOISE_SIZE + 4 + t * tileSize; // row 70 + t * TILE
       for (let ty = 0; ty < tileSize; ty++) {
         const o = (tileBaseRow + ty) * row;
-        const src = ty * tileSize * 4;
+        // Canvas rows are top-down (row 0 = image top) but the shader's
+        // tileSample maps v=0 to the tile's first row, and three.js UVs put
+        // v=0 at the image bottom. Store rows bottom-up so both agree.
+        const src = (tileSize - 1 - ty) * tileSize * 4;
         for (let tx = 0; tx < tileSize; tx++) {
           const p = src + tx * 4;
           // Store as floats 0..1 (same encoding as the rest of the texture).

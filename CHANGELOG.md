@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.2
+
+- Fix: secondary-ray texture tiles rendered vertically mirrored. The tile block
+  copied canvas rows top-down (row 0 = image top) while the shader's tileSample
+  maps v=0 to the tile's first row and three.js UVs put v=0 at the image
+  bottom, so every reflection, refraction, and GI read of a textured surface
+  was upside down relative to the raster view. Tiles are now stored bottom-up.
+  CPU-side only; generated shader source is unchanged.
+
 ## 0.11.1
 
 - Fix: updateDynamic wrote packed attributes at stride 8 unconditionally; scenes compiled WITHOUT texture tiles (stride 4) corrupted normals on every dynamic re-bake, shredding moving meshes into radial artifacts. The re-bake stride now follows the compiled layout.
