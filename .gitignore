@@ -17,3 +17,6 @@ marketing/
 # committing them grew this repo to 508 MB, of which 465 MB was this directory.
 # Keep the captures on disk, keep them out of git.
 _reviews/
+# Benchmark index dumps and campaign data: our own measurement working files.
+quality-campaign/
+bench-results/
