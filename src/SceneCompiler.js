@@ -145,7 +145,12 @@ export class CompiledScene {
     if (!this.hasDynamic || this.dynamic.length === 0) return;
     const posAttr = this.dynamicMerged.getAttribute("position");
     const pos = posAttr.array;
-    const packed = this.dynamicPacked; // stride-2: normal.xyz+matIndex, then uv.xy per vertex
+    // Packed attribute stride in FLOATS per vertex: 8 when the scene compiled
+    // with texture tiles (stride-2 texels: normal+matIndex, then uv), 4 for the
+    // classic stride-1 layout. MUST match packAttributes' stride2 decision or
+    // every re-bake writes normals at wrong offsets (the drag-corruption bug).
+    const S = this.hasTextureTiles ? 8 : 4;
+    const packed = this.dynamicPacked;
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
@@ -154,7 +159,7 @@ export class CompiledScene {
       const m = seg.mesh.matrixWorld.elements;
       const nm = this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements;
       let o = seg.start * 3;
-      let p = seg.start * 8;
+      let p = seg.start * S;
 
       if (seg.skinned) {
         // Animated SkinnedMesh: CPU-skin the SOURCE vertices with three's own
@@ -201,7 +206,7 @@ export class CompiledScene {
         //    (shadows/GI) only need the geometry to be right; primary visibility
         //    still gets smooth normals from the raster path. This skips
         //    CPU-skinning the normal attribute entirely.
-        let fp = seg.start * 8;
+        let fp = seg.start * S;
         for (let i = 0; i < seg.count; i += 3) {
           const b = (seg.start + i) * 3;
           const ax = pos[b], ay = pos[b + 1], az = pos[b + 2];
@@ -212,11 +217,11 @@ export class CompiledScene {
           let nz = e1x * e2y - e1y * e2x;
           const il = 1.0 / (Math.hypot(nx, ny, nz) || 1);
           nx *= il; ny *= il; nz *= il;
-          packed[fp + 0] = nx; packed[fp + 1] = ny; packed[fp + 2] = nz;       // v0
-          packed[fp + 8] = nx; packed[fp + 9] = ny; packed[fp + 10] = nz;      // v1
-          packed[fp + 16] = nx; packed[fp + 17] = ny; packed[fp + 18] = nz;    // v2
-          // packed[fp+3|11|19] (matIndex) and packed[fp+4..fp+7|12..15|20..23] (uv) never change
-          fp += 24;
+          packed[fp + 0] = nx; packed[fp + 1] = ny; packed[fp + 2] = nz;                   // v0
+          packed[fp + S] = nx; packed[fp + S + 1] = ny; packed[fp + S + 2] = nz;           // v1
+          packed[fp + 2 * S] = nx; packed[fp + 2 * S + 1] = ny; packed[fp + 2 * S + 2] = nz; // v2
+          // matIndex (offset 3) and, at stride 8, the uv texel never change
+          fp += 3 * S;
         }
       } else if (seg.deforming) {
         // CPU-deformed mesh (water/cloth): read the LIVE geometry every frame
@@ -260,9 +265,9 @@ export class CompiledScene {
           packed[p] = tx * il;
           packed[p + 1] = ty * il;
           packed[p + 2] = tz * il;
-          // packed[p + 3] (matIndex) and packed[p+4..p+7] (uv) never change
+          // matIndex (offset 3) and, at stride 8, the uv texel never change
           o += 3;
-          p += 8;
+          p += S;
         }
       } else {
         // Rigid mover: transform the frozen local snapshot by the world matrix.
@@ -287,9 +292,9 @@ export class CompiledScene {
           packed[p] = tx * il;
           packed[p + 1] = ty * il;
           packed[p + 2] = tz * il;
-          // packed[p + 3] (matIndex) and packed[p+4..p+7] (uv) never change
+          // matIndex (offset 3) and, at stride 8, the uv texel never change
           o += 3;
-          p += 8;
+          p += S;
         }
       }
     }

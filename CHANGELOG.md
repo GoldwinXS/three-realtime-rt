@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.1
+
+- Fix: updateDynamic wrote packed attributes at stride 8 unconditionally; scenes compiled WITHOUT texture tiles (stride 4) corrupted normals on every dynamic re-bake, shredding moving meshes into radial artifacts. The re-bake stride now follows the compiled layout.
+
 ## 0.11.0 — 2026-08-10
 
 - **Secondary-ray texture maps.** A textured surface seen through glass, in a
