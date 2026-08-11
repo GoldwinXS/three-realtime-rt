@@ -417,6 +417,52 @@ export interface RealtimeRaytracerOptions {
   dispersion?: number;
   /** History length cap: higher = smoother but slower to react. */
   maxHistory?: number;
+  /**
+   * Split the temporal accumulation out of the lighting megakernel into a
+   * dedicated pass (SVGF-style per-tap-validity reprojection, signed normal
+   * agreement, temporal moments). Default true where multiple render targets
+   * are supported; false falls back to the older inline EMA.
+   */
+  splitAccum?: boolean;
+  /**
+   * Shorten every temporal accumulator while the CAMERA moves. Default false;
+   * with it off the frame is identical to a build without the feature.
+   */
+  motionAdaptive?: boolean;
+  /** EMA history cap at full camera motion (`motionAdaptive` only). */
+  maxHistoryMoving?: number;
+  /** TAA fresh-sample weight at full camera motion (`motionAdaptive` only). */
+  taaBlendMoving?: number;
+  /** ReSTIR staleness cap at full camera motion (`motionAdaptive` only). */
+  restirMCapMoving?: number;
+  /**
+   * Shorten temporal accumulation when the LIGHTS change. Default true: unlike
+   * camera motion there is no case where reusing lighting from a light that has
+   * since moved is correct, and without it a moving light drags a visible tail.
+   * Driven by `updateLights()`, so it costs nothing on frames that do not call it.
+   */
+  lightAdaptive?: boolean;
+  /**
+   * Light movement that counts as full response, as a fraction of the scene
+   * diagonal moved since the previous `updateLights()`. Default 0.01.
+   */
+  lightMotionRef?: number;
+  /** Per-frame decay of `lightMotion` once the lights stop changing (default 0.72). */
+  lightMotionDecay?: number;
+  /**
+   * Temporal-gradient rejection threshold in standard deviations of the pixel's
+   * own accumulated luminance; only consulted while lights are moving. Lower
+   * responds faster and is noisier. Default 3.
+   */
+  lightGradK?: number;
+  /**
+   * Firefly cap for the traced glass path, in units of `fireflyClamp` (default
+   * 4, i.e. the same budget the specular path uses). 0 disables it. Glass is
+   * composed with `mix(diffuse, glassRadiance, transmission)`, and a solid
+   * dielectric has transmission exactly 1, so without this the clamped diffuse
+   * terms are discarded and the glass path is unbounded.
+   */
+  glassClampScale?: number;
   /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
   fireflyClamp?: number;
   /**
@@ -773,6 +819,22 @@ export class RealtimeRaytracer {
   temporalReprojection: boolean;
   /** History length cap. */
   maxHistory: number;
+  /** Split accumulation pass in use (see the option of the same name). */
+  splitAccum: boolean;
+  /** Shorten temporal accumulators under camera motion. */
+  motionAdaptive: boolean;
+  /** Shorten temporal accumulators when the lights change. */
+  lightAdaptive: boolean;
+  /** Normalized light motion this frame, 0 (parked) .. 1. Read-only. */
+  readonly lightMotion: number;
+  /** Light movement counting as full response, as a fraction of scene diagonal. */
+  lightMotionRef: number;
+  /** Per-frame decay of `lightMotion`. */
+  lightMotionDecay: number;
+  /** Temporal-gradient rejection threshold, in sigmas. */
+  lightGradK: number;
+  /** Glass firefly cap, in units of `fireflyClamp`. 0 disables. */
+  glassClampScale: number;
   /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
   fireflyClamp: number;
   /** 1-bounce global illumination. */
