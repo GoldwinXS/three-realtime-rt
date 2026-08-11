@@ -409,8 +409,9 @@ async function main() {
   // clears every static body in the corner, which matters because the plinths
   // carry no physics colliders — a prop resting inside one would sink through
   // the stone:
-  //   fox platform   x 5.3..7.7,  z 1.8..3.8    -> 0.16m of z clearance
-  //   teapot plinth  circle r1.035 at (9.7,-1.5) -> 0.075m of x clearance
+  //   fox plinth     x 8.75..11.25, z 3.5..5.5  -> 1.86m of z clearance
+  //   teapot plinth  circle r1.035 at (10.0,-1.4) -> 0.38m clear (x 9.17..8.59)
+  //   knot plinth    circle r0.75 at (9.3,-4.5) -> z -1.34..1.64, knot z max -3.75
   //   Lumiere floor projection  x 0.2..5.0      -> 0.6m of x clearance
   // and it stays inside the default camera frame (ndc x ~0.75) — the true
   // back-right corner is past the right edge at 16:10 and 16:9 alike, which

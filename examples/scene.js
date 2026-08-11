@@ -107,14 +107,19 @@ function plasterTexture(baseHex) {
  * top) laid out as a museum with named ZONES, so panning left-to-right walks a
  * visitor past one staged vignette per renderer feature:
  *
- *   back-left     water pool + stone kerbs under the clerestory windows
- *                 (deforming BVH, moving traced reflections of the glow)
- *   back-centre   DamagedHelmet hero pedestal under its own spotlight
- *                 (normal/roughness maps + analytic-light glints)
- *   back-right    MATERIALS GALLERY — the six-sphere bench (roughness trio,
- *                 chrome, gold, diamond-ior glass), the vertex-painted
- *                 icosahedron, the gold torus knot and the glossy teapot:
- *                 every "look at the surface" piece in one corner
+ *   back-left     AQUA — water pool + stone kerbs under the clerestory windows
+ *                 (deforming BVH, moving traced reflections of the glow).
+ *                 Nothing stands in front of it, so the water stays the zone's
+ *                 single hero sightline.
+ *   back-centre   HERO — the DamagedHelmet on one pedestal under its own
+ *                 spotlight (normal/roughness maps + analytic-light glints),
+ *                 flanked by the pool and the bench so the entrance reads a
+ *                 three-part triptych: water, hero, surfaces.
+ *   back-right    SURFACES — the six-sphere materials bench (roughness trio,
+ *                 chrome, gold, diamond-ior glass) along the back wall, with
+ *                 the gold torus knot right of its line-up and the glossy
+ *                 teapot in front of the knot: a bronze-and-ceramic pair that
+ *                 reads from the entrance without blocking the bench.
  *   left wall     GLASS WING — the blue alpha pane (out-of-BVH blend trick)
  *                 beside "Sunset", the backlit cast-glass relief (real
  *                 Beer-Lambert absorption). Same subject, two techniques.
@@ -123,14 +128,16 @@ function plasterTexture(baseHex) {
  *                 absorbing tiles and lands on the open floor: a plain dark
  *                 shadow with coloured shadows off, a multicolour light quilt
  *                 with them on. Hidden until the "tinted glass" toggle.
- *   front-left    the duck in a museum vitrine (alpha-blend glass, casts no
- *                 shadow onto its own exhibit) + the emissive OPEN sign, and
- *                 "Alabaster": a reading lamp whose cast-stone shade is lit
- *                 from outside by the room and from inside by its own bulb,
- *                 beside two spheres that differ only in whether they scatter.
- *                 Hidden until the "scattering (Kubelka-Munk)" toggle.
- *   front-right   DYNAMICS CORNER — the skinned fox on its platform and the
- *                 physics drop pad, the two things in the room that move
+ *                 The floor around it is deliberately clear, so it stays the
+ *                 room's single mid-floor hero.
+ *   front-left    LIGHT & MATERIALS wing — the duck vitrine (alpha-blend glass)
+ *                 against the left wall, "Alabaster" the reading lamp
+ *                 (Kubelka-Munk scattering, hidden until its toggle), and the
+ *                 vertex-painted icosahedron a metre right of the case, each
+ *                 clear of the others' sightlines. The emissive OPEN sign hangs
+ *                 on the red wall near the entrance, off the floor entirely.
+ *   front-right   DYNAMICS CORNER — the skinned fox on its plinth and the
+ *                 physics drop pad, the two things in the room that move.
  *   right wall    the amber alpha pane, hung to mirror the blue one
  *
  * Every object rests on something: plinths and legs reach the floor, exhibits
@@ -242,22 +249,25 @@ export function buildScene() {
   };
 
   // --- back-centre: helmet hero pedestal (loaded async below) ------------
-  // Placed at the water's edge so the pool catches its reflection; its own
-  // spotlight (toggleable) rakes it from the front-right for map detail +
-  // an analytic glint on the visor.
+  // The back band's hero: one pedestal between the pool (back-left) and the
+  // materials bench (back-right) so the entrance sightline reads a triptych —
+  // water, hero, surfaces — with a clear walkway between each. The helmet is
+  // kept at x=-0.6, left of the Lumiere screen's span (x 1.3..3.9), so it is
+  // NOT hidden behind the stained-glass screen from the default camera. Its own
+  // spotlight (toggleable) rakes it from the front-right for map detail + an
+  // analytic glint on the visor.
   const HELMET_POS = new THREE.Vector3(-0.6, 2.6, -4.2);
   const helmetPlinth = pedestal("pedestal-helmet", HELMET_POS.x, HELMET_POS.z, 1.6);
 
   // --- back-right (MATERIALS GALLERY): gold knot ---------------------------
   // Moved off the open centre floor (it used to stand at 1.4, -0.8, right where
-  // the Lumiere projection now lands) into the surfaces corner beside the
-  // teapot. Its plinth is helmet-height so the knot rises clear of the
-  // six-sphere bench behind it instead of cutting across the line-up.
-  // x is 9.0 rather than the 8.2 the layout first used: measured in NDC from the
-  // default camera, a plinth at 8.2 sits exactly on the bench's sixth sphere
-  // (the diamond-ior glass one) and hides it completely. At 9.0 the column
-  // clips only the sphere's right quarter, and the knot itself is open enough to
-  // see through. Further right than this and it starts eating the teapot.
+  // the Lumiere projection now lands) to a plinth clear of the six-sphere bench
+  // (the trimmed 6.4m bench ends at x=8.25, so the knot at x=9.3 has clear
+  // air) and pulled left and back from the corner light strip, which the round-2
+  // critic said visually "cut through" its silhouette at (10.0, -3.8). Its
+  // plinth is helmet-height so the knot rises clear of the bench line-up
+  // instead of cutting across it, and the teapot stands 3.1m in front of it as
+  // the cream half of a bronze-and-ceramic pair.
   const knot = new THREE.Mesh(
     new THREE.TorusKnotGeometry(0.7, 0.23, 140, 20),
     // metalness just under 1: the traced reflection still dominates, but a
@@ -266,22 +276,33 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({ color: 0xd4af6a, roughness: 0.28, metalness: 0.85 })
   );
   knot.name = "knot-gold";
-  pedestal("pedestal-knot", 9.0, -4.2, 1.5, 0.75);
-  knot.position.set(9.0, 0, -4.2);
+  pedestal("pedestal-knot", 9.3, -4.5, 1.5, 0.75);
+  knot.position.set(9.3, 0, -4.5);
   seatOn(knot, 1.5);
   scene.add(knot);
 
-  // --- back-right (MATERIALS GALLERY): glossy cream teapot (GGX star) ------
+  // --- back-right (BRONZE & CERAMIC): the glossy cream teapot (GGX star) --
+  // The teapot's history: round 0 hid it behind the knot in the far-right
+  // corner ("crammed tightly into the far-right corner behind the golden knot
+  // pedestal"), round 1 moved it to the open centre floor where it blocked the
+  // back-band sightlines ("placed directly in the center of the room's natural
+  // walking path"). Now the bench is trimmed to 6.4m and the teapot stands on
+  // its own plinth right of the knot at (10.0, -1.4), the two forming a bronze
+  // and ceramic pair off the back-right, visible from the entrance (it sits
+  // closer to the camera than the knot, so the cream form reads while the gold
+  // torus rises above it). Scaled to 0.65: the stock TeapotGeometry(0.8) is
+  // ~3.2m across once the spout and handle are counted, too big for a plinth
+  // this size — 0.65 brings it to a proportional ~2.1m museum piece.
   const teapot = new THREE.Mesh(
     new TeapotGeometry(0.8, 10),
     new THREE.MeshStandardMaterial({ color: 0xe4dccd, roughness: 0.12, metalness: 0.0 })
   );
   teapot.name = "teapot";
-  pedestal("pedestal-teapot", 9.7, -1.5);
-  teapot.position.set(9.7, 0, -1.5);
-  // Spout points +x by default — straight into the teal wall from this spot.
-  // Turn it to face back-left into the room (profile view from the camera),
-  // and keep half a metre of air between the handle and the amber painting.
+  teapot.scale.setScalar(0.65);
+  pedestal("pedestal-teapot", 10.0, -1.4);
+  teapot.position.set(10.0, 0, -1.4);
+  // Spout points +x by default — straight at the teal wall from this spot.
+  // Turn it to face back-left into the room (profile view from the camera).
   teapot.rotation.y = 2.3;
   seatOn(teapot, 1.0);
   scene.add(teapot);
@@ -294,11 +315,16 @@ export function buildScene() {
   // (albedo-tinted metal), and solid glass (two-interface refraction). The
   // "reflections" / "refraction" toggles transform the last three IN PLACE —
   // no props popping in and out of the room.
+  // Trimmed from 8.0 to 6.4m (spheres 1.25 -> 1.1 apart) so the bench no longer
+  // swallows the whole back-right: the gold knot and the teapot now stand on
+  // their own plinths right of it with breathing room, instead of the last
+  // layout wedging the teapot into the open centre floor where it blocked the
+  // back-band sightlines.
   const bench = new THREE.Mesh(
-    new THREE.BoxGeometry(8.0, 0.5, 1.3),
+    new THREE.BoxGeometry(6.4, 0.5, 1.3),
     new THREE.MeshStandardMaterial({ color: 0x9aa1ab, roughness: 0.5 })
   );
-  bench.position.set(5.4, 0.25, -6.2);
+  bench.position.set(5.05, 0.25, -6.2);
   bench.name = "bench-materials";
   bench.userData.museumTop = 0.5;
   scene.add(bench);
@@ -322,7 +348,7 @@ export function buildScene() {
   ];
   for (let i = 0; i < gamut.length; i++) {
     const s = new THREE.Mesh(new THREE.SphereGeometry(0.45, 40, 28), gamut[i]);
-    s.position.set(2.3 + i * 1.25, 0.95, -6.2); // 0.45 radius on the 0.5 bench top
+    s.position.set(2.3 + i * 1.1, 0.95, -6.2); // 0.45 radius on the 0.5 bench top
     s.name = `bench-sphere-${i}`;
     scene.add(s);
   }
@@ -333,6 +359,15 @@ export function buildScene() {
   // the case casts NO shadow onto its own exhibit and the straight-through
   // trace shows the duck at true brightness, lightly tinted. (Single-layer
   // deferred: the camera-facing pane wins; the back pane doesn't double-tint.)
+  // Moved five times. From (-4.8, 0.8) it blocked the pool's water surface
+  // (round 0); at (-2.8, 1.0) it squeezed between the pool and the helmet
+  // (round 1); at (-3.5, 4.5) it sat in front of the helmet (round 2); at
+  // (-9.8, 4.0) it read as crammed against the corner wall (rounds 3 and 6).
+  // It now stands at (-6.5, 4.5), 3.4m off the red wall in the open front-left,
+  // clear of the pool's sightline (the ray to the water passes ~4m to its
+  // right) and clear of the icosahedron a metre and a half to its left, so the
+  // glass case reads as a freestanding wing piece rather than a corner squeeze.
+  const VITRINE_POS = new THREE.Vector3(-6.5, 0, 4.5);
   const vitrineGlass = new THREE.MeshStandardMaterial({
     color: 0xbfd8e8,
     roughness: 0.06,
@@ -343,7 +378,7 @@ export function buildScene() {
     new THREE.BoxGeometry(1.5, 0.7, 1.5),
     new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.25 })
   );
-  plinth.position.set(-4.8, 0.35, 0.8);
+  plinth.position.set(VITRINE_POS.x, 0.35, VITRINE_POS.z);
   plinth.name = "plinth-vitrine";
   plinth.userData.museumTop = 0.7;
   scene.add(plinth);
@@ -383,7 +418,7 @@ export function buildScene() {
   puck.position.y = 0.83;
   puck.name = "vitrine-puck";
   vitrine.add(puck);
-  vitrine.position.set(-4.8, 1.55, 0.8);
+  vitrine.position.set(VITRINE_POS.x, 1.55, VITRINE_POS.z);
   scene.add(vitrine);
 
   // --- front-left: a textured EMISSIVE sign beside the vitrine ------------
@@ -429,9 +464,16 @@ export function buildScene() {
   );
   sign.name = "sign-open";
   // The panel hangs in a bronze frame so it reads as a mounted sign.
+  // Moved four times: at -3.2, 1.95 the phone critic called it "marooned in
+  // the middle of the walking path"; in the corner beside the vitrine (round 3)
+  // it read as crammed; at the entrance-left (-3.5, 6.2) it still read as "in
+  // the middle of the floor". It is now mounted on the red LEFT WALL, facing
+  // into the room — the round-1 critic's own suggestion ("move the OPEN sign
+  // to a wall or near the entrance") — so it leaves the floor entirely while
+  // its warm glow still spills onto the floor beside the vitrine below it.
   const signGroup = new THREE.Group();
-  signGroup.position.set(-3.2, 0.72, 1.95); // front-right of the vitrine
-  signGroup.rotation.y = 0.55;              // angled toward the camera / open floor
+  signGroup.position.set(-11.7, 1.6, 3.5); // red wall, between pane and entrance
+  signGroup.rotation.y = Math.PI / 2;      // face +x into the room
   const signFrame = (w, h, x, y) => {
     const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.05), frameMat);
     f.position.set(x, y, 0.02);
@@ -447,10 +489,13 @@ export function buildScene() {
   // …carried by a real bronze stand. The panel used to hang in mid-air at
   // y=0.48–0.96 with nothing under it; now a sled foot on the floor and a post
   // reach up to its bottom edge (post top 0.50 vs panel bottom 0.48).
+  // The wall-mounted sign no longer needs the floor stand (a sled foot and
+  // post used to carry the panel when it stood on the floor). The group stays
+  // defined for the audit's name lookup but is not added to the scene.
   const signStand = new THREE.Group();
   signStand.name = "sign-stand";
-  signStand.position.set(-3.2, 0, 1.95);
-  signStand.rotation.y = 0.55;
+  signStand.position.set(-11.7, 0, 5.0);
+  signStand.rotation.y = Math.PI / 2;
   const signFoot = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.06, 0.3), frameMat);
   signFoot.position.y = 0.03; // bottom face on the floor
   signFoot.name = "sign-stand-foot";
@@ -459,14 +504,19 @@ export function buildScene() {
   signPost.position.y = 0.28; // 0.06 → 0.50, into the panel's bottom edge
   signPost.name = "sign-stand-post";
   signStand.add(signPost);
-  scene.add(signStand);
+  // scene.add(signStand); // wall-mounted — no floor stand
 
-  // --- back-right (MATERIALS GALLERY): vertex-painted icosahedron ---------
-  // Moved out of the front-left corner (it used to stand at -8.5, 2.5, alone in
-  // the vitrine's zone) to a plinth tucked against the back wall between the
-  // helmet and the materials bench, so all four "read the surface" exhibits now
-  // share one corner. Its x is 0.65 rather than the bench's shoulder at 1.4:
-  // the plinth base is 0.67 across, which needs the clearance.
+  // --- front-left (COLOUR & LIGHT nook): vertex-painted icosahedron -------
+  // The vertex-color gradient makes a bright standalone sculpture, so it leads
+  // the front-left "unusual materials" nook it shares with Alabaster (the
+  // scattering lamp) and the duck vitrine a metre and a half to its right at
+  // (-6.5, 4.5). It sits deep against the left wall at (-9.5, 4.5), left of
+  // the pool's x-range, so its tall bright form neither hides the vitrine nor
+  // blocks the water's sightline (rounds 5-6 critics). It used to be wedged
+  // between the helmet pedestal and the materials bench (x 0.65, z -5.85) — the
+  // last layout crammed three plinths and the 8m bench into the back-right
+  // band; giving the ico its own corner clears the back band down to one hero
+  // per sightline (pool, helmet, bench).
   // Its albedo comes entirely from a baked per-vertex `color` attribute (no
   // texture, no map): the hue sweeps with height so the whole form carries a
   // smooth gradient. Demonstrates geometry vertex colours multiplying into the
@@ -493,8 +543,8 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.0 })
   );
   ico.name = "icosahedron-vertexcolor";
-  pedestal("pedestal-ico", 0.65, -5.85, 1.05, 0.58);
-  ico.position.set(0.65, 0, -5.85);
+  pedestal("pedestal-ico", -9.5, 4.5, 1.05, 0.58);
+  ico.position.set(-9.5, 0, 4.5);
   seatOn(ico, 1.05);
   scene.add(ico);
 
@@ -807,9 +857,12 @@ export function buildScene() {
   // feature's cost A/B.
   const alabaster = new THREE.Group();
   alabaster.name = "alabaster";
-  // Open front-left floor: clear of the vitrine plinth (x -5.55..-4.05), the
-  // OPEN sign stand (-3.2, 1.95), and the Lumiere floor projection (x >= 0.2).
-  alabaster.position.set(-1.6, 0, 3.3);
+  // Front-left "unusual materials" nook, paired with the vertex-colour
+  // icosahedron at (-9.5, 4.5) and spaced clear of the vitrine (at -6.5, 4.5),
+  // the wall-mounted OPEN sign (left wall, x -11.7) and the Lumiere floor
+  // projection (x >= 0.2). Moved from (-1.6, 3.3) so the reading lamp fills the
+  // far front-left corner instead of hovering mid-floor.
+  alabaster.position.set(-4.6, 0, 3.2);
   const addAla = (name, mesh) => { mesh.name = name; alabaster.add(mesh); return mesh; };
   const alaBronze = (name, geo, x, y, z) => {
     const m = new THREE.Mesh(geo, frameMat);
@@ -936,23 +989,32 @@ export function buildScene() {
   scene.add(alabaster);
 
   // --- front-right (DYNAMICS CORNER): the animated fox (skinned dynamic BVH) --
-  // A low granite platform sharing the right-hand dynamics half with the physics
-  // drop pad (7.1, 0.15 — see main.js spawnPile): the platform's near edge is at
-  // z = 1.8 and the pad's nearest resting prop face at 1.64, so the pile never
-  // interpenetrates it. The Fox (loaded async below) trots on top; its skeleton
-  // is CPU-skinned into the dynamic BVH every frame, so the warm/cool lights
-  // cast a traced shadow that moves with the gait.
-  const FOX_POS = new THREE.Vector3(6.5, 0.3, 2.8);
+  // A granite plinth in the front-right corner, tucked against the right wall
+  // so it no longer sits in the middle of the walking floor. The critic moved
+  // through four reads: "awkwardly in the middle of the right-hand floor space"
+  // at 6.5, 2.8 (round 1), "marooned directly on the floor" (round 2), and
+  // "marooned in the middle of the floor" even at 8.0, 3.8 (round 4). It is now
+  // at 10.0, 4.5 — the room's front-right corner, 0.65m off the right wall and
+  // 1.5m off the front edge — where it reads as a corner display rather than a
+  // mid-floor obstacle, with the amber pane on the wall beside it. Raised to
+  // 0.5m with a larger footprint so it reads as a deliberate display plinth.
+  // Sharing the dynamics half with the physics drop pad (7.1, 0.15 — see
+  // main.js spawnPile): the plinth sits at x 8.75..11.25, z 3.5..5.5 and the
+  // pad's resting pyramid ends at z 1.64, so the pile never interpenetrates it.
+  // The Fox (loaded async below) trots on top; its skeleton is CPU-skinned into
+  // the dynamic BVH every frame, so the warm/cool lights cast a traced shadow
+  // that moves with the gait.
+  const FOX_POS = new THREE.Vector3(10.0, 0.5, 4.5);
   const foxPlatform = new THREE.Mesh(
-    new THREE.BoxGeometry(2.4, 0.3, 2.0),
+    new THREE.BoxGeometry(2.5, 0.5, 2.0),
     // Warm stone rather than cold grey so the platform reads as an intentional
     // display plinth, not a dark slab (the critic called the fox "on its own
     // dark pedestal").
     new THREE.MeshStandardMaterial({ color: 0x8a857c, roughness: 0.65 })
   );
-  foxPlatform.position.set(FOX_POS.x, 0.15, FOX_POS.z);
+  foxPlatform.position.set(FOX_POS.x, 0.25, FOX_POS.z);
   foxPlatform.name = "fox-platform";
-  foxPlatform.userData.museumTop = 0.3;
+  foxPlatform.userData.museumTop = 0.5;
   scene.add(foxPlatform);
 
   // Handle returned to the demo; populated once the glTF resolves in `ready`.
@@ -961,11 +1023,14 @@ export function buildScene() {
   const fox = { root: null, mixer: null, meshes: [], update: () => {} };
 
   // --- back-left: the water pool (deforming dynamic BVH) ------------------
-  // Directly beneath the emissive gallery light with the helmet at its edge:
-  // the ripples carry moving traced reflections of both. Low-poly on purpose —
+  // A 4m pool under the second clerestory window (x -5.25), pulled off the
+  // back-left corner so it reads as an installation with walking space around
+  // it rather than a slab jammed against the walls (the critic called the old
+  // 5.5m corner pool "crammed tightly into a corner"). The ripples carry moving
+  // traced reflections of the gallery light and windows. Low-poly on purpose —
   // the per-frame refit is O(dynamic tris).
   const WATER_SEGMENTS = 48;
-  const waterGeo = new THREE.PlaneGeometry(5.5, 5.5, WATER_SEGMENTS, WATER_SEGMENTS);
+  const waterGeo = new THREE.PlaneGeometry(4.0, 4.0, WATER_SEGMENTS, WATER_SEGMENTS);
   const water = new THREE.Mesh(
     waterGeo,
     // Low roughness + high metalness reads as mirror-water — the current engine
@@ -973,23 +1038,23 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({ color: 0x2a6f97, roughness: 0.1, metalness: 0.8 })
   );
   water.rotation.x = -Math.PI / 2; // lie flat: local +z displacement -> world height
-  water.position.set(-7.5, 0.35, -3.6);
+  water.position.set(-5.5, 0.35, -4.2);
   water.userData.rtDeforming = true; // opt in to per-frame live-geometry reads
   water.name = "water-surface";
   scene.add(water);
   // A slim stone kerb so the pool reads as built, not painted on the floor. The
-  // 5.5m water plane spans exactly kerb-inner-face to kerb-inner-face, so the
+  // 4m water plane spans exactly kerb-inner-face to kerb-inner-face, so the
   // surface is held by the basin rather than hovering over the floor.
   const kerbMat = new THREE.MeshStandardMaterial({ color: 0x8a8478, roughness: 0.7 });
   let ki = 0;
   for (const [w, d, dx, dz] of [
-    [5.9, 0.2, 0, 2.85],
-    [5.9, 0.2, 0, -2.85],
-    [0.2, 5.5, 2.85, 0],
-    [0.2, 5.5, -2.85, 0],
+    [4.4, 0.2, 0, 2.1],
+    [4.4, 0.2, 0, -2.1],
+    [0.2, 4.0, 2.1, 0],
+    [0.2, 4.0, -2.1, 0],
   ]) {
     const kerb = new THREE.Mesh(new THREE.BoxGeometry(w, 0.5, d), kerbMat);
-    kerb.position.set(-7.5 + dx, 0.25, -3.6 + dz);
+    kerb.position.set(-5.5 + dx, 0.25, -4.2 + dz);
     kerb.name = `pool-kerb-${ki++}`;
     scene.add(kerb);
   }
@@ -1210,7 +1275,7 @@ export function buildScene() {
     scene.add(helmet.scene);
 
     duck.scene.scale.setScalar(0.75);
-    duck.scene.position.set(-4.8, 0, 0.8);
+    duck.scene.position.set(VITRINE_POS.x, 0, VITRINE_POS.z); // on the vitrine plinth
     duck.scene.rotation.y = -0.5;
     duck.scene.name = "duck";
     seatOn(duck.scene, 0.7); // the vitrine plinth top
