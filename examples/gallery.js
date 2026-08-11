@@ -26,6 +26,10 @@ const hudEl = document.getElementById("hud");
 // The control card stays invisible while the hero is on screen, so the two
 // never overlap during the fade.
 hudEl.classList.add("boot");
+// On phones the card would sit over the model for the whole session (the fold
+// collapses it to title + picker), so it starts collapsed there — the scene is
+// the star, every control one tap away.
+if (matchMedia("(max-width: 700px)").matches) hudEl.classList.add("min");
 // Collapse / expand the card (the fold button in its title row).
 hudEl.querySelector(".hud-fold")?.addEventListener("click", () => hudEl.classList.toggle("min"));
 // Mobile first impression: Littlest Tokyo is the showpiece on a desktop, but at

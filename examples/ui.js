@@ -86,6 +86,13 @@ export function buildUI({ rt, physics, lights, scene, state, refreshLights, spaw
   // this recompiles the light tables (deliberate, same hitch as pile spawn).
   lSec.append(slider("windows", 0, 6, 1, 3, (x) => Number(x).toFixed(0), (v) => setWindows && setWindows(Math.round(v))));
   lSec.append(slider("party lights", 0, 13, 1, 0, (x) => Number(x).toFixed(0), (v) => setExtraLights(Math.round(v))));
+  // The owner-requested sky experiment: the procedural dusk sky shows through
+  // the open ceiling and windows, and (with GI on) lights the room as ambient.
+  // Live uniform — no recompile, just a fresh accumulation.
+  lSec.append(toggle("procedural sky", rt.sky.enabled, (v) => {
+    rt.sky.enabled = v;
+    rt.resetAccumulation();
+  }).row);
   exhibits.append(lSec);
 
   // --- Physics ---

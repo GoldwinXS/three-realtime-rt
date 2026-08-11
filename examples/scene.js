@@ -10,6 +10,98 @@ import duckUrl from "./assets/Duck.glb?url";
 const foxUrl =
   "https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/main/2.0/Fox/glTF-Binary/Fox.glb";
 
+// --- procedural surface textures (no assets) ---------------------------------
+// The glow-up's material half: the floor and the back wall get subtle large-
+// format stone/plaster variation so the room reads as built material instead of
+// flat colour. Canvas-generated at boot, deterministic (no random), and the G-
+// buffer consumes them on the primary view exactly like a texture map. Secondary
+// rays still see the flat material colour (the same documented approximation as
+// every texture in the library), so these ground the direct view without adding
+// a single triangle or light.
+function canvasTexture(size, draw) {
+  const c = document.createElement("canvas");
+  c.width = c.height = size;
+  draw(c.getContext("2d"), size);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 4;
+  return t;
+}
+
+// The museum floor: warm grey stone with faint wide mottling and a soft 2 m
+// tile grid. Repeat maps one canvas across ~12 m, so the seams land at ~2 m.
+function floorTexture() {
+  return canvasTexture(1024, (g, s) => {
+    g.fillStyle = "#c7c5c0";
+    g.fillRect(0, 0, s, s);
+    for (let i = 0; i < 9; i++) {
+      const x = ((i * 173) % s) | 0, y = ((i * 311) % s) | 0;
+      const r = 90 + (((i * 47) % 120));
+      const grad = g.createRadialGradient(x, y, 0, x, y, r);
+      const a = 0.05 + (i % 3) * 0.02;
+      grad.addColorStop(0, `rgba(112,110,104,${a})`);
+      grad.addColorStop(1, "rgba(112,110,104,0)");
+      g.fillStyle = grad;
+      g.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+    g.strokeStyle = "rgba(88,86,82,0.15)";
+    g.lineWidth = 2;
+    for (let i = 1; i < 6; i++) {
+      const p = ((s / 6) * i) | 0;
+      g.beginPath(); g.moveTo(p, 0); g.lineTo(p, s); g.stroke();
+      g.beginPath(); g.moveTo(0, p); g.lineTo(s, p); g.stroke();
+    }
+  });
+}
+
+// The back wall: warm plaster with a faint top-down light falloff and soft
+// mottling, so the frieze wall behind the exhibits is not one flat plane.
+function wallTexture() {
+  return canvasTexture(1024, (g, s) => {
+    const grad = g.createLinearGradient(0, 0, 0, s);
+    grad.addColorStop(0, "#c0bab1");
+    grad.addColorStop(0.55, "#b9b3ac");
+    grad.addColorStop(1, "#a39c93");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, s, s);
+    for (let i = 0; i < 6; i++) {
+      const x = ((i * 97) % s) | 0, y = ((i * 211) % s) | 0;
+      const r = 70 + (((i * 61) % 90));
+      const gr = g.createRadialGradient(x, y, 0, x, y, r);
+      gr.addColorStop(0, "rgba(148,143,135,0.07)");
+      gr.addColorStop(1, "rgba(148,143,135,0)");
+      g.fillStyle = gr;
+      g.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+  });
+}
+
+// Saturated side-wall plaster: a vertical light falloff plus bolder mottling,
+// kept in the wall's own hue so the red/teal walls keep their GI-bleed identity.
+// The falloff reads even at the demo's reduced lighting resolution, which is
+// why the first attempt (barely-there mottling) was too subtle for the critic.
+function plasterTexture(baseHex) {
+  return canvasTexture(512, (g, s) => {
+    const base = new THREE.Color(baseHex);
+    const v = g.createLinearGradient(0, 0, 0, s);
+    v.addColorStop(0, "#" + base.clone().multiplyScalar(1.1).getHexString());
+    v.addColorStop(0.5, "#" + base.getHexString());
+    v.addColorStop(1, "#" + base.clone().multiplyScalar(0.78).getHexString());
+    g.fillStyle = v;
+    g.fillRect(0, 0, s, s);
+    for (let i = 0; i < 14; i++) {
+      const x = ((i * 137) % s) | 0, y = ((i * 293) % s) | 0;
+      const r = 36 + (((i * 53) % 64));
+      const gr = g.createRadialGradient(x, y, 0, x, y, r);
+      gr.addColorStop(0, i % 2 === 0 ? "rgba(0,0,0,0.13)" : "rgba(255,255,255,0.11)");
+      gr.addColorStop(1, "rgba(0,0,0,0)");
+      g.fillStyle = gr;
+      g.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+  });
+}
+
 /**
  * An indoor gallery: a Cornell-style room (24 x 14, saturated side walls, open
  * top) laid out as a museum with named ZONES, so panning left-to-right walks a
@@ -58,16 +150,23 @@ export function buildScene() {
     0.1,
     100
   );
-  camera.position.set(4.5, 4.2, 11.0);
+  // Slightly further back and centred on the middle of the frieze (helmet /
+  // Lumiere axis) so the default view reads the whole left-to-right sweep —
+  // pool left, hero centre, materials right — instead of crowding the right
+  // half. main.js points the orbit target at (0.4, 1.6, -3.2) to match.
+  camera.position.set(3.2, 4.4, 11.6);
 
   const bounds = { x: 12, z: 7, wallH: 7, floorY: 0 };
 
   // Room shell — thin boxes. Saturated side walls so colour bleed is obvious;
   // the floor keeps a mild sheen so the GGX pass picks up the emissive strips.
   const white = new THREE.MeshStandardMaterial({ color: 0xc4c4c4, roughness: 0.6 });
-  const backGrey = new THREE.MeshStandardMaterial({ color: 0xb9b3ac, roughness: 0.85 });
-  const red = new THREE.MeshStandardMaterial({ color: 0xc42f2a, roughness: 0.85 });
-  const teal = new THREE.MeshStandardMaterial({ color: 0x22808f, roughness: 0.8 });
+  // The two big flat surfaces carry the procedural stone/plaster textures above;
+  // the tinted side walls stay saturated so GI colour bleed stays legible.
+  const floorMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.62, map: floorTexture() });
+  const backGrey = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85, map: wallTexture() });
+  const red = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.85, map: plasterTexture(0xc42f2a) });
+  const teal = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8, map: plasterTexture(0x22808f) });
   // Museum bronze: every frame, standoff peg, muntin, leg and stand in the room
   // is made of this, so the hardware reads as one commissioned set.
   const frameMat = new THREE.MeshStandardMaterial({
@@ -79,7 +178,7 @@ export function buildScene() {
   // Panoramic gallery: wider than deep, exhibits stationed left-to-right along
   // the back band so the natural move is to PAN along the frieze; the open
   // front half is the physics floor (pile drops there).
-  const ground = new THREE.Mesh(new THREE.BoxGeometry(24, 0.2, 14), white);
+  const ground = new THREE.Mesh(new THREE.BoxGeometry(24, 0.2, 14), floorMat);
   ground.position.y = -0.1;
   ground.name = "floor";
   scene.add(ground);
@@ -98,6 +197,22 @@ export function buildScene() {
   rightWall.position.set(12, 3.5, 0);
   rightWall.name = "wall-right-teal";
   scene.add(rightWall);
+
+  // Stone coping along the wall tops so the walls meet the open sky with a
+  // finished architectural edge instead of reading as paper-thin cards cut into
+  // the skybox (the critic's "wall-to-sky transition" complaint). A light stone
+  // slab with a visible overhang on both faces.
+  const copeMat = new THREE.MeshStandardMaterial({ color: 0x8a8478, roughness: 0.7 });
+  const backCope = new THREE.Mesh(new THREE.BoxGeometry(24.2, 0.3, 0.7), copeMat);
+  backCope.position.set(0, 7.15, -7);
+  backCope.name = "coping-back";
+  scene.add(backCope);
+  for (const [x, name] of [[-12, "coping-left"], [12, "coping-right"]]) {
+    const cope = new THREE.Mesh(new THREE.BoxGeometry(0.7, 0.3, 14.2), copeMat);
+    cope.position.set(x, 7.15, 0);
+    cope.name = name;
+    scene.add(cope);
+  }
 
   // Every plinth is a real cylinder standing ON the floor (bottom face at y=0)
   // and reports its own top height, which is what exhibits are seated against.
@@ -274,26 +389,30 @@ export function buildScene() {
   // --- front-left: a textured EMISSIVE sign beside the vitrine ------------
   // A small "OPEN" sign whose glow comes from an emissiveMap generated on a
   // canvas (no binary asset). The map's per-pixel pattern shows in the G-buffer
-  // (the sign LOOKS like lettering), and its AVERAGE colour — greenish here —
+  // (the sign LOOKS like lettering), and its AVERAGE colour — warm amber here —
   // now also CASTS light: the raytracer approximates a textured emitter by
-  // avg(map) x emissive x emissiveIntensity, so the white floor in front of the
-  // sign picks up its green-cyan spill. (Emitters need a non-black `emissive`;
-  // white keeps the cast hue equal to the map average.)
+  // avg(map) x emissive x emissiveIntensity, so the floor in front of the sign
+  // picks up its warm spill. The canvas is drawn as a brass shop sign (serif
+  // lettering, no UI-style rails) and the panel wears a bronze frame, so it
+  // reads as a physical mounted sign rather than a clickable web button.
   const signCanvas = document.createElement("canvas");
   signCanvas.width = 128;
   signCanvas.height = 64;
   {
     const g = signCanvas.getContext("2d");
-    g.fillStyle = "#03130d"; // near-black green ground
+    g.fillStyle = "#171310"; // dark bronze ground
     g.fillRect(0, 0, 128, 64);
-    g.fillStyle = "#25e0ff"; // cyan rails top and bottom
-    g.fillRect(0, 3, 128, 5);
-    g.fillRect(0, 56, 128, 5);
-    g.fillStyle = "#28ff9a"; // bright green lettering
-    g.font = "bold 34px monospace";
+    g.shadowColor = "#ffb95c";
+    g.shadowBlur = 7;
+    g.fillStyle = "#ffd9a0"; // warm amber lettering
+    g.font = "bold 34px Georgia, serif";
     g.textAlign = "center";
     g.textBaseline = "middle";
-    g.fillText("OPEN", 64, 33);
+    g.fillText("OPEN", 64, 34);
+    g.shadowBlur = 0;
+    g.strokeStyle = "rgba(255,196,140,0.28)"; // lit-tubing outline
+    g.lineWidth = 1.5;
+    g.strokeRect(3, 3, 122, 58);
   }
   const signTex = new THREE.CanvasTexture(signCanvas);
   signTex.colorSpace = THREE.SRGBColorSpace;
@@ -303,15 +422,28 @@ export function buildScene() {
       color: 0x040404,
       emissive: 0xffffff,
       emissiveMap: signTex,
-      emissiveIntensity: 7,
+      emissiveIntensity: 5,
       roughness: 1,
       side: THREE.DoubleSide,
     })
   );
   sign.name = "sign-open";
-  sign.position.set(-3.2, 0.72, 1.95); // front-right of the vitrine
-  sign.rotation.y = 0.55;              // angled toward the camera / open floor
-  scene.add(sign);
+  // The panel hangs in a bronze frame so it reads as a mounted sign.
+  const signGroup = new THREE.Group();
+  signGroup.position.set(-3.2, 0.72, 1.95); // front-right of the vitrine
+  signGroup.rotation.y = 0.55;              // angled toward the camera / open floor
+  const signFrame = (w, h, x, y) => {
+    const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.05), frameMat);
+    f.position.set(x, y, 0.02);
+    f.name = "sign-frame";
+    signGroup.add(f);
+  };
+  signFrame(0.95, 0.05, 0, 0.245);
+  signFrame(0.95, 0.05, 0, -0.245);
+  signFrame(0.05, 0.54, 0.485, 0);
+  signFrame(0.05, 0.54, -0.485, 0);
+  signGroup.add(sign);
+  scene.add(signGroup);
   // …carried by a real bronze stand. The panel used to hang in mid-air at
   // y=0.48–0.96 with nothing under it; now a sled foot on the floor and a post
   // reach up to its bottom edge (post top 0.50 vs panel bottom 0.48).
@@ -813,7 +945,10 @@ export function buildScene() {
   const FOX_POS = new THREE.Vector3(6.5, 0.3, 2.8);
   const foxPlatform = new THREE.Mesh(
     new THREE.BoxGeometry(2.4, 0.3, 2.0),
-    new THREE.MeshStandardMaterial({ color: 0x6f747c, roughness: 0.6 })
+    // Warm stone rather than cold grey so the platform reads as an intentional
+    // display plinth, not a dark slab (the critic called the fox "on its own
+    // dark pedestal").
+    new THREE.MeshStandardMaterial({ color: 0x8a857c, roughness: 0.65 })
   );
   foxPlatform.position.set(FOX_POS.x, 0.15, FOX_POS.z);
   foxPlatform.name = "fox-platform";
@@ -888,13 +1023,14 @@ export function buildScene() {
   // each change recompiles — a deliberate, visible cost). Three start open;
   // the first hangs over the pool so the water always has a glow to ripple.
   const windows = [];
+  let framesIndex = 0;
   for (let i = 0; i < 6; i++) {
     const win = new THREE.Mesh(
       new THREE.BoxGeometry(1.9, 2.1, 0.1),
       new THREE.MeshStandardMaterial({
         color: 0x000000,
-        emissive: 0xeaf2ff,
-        emissiveIntensity: 7,
+        emissive: 0xd8e4f7, // soft clerestory sky, not a hard white panel
+        emissiveIntensity: 5.5,
       })
     );
     // Back face flush with the back wall's inner plane (z = -6.9): the windows
@@ -904,6 +1040,22 @@ export function buildScene() {
     win.name = `clerestory-window-${i}`;
     scene.add(win);
     windows.push(win);
+
+    // Bronze reveal frame so each pane reads as built-in clerestory glazing
+    // rather than a floating emissive panel. Thin boxes hugging the pane's
+    // four edges, proud of the wall face by ~0.1 m.
+    const WF = 1.9, WH = 2.1, WD = 0.12;
+    const x = win.position.x, y = win.position.y, z = win.position.z;
+    const framePart = (w, h, d, px, py) => {
+      const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), frameMat);
+      f.position.set(px, py, z);
+      f.name = `clerestory-frame-${i}-${framesIndex++}`;
+      scene.add(f);
+    };
+    framePart(WF + 0.16, 0.1, WD, x, y + WH / 2 + 0.05);
+    framePart(WF + 0.16, 0.1, WD, x, y - WH / 2 - 0.05);
+    framePart(0.1, WH + 0.16, WD, x - WF / 2 - 0.05, y);
+    framePart(0.1, WH + 0.16, WD, x + WF / 2 + 0.05, y);
   }
 
   // Corner strips: tucked into the back corners, within 3-4cm of BOTH wall faces
@@ -928,12 +1080,16 @@ export function buildScene() {
   // The wide room needs two default keys: warm carries the left half (pool /
   // vitrine), cool carries the right (bench / teapot). Everything else stays
   // an opt-in add-on.
-  const warm = new THREE.PointLight(0xffd9a0, 30);
+  // Rebalanced for the sky: the dusk sky adds a soft ambient wash, so the two
+  // gallery keys step down a touch (30->27, 22->20) to keep the evening mood
+  // rather than drifting toward noon. The moon-tinged cool key sits a little
+  // warmer to read as the counterpoint to the warm key.
+  const warm = new THREE.PointLight(0xffd9a0, 27);
   warm.position.set(-4.5, 6.2, 2.8);
   warm.userData.rtRadius = 0.4;
   scene.add(warm);
 
-  const cool = new THREE.PointLight(0x9fc4ff, 22);
+  const cool = new THREE.PointLight(0xb0ccff, 20);
   cool.position.set(5.5, 5.8, -2.6); // in front of and above the roughness ramp
   cool.userData.rtRadius = 0.35;
   scene.add(cool);
@@ -1016,8 +1172,24 @@ export function buildScene() {
     { label: "projector", light: projector, color: true, gated: "absorption" },
   ];
 
-  // No procedural sky indoors — a low ambient fills GI rays that escape the room.
-  const sky = { enabled: false };
+  // The procedural-sky experiment (owner-requested): the room's open ceiling and
+  // clerestory windows no longer look out on a black void. A twilight sky — deep
+  // blue zenith, warm dusk band, low amber sun — shows through the open top,
+  // gives the metals and the water pool something real to reflect, and (via GI
+  // rays that escape the room) adds a soft evening ambient. Intensity is kept
+  // low so the museum keeps its evening-gallery mood; the room's analytic lights
+  // were rebalanced above to compensate.
+  const sky = {
+    enabled: true,
+    sunDir: new THREE.Vector3(-0.55, 0.32, 0.77).normalize(),
+    sunColor: new THREE.Color(0.95, 0.72, 0.48),
+    // Bright enough to read as a sky on a small phone screen (a near-black
+    // dusk read as a void on the owner's device) but still clearly evening:
+    // deep blue overhead, a warm dusk band at the horizon.
+    zenith: new THREE.Color(0.10, 0.18, 0.38),
+    horizon: new THREE.Color(0.42, 0.36, 0.31),
+    intensity: 1.0,
+  };
 
   const ready = (async () => {
     const loader = new GLTFLoader();

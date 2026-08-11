@@ -8,12 +8,26 @@ choice and record it.
 ## The brief, verbatim
 
 The project owner, reviewing on his PHONE, says the demo "feels weird... just
-unnatural", and clarified the target: "I meant the room with all the features
-but a skybox could be cool." The room = the MUSEUM demo (index.html +
-examples/main.js): the panoramic museum with the materials bench, water pool,
-helmet, gold knot, teapot, duck vitrine, clerestory windows and party lights.
-Use the Gemini critic to turn "unnatural" into named, fixable problems, then
-fix them in a review loop until the critic stops finding them.
+unnatural", clarified the target ("I meant the room with all the features but
+a skybox could be cool"), then expanded it: "Skybox rendering for the random
+objects on the dish, better placement and glow up for the models in the
+room." So TWO surfaces, one round:
+
+1. **The MUSEUM room** (index.html + examples/main.js): the panoramic museum
+   with the materials bench, water pool, helmet, gold knot, teapot, duck
+   vitrine, clerestory windows and party lights. Better PLACEMENT of the
+   exhibits (composition, sightlines, nothing floating, nothing crowding) and
+   an overall glow-up, plus the sky experiment below.
+2. **The GALLERY page** (gallery.html + examples/gallery.js +
+   examples/gallery-scenes.js): the stock-glTF scenes, each a model on a disc
+   in a void. The owner wants SKYBOX RENDERING here: the procedural sky as
+   backdrop and ambient so the "specimen on a dish in blackness" look becomes
+   a grounded, naturally lit turntable. Keep each scene recognizable; the
+   disc/ground can stay if it earns its place under a sky.
+
+Use the Gemini critic to turn "unnatural" into named, fixable problems on
+BOTH surfaces, then fix them in a review loop until the critic stops finding
+them.
 
 ## Owner-requested experiment: a skybox
 
@@ -44,7 +58,8 @@ legibility on a phone. Let the critic NAME the problems before you fix any.
 
 - `examples/main.js` (the museum scene build + lighting rig), `index.html`
   (chrome/CSS), `examples/ui.js` if a control needs adding (e.g. a sky
-  toggle). Nothing else.
+  toggle), and for the gallery leg: `gallery.html`, `examples/gallery.js`,
+  `examples/gallery-scenes.js`. Nothing else.
 - `src/` is UNTOUCHED this round. The look must come from scene content and
   page chrome. Engine defaults and presets are not yours.
 - The museum must stay deterministic and within its performance envelope:
@@ -60,9 +75,11 @@ legibility on a phone. Let the critic NAME the problems before you fix any.
 
 ## The loop
 
-1. BASELINE: capture video of the museum default orbit plus a walk to the
-   materials bench and the Lumiere screen, at TWO viewports: mobile 390x844
-   (--viewport; the owner's context) and desktop 1280x800. Ask the critic the
+1. BASELINE: capture video of (a) the museum default orbit plus a walk to
+   the materials bench and the Lumiere screen, and (b) at least three gallery
+   scenes (fox, tokyo, one metal-heavy) with an orbit drag each, at TWO
+   viewports: mobile 390x844 (--viewport; the owner's context) and desktop
+   1280x800. Ask the critic the
    OPEN question first: "does this feel like a real place, what feels off,
    why?" plus a mobile pass (UI legibility, overlap, thumb reach).
 2. Fix the top named problems (skybox experiment included).
@@ -79,7 +96,7 @@ under `_reviews/museum-glowup/`.
 
 ## Deliverables
 
-The changes, the review-loop artifacts, and `REPORT_MUSEUM_GLOWUP.md`: the
+The changes, the review-loop artifacts, and `REPORT_MUSEUM_GLOWUP.md` (covering both surfaces): the
 critic's baseline diagnosis (quoted, attributed), what changed per round with
 the reasoning, before/after captures, the light/NEE budget ledger after your
 changes, the perf numbers, and honest caveats. The architect gates by

@@ -223,11 +223,19 @@ async function main() {
   // so the starting point is identical everywhere. targetFps stays set so the
   // "auto quality" toggle has a target to walk quality toward.
   const rt = new RealtimeRaytracer(renderer, {
-    renderScale: 0.25,
+    renderScale: 0.375,
     denoiseIterations: 5,
     stochasticLights: true,
     adaptiveQuality: false,
-    gi: false,
+    // GI is ON at boot now, deliberately: this room's pitch is "every feature,
+    // one lit room", and the owner's glow-up ask (a natural feel) plus the
+    // procedural-sky experiment both need the one-bounce path — the sky only
+    // lights the room through GI-miss rays, and the critic's "objects float,
+    // no contact shadows" read is the flat no-bounce look. Everything else
+    // stays at the tested minimal boot so the per-feature cost rows in the
+    // panel keep their A/B meaning. The added frame cost is fenced in the
+    // report.
+    gi: true,
     emissiveNEE: false,
     reflections: false,
     refraction: false,
@@ -301,12 +309,13 @@ async function main() {
   const controls = new OrbitControls(camera, renderer.domElement);
   // Expose for debugging / automated verification.
   Object.assign(window, { RT: rt, SCENE: scene, CAMERA: camera, PHYSICS: physics, CONTROLS: controls, FOX: fox });
-  controls.target.set(-1.0, 1.8, -2.8); // bias toward the exhibit frieze
+  controls.target.set(0.4, 1.6, -3.2); // centred on the hero frieze (see scene.js camera)
   controls.enableDamping = true;
   controls.dampingFactor = 0.08;
   controls.maxPolarAngle = Math.PI * 0.5; // stay above the ground
+  controls.minPolarAngle = Math.PI * 0.28; // don't climb to a void-exposing top-down
   controls.minDistance = 4;
-  controls.maxDistance = 40;
+  controls.maxDistance = 26; // keep the view inside the room's context
   controls.update();
 
   // Lights only need re-reading when they actually change, so the UI calls this

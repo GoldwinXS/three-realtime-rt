@@ -144,6 +144,19 @@
       /* the technical readout yields the viewport on phones; the scene is the star */
       #hud .hud-desc, #hud .raster-note, #stats { display: none; }
     }
+    /* glow-up mobile pass: fat-finger-safe buttons, and the collapsed card's
+       picker gets a taller hit target so switching scenes is one easy tap. The
+       card also anchors to the bottom on phones — a one-handed thumb reaches
+       the bottom of a tall screen far more easily than the top-left corner.
+       While a scene loads the card dims to near-invisible so the compact
+       "loading scene..." pill never collides with the picker text. */
+    @media (max-width: 700px) {
+      #hud { top: auto; bottom: 16px; }
+      #hud .hud-btns button { padding: 10px 8px; font-size: 12px; min-height: 40px; }
+      #hud .pick-wrap select { padding: 10px 34px 10px 10px; }
+      #hud .hud-title b { font-size: 12px; }
+      #hud.busy { opacity: 0.12; }
+    }
   </style>
 </head>
 <body>
@@ -218,7 +231,7 @@
       <p class="lede">Stock glTF models, unmodified, lit by path-traced light, glass and metal. Pick a scene and watch it converge.</p>
       <div class="status"><div class="spin"></div><div id="boot-msg">preparing the scene…</div></div>
       <div class="bar"><i></i></div>
-      <p class="cue">drag to orbit · scroll to zoom</p>
+      <p class="cue">drag to orbit · scroll / pinch to zoom</p>
     </div>
   </div>
   <script type="module" src="/examples/gallery.js"></script>

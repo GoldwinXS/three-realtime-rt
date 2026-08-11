@@ -39,6 +39,28 @@
       #boot .lede { font-size: 12px; }
       #boot .kicker { letter-spacing: 2.4px; font-size: 10px; }
     }
+    /* mobile legibility overrides for the shared tour/panel chrome. The chrome
+       itself is built by examples/tour.js and examples/panel.js (shared with the
+       other tour stops), so these are page-scoped wins for THIS stop: body-scoped
+       selectors out-specify the injected rules and make the phone UI readable and
+       thumb-safe without touching the shared modules. */
+    @media (max-width: 700px) {
+      body #fps { font-size: 13px; padding: 6px 13px; }
+      /* clear the mobile OS home indicator / gesture zone, and give the stacked
+         tour bar (RT switch + nav + dots + costs) room to breathe so the
+         controls stop looking like one cramped cluster */
+      body #tour { bottom: 26px; }
+      body #tour .bar { gap: 11px; }
+      body #tour .nav a, body #tour .nav span.stop { padding: 10px 11px; font-size: 13px; }
+      body #tour .rtsw { padding: 9px 14px; }
+      body #tour .dots { margin-bottom: 2px; gap: 8px; }
+      body #tour .dots a.costs { padding: 4px 9px; margin-left: 10px; }
+      body #tour .nav .stop b { color: #b6f2d6; }
+    }
+    /* tone down the shared tour's bright cyan RT-on pill so the scene keeps the
+       focus (the critic: "the bright cyan RAY TRACING ON button is overly
+       dominant") */
+    body #tour .rtsw.on { background: rgba(47, 194, 212, 0.72); }
   </style>
 </head>
 <body>

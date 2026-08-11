@@ -53,45 +53,94 @@ function normalize(root, size) {
   root.position.z -= (box.min.z + box.max.z) / 2;
 }
 
-function groundPlane(color = 0x9aa3ac) {
-  // A radial colour falloff toward the disc edge, so the shadow-catcher fades
-  // into the dark background instead of ending on a hard circle. Opaque — the
-  // tracer keeps the full surface for shadows and contact.
-  const base = new THREE.Color(color);
-  const edge = base.clone().multiplyScalar(0.1);
+function groundPlane(baseHex, edgeHex) {
+  // A radial colour falloff toward the disc edge that fades INTO the sky's
+  // horizon colour instead of to black, so the platform reads as a naturally lit
+  // turntable receding into the environment rather than a specimen on a dark
+  // dish in a void. Opaque — the tracer keeps the full surface for shadows and
+  // contact. The cylinder's side carries the same gradient, so the rim blends
+  // with the background it sits against.
+  const base = new THREE.Color(baseHex);
+  const edge = new THREE.Color(edgeHex);
   const size = 256;
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d");
   const grad = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
   grad.addColorStop(0, "#" + base.getHexString());
-  grad.addColorStop(0.36, "#" + base.getHexString());
-  grad.addColorStop(0.5, "#" + edge.getHexString());
+  grad.addColorStop(0.4, "#" + base.getHexString());
+  grad.addColorStop(0.74, "#" + base.clone().lerp(edge, 0.8).getHexString());
   grad.addColorStop(1, "#" + edge.getHexString());
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, size, size);
   const map = new THREE.CanvasTexture(canvas);
   map.colorSpace = THREE.SRGBColorSpace;
+  // Radius 22, not 14: a far-backed camera (tokyo sits ~19 units out) used to
+  // frame the disc's hard outer edge, reading as a floating plate. At 22 the
+  // edge stays out of frame on every scene, so all you see is the platform top
+  // fading toward the horizon colour.
   const g = new THREE.Mesh(
-    new THREE.CylinderGeometry(14, 14, 0.3, 48),
+    new THREE.CylinderGeometry(22, 22, 0.35, 48),
     new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9, map })
   );
-  g.position.y = -0.15;
+  g.position.y = -0.175;
   return g;
 }
 
-function sunAndSky(scene, intensity = 3.2, pos = [8, 14, 6]) {
-  const sun = new THREE.DirectionalLight(0xfff2dd, intensity);
-  sun.position.set(...pos);
+// Procedural sky palettes. Each scene picks one; the sun DirectionalLight is
+// placed ALONG the same sunDir so the direct shadows line up with the sky's sun
+// disk (the old helper placed the light at an arbitrary pos and then derived
+// sunDir from it, which never disagreed but was roundabout).
+const SKY_PALETTES = {
+  // clean daylight — the neutral turntable look
+  day: {
+    sunDir: [0.5, 0.75, 0.45], lightColor: 0xfff2dd, sunIntensity: 3.2,
+    sunColor: new THREE.Color(1.0, 0.93, 0.82),
+    zenith: new THREE.Color(0.22, 0.40, 0.66), horizon: new THREE.Color(0.75, 0.82, 0.90),
+    skyIntensity: 1.05, ground: [0x9aa3ac, 0xe0e9f4],
+  },
+  // golden hour — warm low sun for the fox and the warm-metal pieces
+  golden: {
+    sunDir: [-0.4, 0.42, 0.82], lightColor: 0xffe2bd, sunIntensity: 2.6,
+    sunColor: new THREE.Color(1.0, 0.82, 0.58),
+    zenith: new THREE.Color(0.30, 0.44, 0.66), horizon: new THREE.Color(0.92, 0.78, 0.62),
+    skyIntensity: 1.1, ground: [0x9a9486, 0xf6e5cd],
+  },
+  // dusk — a night street: deep blue overhead, warm low sun, dark asphalt.
+  // The disc edge is set to the horizon's sRGB value so a low camera sees the
+  // platform recede into the sky instead of a dark circle against a light band.
+  dusk: {
+    sunDir: [0.55, 0.28, 0.78], lightColor: 0xffc9a0, sunIntensity: 2.0,
+    sunColor: new THREE.Color(1.0, 0.60, 0.38),
+    zenith: new THREE.Color(0.05, 0.10, 0.24), horizon: new THREE.Color(0.20, 0.22, 0.32),
+    skyIntensity: 1.0, ground: [0x3f4550, 0x7c819b],
+  },
+  // bright studio daylight — for clearcoat/showcase pieces
+  studio: {
+    sunDir: [0.5, 0.8, 0.4], lightColor: 0xfff6e8, sunIntensity: 2.8,
+    sunColor: new THREE.Color(1.0, 0.95, 0.85),
+    zenith: new THREE.Color(0.30, 0.50, 0.72), horizon: new THREE.Color(0.86, 0.90, 0.95),
+    skyIntensity: 1.2, ground: [0x7d848c, 0xeff4f9],
+  },
+};
+
+function sunAndSky(scene, palette = "day") {
+  const p = SKY_PALETTES[palette] || SKY_PALETTES.day;
+  const sunDir = new THREE.Vector3(...p.sunDir).normalize();
+  const sun = new THREE.DirectionalLight(p.lightColor, p.sunIntensity);
+  sun.position.copy(sunDir).multiplyScalar(18);
   sun.userData.rtRadius = 0.04;
   scene.add(sun, sun.target);
   return {
     enabled: true,
-    sunDir: sun.position.clone().normalize(),
-    sunColor: new THREE.Color(1.0, 0.93, 0.82),
-    zenith: new THREE.Color(0.2, 0.36, 0.62),
-    horizon: new THREE.Color(0.74, 0.82, 0.9),
-    intensity: 1.0,
+    sunDir: sunDir.clone(),
+    sunColor: p.sunColor.clone(),
+    zenith: p.zenith.clone(),
+    horizon: p.horizon.clone(),
+    intensity: p.skyIntensity,
+    // ground colours ride along so the scene builders keep sky and ground in
+    // one place instead of re-deriving them per scene.
+    ground: p.ground,
   };
 }
 
@@ -140,19 +189,30 @@ export const SCENES = {
     };
   },
   async tokyo() {
+    // Dusk: the scene is a night street, so the sky is a deep twilight (not the
+    // flat bright grey the generic daylight palette gave it). The model's
+    // emissive geometry massively exceeds the shared NEE cap (88837 tris -> the
+    // largest 256 kept), so its signs read as glowing but cast almost no light;
+    // two low analytic fills near the street simulate the ambient spill that the
+    // cap drops.
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x10151d);
     const gltf = await loadGltf(tokyoUrl);
     normalize(gltf.scene, 12);
-    scene.add(gltf.scene, groundPlane(0x2a2f36));
-    // Sun on the camera side so the street facade reads.
-    const sky = sunAndSky(scene, 2.4, [14, 16, 15]);
-    const fill = new THREE.PointLight(0xaac8ff, 4);
+    const sky = sunAndSky(scene, "dusk");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
+    const fill = new THREE.PointLight(0xaac8ff, 3);
     fill.position.set(-6, 7, -4);
     fill.userData.rtRadius = 0.4;
-    scene.add(fill);
+    const spillWarm = new THREE.PointLight(0xffc9a0, 5);
+    spillWarm.position.set(5, 6, 4);
+    spillWarm.userData.rtRadius = 0.5;
+    const spillCool = new THREE.PointLight(0x8fd0ff, 3.5);
+    spillCool.position.set(-3, 5, 5);
+    spillCool.userData.rtRadius = 0.5;
+    scene.add(fill, spillWarm, spillCool);
     return {
-      scene, sky, cam: [11, 7, 12], target: [0, 3.4, 0],
+      scene, sky, cam: [12, 8, 14], target: [0, 4.5, 0],
       env: { color: new THREE.Color(0.35, 0.42, 0.55), intensity: 0.8 },
     };
   },
@@ -161,8 +221,8 @@ export const SCENES = {
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(lanternUrl);
     normalize(gltf.scene, 8);
-    scene.add(gltf.scene, groundPlane(0x8d939b));
-    const sky = sunAndSky(scene, 2.2);
+    const sky = sunAndSky(scene, "golden");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
     return { scene, sky, cam: [7, 5, 9], target: [0, 3, 0] };
   },
   async helmet() {
@@ -183,8 +243,8 @@ export const SCENES = {
       new THREE.MeshStandardMaterial({ color: 0xf2f4f8, roughness: 0.06, metalness: 1.0 })
     );
     mirror.position.set(-3.0, 0.9, 1.4);
-    scene.add(helmet.scene, duck.scene, plinth, mirror, groundPlane());
-    const sky = sunAndSky(scene, 2.8);
+    const sky = sunAndSky(scene, "studio");
+    scene.add(helmet.scene, duck.scene, plinth, mirror, groundPlane(sky.ground[0], sky.ground[1]));
     return { scene, sky, cam: [6, 4, 8], target: [0, 2, 0] };
   },
   async camera() {
@@ -192,8 +252,8 @@ export const SCENES = {
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(cameraUrl);
     normalize(gltf.scene, 7);
-    scene.add(gltf.scene, groundPlane(0x8d939b));
-    const sky = sunAndSky(scene, 2.6, [10, 15, 8]);
+    const sky = sunAndSky(scene, "studio");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
     return { scene, sky, cam: [6, 5, 8], target: [0, 3, 0] };
   },
   async boombox() {
@@ -203,8 +263,8 @@ export const SCENES = {
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(boomBoxUrl);
     normalize(gltf.scene, 7);
-    scene.add(gltf.scene, groundPlane(0x777d85));
-    const sky = sunAndSky(scene, 2.8);
+    const sky = sunAndSky(scene, "studio");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
     return { scene, sky, cam: [5, 4, 7], target: [0, 2.2, 0] };
   },
   async corset() {
@@ -213,8 +273,8 @@ export const SCENES = {
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(corsetUrl);
     normalize(gltf.scene, 7);
-    scene.add(gltf.scene, groundPlane(0x8d939b));
-    const sky = sunAndSky(scene, 2.6);
+    const sky = sunAndSky(scene, "studio");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
     return { scene, sky, cam: [5, 5, 7], target: [0, 3.4, 0] };
   },
   async waterbottle() {
@@ -222,28 +282,29 @@ export const SCENES = {
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(waterBottleUrl);
     normalize(gltf.scene, 7);
-    scene.add(gltf.scene, groundPlane(0x8d939b));
-    const sky = sunAndSky(scene, 2.6);
+    const sky = sunAndSky(scene, "studio");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
     return { scene, sky, cam: [5, 5, 7], target: [0, 3.2, 0] };
   },
   async toycar() {
     // Sub-centimetre clearcoat asset — scaled up so the metallic paint and the
-    // reflective clearcoat over it read on the raytraced side.
+    // reflective clearcoat over it read on the raytraced side. Bright studio
+    // daylight gives the clearcoat a real sky gradient to reflect.
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(toyCarUrl);
     normalize(gltf.scene, 7);
-    scene.add(gltf.scene, groundPlane(0x777d85));
-    const sky = sunAndSky(scene, 2.8);
-    return { scene, sky, cam: [5, 4, 7], target: [0, 2.2, 0] };
+    const sky = sunAndSky(scene, "studio");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
+    return { scene, sky, cam: [5.6, 4.4, 7.4], target: [0, 2.4, 0] };
   },
   async iridescence() {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(iridescenceLampUrl);
     normalize(gltf.scene, 7);
-    scene.add(gltf.scene, groundPlane(0x8d939b));
-    const sky = sunAndSky(scene, 2.6);
+    const sky = sunAndSky(scene, "golden");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
     return { scene, sky, cam: [6, 5, 8], target: [0, 3.2, 0] };
   },
   async mosquito() {
@@ -253,20 +314,22 @@ export const SCENES = {
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(mosquitoUrl);
     normalize(gltf.scene, 7);
-    scene.add(gltf.scene, groundPlane(0x8d939b));
-    const sky = sunAndSky(scene, 2.6);
+    const sky = sunAndSky(scene, "studio");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
     return { scene, sky, cam: [5, 5, 7], target: [0, 3.4, 0] };
   },
   async fox() {
     // Fox is a skinned/animated asset — we load it and render the bind pose
-    // (no mixer), which is fine for a static lighting showcase.
+    // (no mixer), which is fine for a static lighting showcase. Golden-hour sky
+    // and a tighter, lower camera so the low-poly fox fills the frame instead of
+    // floating in grey space.
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x0c1017);
     const gltf = await loadGltf(foxUrl);
     normalize(gltf.scene, 7);
-    scene.add(gltf.scene, groundPlane(0x8d939b));
-    const sky = sunAndSky(scene, 2.8, [10, 15, 8]);
-    return { scene, sky, cam: [6, 5, 8], target: [0, 3, 0] };
+    const sky = sunAndSky(scene, "golden");
+    scene.add(gltf.scene, groundPlane(sky.ground[0], sky.ground[1]));
+    return { scene, sky, cam: [4.6, 3.4, 5.6], target: [0, 2.2, 0] };
   },
 };
 
