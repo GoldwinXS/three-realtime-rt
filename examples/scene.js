@@ -783,10 +783,20 @@ export function buildScene() {
       0, FIELD_Y0 + r * (TILE_H + MUNTIN) - MUNTIN / 2, 0);
   }
   // Palette. attenuationDistance is the depth at which the transmitted colour
-  // equals attenuationColor, so it is tuned AGAINST the tile thicknesses below:
-  // roughly attDist ~ the thickness of the tiles that use it, which lands the
-  // saturated tiles near their attenuation colour without crushing to black,
-  // and leaves the thin ones a visible wash.
+  // equals attenuationColor, so each hue is tuned against a DESIGN thickness:
+  // the [hex, attHex, attDist] triple below reads "a tile attDist metres deep
+  // lands on attHex". Cells then build at whatever physical depth the tracer
+  // needs (see the tiles table) and scale their attenuationDistance by
+  // built/design, so every cell keeps its authored optical depth exactly.
+  //
+  // WHY EVERY TILE IS >= 9 CM. The tracer offsets a refraction ray 2 x rt.eps
+  // past the entry face along the normal — ~7.2 cm in this room — and a body
+  // thinner than that never resolves its own exit face: the ray exits onto
+  // whatever is behind, whose sigma is 0, and the tile reads as clear frost no
+  // matter what the palette says (this shipped broken once; the fix in
+  // RTLightingPass restored the measured chord, but it cannot help a tile the
+  // ray never resolves). The original 3-6 cm cells are kept in the table as
+  // the design thickness so the palette tuning survives the chunking.
   const tileGlass = (hex, attHex, attDist) =>
     new THREE.MeshPhysicalMaterial({
       color: hex,           // albedo fallback for secondary rays / refraction off
@@ -797,20 +807,25 @@ export function buildScene() {
       attenuationColor: new THREE.Color(attHex),
       attenuationDistance: attDist,
     });
-  const RUBY = tileGlass(0xff6152, 0xff2418, 0.10);
-  const COBALT = tileGlass(0x86b2ff, 0x2f6bff, 0.07);
-  const AMBER2 = tileGlass(0xffc07a, 0xff9a2e, 0.07);
-  const EMERALD = tileGlass(0x9fe8bc, 0x21c46a, 0.06);
-  const CLEAR = tileGlass(0xeef4ff, 0xdce8ff, 0.14); // the control tile
-  // [material, thickness] per cell, bottom row first. Centre row >= 8cm.
+  const TILE_HUES = {
+    RUBY: [0xff6152, 0xff2418, 0.10],
+    COBALT: [0x86b2ff, 0x2f6bff, 0.07],
+    AMBER2: [0xffc07a, 0xff9a2e, 0.07],
+    EMERALD: [0x9fe8bc, 0x21c46a, 0.06],
+    CLEAR: [0xeef4ff, 0xdce8ff, 0.14], // the control tile
+  };
+  // [hue, designThickness, builtThickness] per cell, bottom row first. The
+  // relief still varies (9-12 cm) so raking light keeps reading depth.
   const tiles = [
-    [[EMERALD, 0.04], [RUBY, 0.06], [COBALT, 0.05]],
-    [[RUBY, 0.10], [AMBER2, 0.09], [EMERALD, 0.08]],
-    [[COBALT, 0.05], [CLEAR, 0.03], [AMBER2, 0.04]],
+    [["EMERALD", 0.04, 0.09], ["RUBY", 0.06, 0.11], ["COBALT", 0.05, 0.10]],
+    [["RUBY", 0.10, 0.12], ["AMBER2", 0.09, 0.11], ["EMERALD", 0.08, 0.10]],
+    [["COBALT", 0.05, 0.10], ["CLEAR", 0.03, 0.09], ["AMBER2", 0.04, 0.09]],
   ];
   for (let r = 0; r < 3; r++) {
     for (let c = 0; c < 3; c++) {
-      const [mat, t] = tiles[r][c];
+      const [hue, tDesign, t] = tiles[r][c];
+      const [hex, attHex, attDist] = TILE_HUES[hue];
+      const mat = tileGlass(hex, attHex, attDist * (t / tDesign));
       const tile = new THREE.Mesh(new THREE.BoxGeometry(TILE_W, TILE_H, t), mat);
       tile.position.set(
         FIELD_X0 + TILE_W / 2 + c * (TILE_W + MUNTIN),
