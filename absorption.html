@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt — Beer-Lambert absorption + coloured shadows</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
+    body { display: flex; align-items: center; justify-content: center; }
+    #app canvas { display: block; }
+    #hud {
+      position: fixed; top: 12px; left: 12px; z-index: 30;
+      display: flex; flex-direction: column; gap: 8px;
+      color: #cfe0ea; font: 12px/1.5 ui-monospace, Consolas, monospace;
+      background: rgba(14, 18, 24, 0.85); border: 1px solid #26323c;
+      border-radius: 8px; padding: 10px 12px; min-width: 232px; max-width: 320px;
+    }
+    #hud b { color: #7fd8c8; }
+    #hud .desc { color: #8fa3b3; }
+    #stats { white-space: pre; color: #8fa3b3; border-top: 1px solid #26323c; padding-top: 8px; }
+  </style>
+  <script type="module" crossorigin src="./assets/absorption-CTeVEZv1.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/modulepreload-polyfill-B5Qt9EMX.js">
+  <link rel="modulepreload" crossorigin href="./assets/RealtimeRaytracer-Bb3iMtd4.js">
+  <link rel="modulepreload" crossorigin href="./assets/OrbitControls-BlBZCci6.js">
+</head>
+<body>
+  <div id="app"></div>
+  <div id="hud">
+    <div><b>Beer-Lambert absorption</b></div>
+    <div class="desc">
+      Cast-glass slabs on an emissive lightbox. Thickness doubles along the
+      amber staircase (20&#8594;160 mm), so the tint deepens and saturates —
+      exp(&#8722;&#963;&#183;d) per channel over the in-medium path. Back row:
+      a blue-on-amber stack vs. its lone slabs, and a backlit panel glowing
+      through amber. Assertions run automatically (see #stats). Drag to orbit.
+    </div>
+    <div class="desc">
+      <b>Phase 2</b> (after frame 300) reveals the <b>coloured-shadow</b>
+      exhibit at the back: two overlapping slabs under a high lamp, throwing
+      amber, blue and their product onto a white floor. It runs with ReSTIR
+      off &#8212; coloured shadows act on the next-event shadow rays, not the
+      reservoir's visibility ray. Phase 3 repeats it with
+      <b>rt.absorptionShadows</b> off, the A/B control.
+    </div>
+    <div id="stats"></div>
+  </div>
+</body>
+</html>

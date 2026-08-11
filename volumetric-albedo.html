@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt — volumetric surface albedo</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
+    #app { width: 100%; height: 100%; }
+    #app canvas { display: block; }
+    #hud {
+      position: fixed; top: 12px; left: 12px; z-index: 30;
+      display: flex; flex-direction: column; gap: 8px;
+      color: #cfe0ea; font: 12px/1.5 ui-monospace, Consolas, monospace;
+      background: rgba(14, 18, 24, 0.85); border: 1px solid #26323c;
+      border-radius: 8px; padding: 10px 12px; min-width: 232px; max-width: 300px;
+    }
+    #hud b { color: #7fd8c8; }
+    #hud .desc { color: #8fa3b3; }
+    #hud select, #hud button {
+      font: inherit; color: inherit; background: #16202b;
+      border: 1px solid #2c3a46; border-radius: 6px; padding: 5px 8px; cursor: pointer;
+    }
+    #hud button.on { border-color: #38d0e0; color: #7fd8c8; }
+    #hud label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    #hud input[type="checkbox"] { accent-color: #38d0e0; cursor: pointer; }
+    #stats { white-space: pre; color: #8fa3b3; border-top: 1px solid #26323c; padding-top: 8px; }
+    .row { display: flex; align-items: center; gap: 8px; }
+  </style>
+  <script type="module" crossorigin src="./assets/volumetricAlbedo-DZX0uhNd.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/modulepreload-polyfill-B5Qt9EMX.js">
+  <link rel="modulepreload" crossorigin href="./assets/RealtimeRaytracer-Bb3iMtd4.js">
+  <link rel="modulepreload" crossorigin href="./assets/OrbitControls-BlBZCci6.js">
+</head>
+<body>
+  <div id="app"></div>
+  <div id="hud">
+    <div><b>volumetric surface albedo</b></div>
+    <div class="desc">
+      A torus knot coloured by a procedural 3D field baked into a Data3DTexture,
+      sampled at the world hit point. Watch the field's colours bleed onto the
+      white walls through GI. Drag to orbit.
+    </div>
+    <button id="rt-toggle" class="on">ray tracing: ON</button>
+    <label class="row">view
+      <select id="view-pick">
+        <option value="0">composite</option>
+        <option value="1">albedo (G-buffer)</option>
+        <option value="3">irradiance (direct + GI)</option>
+        <option value="2">normals</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="opt-spin" /> spin knot through the field</label>
+    <div id="stats"></div>
+  </div>
+</body>
+</html>

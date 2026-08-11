@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>three-realtime-rt · tour stop 3: model scenes</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0a0f16; }
+    #app { width: 100%; height: 100%; }
+    #app canvas { display: block; }
+    #boot {
+      position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+      z-index: 50; color: #cfe0ea; font: 14px/1.5 ui-monospace, "SF Mono", Consolas, monospace;
+      background: radial-gradient(circle at 50% 40%, #17212c 0%, #0a0f16 70%);
+      transition: opacity 0.3s; text-align: center; padding: 20px;
+    }
+    #boot.hidden { opacity: 0; pointer-events: none; }
+    #boot .hero { display: flex; flex-direction: column; align-items: center; gap: 13px; max-width: 640px; }
+    #boot .mark { width: 44px; height: 44px; color: #38d0e0; opacity: 0.9; }
+    #boot .kicker { margin: 0; font-size: 11px; letter-spacing: 3.2px; color: #7fd8c8; text-transform: uppercase; }
+    #boot h1 { margin: 0; font-size: clamp(26px, 4.6vw, 36px); line-height: 1.14; font-weight: 600;
+      color: #eef4f8; letter-spacing: 0.2px; }
+    #boot .lede { margin: 0; font-size: 13px; line-height: 1.6; color: #a9bcc9; max-width: 500px; }
+    #boot .status { display: flex; align-items: center; gap: 11px; margin-top: 4px; color: #d7e0e6;
+      background: rgba(14,18,24,0.72); border: 1px solid #26323c; border-radius: 999px;
+      padding: 7px 16px 7px 9px; font-size: 13px; }
+    #boot .spin { width: 18px; height: 18px; border: 2px solid #223240; border-top-color: #38d0e0;
+      border-radius: 50%; animation: spin 0.9s linear infinite; }
+    #boot .bar { position: relative; width: min(300px, 66vw); height: 3px; border-radius: 2px;
+      background: rgba(56,208,224,0.13); overflow: hidden; }
+    #boot .bar i { position: absolute; top: 0; left: 0; bottom: 0; width: 38%;
+      background: linear-gradient(90deg, transparent, #38d0e0, transparent);
+      animation: sweep 1.1s ease-in-out infinite; }
+    @keyframes sweep { 0% { transform: translateX(-100%); } 100% { transform: translateX(330%); } }
+    #boot .cue { margin: 2px 0 0; font-size: 11px; letter-spacing: 0.4px; color: #6f8494; }
+    #boot .err { color: #ff8a80; max-width: 520px; white-space: pre-wrap; }
+    #boot.compact { background: none; align-items: flex-end; padding: 0 0 30px; }
+    #boot.compact .hero { flex-direction: row; gap: 10px; max-width: none;
+      background: rgba(14,18,24,0.86); border: 1px solid #26323c; border-radius: 999px;
+      padding: 8px 15px 8px 10px; }
+    #boot.compact .hero > *:not(.status) { display: none; }
+    #boot.compact .status { margin: 0; background: none; border: none; padding: 0; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 480px) {
+      #boot .lede { font-size: 12px; }
+      #boot .kicker { letter-spacing: 2.4px; font-size: 10px; }
+    }
+  </style>
+  <script type="module" crossorigin src="./assets/models-BTEFBqZX.js"></script>
+  <link rel="modulepreload" crossorigin href="./assets/modulepreload-polyfill-B5Qt9EMX.js">
+  <link rel="modulepreload" crossorigin href="./assets/RealtimeRaytracer-Bb3iMtd4.js">
+  <link rel="modulepreload" crossorigin href="./assets/OrbitControls-BlBZCci6.js">
+  <link rel="modulepreload" crossorigin href="./assets/Duck-Dacmoewm.js">
+  <link rel="modulepreload" crossorigin href="./assets/DRACOLoader-N4ug4sxl.js">
+  <link rel="modulepreload" crossorigin href="./assets/DamagedHelmet-Ra207Cae.js">
+  <link rel="modulepreload" crossorigin href="./assets/gallery-scenes-CrEssIiW.js">
+  <link rel="modulepreload" crossorigin href="./assets/tour-COu05XmT.js">
+</head>
+<body>
+  <div id="app"></div>
+  <div id="boot">
+    <div class="hero">
+      <p class="kicker">three-realtime-rt</p>
+      <h1>Model scenes</h1>
+      <p class="lede">Stock glTF the library never met, ray traced as-is. Every scene is streamed from its canonical public host.</p>
+      <div class="status"><div class="spin"></div><div id="boot-msg">preparing the scene…</div></div>
+      <div class="bar"><i></i></div>
+      <p class="cue">drag to orbit · scroll to zoom · pick a model in the panel</p>
+    </div>
+  </div>
+</body>
+</html>
