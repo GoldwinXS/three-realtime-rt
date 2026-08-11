@@ -20,6 +20,16 @@
   v0.12.0 evidence round  -  see `REPORT_PRESETS.md` for the bench table, the
   blind Gemini video rankings, and the defaults recommendation (recommendation
   only; the architect decides default changes).
+- **Default change: `maxHistory` 128 -> 48** (and the `balanced` preset
+  captures the new default). Adopted from the evidence round's recommendation:
+  on the ghosting-stress arena scene the shorter history cuts residual ghost
+  at 40 frames by 21% for a 4% still-noise increase, and the blind video
+  review explicitly flagged the old 128's light-toggle lag ("the illumination
+  slowly fades up over several frames"). The throttled-leg finding stands
+  documented: at LOW frame rates a longer history is the better trade  -  a
+  low-end product can restore it with `maxHistory: 128` or the `quality`
+  preset. The 0.11.1 option-snapshot assertion in the self-test is updated to
+  the new default.
 - **Game-scene benchmark page** `game-bench.html?scene=chase|stealth|arena`.
   The presets exist for games, so the evidence runs on three deterministic
   game scenes (chase / stealth / arena  -  fixed waypoints and event timings, no

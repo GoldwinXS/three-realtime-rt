@@ -418,7 +418,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     balanced: {
       renderScale: 0.5,
       denoiseIterations: 2,
-      maxHistory: 128,
+      maxHistory: 48,
       taa: true,
       restir: true,
       giHalfRate: false,
@@ -588,8 +588,11 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this._autoEps = options.eps == null;
     /** Reproject accumulated lighting through camera motion (stage 2). */
     this.temporalReprojection = options.temporalReprojection ?? true;
-    /** History length cap: higher = smoother but slower to react. */
-    this.maxHistory = options.maxHistory ?? 128;
+    /** History length cap: higher = smoother but slower to react. 128 until
+     *  0.12.0; lowered to 48 on the presets round's evidence (arena ghost@40
+     *  -21% for +4% still-noise, and the blind video review called out 128's
+     *  light-toggle lag). See REPORT_PRESETS.md "Defaults recommendation". */
+    this.maxHistory = options.maxHistory ?? 48;
     /**
      * EXPERIMENTAL — MOTION-ADAPTIVE TEMPORAL RESPONSE. Default OFF, and with it
      * off every uniform below keeps the value it had before this option existed,

@@ -1036,7 +1036,7 @@ async function runPresetsSelftest() {
     fireflyClamp: 4.0,
     volumetricEnabled: false,
     motionAdaptive: false,
-    maxHistory: 128,
+    maxHistory: 48,
     maxHistoryMoving: 6,
     taaBlendMoving: 0.4,
     temporalReprojection: true,
