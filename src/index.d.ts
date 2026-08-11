@@ -12,6 +12,34 @@ import type {
 export type Tier = "none" | "mid" | "high";
 
 /**
+ * Named quality preset accepted by {@link RealtimeRaytracerOptions.preset} and
+ * {@link RealtimeRaytracer.applyPreset}.
+ */
+export type PresetName = "quality" | "balanced" | "performance" | "motion";
+
+/**
+ * One quality preset: a flat map of EXISTING option values. Every bundled knob
+ * is live-tunable  -  none swaps the lighting megakernel's source or needs
+ * compileScene (renderScale reallocates lighting targets, which the renderer
+ * carries history across; the rest are uniforms or pass toggles read per frame).
+ * Knobs that WOULD require a recompile (`absorptionShadows`, `kmScattering`,
+ * `textureTiles`) are deliberately absent from every bundle.
+ */
+export interface RealtimeRaytracerPreset {
+  renderScale?: number;
+  denoiseIterations?: number;
+  maxHistory?: number;
+  taa?: boolean;
+  restir?: boolean;
+  giHalfRate?: boolean;
+  specular?: boolean;
+  /** Partial  -  a preset only ever sets `enabled`; density/maxDist/zones survive. */
+  volumetric?: { enabled?: boolean };
+  stochasticLights?: boolean;
+  fireflyClamp?: number;
+}
+
+/**
  * World-space 3D-texture albedo ("volumetric surface albedo"). Set it on a
  * material's `userData.rtVolumeAlbedo` to make the tracer sample a 3D texture at
  * the world-space HIT POINT for that surface's albedo — colouring a mesh by a
@@ -196,6 +224,15 @@ export interface VolumetricOptions {
 
 /** Constructor options for {@link RealtimeRaytracer}. All optional. */
 export interface RealtimeRaytracerOptions {
+  /**
+   * Named quality preset to apply as the BASE of these options  -  explicit
+   * options win over the preset. One of {@link PRESETS}: `"quality"` (fidelity
+   * first), `"balanced"` (today's defaults  -  a no-op on a fresh instance),
+   * `"performance"` (fps first), `"motion"` (short history + strong firefly
+   * clamp for fast camera movement). With no `preset` key the constructor is
+   * byte-identical to the build without the feature.
+   */
+  preset?: PresetName;
   /**
    * Resolution scale for the ray traced lighting (G-buffer and final image
    * stay full res). 0.5 traces 4x fewer rays; the bilateral upsample +
@@ -631,13 +668,21 @@ export class RealtimeRaytracer {
   /** Canvas-scale ladder used by the adaptive governor's deepest lever. */
   static CANVAS_LEVELS: number[];
 
+  /**
+   * Named quality presets (see {@link RealtimeRaytracerPreset}): flat maps of
+   * existing, live-tunable option values. Inspect them freely  -  they are plain
+   * objects. `"balanced"` captures today's defaults and is a no-op on a fresh
+   * instance.
+   */
+  static PRESETS: Record<PresetName, RealtimeRaytracerPreset>;
+
   /** Can this renderer run the ray tracing pipeline at all (WebGL2 + float RTs on hardware GPU)? */
   static isSupported(renderer: WebGLRenderer): boolean;
   /** Rough capability tier for choosing defaults (synchronous WebGL heuristic). */
   static detectTier(renderer?: WebGLRenderer): Tier;
   /**
    * Optional async GPU tier probe: inspects real WebGPU adapter limits when
-   * available (honest heuristic — WebGPU does NOT expose VRAM, so it uses
+   * available (honest heuristic  -  WebGPU does NOT expose VRAM, so it uses
    * `maxBufferSize`/texture limits as a proxy and factors screen resolution),
    * else falls back to {@link detectTier}. The constructor stays synchronous;
    * feed the result to {@link recommendedOptions}.
@@ -681,9 +726,28 @@ export class RealtimeRaytracer {
   frame: number;
   /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular, 7 bvh cost. */
   outputMode: number;
+
+  /**
+   * Name of the preset governing this instance: the LAST preset applied
+   * (constructor `preset` option or {@link applyPreset}), or `"custom"` when no
+   * named preset has been applied (a fresh instance's VALUES equal `balanced`,
+   * but that name only sticks once the preset is applied). Deliberately
+   * last-applied-name only  -  a knob the adaptive governor or a manual
+   * assignment changes afterwards does not flip this back to `"custom"`.
+   */
+  get preset(): PresetName | "custom";
+
+  /**
+   * Apply a named quality preset to this LIVE instance. Every bundled knob is
+   * live-tunable, so this never needs compileScene and is safe mid-frame.
+   * Applying a preset re-arms the adaptive governor at the new baseline (its
+   * EMA / cooldown / free-win state is reset). Throws for an unknown name,
+   * listing the valid presets.
+   */
+  applyPreset(name: PresetName): this;
   /**
    * BVH-cost heatmap scale (outputMode 7): the per-pixel shadow-ray node-visit
-   * count is multiplied by this before the palette (default 1/96 — ~96 visits
+   * count is multiplied by this before the palette (default 1/96  -  ~96 visits
    * saturate to white). Live-tunable.
    */
   costScale: number;

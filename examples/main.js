@@ -78,6 +78,12 @@ async function main() {
     await runWarningsSelftest();
     return;
   }
+  // ?selftest=presets: the quality-presets API check (see runPresetsSelftest).
+  // No scene, no render — pure constructor + applyPreset assertions.
+  if (PARAMS.get("selftest") === "presets") {
+    await runPresetsSelftest();
+    return;
+  }
 
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
   const { scene, camera, bounds, lights, sky, ready, showcase, water, windows, fox } = buildScene();
@@ -944,6 +950,263 @@ async function runWarningsSelftest() {
     emit({ pass: false, threw: true, error: (err && err.message) || String(err) });
   } finally {
     console.warn = origWarn;
+    try { if (renderer) renderer.dispose(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Quality-presets API check (?selftest=presets).
+ *
+ * Guards the two contracts the presets round is built on, WITHOUT rendering a
+ * scene (pure construction + applyPreset, so it is fast and focused):
+ *
+ *   1. BYTE-IDENTITY OF DEFAULTS. A fresh instance (no `preset` option) must
+ *      carry exactly the 0.11.1 constructor option values. The renderer's
+ *      defaults are snapshotted below; if a future change moves one, this fails.
+ *      (Shader source is untouched by this round  -  the km/absorption pattern
+ *      guards that separately  -  so option equality is the remaining half of the
+ *      "identical to 0.11.1" claim.)
+ *
+ *   2. BALANCED IS A NO-OP. applyPreset("balanced") on a fresh instance changes
+ *      nothing, and a constructor with `preset: "balanced"` yields the same
+ *      values as a bare constructor.
+ *
+ * Plus the behavioural surface: the constructor preset applies BEFORE explicit
+ * options (explicit wins), applyPreset() actually changes the bundled knobs,
+ * unknown names throw listing the valid presets, the `preset` getter reports
+ * the last applied name (or "custom"), and the PRESETS object is four flat
+ * maps of scalar/plain-object knob values (no nested objects, no arrays).
+ *
+ * Emits its verdict into the same #selftest-verdict node the Playwright driver
+ * reads (scripts/selftest.mjs), tagged `presetsScene:true`.
+ */
+async function runPresetsSelftest() {
+  const emit = (v) => {
+    const line = JSON.stringify({ presetsScene: true, ...v });
+    console.log("[selftest:presets] " + line);
+    let node = document.getElementById("selftest-verdict");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "selftest-verdict";
+      node.style.cssText =
+        "position:fixed;left:-99999px;top:0;white-space:pre;pointer-events:none;";
+      document.body.appendChild(node);
+    }
+    node.textContent = line;
+    node.setAttribute("data-pass", String(!!v.pass));
+  };
+
+  // Reference snapshot of the 0.11.1 constructor defaults. `read()` below reads
+  // exactly these fields off a live instance; string-equality against this
+  // object IS the "option values identical to 0.11.1" assertion.
+  const DEFAULTS = {
+    renderScale: 0.5,
+    overscan: 0,
+    denoiseIterations: 2,
+    denoise: true,
+    taa: true,
+    taaBlend: 0.1,
+    taaJitterScale: 1,
+    gi: true,
+    giHalfRate: false,
+    emissiveNEE: true,
+    emissiveImportance: true,
+    specular: true,
+    reflections: true,
+    refraction: true,
+    transparency: true,
+    absorptionShadows: true,
+    kmScattering: false,
+    textureTiles: false,
+    restir: true,
+    restirMCap: 16,
+    restirMCapMoving: 16,
+    restirGI: false,
+    restirGIMCap: 20,
+    restirGISpatialTaps: 2,
+    restirGIValidate: 8,
+    restirGIResolveAlpha: 1.0,
+    restirGIConfLow: 0.3,
+    restirGIChromaMean: true,
+    restirGIVisFallback: true,
+    stochasticLights: true,
+    adaptiveQuality: true,
+    targetFps: 55,
+    overloadProtection: true,
+    fireflyClamp: 4.0,
+    volumetricEnabled: false,
+    motionAdaptive: false,
+    maxHistory: 128,
+    maxHistoryMoving: 6,
+    taaBlendMoving: 0.4,
+    temporalReprojection: true,
+    ior: 1.5,
+    dispersion: 0,
+    denoiseMaxStep: 0,
+    denoiseStepJitter: 0,
+    denoiseWideDamp: 0,
+  };
+
+  const read = (rt) => ({
+    renderScale: rt.renderScale,
+    overscan: rt.overscan,
+    denoiseIterations: rt.denoiseIterations,
+    denoise: rt.denoise,
+    taa: rt.taa,
+    taaBlend: rt.taaBlend,
+    taaJitterScale: rt.taaJitterScale,
+    gi: rt.gi,
+    giHalfRate: rt.giHalfRate,
+    emissiveNEE: rt.emissiveNEE,
+    emissiveImportance: rt.emissiveImportance,
+    specular: rt.specular,
+    reflections: rt.reflections,
+    refraction: rt.refraction,
+    transparency: rt.transparency,
+    absorptionShadows: rt.absorptionShadows,
+    kmScattering: rt.kmScattering,
+    textureTiles: rt.textureTiles,
+    restir: rt.restir,
+    restirMCap: rt.restirMCap,
+    restirMCapMoving: rt.restirMCapMoving,
+    restirGI: rt.restirGI,
+    restirGIMCap: rt.restirGIMCap,
+    restirGISpatialTaps: rt.restirGISpatialTaps,
+    restirGIValidate: rt.restirGIValidate,
+    restirGIResolveAlpha: rt.restirGIResolveAlpha,
+    restirGIConfLow: rt.restirGIConfLow,
+    restirGIChromaMean: rt.restirGIChromaMean,
+    restirGIVisFallback: rt.restirGIVisFallback,
+    stochasticLights: rt.stochasticLights,
+    adaptiveQuality: rt.adaptiveQuality,
+    targetFps: rt.targetFps,
+    overloadProtection: rt.overloadProtection,
+    fireflyClamp: rt.fireflyClamp,
+    volumetricEnabled: rt.volumetric.enabled,
+    motionAdaptive: rt.motionAdaptive,
+    maxHistory: rt.maxHistory,
+    maxHistoryMoving: rt.maxHistoryMoving,
+    taaBlendMoving: rt.taaBlendMoving,
+    temporalReprojection: rt.temporalReprojection,
+    ior: rt.ior,
+    dispersion: rt.dispersion,
+    denoiseMaxStep: rt.denoiseMaxStep,
+    denoiseStepJitter: rt.denoiseStepJitter,
+    denoiseWideDamp: rt.denoiseWideDamp,
+  });
+
+  let renderer = null;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false });
+    renderer.setSize(64, 64);
+    const supported = RealtimeRaytracer.isSupported(renderer);
+    // On a non-GPU machine the constructor bails before any option is applied, so
+    // every value assertion is a no-op there (the supported path is what this
+    // gate guards; it is the machine the selftest actually runs on).
+    const s = (v) => (supported ? v : true);
+
+    // 1. Byte-identity: a fresh instance (no preset) matches the 0.11.1 defaults.
+    const a = new RealtimeRaytracer(renderer);
+    const before = JSON.stringify(read(a));
+    const defaultsMatch = s(before === JSON.stringify(DEFAULTS));
+
+    // 2. applyPreset("balanced") on that fresh instance changes nothing.
+    a.applyPreset("balanced");
+    const balancedNoop = s(JSON.stringify(read(a)) === before);
+
+    // 3. A constructor with preset:"balanced" equals the bare constructor.
+    const b = new RealtimeRaytracer(renderer, { preset: "balanced" });
+    const ctorBalanced = s(JSON.stringify(read(b)) === before);
+
+    // 4. Constructor preset applies BEFORE explicit options: explicit wins,
+    //    and the rest of the preset still applies.
+    const c = new RealtimeRaytracer(renderer, { preset: "performance", renderScale: 0.9 });
+    const explicitWins = s(c.renderScale === 0.9);
+    const presetStillApplied = s(c.giHalfRate === true && c.stochasticLights === true);
+
+    // 5. applyPreset actually changes the bundled knobs per preset.
+    const q = new RealtimeRaytracer(renderer, { preset: "balanced", adaptiveQuality: false });
+    q.applyPreset("quality");
+    const qualityApplied = s(
+      q.renderScale === RealtimeRaytracer.PRESETS.quality.renderScale &&
+      q.maxHistory === RealtimeRaytracer.PRESETS.quality.maxHistory &&
+      q.giHalfRate === false
+    );
+    const per = new RealtimeRaytracer(renderer, { preset: "balanced", adaptiveQuality: false });
+    per.applyPreset("performance");
+    const perfApplied = s(
+      per.renderScale === RealtimeRaytracer.PRESETS.performance.renderScale &&
+      per.giHalfRate === true &&
+      per.volumetric.enabled === false
+    );
+    const mo = new RealtimeRaytracer(renderer, { preset: "balanced", adaptiveQuality: false });
+    mo.applyPreset("motion");
+    const motionApplied = s(
+      mo.maxHistory === RealtimeRaytracer.PRESETS.motion.maxHistory &&
+      mo.fireflyClamp === RealtimeRaytracer.PRESETS.motion.fireflyClamp
+    );
+
+    // 6. Unknown name throws, listing the valid presets.
+    let threw = null;
+    try { a.applyPreset("bogus"); } catch (err) { threw = String((err && err.message) || err); }
+    const unknownThrows = s(
+      !!threw &&
+      threw.includes("quality") && threw.includes("balanced") &&
+      threw.includes("performance") && threw.includes("motion")
+    );
+
+    // 7. preset getter: constructor option, applyPreset, and the "custom" default.
+    const d = new RealtimeRaytracer(renderer, { preset: "quality" });
+    const getterCtor = s(d.preset === "quality");
+    d.applyPreset("motion");
+    const getterApply = s(d.preset === "motion");
+    const getterCustom = s(new RealtimeRaytracer(renderer).preset === "custom");
+
+    // 8. PRESETS shape: exactly the four named presets, flat maps of scalar or
+    //    plain-object (partial) values  -  no arrays, no nested objects.
+    const presetsShape = s(Object.keys(RealtimeRaytracer.PRESETS).sort().join(",") === "balanced,motion,performance,quality");
+    const allFlat = s(
+      Object.values(RealtimeRaytracer.PRESETS).every((p) =>
+        Object.values(p).every((v) => {
+          if (v === null || typeof v !== "object") return true;
+          if (Array.isArray(v)) return false;
+          return Object.values(v).every((x) => typeof x !== "object");
+        })
+      )
+    );
+
+    const pass =
+      defaultsMatch && balancedNoop && ctorBalanced && explicitWins && presetStillApplied &&
+      qualityApplied && perfApplied && motionApplied && unknownThrows &&
+      getterCtor && getterApply && getterCustom && presetsShape && allFlat;
+
+    emit({
+      pass,
+      presetsScene: true,
+      threw: false,
+      supported,
+      defaultsMatch,
+      balancedNoop,
+      ctorBalanced,
+      explicitWins,
+      presetStillApplied,
+      qualityApplied,
+      perfApplied,
+      motionApplied,
+      unknownThrows,
+      getterCtor,
+      getterApply,
+      getterCustom,
+      presetsShape,
+      allFlat,
+    });
+
+    for (const inst of [a, b, c, q, per, mo, d]) {
+      try { inst.dispose(); } catch { /* ignore */ }
+    }
+  } catch (err) {
+    emit({ pass: false, presetsScene: true, threw: true, error: (err && err.message) || String(err) });
+  } finally {
     try { if (renderer) renderer.dispose(); } catch { /* ignore */ }
   }
 }

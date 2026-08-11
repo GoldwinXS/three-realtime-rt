@@ -713,6 +713,81 @@ rasterizes and gets lit — useful for water / translucent surfaces).
 Transparent materials never act as occluders (a glass case shouldn't cast an
 opaque shadow); `alphaTest` cut-outs still do.
 
+## Quality presets *(since 0.12.0)*
+
+A product or game that wants "quality" or "performance" without learning fifteen
+sliders can pick a named preset. `RealtimeRaytracer.PRESETS` is a plain,
+inspectable object; `rt.applyPreset(name)` applies one to a live instance at any
+time.
+
+| Preset | Intent | Knobs |
+|--------|--------|-------|
+| `quality` | Fidelity first | `renderScale` 0.75, `denoiseIterations` 2, `maxHistory` 256, TAA on, ReSTIR on, `giHalfRate` off, specular on |
+| `balanced` | Today's defaults, captured explicitly | The preset-managed knob set at its constructor defaults. A no-op on a fresh instance, asserted in the render self-test |
+| `performance` | FPS first | `renderScale` 0.375, `denoiseIterations` 3, `giHalfRate` on, volumetric off, `stochasticLights` on |
+| `motion` | Fast camera / gameplay | `maxHistory` 32, `fireflyClamp` 2.5, TAA on, ReSTIR on  -  short history and a tighter firefly clamp cut ghosting, accepting a little extra noise |
+
+Every bundled knob is a live-tunable setting  -  **none of them needs a
+recompile**. Knobs that swap the lighting megakernel's source or a recompile
+(`absorptionShadows`, `kmScattering`, `textureTiles`) are deliberately excluded
+from every bundle; the values shipped are the measured winners of the v0.12.0
+evidence round (see `REPORT_PRESETS.md` for the bench table and the blind Gemini
+video rankings).
+
+Constructor: pass `preset` and it is applied as the BASE of the options, so an
+explicit per-option value always wins over the preset:
+
+```js
+const rt = new RealtimeRaytracer(renderer, {
+  preset: "performance",     // start from the performance bundle…
+  renderScale: 0.5,          // …but override one knob
+});
+```
+
+With **no** `preset` key the constructor is byte-identical to the build without
+the feature (option values asserted in the render self-test).
+
+At runtime, switching is a live call:
+
+```js
+rt.applyPreset("quality");   // mid-frame safe  -  no recompile, no scene reset
+```
+
+**Adaptive quality interplay.** A preset sets the BASELINE the adaptive governor
+breathes around. Applying one re-arms the governor at that baseline (its EMA,
+cooldown and free-win state reset), so it measures the new settings fresh. On a
+machine where the governor is active, the preset's `renderScale` /
+`denoiseIterations` / `stochasticLights` are starting points the governor then
+moves; the preset's other knobs (`maxHistory`, `fireflyClamp`, `giHalfRate`,
+`specular`, volumetric) are direct.
+
+`rt.preset` returns the last preset name applied (constructor option or
+`applyPreset()`), or `"custom"` when no named preset has been applied. It is
+deliberately **last-applied-name only**: a knob the governor or a manual
+assignment changes afterwards does not flip it back to `"custom"`.
+
+Game-loop integration:
+
+```js
+const rt = new RealtimeRaytracer(renderer, { preset: "balanced" });
+rt.compileScene(scene, { dynamicMeshes: movers });
+
+// A settings menu maps a user's choice straight to a preset.
+function applyQualitySetting(choice) {
+  rt.applyPreset(choice === "low" ? "performance"
+    : choice === "high" ? "quality"
+    : choice === "motion" ? "motion"
+    : "balanced");
+}
+
+function frame() {
+  requestAnimationFrame(frame);
+  rt.updateDynamic();       // only on frames where something moved
+  rt.render(scene, camera);
+}
+frame();
+```
+
 ## ReSTIR GI: why the colour is resolved as a mean
 
 `restirGI` shipped measurably *faster* than the inline GI path at flat error, and
@@ -1038,6 +1113,37 @@ key meant — the rooms behind those names get redesigned, and a comparison acro
 a redesign is not a regression. The files already in that directory predate the
 museum and are **not** a time series; see
 [`bench-results/README.md`](bench-results/README.md) before quoting any of them.
+
+### Game-scene benchmark (`game-bench.html`) *(since 0.12.0)*
+
+[`game-bench.html?scene=<name>`](game-bench.html) is the permanent regression
+asset for the quality-presets round: presets are for GAMES, so they are tuned
+and judged on game scenes, not gallery orbits. Three DETERMINISTIC scenes (no
+`Math.random`, no physics engine, fixed waypoints and event timings  -  frame N
+is identical across presets at the same wall-clock time), each a scripted
+~20s loop:
+
+- `chase`  -  third-person camera following a fast prop down a corridor with
+  large occluders. The camera translates AND turns, so pixels are constantly
+  disoccluded  -  the ghosting the `motion` preset exists for.
+- `stealth`  -  Umbral-flavored dark room: two sweeping SpotLight cones, a
+  player-proxy box sneaking between crates, one flickering emissive. Dark-scene
+  noise is where viewers judge RT hardest.
+- `arena`  -  combat chaos: 16 low-poly dynamic props, a mid-clip scatter
+  impulse (the explode pattern), two emissive projectiles flying, a light
+  toggling mid-clip. Stresses dynamic BVH re-bake, NEE churn and firefly
+  control.
+
+Modes: `?mode=bench` fence-times ms/frame at a fixed pose, runs a ghost probe
+(reference at pose B, approach A→B, measure residual vs the reference after
+1/5/10/20/40 frames) and a still-noise read, and POSTs a JSON row to
+`/__bench` (saved under `bench-results/` with a `gameBench: true` flag).
+`?mode=clip` runs the loop continuously for video capture, with the adaptive
+governor ON and an fps badge so governor steps are visible in the recording.
+`?preset=` selects a named preset (omitted = today's defaults);
+`&tune=key:value,...` overrides individual knobs after the preset for A/B
+tuning. The scene geometry lives in
+[`examples/game-scenes.js`](examples/game-scenes.js).
 
 ### Movement-artifact harness
 

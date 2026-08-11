@@ -366,6 +366,32 @@ function describeWarnings(v) {
   return `gate(s): ${bad.join(", ") || "unknown"} (codes: ${JSON.stringify(v.codes || [])})`;
 }
 
+// Usage-diagnostics / quality-presets describe helpers (examples/main.js
+// ?selftest=warnings / ?selftest=presets). Both pages are single-page loads
+// that build their own renderer and write ONE JSON verdict into
+// #selftest-verdict; `describe` turns a failing verdict into a human sentence.
+function describePresets(v) {
+  if (v.threw) return `presets scene threw: ${v.error}`;
+  const gates = [
+    ["defaultsMatch", v.defaultsMatch],
+    ["balancedNoop", v.balancedNoop],
+    ["ctorBalanced", v.ctorBalanced],
+    ["explicitWins", v.explicitWins],
+    ["presetStillApplied", v.presetStillApplied],
+    ["qualityApplied", v.qualityApplied],
+    ["perfApplied", v.perfApplied],
+    ["motionApplied", v.motionApplied],
+    ["unknownThrows", v.unknownThrows],
+    ["getterCtor", v.getterCtor],
+    ["getterApply", v.getterApply],
+    ["getterCustom", v.getterCustom],
+    ["presetsShape", v.presetsShape],
+    ["allFlat", v.allFlat],
+  ];
+  const bad = gates.filter(([, ok]) => !ok).map(([n]) => n);
+  return `gate(s): ${bad.join(", ") || "unknown"}`;
+}
+
 // Drive the empty-scene regression check (examples/main.js ?selftest=empty) to a
 // verdict on chromium. Confirms compileScene() on a scene with no meshes is a
 // no-op and render() falls back to plain raster instead of crashing — the
@@ -460,6 +486,7 @@ async function main() {
   const results = [];
   let empty = null;
   let warnings = null;
+  let presets = null;
   try {
     results.push(["chromium", await runChromiumLeg("chromium", base)]);
     for (const [name, launcher] of [["firefox", firefox], ["webkit", webkit]]) {
@@ -493,6 +520,15 @@ async function main() {
         (warnings.reason ? `\n     reason: ${warnings.reason}` : "") +
         (warnings.verdict ? `\n     ${JSON.stringify(warnings.verdict)}` : "")
     );
+
+    // Quality-presets API check (chromium, default three).
+    console.log(`\n=== quality presets (chromium, ?selftest=presets) ===`);
+    presets = await driveCheck(base, "presets", describePresets);
+    console.log(
+      `  -> ${presets.status.toUpperCase()} (${presets.ms}ms)` +
+        (presets.reason ? `\n     reason: ${presets.reason}` : "") +
+        (presets.verdict ? `\n     ${JSON.stringify(presets.verdict)}` : "")
+    );
   } finally {
     cleanup();
   }
@@ -515,11 +551,13 @@ async function main() {
   }
   console.log(pad("empty-scene", 18) + pad(empty ? empty.status : "-", 8) + "(compileScene no-op + render fallback)");
   console.log(pad("warnings", 18) + pad(warnings ? warnings.status : "-", 8) + "(usage diagnostics fire once, status.warnings)");
+  console.log(pad("presets", 18) + pad(presets ? presets.status : "-", 8) + "(preset API: defaults byte-identity + balanced no-op)");
   for (const [name, r] of results) {
     if (r.status !== "pass" && r.reason) console.log(`  ${name}: ${r.reason}`);
   }
   if (empty && empty.status !== "pass" && empty.reason) console.log(`  empty-scene: ${empty.reason}`);
   if (warnings && warnings.status !== "pass" && warnings.reason) console.log(`  warnings: ${warnings.reason}`);
+  if (presets && presets.status !== "pass" && presets.reason) console.log(`  presets: ${presets.reason}`);
   console.log("========================================================");
 
   // Gate: BOTH chromium legs (default three AND three@latest) must PASS, and the
@@ -532,6 +570,7 @@ async function main() {
   }
   if (!empty || empty.status !== "pass") problems.push(`empty-scene (${empty ? empty.status : "missing"})`);
   if (!warnings || warnings.status !== "pass") problems.push(`warnings (${warnings ? warnings.status : "missing"})`);
+  if (!presets || presets.status !== "pass") problems.push(`presets (${presets ? presets.status : "missing"})`);
   const failed = results.filter(([, r]) => r.status === "fail").map(([n]) => n);
   for (const n of failed) if (!problems.some((p) => p.startsWith(n))) problems.push(`${n} (fail)`);
 
