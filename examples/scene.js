@@ -662,9 +662,9 @@ export function buildScene() {
       attenuationColor: new THREE.Color(attHex),
       attenuationDistance: attDist, // world units (metres)
     });
-  const amberGlass = castGlass(0xffb36b, 0xffa14f, 0.12);
-  const redGlass = castGlass(0xff7a6a, 0xff2919, 0.15);
-  const blueGlass = castGlass(0x9cc4ff, 0x59a6ff, 0.12);
+  const amberGlass = castGlass(0xffb36b, 0xff7a20, 0.34);
+  const redGlass = castGlass(0xff7a6a, 0xdd2020, 0.26);
+  const blueGlass = castGlass(0x9cc4ff, 0x1058ff, 0.30);
   // Backlight: a two-triangle emissive plane (cheap in the shared 256-tri NEE
   // budget) forming the BACK PANEL of the box — the glass blocks are mounted
   // directly onto it (6mm of clearance, enough that the coplanar faces never
@@ -676,7 +676,7 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({
       color: 0x000000,
       emissive: 0xffedd8,
-      emissiveIntensity: 6,
+      emissiveIntensity: 12,
       roughness: 1,
     })
   );
@@ -783,34 +783,56 @@ export function buildScene() {
       0, FIELD_Y0 + r * (TILE_H + MUNTIN) - MUNTIN / 2, 0);
   }
   // Palette. attenuationDistance is the depth at which the transmitted colour
-  // equals attenuationColor, so it is tuned AGAINST the tile thicknesses below:
-  // roughly attDist ~ the thickness of the tiles that use it, which lands the
-  // saturated tiles near their attenuation colour without crushing to black,
-  // and leaves the thin ones a visible wash.
+  // equals attenuationColor, so each hue is tuned against a DESIGN thickness:
+  // the [hex, attHex, attDist] triple below reads "a tile attDist metres deep
+  // lands on attHex". Cells then build at whatever physical depth the tracer
+  // needs (see the tiles table) and scale their attenuationDistance by
+  // built/design, so every cell keeps its authored optical depth exactly.
+  //
+  // WHY EVERY TILE IS >= 9 CM. The tracer offsets a refraction ray 2 x rt.eps
+  // past the entry face along the normal — ~7.2 cm in this room — and a body
+  // thinner than that never resolves its own exit face: the ray exits onto
+  // whatever is behind, whose sigma is 0, and the tile reads as clear frost no
+  // matter what the palette says (this shipped broken once; the fix in
+  // RTLightingPass restored the measured chord, but it cannot help a tile the
+  // ray never resolves). The original 3-6 cm cells are kept in the table as
+  // the design thickness so the palette tuning survives the chunking.
   const tileGlass = (hex, attHex, attDist) =>
     new THREE.MeshPhysicalMaterial({
       color: hex,           // albedo fallback for secondary rays / refraction off
       roughness: 0.04,
       metalness: 0,
       transmission: 1.0,    // NOT `transparent` — real refractive glass, in the BVH
-      ior: 1.5,
+      // 1.62 rather than stock 1.5 so the tiles visibly warp whatever is behind
+      // them (the critic read the subtle 1.5 bend as "frosted plastic" — the
+      // stronger bend is what makes a pane read as glass, not a tinted filter).
+      ior: 1.62,
       attenuationColor: new THREE.Color(attHex),
       attenuationDistance: attDist,
     });
-  const RUBY = tileGlass(0xff6152, 0xff2418, 0.10);
-  const COBALT = tileGlass(0x86b2ff, 0x2f6bff, 0.07);
-  const AMBER2 = tileGlass(0xffc07a, 0xff9a2e, 0.07);
-  const EMERALD = tileGlass(0x9fe8bc, 0x21c46a, 0.06);
-  const CLEAR = tileGlass(0xeef4ff, 0xdce8ff, 0.14); // the control tile
-  // [material, thickness] per cell, bottom row first. Centre row >= 8cm.
+  const TILE_HUES = {
+    RUBY: [0xff5346, 0xff1008, 0.09],
+    COBALT: [0x7aa6ff, 0x1038ff, 0.065],
+    AMBER2: [0xffc07a, 0xff6e00, 0.065],
+    EMERALD: [0x8fe0b4, 0x00b850, 0.055],
+    // The control tile: pure-white attenuationColor means sigma 0 on every
+    // channel, so the tracer reads it as plain glass and the room shows through
+    // un-tinted — the A/B that proves the other eight cells' colour is the
+    // absorption, not a texture or a tinted albedo.
+    CLEAR: [0xeef4ff, 0xffffff, 0.5],
+  };
+  // [hue, designThickness, builtThickness] per cell, bottom row first. The
+  // relief still varies (9-12 cm) so raking light keeps reading depth.
   const tiles = [
-    [[EMERALD, 0.04], [RUBY, 0.06], [COBALT, 0.05]],
-    [[RUBY, 0.10], [AMBER2, 0.09], [EMERALD, 0.08]],
-    [[COBALT, 0.05], [CLEAR, 0.03], [AMBER2, 0.04]],
+    [["EMERALD", 0.04, 0.09], ["RUBY", 0.06, 0.11], ["COBALT", 0.05, 0.10]],
+    [["RUBY", 0.10, 0.12], ["AMBER2", 0.09, 0.11], ["EMERALD", 0.08, 0.10]],
+    [["COBALT", 0.05, 0.10], ["CLEAR", 0.03, 0.09], ["AMBER2", 0.04, 0.09]],
   ];
   for (let r = 0; r < 3; r++) {
     for (let c = 0; c < 3; c++) {
-      const [mat, t] = tiles[r][c];
+      const [hue, tDesign, t] = tiles[r][c];
+      const [hex, attHex, attDist] = TILE_HUES[hue];
+      const mat = tileGlass(hex, attHex, attDist * (t / tDesign));
       const tile = new THREE.Mesh(new THREE.BoxGeometry(TILE_W, TILE_H, t), mat);
       tile.position.set(
         FIELD_X0 + TILE_W / 2 + c * (TILE_W + MUNTIN),
@@ -899,7 +921,11 @@ export function buildScene() {
     new THREE.MeshStandardMaterial({
       color: 0x000000,
       emissive: 0xffdcae,
-      emissiveIntensity: 9,
+      // 9 -> 5.5: at 9 the shade's bloom washed out the stem/finial join and
+      // read as a flat white disc; 5.5 still glows warmly through the alabaster
+      // wall and lights the table through it, but the shade reads as a lit
+      // translucent object with visible structure, not a blown-out emitter.
+      emissiveIntensity: 5.5,
       roughness: 1,
     })
   );
@@ -953,12 +979,22 @@ export function buildScene() {
   // distance can express is -ln(1e-4)/distance. At 25 cm that caps red at 36.8
   // and the jade comes out a washed sage; at 5 cm the cap is 184, which is what
   // this needs.
-  const marbleGeo = new THREE.SphereGeometry(0.2, 36, 24);
+  // The A/B pair, restaged. They used to sit ON the tabletop at (+-0.44, z 0.34),
+  // r 0.2 — geometrically inside the shade's bottom rim (radius 0.58 at the same
+  // height, the owner's screenshot clip), and small enough that the scatter-vs-
+  // absorb difference was invisible from the entrance. They now stand side by
+  // side on ONE shared light-stone plinth to the lamp's right-front (layout and
+  // clearances spelled out at the plinth below), grown to r 0.30 so the pair
+  // reads from the default museum camera.
+  const SPHERE_R = 0.30;
+  const marbleGeo = new THREE.SphereGeometry(SPHERE_R, 40, 28);
   const jadeBase = () => ({
     color: 0xffffff,
-    // Soft enough that the GGX highlight reads as polished stone rather than
-    // covering the pigment it is supposed to sit on.
-    roughness: 0.34,
+    // Glossy enough that the pair catches a tight specular glint from the warm
+    // light (that glint is what makes the DARK sphere read as polished glass
+    // rather than a matte black void, and it sits on top of the jade's green
+    // instead of covering it) — 0.16 instead of the old 0.34, which read matte.
+    roughness: 0.16,
     metalness: 0,
     transmission: 1.0,
     ior: 1.55,
@@ -973,16 +1009,35 @@ export function buildScene() {
   const jadeStone = new THREE.MeshPhysicalMaterial(jadeBase());
   jadeStone.userData.rtAttenuation = jadeK;
   jadeStone.userData.rtScattering = { color: [0.14, 0.14, 0.14], distance: 0.1 };
-  const mounts = [
-    ["absorb", -0.44, 0.34, glassMarble],
-    ["scatter", 0.44, 0.34, jadeStone],
+  // A SINGLE shared display plinth, set clear of the lamp table so neither
+  // sphere can be misread as sitting on it (the nearest sphere's axis distance
+  // is sqrt(1.1^2+0.85^2)=1.39 vs the table's 0.78 radius, and the plinth's
+  // nearest corner sqrt(0.95^2+0.575^2)=1.11 clears the same). The two spheres
+  // sit side by side 0.80m apart (0.20 clear of each other at r 0.30) — one
+  // deliberate A/B pair, not two stray props. Warm light stone (the duck
+  // vitrine's plinth family), deliberately NOT dark: the dark marble's whole
+  // point is that it is the dark one, and it vanishes against a dark stand.
+  const PLINTH_TOP = 0.55;
+  // CX 1.75 (not 1.5): at 1.5 the dark sphere lined up with the bronze lamp
+  // base from the default camera and its silhouette vanished into the dark
+  // metal. 1.75 frames it against the light floor to the right instead.
+  const PLINTH_CX = 1.75, PLINTH_CZ = 0.85;
+  const spherePlinth = new THREE.Mesh(
+    new THREE.BoxGeometry(1.5, PLINTH_TOP, 0.55),
+    new THREE.MeshStandardMaterial({ color: 0xd8d4cc, roughness: 0.5 })
+  );
+  spherePlinth.position.set(PLINTH_CX, PLINTH_TOP / 2, PLINTH_CZ);
+  spherePlinth.name = "alabaster-shared-plinth";
+  spherePlinth.userData.museumTop = PLINTH_TOP;
+  alabaster.add(spherePlinth);
+  const displays = [
+    ["absorb", PLINTH_CX - 0.4, PLINTH_CZ, glassMarble],
+    ["scatter", PLINTH_CX + 0.4, PLINTH_CZ, jadeStone],
   ];
-  for (const [tag, mx, mz, mat] of mounts) {
-    alaBronze(`alabaster-mount-${tag}`, new THREE.CylinderGeometry(0.12, 0.14, 0.06, 18),
-      mx, TABLE_TOP + 0.03, mz);
+  for (const [tag, mx, mz, mat] of displays) {
     const ball = new THREE.Mesh(marbleGeo, mat);
-    // Seated on its mount's top face (a ball in a cup rests at one point).
-    ball.position.set(mx, TABLE_TOP + 0.06 + 0.2, mz);
+    // Seated on the plinth top (a ball rests at one point).
+    ball.position.set(mx, PLINTH_TOP + SPHERE_R, mz);
     addAla(`alabaster-ball-${tag}`, ball);
   }
   alabaster.traverse((o) => (o.visible = false)); // revealed by the KM toggle
@@ -1177,13 +1232,27 @@ export function buildScene() {
   // the coloured quilt always has an untinted reference right beside it. Small
   // rtRadius keeps the projected tile edges crisp rather than soft-shadow mush.
   // Hidden at boot; the UI reveals it with the rest of the Lumiere ensemble.
-  const projector = new THREE.SpotLight(0xfff2e0, 55, 0, 0.38, 0.3);
+  const projector = new THREE.SpotLight(0xfff2e0, 115, 0, 0.38, 0.3);
   projector.position.set(2.6, 5.4, -3.2);
   projector.target.position.set(2.6, 0, 0.4);
   projector.userData.rtRadius = 0.06;
   projector.visible = false;
   scene.add(projector);
   scene.add(projector.target);
+
+  // A soft fill behind the Lumiere screen. The tiles are see-through: the view
+  // path refracts THROUGH each cell and lands on the open floor behind the
+  // screen, and that floor was barely lit, so every tile read as a dark smudge.
+  // This low warm fill lights exactly that region (z -1..-5 behind the glazing)
+  // so the tinted view path has something bright to attenuate: the ruby reads
+  // red against a lit floor instead of black against black. Gated with the
+  // ensemble like the projector, and kept soft (rtRadius 0.5) so it reads as
+  // ambient case light rather than a second hard spot.
+  const lumFill = new THREE.PointLight(0xffe9cf, 15, 0, 2);
+  lumFill.position.set(2.6, 1.4, -3.8);
+  lumFill.userData.rtRadius = 0.5;
+  lumFill.visible = false;
+  scene.add(lumFill);
 
   // Orbiting ceiling light — shows moving ray traced shadows sweeping the room.
   // Its soft-shadow radius is kept small so the sampled light points stay clear
@@ -1216,7 +1285,7 @@ export function buildScene() {
 
   // Fair raster comparison: when ray tracing is toggled off, the demo enables
   // shadow maps — flag everything now so that path just works.
-  for (const l of [warm, cool, spot, orbit, projector]) {
+  for (const l of [warm, cool, spot, orbit, projector, lumFill]) {
     l.castShadow = true;
     l.shadow.mapSize.set(1024, 1024);
     l.shadow.bias = -0.004;
@@ -1235,6 +1304,7 @@ export function buildScene() {
     { label: "spot light", light: spot, color: true },
     { label: "orbit light", light: orbit, color: true },
     { label: "projector", light: projector, color: true, gated: "absorption" },
+    { label: "lumiere fill", light: lumFill, color: true, gated: "absorption" },
   ];
 
   // The procedural-sky experiment (owner-requested): the room's open ceiling and

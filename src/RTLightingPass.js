@@ -1078,19 +1078,34 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
     // THICKNESS CORRECTION. dist is measured from ro, which the line above put
     // 2*eps INSIDE the entry surface along the normal, so it under-reports the
     // chord by the distance from ro back to the entry plane: 2*eps / |rd.N|.
-    // That is a fixed 7 cm in a room-sized scene, i.e. HALF the wall of a cast
-    // shade — small enough to ignore for a tint, fatal for a reflectance. The
-    // correction is exact, and it deliberately does not touch the absorption
-    // line below, whose behaviour is what 0.8.0 shipped.
+    // That is a fixed 7 cm in a room-sized scene — half the wall of a cast
+    // shade, or MORE THAN THE FULL DEPTH of a stained-glass tile: an 8 cm pane
+    // in the museum kept under 1 cm of measured chord and read nearly clear.
+    // The correction is exact and applies to BOTH consumers of the chord: the
+    // KM layer and the Beer-Lambert line below. (Until 0.12.1 the absorption
+    // line kept 0.8.0's uncorrected chord "because a tint could absorb the
+    // error"; the Lumiere screen's thin tiles proved it cannot.) Bodies
+    // thinner than 2*eps along the normal remain unresolvable: ro starts
+    // beyond their exit face, so the exit hit lands on some other surface and
+    // no chord accounting can recover the tint. Keep exhibits chunkier than
+    // 2*eps, and see the eps auto-scale in RealtimeRaytracer.
+    //
+    // The 0.25 floor bounds the correction at 8*eps. For real glass it never
+    // binds: refraction into a denser medium caps the internal angle at
+    // asin(1/ior), so rd.N is at least 0.745 at ior 1.5. It exists for the
+    // ior -> 1 end of the G-buffer's [1, 1.98] range, where the refracted ray
+    // approaches the view ray and can graze — there an unbounded 1/|rd.N|
+    // would invent metres of chord and read the whole silhouette as masstone.
+    //
+    // The correction expression is spelled out inside EACH marker block rather
+    // than hoisted to a shared local: these >>> <<< blocks are spliced in and
+    // out independently per feature (see setAbsorption / setKmScattering), so
+    // a local declared in one block is an undeclared identifier when the other
+    // block compiles without it — which ships as a black frame, not an error
+    // you see in dev.
     vec4 rtKmRow = rtKmFetch(attr.w);
     gKmOn = rtKmRow.w > 0.0;
     if (gKmOn) {
-      // The 0.25 floor bounds the correction at 8*eps. For real glass it never
-      // binds: refraction into a denser medium caps the internal angle at
-      // asin(1/ior), so rd.N is at least 0.745 at ior 1.5. It exists for the
-      // ior -> 1 end of the G-buffer's [1, 1.98] range, where the refracted ray
-      // approaches the view ray and can graze — there an unbounded 1/|rd.N|
-      // would invent metres of chord and read the whole silhouette as masstone.
       rtKmLayer(rtAbsorbSigma(attr.w), rtKmRow.rgb,
         dist + 2.0 * uEps / max(abs(dot(rd, N)), 0.25), gKmR, gKmT);
       gKmBehind = refrRad;
@@ -1117,7 +1132,11 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
     // inside the slab is not tracked (the documented one-layer limit). Order
     // vs the dispersion channel mask below is irrelevant — both are
     // per-channel scale factors.
-    refrRad *= rtTransmittance(attr.w, dist);
+    // Chord corrected for the 2*eps entry offset exactly like the KM layer
+    // above (same expression, kept inline for the splice-block reason given
+    // there); until 0.12.1 this used the raw under-reported dist.
+    refrRad *= rtTransmittance(attr.w,
+      dist + 2.0 * uEps / max(abs(dot(rd, N)), 0.25));
 // <<< RT_ABSORPTION
   } else {
     refrRad = uSkyEnabled
