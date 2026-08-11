@@ -96,7 +96,27 @@ void main() {
   }
   vec3 P = wp.xyz;
   vec4 nm = texture(uGNormalMetal, vUv);
-  vec3 N = normalize(nm.xyz);
+  // Non-finite center irradiance: half-float can reach inf, and a NaN/Inf
+  // center value poisons every exp()-based weight below. Zero it AND drop its
+  // kernel weight, so the output is rebuilt from valid neighbours instead of
+  // rendering a black dot at full center weight.
+  float centerW = 4.0;
+  if (any(isnan(center.rgb)) || any(isinf(center.rgb))) {
+    center.rgb = vec3(0.0);
+    centerW = 0.0;
+  }
+  // Degenerate center normal (e.g. geometry with no normal attribute):
+  // normalize(vec3(0)) is NaN, and every dot/pow below produces NaN that
+  // spreads through the à-trous weights into a black silhouette.
+  // The G-buffer's FrontSide culling already guarantees background pixels
+  // hit the wp.w < 0.5 early-return above, so a zero normal here means a
+  // genuine defect — skip filtering and pass the center sample through.
+  float nmLen = length(nm.xyz);
+  if (nmLen < 1e-4) {
+    outColor = center;
+    return;
+  }
+  vec3 N = nm.xyz / nmLen;
   // Specular surfaces (mirror metals, glass) carry traced reflections whose
   // detail is NOT in the G-buffer guides — filtering would smear them, and
   // their signal is nearly deterministic anyway. Scale the filter down as the
@@ -157,8 +177,8 @@ void main() {
   float lumC = rtLum(center.rgb);
 
   // 3x3 B-spline-ish kernel, edge-avoiding weights.
-  vec3 sum = center.rgb * 4.0;
-  float wsum = 4.0;
+  vec3 sum = center.rgb * centerW;
+  float wsum = centerW;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
       if (dx == 0 && dy == 0) continue;
@@ -168,7 +188,14 @@ void main() {
       vec4 g = texture(uGWorldPos, tuv);
       if (g.w < 0.5) continue;
       vec4 s = sampleIrr(tuv);
-      vec3 Nt = normalize(texture(uGNormalMetal, tuv).xyz);
+      vec3 nmt = texture(uGNormalMetal, tuv).xyz;
+      // Skip taps whose normal is degenerate or whose irradiance is non-finite:
+      // either would inject NaN/Inf into the à-trous weights and spread as a
+      // black blob (observed on the WaterBottle label band edge at denoise 2).
+      float nmtLen = length(nmt);
+      if (nmtLen < 1e-4) continue;
+      if (any(isnan(s.rgb)) || any(isinf(s.rgb))) continue;
+      vec3 Nt = nmt / nmtLen;
 
       float k = (dx == 0 || dy == 0) ? 2.0 : 1.0;
       float wN = pow(max(dot(N, Nt), 0.0), 32.0);
@@ -186,7 +213,9 @@ void main() {
   // Uniform branch, not a mix(): at uPassWeight 1.0 a mix would still evaluate
   // 0.0 * center.rgb, which is NaN rather than 0 if a half-float irradiance
   // texel ever reaches inf. The branch keeps the off-state provably untouched.
-  vec3 filtered = sum / wsum;
+  // wsum can only be 0 when the center was non-finite AND every tap was
+  // skipped; emit 0 rather than 0/0 (which is NaN and would re-poison history).
+  vec3 filtered = wsum > 0.0 ? sum / wsum : vec3(0.0);
   outColor = vec4(uPassWeight >= 1.0 ? filtered : mix(center.rgb, filtered, uPassWeight), center.a);
 }
 `;

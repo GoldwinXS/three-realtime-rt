@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.11.3
+
+- Fix: normal-less geometry (e.g. Khronos Fox) rendered black under denoising.
+  `extractMeshGeometry` computed normals on its clone for the BVH path but left
+  the original geometry untouched; the G-buffer swap material read a zero normal
+  from the original, `normalize(vec3(0))` produced NaN in the denoiser, and the
+  a-trous weights spread the NaN into a black silhouette. The compiler now also
+  computes vertex normals on the original mesh geometry when missing.
+- Fix: the denoiser spread non-finite (NaN/Inf) irradiance into black blobs
+  (observed on the WaterBottle label band edge and as large black squares on
+  real GPUs). The a-trous loop now skips taps whose normal length is below 1e-4
+  and taps whose irradiance carries NaN/Inf. A degenerate center normal
+  short-circuits to the unfiltered center sample.
+- Fix: transmission materials with a non-white base-colour map (e.g.
+  MosquitoInAmber amber) rendered fully opaque instead of translucent. The
+  CompositePass multiplied the glass-path irradiance by the G-buffer albedo,
+  double-tinting the transmitted light: the base-colour map intended for the
+  diffuse share (1 - transmission) of the mix was also multiplying the
+  refraction, making the glass read as an opaque surface. Glass pixels now
+  fade the albedo tint out with transmission (t=0 matches the diffuse branch
+  exactly, no pop at the band edge; full glass leaves traced radiance
+  untouched).
+- New: derived glass tint. Glass materials with a non-white base colour or
+  base-colour map and NO explicit attenuation now get Beer-Lambert absorption
+  derived from the average base colour (characteristic distance 5% of the
+  scene diagonal), matching three.js raster's convention that transmission is
+  tinted by base colour, but along the refracted in-medium chord where it
+  physically belongs (reflections stay untinted, thickness compounds).
+  Explicit attenuationColor/attenuationDistance or userData.rtAttenuation
+  always wins; an explicit white rtAttenuation opts out. Near-white bases
+  derive nothing (the absorption row stays unmaterialized). Known limit:
+  meshes ENCLOSED in glass (MosquitoInAmber's insect) end the chord at the
+  first interior hit, so heavily occupied glass tints weakly; full in-medium
+  accumulation across interior hits is future work.
+- Fix (denoiser, follow-up): a non-finite center sample previously kept full
+  kernel weight after being zeroed, rendering a black dot per NaN seed; it now
+  gets zero weight and the pixel is rebuilt from valid neighbours (0/0 guarded).
+
 ## 0.11.2
 
 - Fix: secondary-ray texture tiles rendered vertically mirrored. The tile block

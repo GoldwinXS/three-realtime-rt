@@ -148,6 +148,22 @@ void main() {
       float opacity = clamp(nmFull.w - 4.0, 0.0, 1.0);
       vec3 paneCol = albedoRough.rgb * irradiance + emissive;
       color = uSpecEnabled ? mix(specular, paneCol, opacity) : paneCol;
+    } else if (nmFull.w >= 2.0) {
+      // Glass (packed word in [2,4)): the irradiance slot already carries
+      // full-colour radiance from the glass path (refraction + Fresnel
+      // reflection), NOT demodulated irradiance. Multiplying by the surface
+      // albedo would double-tint the transmitted light — a base-colour map
+      // intended for the diffuse component (1-transmission share of the mix)
+      // would wrongly tint the see-through image and make the glass read as
+      // opaque. The buffer cannot separate the diffuse share from the glass
+      // radiance, so approximate: fade the albedo tint out with transmission
+      // (t=0 matches the diffuse branch exactly, avoiding a pop at the band
+      // edge; t=1 leaves traced radiance untouched). [3,4) is full glass and
+      // the clamp reads it as t=1. In-medium colour belongs to absorption
+      // (SceneCompiler derives it from the base colour when unset), not to a
+      // surface multiply. See SPEC_MODEL_FIXES.md.
+      float glassT = clamp(nmFull.w - 2.0, 0.0, 1.0);
+      color = mix(albedoRough.rgb, vec3(1.0), glassT) * irradiance + specular + emissive;
     } else {
       color = albedoRough.rgb * irradiance + specular + emissive;
     }

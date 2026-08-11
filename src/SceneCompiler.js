@@ -404,7 +404,17 @@ function extractMeshGeometry(mesh) {
   const indexed = mesh.geometry.index;
   const src = indexed ? mesh.geometry.toNonIndexed() : mesh.geometry.clone();
 
-  if (!src.getAttribute("normal")) src.computeVertexNormals();
+  if (!src.getAttribute("normal")) {
+    src.computeVertexNormals();
+    // The G-buffer swap material (GBufferPass) reads from the ORIGINAL mesh
+    // geometry, not from this clone. A zero normal there reaches the denoiser
+    // as normalize(vec3(0)) → NaN and the entire silhouette goes black.
+    // computeVertexNormals on the original is a benign mutation: it only
+    // fills in an attribute the geometry already should have carried.
+    if (!mesh.geometry.getAttribute("normal")) {
+      mesh.geometry.computeVertexNormals();
+    }
+  }
   const localPos = src.getAttribute("position").array.slice();
   const localNorm = src.getAttribute("normal").array.slice();
 
@@ -781,7 +791,7 @@ function collectVolumeAlbedo(materials) {
 // large but finite sigma; a channel >= 1 would mean gain, and clamps to sigma 0.
 // A material whose every channel lands on sigma 0 (white attenuationColor) is
 // treated as non-absorbing — exactly today's behaviour, as is setting nothing.
-function absorptionSigmaFor(mat) {
+function absorptionSigmaFor(mat, derivedScale = 0) {
   if (!mat) return null;
   // Only glass surfaces ever have an in-medium path length to attenuate over
   // (the refracted entry-to-exit chord in RTLightingPass.glassRadiance), and the
@@ -816,10 +826,41 @@ function absorptionSigmaFor(mat) {
     if (!isGlass) return null;
     const c = mat.attenuationColor;
     distance = mat.attenuationDistance;
-    if (!c || typeof c.r !== "number") return null;
-    // Infinity is three's "no attenuation" default — not an opt-in, stay quiet.
-    if (!Number.isFinite(distance) || distance <= 0) return null;
-    color = [c.r, c.g, c.b];
+    if (c && typeof c.r === "number" && Number.isFinite(distance) && distance > 0) {
+      color = [c.r, c.g, c.b];
+    } else if (derivedScale > 0) {
+      // DERIVED TINT: no explicit attenuation configured (Infinity is three's
+      // "no absorption" default), but the material carries a non-white base
+      // colour and/or base-colour map. three.js's raster transmission tints
+      // transmitted light by the base colour; without this, a mapped glass
+      // like MosquitoInAmber's amber renders as CLEAR glass because the
+      // composite correctly stopped multiplying traced radiance by albedo
+      // (that multiply double-tinted and read as opaque). Deriving Beer-Lambert
+      // sigma from the base colour puts the tint where it physically belongs:
+      // along the refracted in-medium chord, compounding with thickness, and
+      // NOT on Fresnel reflections. The characteristic distance is 5% of the
+      // scene diagonal: bright sky/ground behind the glass plus ACES tone
+      // mapping wash mild tints toward white, so the default must saturate a
+      // typical chord to read at all (measured on MosquitoInAmber: 15% gave
+      // chord survival ~(0.6,0.4,0.2) which tonemapped to cream; 5% gives
+      // ~(0.2,0.05,0.01), an unmistakable amber). A material that wants a
+      // different strength sets attenuationColor/attenuationDistance or
+      // userData.rtAttenuation (explicit always wins; an explicit WHITE
+      // rtAttenuation opts out entirely).
+      const base = mat.color && typeof mat.color.r === "number"
+        ? [mat.color.r, mat.color.g, mat.color.b] : [1, 1, 1];
+      if (mat.map) {
+        const avg = averageEmissiveMap(mat.map);
+        if (avg) { base[0] *= avg[0]; base[1] *= avg[1]; base[2] *= avg[2]; }
+      }
+      // Near-white base = effectively clear: stay out, keep the absorption
+      // row unmaterialized (zero-cost-when-unused contract).
+      if (Math.min(base[0], base[1], base[2]) >= 0.85) return null;
+      color = base;
+      distance = 0.05 * derivedScale;
+    } else {
+      return null;
+    }
   }
   const sigma = [0, 0, 0];
   let absorbs = false;
@@ -850,7 +891,7 @@ function absorptionSigmaFor(mat) {
 // it: a purely scattering pigment (white, K = 0) has sigma 0 in every channel,
 // but the two-flux code reads K from this very row and the glass flag from its
 // .w, so the row has to exist whenever a KM material does.
-function collectAbsorption(materials, force = false) {
+function collectAbsorption(materials, force = false, derivedScale = 0) {
   let count = 0;
   const sigma = new Float32Array(materials.length * 3);
   const glass = new Float32Array(materials.length);
@@ -860,7 +901,7 @@ function collectAbsorption(materials, force = false) {
     // packs into the [2,4) band of the material word: a transparent surface is
     // kept out of the BVH entirely, so it can never be a shadow-ray hit anyway.
     glass[i] = mat && !mat.transparent ? mat.transmission ?? 0 : 0;
-    const s = absorptionSigmaFor(mat);
+    const s = absorptionSigmaFor(mat, derivedScale);
     if (!s) continue;
     sigma[i * 3 + 0] = s[0];
     sigma[i * 3 + 1] = s[1];
@@ -1564,7 +1605,11 @@ export function compileScene(scene, options = {}) {
   // nothing absorbs — the two-flux code reads K from row 67 and the glass flag
   // from its .w, and row 68 is addressed relative to it.
   compiled.scattering = collectScattering(materials);
-  compiled.absorption = collectAbsorption(materials, !!(compiled.scattering || hasTiles));
+  compiled.absorption = collectAbsorption(
+    materials,
+    !!(compiled.scattering || hasTiles),
+    compiled.sceneDiagonal
+  );
   compiled.hasTextureTiles = hasTiles;
   compiled._tileSize = tileSize; // for shader source injection
   compiled.materialsTex = buildSceneDataTexture(

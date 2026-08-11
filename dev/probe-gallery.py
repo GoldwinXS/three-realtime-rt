@@ -8,7 +8,7 @@ Writes bis-<name>.png to the CWD and prints pageerrors.
 import asyncio, sys
 from playwright.async_api import async_playwright
 
-PORT = 8127
+PORT = 8133
 INIT = ("Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });"
         " Object.defineProperty(document, 'hidden', { get: () => false });")
 
