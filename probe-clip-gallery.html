@@ -40,13 +40,16 @@ const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerH
 camera.position.set(...def.cam);
 camera.lookAt(...def.target);
 
+window.__clipOpts = Object.fromEntries([...q.entries()].map(([k,v]) => [k, v==="false"?false:(v==="true"?true:(isNaN(parseFloat(v))?v:parseFloat(v)))]));
 const rt = new RealtimeRaytracer(renderer, {
   ...RealtimeRaytracer.recommendedOptions(RealtimeRaytracer.detectTier(renderer)),
   sky: def.sky,
   envColor: def.env?.color ?? new THREE.Color(0x121821),
   envIntensity: def.env?.intensity ?? 1.0,
   adaptiveQuality: true,
+  ...window.__clipOpts,
 });
+window.rt = rt;
 rt.compileScene(scene);
 const db = renderer.getDrawingBufferSize(new THREE.Vector2());
 rt.setSize(db.x, db.y);

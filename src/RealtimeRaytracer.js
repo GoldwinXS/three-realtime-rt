@@ -379,6 +379,14 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   // Largest renderScale change the adaptive governor may commit in one step
   // (0.25 = five 0.05 ladder steps). Bounds the reaction to a single very slow
   // frame now that 100ms-2s frames feed the EMA; see _adaptQuality.
+  /**
+   * Frames the adaptive governor observes before it is allowed to change
+   * anything. Covers shader compilation and the first BVH upload, whose cost
+   * lands in the first handful of frames and is not representative of steady
+   * state. 60 frames is about a second at 60Hz.
+   */
+  static GOVERNOR_WARMUP_FRAMES = 60;
+
   static MAX_SCALE_STEP = 0.25;
 
   /**
@@ -660,6 +668,13 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * response, more noise); higher = more conservative.
      */
     this.lightGradK = options.lightGradK ?? 3.0;
+    /**
+     * Firefly cap for the traced glass path, in units of `fireflyClamp`
+     * (so the default 4 means 4 x 4.0 = 16 luminance, the same budget the
+     * specular path uses). 0 disables it, which is the pre-0.14 behaviour:
+     * glass was the one radiance in the shader with no bound at all.
+     */
+    this.glassClampScale = options.glassClampScale ?? 4.0;
     /** Normalized light motion, 0 (lights parked) .. 1. Read-only. */
     this.lightMotion = 0;
     this._lightSig = null;
@@ -839,6 +854,9 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this._qEma = null;
     this._qLastT = null;
     this._qLastChange = 0;
+    /** Frames observed by the governor; gates the first decision (see the
+     *  warm-up note in _adaptQuality). */
+    this._qSamples = 0;
     // Direction of the last committed quality change (+1 up / -1 down) and an
     // oscillation flag: when two consecutive steps reverse direction the
     // governor is hunting around the frame-time boundary, so it widens its
@@ -1960,6 +1978,23 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // so a 3fps device walks down the ladder like any other.
     if (dt > 2000) return;
     this._qEma = this._qEma == null ? dt : this._qEma * 0.9 + dt * 0.1;
+    // WARM-UP. The EMA used to seed from a SINGLE sample and _qLastChange
+    // initialised to 0, so the cooldown was already satisfied on the first
+    // call: the governor's first decision was made from one frame that
+    // typically contained compileScene and the megakernel shader link. On a
+    // vsync-capped display that decision took the free wins (giHalfRate and
+    // restirGI) permanently, because their release gate needs ratio < 0.5, i.e.
+    // a refresh above 110Hz. Verified on the shipped gallery before this
+    // change: giHalfRate and restirGI were both on by frame 3 of every page
+    // load, and still on, unreleasable, at frame 476.
+    //
+    // Requiring a real sample count before the first decision costs a second of
+    // conservative rendering at startup and removes an entire class of
+    // permanent, invisible quality loss. It does not weaken the emergency
+    // path: _overloadBrake is independent of the governor and still reacts to
+    // catastrophic frames from the very first one.
+    this._qSamples = (this._qSamples || 0) + 1;
+    if (this._qSamples < RealtimeRaytracer.GOVERNOR_WARMUP_FRAMES) return;
     // Calmness: normally 2s between changes. When the last two steps reversed
     // direction the governor is hunting the boundary, so hold for 5s AND widen
     // the "comfortable" deadband — both push it to commit to a level instead of
@@ -2258,6 +2293,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     if (this.lightMotion < 1e-3) this.lightMotion = 0;
     rtU.uMaxHistory.value = this.maxHistory + (this.maxHistoryMoving - this.maxHistory) * mt;
     rtU.uFireflyClamp.value = this.fireflyClamp > 0 ? this.fireflyClamp : 1e6;
+    rtU.uGlassClampScale.value = this.glassClampScale;
     rtU.uGIEnabled.value = this.gi;
     rtU.uGIHalfRate.value = this.giHalfRate;
     // ReSTIR GI (experimental) supplies the 1-bounce indirect externally when

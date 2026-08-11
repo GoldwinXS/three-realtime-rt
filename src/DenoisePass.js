@@ -84,7 +84,15 @@ vec4 sampleIrr(vec2 uv) {
   if (uHasAdd) {
     float mw = texture(uGNormalMetal, uv).w;
     float metalT = mw < 2.0 ? clamp(mw, 0.0, 1.0) : 0.0;
-    c.rgb += texture(uAddTex, uv).rgb * (1.0 - metalT);
+    // Glass must be discounted the same way metal is. The INLINE GI bounce is
+    // already scaled by (1 - transmission) where it is composed (the lighting
+    // pass mixes the diffuse terms out of a transmissive pixel), so adding the
+    // external ReSTIR GI at full strength here double-counts indirect light on
+    // exactly the pixels that have no diffuse lobe to receive it, and it lands
+    // on the material least able to hide it: a solid dielectric, transmission
+    // 1.0, which should take none of it at all.
+    float transT = (mw >= 2.0 && mw < 4.0) ? clamp(mw - 2.0, 0.0, 1.0) : 0.0;
+    c.rgb += texture(uAddTex, uv).rgb * (1.0 - metalT) * (1.0 - transT);
   }
   return c;
 }
