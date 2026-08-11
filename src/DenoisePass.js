@@ -34,6 +34,8 @@ uniform bool uBlendIsSpec;       // this instance filters the specular buffer
 // to the original filter (the alpha/history-count channel is never touched).
 uniform sampler2D uAddTex;
 uniform bool uHasAdd;
+uniform sampler2D uVarTex;       // AccumulatePass moments (r = mean, g = mean^2)
+uniform bool uHasVar;            // variance-guided sigmaL A/B switch
 
 // À-TROUS LATTICE JITTER (EXPERIMENTAL, 0.0 = off = byte-identical).
 // Pass i taps its 3x3 neighbourhood at a spacing of uStep lighting texels.
@@ -140,7 +142,17 @@ void main() {
   // apparitions") and only grounded once the camera stopped. Blue-noise
   // sampling + ReSTIR keep fresh pixels clean enough for the tighter gate.
   float count = max(center.a, 1.0);
-  float sigmaL = uLumSigma * clamp(8.0 / sqrt(count), 0.75, 3.0);
+  // Step 6: temporal variance sigmaL from moments (min: only narrow, never widen).
+  float sigmaL;
+  if (uHasVar && count >= 4.0) {
+    vec2 m = texture(uVarTex, vUv).rg;
+    float var = max(m.g - m.r * m.r, 0.0);
+    float cntSigma = uLumSigma * clamp(8.0 / sqrt(count), 0.75, 3.0);
+    float varSigma = uLumSigma * clamp(sqrt(var), 0.75, 3.0);
+    sigmaL = min(varSigma, cntSigma); // only narrow — preserve detail on stable pixels
+  } else {
+    sigmaL = uLumSigma * clamp(8.0 / sqrt(count), 0.75, 3.0);
+  }
 
   float distToCam = distance(P, uCameraPos);
   float planeTol = 0.01 * distToCam + 20.0 * uEps;
@@ -257,6 +269,8 @@ export class DenoisePass {
         uBlendIsSpec: { value: blendIsSpec },
         uAddTex: { value: null },
         uHasAdd: { value: false },
+        uVarTex: { value: null },
+        uHasVar: { value: false },
       },
       depthTest: false,
       depthWrite: false,
@@ -321,6 +335,15 @@ export class DenoisePass {
     u.uCameraPos.value.copy(cameraPos);
     u.uEps.value = eps;
     u.uAddTex.value = addTexture;
+
+    // Part 2: temporal variance from AccumulatePass moments.
+    const momentsTexture = opts.momentsTexture || null;
+    if (momentsTexture) {
+      u.uVarTex.value = momentsTexture;
+      u.uHasVar.value = true;
+    } else {
+      u.uHasVar.value = false;
+    }
 
     const maxStep = opts.maxStep > 0 ? opts.maxStep : 0;
     const jitter = opts.stepJitter > 0 ? Math.min(1, opts.stepJitter) : 0;

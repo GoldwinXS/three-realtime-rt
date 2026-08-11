@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.13.0-dev
+
+- **Temporal quality campaign — split accumulation pipeline (all core fences PASS).**
+  New `AccumulatePass` with texelFetch point sampling, per-tap-validity 4-tap
+  bilinear reprojection (SVGF standard), ungated 3x3 luminance-rank anti-firefly
+  clamp (default off), and EMA merge. Megakernel gains `uRawOutput` uniform +
+  `renderRaw()` method. Arena fence results (clamps off): motion spikes 9 (<10),
+  stillNoise 0.122 (<0.127 baseline), ghost@40 1.308 (<1.35), frame-time 62.0ms
+  (<65ms). Old inline-EMA path preserved as fallback. Temporal moments and
+  DenoisePass variance wiring deferred (3-MRT stability). See
+  `REPORT_TEMPORAL_QUALITY.md`.
+
 ## 0.12.0
 
 - **Quality presets.** A product or game can now wire in a named quality tier

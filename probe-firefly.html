@@ -1,0 +1,271 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>firefly probe</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}#hud{position:fixed;top:8px;left:8px;color:#9f9;font:12px monospace;background:rgba(0,0,0,.6);padding:6px;white-space:pre;z-index:9}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">booting</div>
+<script type="module">
+import * as THREE from "three";
+import { RealtimeRaytracer } from "/src/index.js";
+import { SCENES } from "/examples/gallery-scenes.js";
+
+const q = new URLSearchParams(location.search);
+const sceneKey = q.get("scene") || "fox";
+const WARM = parseInt(q.get("warm")) || 90;
+const TEMPORAL_N = parseInt(q.get("temporalN")) || 60;
+const GI_OFF = q.has("giOff");
+
+const renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const def = await SCENES[sceneKey]();
+const scene = def.scene;
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 200);
+camera.position.set(...def.cam);
+camera.lookAt(...def.target);
+
+const opts = {
+  ...RealtimeRaytracer.recommendedOptions(RealtimeRaytracer.detectTier(renderer)),
+  sky: def.sky,
+  envColor: def.env?.color ?? new THREE.Color(0x121821),
+  envIntensity: def.env?.intensity ?? 1.0,
+  adaptiveQuality: false,
+  overloadProtection: false,
+};
+if (GI_OFF) opts.giEnabled = false;
+for (const [k, v] of q.entries()) {
+  if (k === "scene" || k === "warm" || k === "temporalN" || k === "giOff") continue;
+  if (v === "0" || v === "false") opts[k] = false;
+  else if (v === "1" || v === "true") opts[k] = true;
+  else if (!Number.isNaN(parseFloat(v))) opts[k] = parseFloat(v);
+}
+
+const rt = new RealtimeRaytracer(renderer, opts);
+window.rt = rt;
+rt.compileScene(scene);
+const db = renderer.getDrawingBufferSize(new THREE.Vector2());
+rt.setSize(db.x, db.y);
+
+const gl = renderer.getContext();
+const hud = document.getElementById("hud");
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Read the COMPOSITED frame at FULL resolution for firefly detection.
+// (320x180 downsample averages away single-pixel spikes — see spec note.)
+const LUMA = [0.299, 0.587, 0.114];
+function readFullLuma() {
+  const w = gl.drawingBufferWidth, h = gl.drawingBufferHeight;
+  if (w === 0 || h === 0) return { luma: new Float32Array(0), w: 0, h: 0 };
+  const buf = new Uint8Array(w * h * 4);
+  gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+  const out = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    const j = i * 4;
+    out[i] = buf[j] * LUMA[0] + buf[j + 1] * LUMA[1] + buf[j + 2] * LUMA[2];
+  }
+  return { luma: out, w, h };
+}
+
+// Read the composited frame downsampled to ~DS_W x DS_H for temporal analysis.
+const DS_W = 240, DS_H = 160;
+function readDsLuma() {
+  const fw = gl.drawingBufferWidth, fh = gl.drawingBufferHeight;
+  if (fw === 0 || fh === 0) return { luma: new Float32Array(DS_W * DS_H), w: DS_W, h: DS_H };
+  const buf = new Uint8Array(fw * fh * 4);
+  gl.readPixels(0, 0, fw, fh, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+  const sx = fw / DS_W, sy = fh / DS_H;
+  const out = new Float32Array(DS_W * DS_H);
+  for (let y = 0; y < DS_H; y++) {
+    const y0 = Math.floor(y * sy), y1 = Math.max(y0 + 1, Math.floor((y + 1) * sy));
+    for (let x = 0; x < DS_W; x++) {
+      const x0 = Math.floor(x * sx), x1 = Math.max(x0 + 1, Math.floor((x + 1) * sx));
+      let l = 0, n = 0;
+      for (let yy = y0; yy < y1; yy++) {
+        for (let xx = x0; xx < x1; xx++) {
+          const i = (yy * fw + xx) * 4;
+          l += buf[i] * LUMA[0] + buf[i + 1] * LUMA[1] + buf[i + 2] * LUMA[2];
+          n++;
+        }
+      }
+      out[y * DS_W + x] = l / n;
+    }
+  }
+  return { luma: out, w: DS_W, h: DS_H };
+}
+
+// 5x5 median of a pixel's neighborhood (robust to single-pixel spikes).
+function median5x5(luma, w, h, cx, cy) {
+  const vals = [];
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const x = cx + dx, y = cy + dy;
+      if (x >= 0 && x < w && y >= 0 && y < h) vals.push(luma[y * w + x]);
+    }
+  }
+  vals.sort((a, b) => a - b);
+  const mid = vals.length >> 1;
+  return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) * 0.5;
+}
+
+async function run() {
+  hud.textContent = `scene=${sceneKey} GI=${GI_OFF ? "off" : "on"}\nwarming ${WARM} frames...`;
+
+  // Warm frames
+  for (let i = 0; i < WARM; i++) rt.render(scene, camera);
+  await sleep(200);
+
+  // --- Spatial firefly detection (FULL resolution) ---
+  hud.textContent += "\nmeasuring spatial spikes (full res)...";
+  rt.render(scene, camera);
+  const { luma: fullLuma, w: fw, h: fh } = readFullLuma();
+
+  // Mean luminance for energy-shift fence
+  let meanLum = 0;
+  for (let i = 0; i < fullLuma.length; i++) meanLum += fullLuma[i];
+  meanLum /= fullLuma.length;
+
+  let spikeCount = 0;
+  let maxRatio = 0;
+  const threshold = 8.0;
+
+  for (let y = 2; y < fh - 2; y++) {
+    for (let x = 2; x < fw - 2; x++) {
+      const val = fullLuma[y * fw + x];
+      if (val < 0.5) continue;
+      const med = median5x5(fullLuma, fw, fh, x, y);
+      if (med < 0.5) continue;
+      const ratio = val / med;
+      if (ratio > threshold) {
+        spikeCount++;
+        if (ratio > maxRatio) maxRatio = ratio;
+      }
+    }
+  }
+
+  const spatialCount = spikeCount;
+  const spatialMaxRatio = maxRatio;
+  const totalPixels = fw * fh;
+
+  // --- Temporal firefly detection (240x160 downsample, 60 frames) ---
+  hud.textContent += `\nspatial: ${spatialCount} spikes / ${totalPixels} px, max ratio ${spatialMaxRatio.toFixed(1)}`;
+  hud.textContent += `\nmeasuring temporal spikes over ${TEMPORAL_N} frames...`;
+
+  let prevLuma = null;
+  let temporalEvents = 0;
+  const temporalThresh = 4.0;
+
+  for (let f = 0; f < TEMPORAL_N; f++) {
+    rt.render(scene, camera);
+    const ds = readDsLuma();
+    if (prevLuma) {
+      for (let i = 0; i < ds.luma.length; i++) {
+        if (prevLuma[i] > 0.5 && ds.luma[i] > prevLuma[i] * temporalThresh) {
+          temporalEvents++;
+        }
+      }
+    }
+    prevLuma = ds.luma;
+    if (f % 10 === 0) {
+      hud.textContent = hud.textContent.replace(/\nframe.*/, `\nframe ${f + 1}/${TEMPORAL_N}`);
+    }
+  }
+
+  const eventsPerFrame = temporalEvents / (TEMPORAL_N - 1);
+  const dsPixels = DS_W * DS_H;
+
+  // --- Motion-phase firefly detection: camera sweep, shallow EMA ---
+  // Orbit ~90 degrees over ~12 frames WITHOUT resetting accumulation. The warm
+  // frames have built deep history at the start position; camera motion creates
+  // natural disocclusions where count drops to 1. This matches the game-bench
+  // ghost probe protocol and lets the pre-accumulation neighbourhood clamp find
+  // valid history neighbours for disoccluded pixels.
+  hud.textContent += `\nmeasuring motion-phase fireflies (sweep)...`;
+  const SWEEP = 12;
+  const motionFF = [];
+  const center = new THREE.Vector3(...def.target);
+  const startPos = camera.position.clone();
+  const startAngle = Math.atan2(startPos.z - center.z, startPos.x - center.x);
+  const startR = Math.sqrt((startPos.x - center.x) ** 2 + (startPos.z - center.z) ** 2);
+  const startH = startPos.y;
+  for (let s = 0; s < SWEEP; s++) {
+    const frac = (s + 1) / SWEEP;
+    const angle = startAngle + frac * (Math.PI / 2); // 90-degree orbit
+    camera.position.set(
+      center.x + Math.cos(angle) * startR,
+      startH + Math.sin(frac * Math.PI) * 0.5,
+      center.z + Math.sin(angle) * startR
+    );
+    camera.lookAt(center);
+    camera.updateMatrixWorld();
+    rt.render(scene, camera);
+    const { luma: mluma, w: mw, h: mh } = readFullLuma();
+    let spikes = 0; let maxR = 0;
+    for (let y = 2; y < mh - 2; y++) {
+      for (let x = 2; x < mw - 2; x++) {
+        const val = mluma[y * mw + x];
+        if (val < 0.5) continue;
+        const med = median5x5(mluma, mw, mh, x, y);
+        if (med < 0.5) continue;
+        const ratio = val / med;
+        if (ratio > threshold) { spikes++; if (ratio > maxR) maxR = ratio; }
+      }
+    }
+    motionFF.push({ frame: s + 1, spikes, maxRatio: maxR });
+  }
+
+  const result = {
+    scene: sceneKey,
+    giEnabled: !GI_OFF,
+    resolution: `${gl.drawingBufferWidth}x${gl.drawingBufferHeight}`,
+    downsample: `${DS_W}x${DS_H}`,
+    warmFrames: WARM,
+    spatial: { spikeCount: spatialCount, maxRatio: spatialMaxRatio, threshold, meanLuminance: meanLum },
+    temporal: { totalEvents: temporalEvents, frames: TEMPORAL_N, eventsPerFrame, threshold: temporalThresh, dsResolution: `${DS_W}x${DS_H}` },
+    motionFF,
+    totalPixels,
+  };
+
+  hud.textContent = [
+    `scene=${sceneKey}  GI=${GI_OFF ? "off" : "on"}  res=${result.resolution}`,
+    `--- SPATIAL FIREFLIES (>${threshold}x 5x5 median, full res) ---`,
+    `spikes: ${spatialCount} / ${totalPixels} pixels (${(100 * spatialCount / totalPixels).toFixed(4)}%)`,
+    `max ratio: ${spatialMaxRatio.toFixed(1)}x`,
+    `--- TEMPORAL FIREFLIES (>${temporalThresh}x prev frame, ${DS_W}x${DS_H} ds) ---`,
+    `events: ${temporalEvents} over ${TEMPORAL_N} frames = ${eventsPerFrame.toFixed(2)} events/frame`,
+    `--- MOTION-PHASE FIREFLIES (>${threshold}x median, ${SWEEP}f sweep) ---`,
+    `per-frame spikes: ${JSON.stringify(motionFF.map(f => f.spikes))}`,
+    `total: ${motionFF.reduce((s,f) => s + f.spikes, 0)}  max/frame: ${Math.max(...motionFF.map(f => f.spikes))}  max ratio: ${Math.max(...motionFF.map(f => f.maxRatio)).toFixed(1)}`,
+    `--- DONE ---`,
+  ].join("\n");
+
+  window.FIREFLY_RESULT = result;
+
+  // POST to dev server sink
+  try {
+    await fetch("/__bench", { method: "POST", body: JSON.stringify({ fireflyBench: true, ...result }) });
+    hud.textContent += "\nPOSTed to /__bench";
+  } catch (e) {
+    hud.textContent += "\nPOST failed: " + (e?.message ?? e);
+  }
+}
+
+run().catch(err => {
+  hud.textContent = "FAILED: " + (err?.message ?? err) + "\n" + (err?.stack ?? "");
+  console.error(err);
+});
+</script>
+</body>
+</html>

@@ -56,6 +56,7 @@ uniform vec3 uCameraPos;
 uniform float uMaxHistory;
 uniform bool uTemporalReprojection;
 uniform float uFireflyClamp;
+uniform bool uRawOutput; // when true: skip EMA, write raw sampleIrr for AccumulatePass
 
 uniform vec4 uLightPosType[MAX_LIGHTS];     // xyz pos|dir, w: 0 point, 1 directional, >=2 spot (w-2 = cosInner)
 uniform vec4 uLightColorRadius[MAX_LIGHTS]; // rgb color*intensity, w radius
@@ -1350,6 +1351,12 @@ void main() {
   }
   outSpecular = vec4(spec, 1.0);
 
+  if (uRawOutput) {
+    // Split-accumulation path: write RAW per-frame sample. AccumulatePass reads
+    // this and does the EMA merge with neighbourhood anti-firefly clamping.
+    outIrradiance = vec4(sampleIrr, 1.0);
+  } else {
+
   // --- temporal reprojection: pull validated history from last frame ---
   float count = 1.0;
   vec3 history = vec3(0.0);
@@ -1395,6 +1402,8 @@ void main() {
   // the fresh sample is used as-is.
   vec3 blended = mix(history, sampleIrr, 1.0 / count);
   outIrradiance = vec4(blended, count);
+
+  } // end if (!uRawOutput)
 
   // BVH traversal-cost heatmap (outputMode 7). Overwrite the accumulated
   // lighting with the palette-mapped shadow-ray node-visit count for this pixel.
@@ -1639,6 +1648,7 @@ export class RTLightingPass {
         uCameraPos: { value: new THREE.Vector3() },
         uMaxHistory: { value: 128 },
         uTemporalReprojection: { value: true },
+        uRawOutput: { value: false },
         uFireflyClamp: { value: 4.0 },
         uLightPosType: { value: [] },
         uLightColorRadius: { value: [] },
@@ -1979,6 +1989,34 @@ export class RTLightingPass {
       else delete this.material.defines.RT_VOLUME_ALBEDO;
       this.material.needsUpdate = true; // recompile with/without the sampler3D
     }
+  }
+
+  /** Part 2: render RAW per-frame samples (uRawOutput=true, no EMA). Returns
+   *  { rawIrradiance, rawSpecular } textures for the AccumulatePass. */
+  renderRaw(renderer, gbuffer, frame, reservoirTexture = null) {
+    const u = this.material.uniforms;
+    u.uRawOutput.value = true;
+    u.uGWorldPos.value = gbuffer.worldPos;
+    u.uGNormalMetal.value = gbuffer.normalMetal;
+    u.uPrevGWorldPos.value = gbuffer.prevWorldPos;
+    u.uPrevAccum.value = this._irrTex(this.targetB);
+    u.uReservoir.value = reservoirTexture;
+    u.uRestirEnabled.value = reservoirTexture !== null;
+    u.uFrame.value = frame;
+
+    this.quad.material = this.material;
+    renderer.setRenderTarget(this.targetA);
+    renderer.render(this.scene, this.camera);
+    renderer.setRenderTarget(null);
+    u.uRawOutput.value = false; // restore
+
+    if (!this.specMRT) {
+      return { rawIrradiance: this.targetA.texture, rawSpecular: null };
+    }
+    return {
+      rawIrradiance: this.targetA.texture[0],
+      rawSpecular: this.targetA.texture[1],
+    };
   }
 
   /**

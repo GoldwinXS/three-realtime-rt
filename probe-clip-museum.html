@@ -1,0 +1,86 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>museum clip probe</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}
+#badge{position:fixed;left:12px;top:10px;z-index:20;color:#eef4f8;font:11px/1.5 monospace;background:rgba(14,18,24,.78);border:1px solid #26323c;border-radius:6px;padding:6px 10px;pointer-events:none}
+#label{position:fixed;right:14px;top:12px;z-index:20;color:#eef4f8;font:11px/1.5 monospace;font-weight:bold;background:rgba(14,18,24,.78);border:1px solid #38d0e0;border-radius:6px;padding:6px 10px;pointer-events:none}
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="app"></div>
+<div id="badge"></div>
+<div id="label">clip BASELINE</div>
+<script type="module">
+import * as THREE from "three";
+import { RealtimeRaytracer } from "/src/index.js";
+import { buildScene } from "/examples/scene.js";
+
+const q = new URLSearchParams(location.search);
+const LABEL = (q.get("label") || "BASELINE").toUpperCase().slice(0, 8);
+document.getElementById("label").textContent = `clip ${LABEL}`;
+
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.getElementById("app").appendChild(renderer.domElement);
+
+const built = buildScene();
+const scene = built.scene;
+const camera = built.camera;
+camera.aspect = window.innerWidth / window.innerHeight;
+camera.updateProjectionMatrix();
+
+const rt = new RealtimeRaytracer(renderer, {
+  renderScale: 0.375,
+  denoiseIterations: 5,
+  stochasticLights: true,
+  adaptiveQuality: true,
+});
+rt.compileScene(scene, { dynamicMeshes: built.dynamicObjects });
+scene.traverse((o) => { if (o.isLight) o.visible = true; });
+rt.updateLights(scene);
+const db = renderer.getDrawingBufferSize(new THREE.Vector2());
+rt.setSize(db.x, db.y);
+
+// Scripted camera orbit for clip capture — ~15s loop
+const badge = document.getElementById("badge");
+const LOOP = 15;
+let anchor = null;
+let frames = 0, fps = 0, lastBadge = 0;
+
+function render(now) {
+  requestAnimationFrame(render);
+  if (anchor === null) anchor = now;
+  const t = (now - anchor) / 1000;
+
+  // Orbit: radius ~6m, height oscillates 1.5-4.5m, circles the room
+  const u = (t % LOOP) / LOOP;
+  const angle = u * Math.PI * 2;
+  const r = 5.5 + Math.sin(u * Math.PI * 2) * 0.5;
+  const h = 1.8 + Math.sin(u * Math.PI * 3) * 0.8;
+  camera.position.set(Math.cos(angle) * r, h, Math.sin(angle) * r);
+  camera.lookAt(0, 1.8, -1.5);
+  camera.updateMatrixWorld();
+
+  rt.render(scene, camera);
+
+  frames++;
+  if (now - lastBadge >= 500) {
+    fps = Math.round((frames * 1000) / (now - lastBadge));
+    frames = 0; lastBadge = now;
+    badge.textContent = `${fps} fps · ${Math.round(t * 10) / 10}s / ${LOOP}s\nclip ${LABEL} · museum`;
+  }
+}
+requestAnimationFrame(render);
+</script>
+</body>
+</html>

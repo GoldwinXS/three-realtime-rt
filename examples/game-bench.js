@@ -144,6 +144,23 @@ function timeConfig(renderFrame, warm = 20, n = 60) {
   return (performance.now() - t0) / n;
 }
 
+// Shared 5x5 median helper, used by both the ghost probe's motion-firefly pass
+// and the stationary firefly section below. Must be defined before ghostProbe
+// because Firefox/Chrome do not hoist block-scoped function declarations past
+// async boundaries in ESM strict mode.
+function median5x5(luma, w, h, cx, cy) {
+  const vals = [];
+  for (let dy = -2; dy <= 2; dy++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const x = cx + dx, y = cy + dy;
+      if (x >= 0 && x < w && y >= 0 && y < h) vals.push(luma[y * w + x]);
+    }
+  }
+  vals.sort((a, b) => a - b);
+  const mid = vals.length >> 1;
+  return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) * 0.5;
+}
+
 // --- ghost probe (bench.html-compatible: centred 96x96 patch) ---------------
 const PATCH = 96;
 const patchBuf = new Uint8Array(PATCH * PATCH * 4);
@@ -175,12 +192,37 @@ async function ghostProbe(poseA, poseB) {
   const aPos = new THREE.Vector3(...poseA.pos), bPos = new THREE.Vector3(...poseB.pos);
   const aLook = new THREE.Vector3(...poseA.look), bLook = new THREE.Vector3(...poseB.look);
   const look = new THREE.Vector3();
+
+  // Motion-phase firefly: read per-frame spatial spike counts during the sweep.
+  // This is the low-count regime where the EMA is shallow at disoccluded pixels
+  // and a raw-sample spike enters at nearly full weight. Count pixels whose
+  // luma exceeds 8x the 5x5 neighbourhood median on the 320x180 downsample.
+  const motionFF = [];
+  const FF_THRESH = 8.0;
+  function countSpatialSpikes(lumaArr) {
+    let spikes = 0; let maxR = 0;
+    const w = DS_W, h = DS_H;
+    for (let y = 2; y < h - 2; y++) {
+      for (let x = 2; x < w - 2; x++) {
+        const val = lumaArr[y * w + x];
+        if (val < 0.5) continue;
+        // median5x5 is defined in the firefly section below; declared before use.
+        const med = median5x5(lumaArr, w, h, x, y);
+        if (med < 0.5) continue;
+        const ratio = val / med;
+        if (ratio > FF_THRESH) { spikes++; if (ratio > maxR) maxR = ratio; }
+      }
+    }
+    return { spikes, maxRatio: maxR };
+  }
   for (let s = 1; s <= 24; s++) {
     camera.position.lerpVectors(aPos, bPos, s / 24);
     look.lerpVectors(aLook, bLook, s / 24);
     camera.lookAt(look);
     camera.updateMatrixWorld();
     rt.render(scene, camera);
+    const luma = readFull();
+    motionFF.push(countSpatialSpikes(luma));
   }
 
   // Parked at B: measure ghost decay over settling frames.
@@ -194,7 +236,7 @@ async function ghostProbe(poseA, poseB) {
     out[keys[ci]] = patchDiff(readPatch(), ref);
     await nextFrame();
   }
-  return out;
+  return { ghost: out, motionFF };
 }
 
 // --- still temporal noise ---------------------------------------------------
@@ -266,7 +308,7 @@ async function runBench() {
   rt.updateLights(scene);
   const poseB = built.cameraAt(built.ghostT.b);
   const poseA = built.cameraAt(built.ghostT.a);
-  const ghost = await ghostProbe(poseA, poseB);
+  const { ghost, motionFF } = await ghostProbe(poseA, poseB);
 
   // 3. Still temporal noise: 30 parked frames at the home pose.
   built.update(built.homeT);
@@ -285,6 +327,59 @@ async function runBench() {
   }
   const stillNoise = noise / 29;
 
+  // 4. Firefly detection: spatial + temporal spike counts.
+  //    Spatial: count pixels whose luminance exceeds 8x the 5x5 neighborhood median.
+  //    Temporal: over 30 parked frames, count pixel events where luminance > 4x
+  //    the previous frame's value. Both use the 320x180 downsampled luma buffer
+  //    already read by readFull().
+  // Spatial: use the last stillNoise frame's luma (still in `prev`).
+  let spatialSpikes = 0;
+  let spatialMaxRatio = 0;
+  const FF_SPATIAL_THRESH = 8.0;
+  if (prev) {
+    for (let y = 2; y < DS_H - 2; y++) {
+      for (let x = 2; x < DS_W - 2; x++) {
+        const val = prev[y * DS_W + x];
+        if (val < 0.5) continue;
+        const med = median5x5(prev, DS_W, DS_H, x, y);
+        if (med < 0.5) continue;
+        const ratio = val / med;
+        if (ratio > FF_SPATIAL_THRESH) {
+          spatialSpikes++;
+          if (ratio > spatialMaxRatio) spatialMaxRatio = ratio;
+        }
+      }
+    }
+  }
+
+  // Temporal: 30 frames parked, count pixel-level >4x brightening events.
+  // Re-use the still-noise frames we already collected.
+  let temporalSpikeEvents = 0;
+  const FF_TEMPORAL_THRESH = 4.0;
+  // We already have `prev` pointing to the last frame; re-read a fresh frame
+  // sequence (short, since we don't want to change scene state).
+  // Re-warm briefly to ensure convergence after the spatial read.
+  for (let i = 0; i < 10; i++) rt.render(scene, camera);
+  let tfPrev = readFull();
+  for (let f2 = 0; f2 < 30; f2++) {
+    rt.render(scene, camera);
+    const tfCur = readFull();
+    for (let i = 0; i < tfCur.length; i++) {
+      if (tfPrev[i] > 0.5 && tfCur[i] > tfPrev[i] * FF_TEMPORAL_THRESH) {
+        temporalSpikeEvents++;
+      }
+    }
+    tfPrev = tfCur;
+  }
+  const temporalEventsPerFrame = temporalSpikeEvents / 29;
+  const totalDsPixels = DS_W * DS_H;
+
+  const firefly = {
+    spatial: { spikeCount: spatialSpikes, maxRatio: spatialMaxRatio, threshold: FF_SPATIAL_THRESH },
+    temporal: { totalEvents: temporalSpikeEvents, frames: 30, eventsPerFrame: temporalEventsPerFrame, threshold: FF_TEMPORAL_THRESH },
+    totalPixels: totalDsPixels,
+  };
+
   const result = {
     gameBench: true,
     scene: def.name,
@@ -298,7 +393,7 @@ async function runBench() {
       const d = gl.getExtension("WEBGL_debug_renderer_info");
       return d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : "unknown";
     })(),
-    ms, fps, msBlocks: blocks, stillNoise, ghost,
+    ms, fps, msBlocks: blocks, stillNoise, ghost, firefly, motionFF,
   };
 
   const lines = [
@@ -308,6 +403,12 @@ async function runBench() {
     `ms/frame ${ms.toFixed(2)} · fps ${fps.toFixed(1)} · stillNoise ${stillNoise.toFixed(3)}`,
     `ghost (mean abs diff vs settled ref, 0-255, lower=better):`,
     `  g1 ${ghost.g1.toFixed(3)}  g5 ${ghost.g5.toFixed(3)}  g10 ${ghost.g10.toFixed(3)}  g20 ${ghost.g20.toFixed(3)}  g40 ${ghost.g40.toFixed(3)}`,
+    `firefly (320x180 downsample):`,
+    `  spatial spikes >${FF_SPATIAL_THRESH}x median: ${spatialSpikes} / ${totalDsPixels} (${(100 * spatialSpikes / totalDsPixels).toFixed(3)}%) maxRatio ${spatialMaxRatio.toFixed(1)}`,
+    `  temporal events >${FF_TEMPORAL_THRESH}x prev: ${temporalSpikeEvents} over 30f = ${temporalEventsPerFrame.toFixed(2)} events/frame`,
+    `motion firefly (per-frame spatial >${FF_SPATIAL_THRESH}x median during 24f camera sweep):`,
+    `  peaks: ${JSON.stringify(motionFF.map(f => f.spikes))}`,
+    `  max/frame: ${Math.max(...motionFF.map(f => f.spikes))}  total: ${motionFF.reduce((s, f) => s + f.spikes, 0)}  maxRatio: ${Math.max(...motionFF.map(f => f.maxRatio)).toFixed(1)}`,
   ];
   outEl.textContent = lines.join("\n");
   window.GAME_BENCH_RESULT = result;

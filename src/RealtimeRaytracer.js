@@ -3,6 +3,7 @@ import { compileScene, syncLights } from "./SceneCompiler.js";
 import { GBufferPass } from "./GBufferPass.js";
 import { RTLightingPass } from "./RTLightingPass.js";
 import { DenoisePass } from "./DenoisePass.js";
+import { AccumulatePass } from "./AccumulatePass.js";
 import { CompositePass } from "./CompositePass.js";
 import { TAAPass } from "./TAAPass.js";
 import { VolumetricPass } from "./VolumetricPass.js";
@@ -556,6 +557,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.specDenoisePass = new DenoisePass(this._scaledW, this._scaledH, {
       blendIsSpec: true, // blend pixels here hold the behind-the-pane image
     });
+    this.accumulatePass = new AccumulatePass(this._scaledW, this._scaledH);
     this.composite = new CompositePass();
     this.taaPass = new TAAPass(this._width, this._height);
     this._sceneColor = this._makeColorTarget(this._width, this._height);
@@ -1677,6 +1679,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       );
       this.denoisePass.setSize(sw, sh); // display-only, no temporal state
       this.specDenoisePass.setSize(sw, sh); // ditto; spec history lives in rtPass
+      this.accumulatePass.setSize(sw, sh);
       // ReSTIR reservoirs store packed id·64+M encodings — invalid to linearly
       // resample — but they reconverge in a few frames, so just reallocate and
       // clear them.
@@ -2085,6 +2088,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
 
     if (this._needsClear) {
       this.rtPass.clearHistory(this.renderer);
+      this.accumulatePass.clearHistory(this.renderer);
       this.volumetricPass.clearHistory(this.renderer);
       this.restirPass.clearHistory(this.renderer);
       this.giReservoirPass.clearHistory(this.renderer);
@@ -2194,7 +2198,30 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       );
     }
 
-    let { irradiance, specular } = this.rtPass.render(this.renderer, this.gbuffer, this.frame, reservoirTex);
+    // Part 2: split accumulation pipeline. Set bypassAccum=true to use the
+    // old inline-EMA path for baseline comparison (mean-luminance fence).
+    let irradiance, specular;
+    if (this.specMRTSupported) {
+      const raw = this.rtPass.renderRaw(this.renderer, this.gbuffer, this.frame, reservoirTex);
+      const acc = this.accumulatePass.render(
+        this.renderer,
+        raw.rawIrradiance,
+        raw.rawSpecular,
+        this.gbuffer,
+        this._prevViewProj,
+        this._jitteredViewProj,
+        this._camWorldPos,
+        this.eps,
+        this.maxHistory,
+        { preFireflyClamp: 0.0, historyClampK: 0.0 }
+      );
+      irradiance = acc.irradiance;
+      specular = acc.specular;
+      this._momentsTex = acc.moments;
+    } else {
+      ({ irradiance, specular } = this.rtPass.render(this.renderer, this.gbuffer, this.frame, reservoirTex));
+      this._momentsTex = null;
+    }
 
     // 3. denoise (display-only: history keeps accumulating raw samples). The
     // experimental ReSTIR GI (giTex) is added on the first à-trous iteration —
@@ -2216,6 +2243,11 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
           stepJitter: this.denoiseStepJitter,
           wideDamp: this.denoiseWideDamp,
           frame: this.frame,
+          // Variance-guided sigmaL failed its fences (spikes 9 -> 35): the
+          // sqrt(var)-to-sigma mapping collapses to the clamp floor and
+          // weakens the denoise exactly where motion needs it. Moments stay
+          // available here; re-enable only behind a fresh A/B.
+          momentsTexture: null,
         }
       );
     }
