@@ -1,0 +1,63 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>gallery bisect probe (temp)</title>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:#000}#hud{position:fixed;top:8px;left:8px;color:#9f9;font:12px monospace;background:rgba(0,0,0,.6);padding:6px;white-space:pre;z-index:9}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">booting</div>
+<script type="module">
+import * as THREE from "three";
+import { RealtimeRaytracer } from "/src/index.js";
+import { SCENES } from "/examples/gallery-scenes.js";
+
+const q = new URLSearchParams(location.search);
+const sceneKey = q.get("scene") || "fox";
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(1);
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+document.body.appendChild(renderer.domElement);
+
+const def = await SCENES[sceneKey]();
+const scene = def.scene;
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 200);
+camera.position.set(...def.cam);
+camera.lookAt(...def.target);
+
+const opts = {
+  ...RealtimeRaytracer.recommendedOptions(RealtimeRaytracer.detectTier(renderer)),
+  sky: def.sky,
+  envColor: def.env?.color ?? new THREE.Color(0x121821),
+  envIntensity: def.env?.intensity ?? 1.0,
+};
+for (const [k, v] of q.entries()) {
+  if (k === "scene") continue;
+  if (v === "0" || v === "false") opts[k] = false;
+  else if (v === "1" || v === "true") opts[k] = true;
+  else if (!Number.isNaN(parseFloat(v))) opts[k] = parseFloat(v);
+}
+document.title = sceneKey + " " + JSON.stringify(Object.fromEntries(q));
+const rt = new RealtimeRaytracer(renderer, opts);
+window.rt = rt;
+window.probeScene = scene;
+rt.compileScene(scene);
+const db = renderer.getDrawingBufferSize(new THREE.Vector2());
+rt.setSize(db.x, db.y);
+
+const hud = document.getElementById("hud");
+renderer.setAnimationLoop(() => {
+  rt.render(scene, camera);
+  const s = rt.status || {};
+  hud.textContent = `scene=${sceneKey}\ntiles=${rt.textureTiles}\ndenoise=${rt.denoiseIterations}\ngiHalfRate=${rt.giHalfRate}\nok=${s.ok} disabled=${JSON.stringify(s.disabled ?? [])}\nwarnings=${JSON.stringify(s.warnings ?? [])}`;
+});
+</script>
+</body>
+</html>
