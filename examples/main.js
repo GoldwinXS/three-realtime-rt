@@ -78,6 +78,12 @@ async function main() {
     await runWarningsSelftest();
     return;
   }
+  // ?selftest=governor: the governor-pinning regression check (see runGovernorSelftest).
+  // No scene, no render — pure constructor + _takeFreeWins / _releaseFreeWins assertions.
+  if (PARAMS.get("selftest") === "governor") {
+    await runGovernorSelftest();
+    return;
+  }
   // ?selftest=presets: the quality-presets API check (see runPresetsSelftest).
   // No scene, no render — pure constructor + applyPreset assertions.
   if (PARAMS.get("selftest") === "presets") {
@@ -986,6 +992,171 @@ async function runWarningsSelftest() {
  * unknown names throw listing the valid presets, the `preset` getter reports
  * the last applied name (or "custom"), and the PRESETS object is four flat
  * maps of scalar/plain-object knob values (no nested objects, no arrays).
+ *
+/**
+ * Governor-pinning regression check (?selftest=governor).
+ *
+ * Guards the four invariants of the option-pinning mechanism (0.14.1):
+ *
+ *   1. An app that passes `restirGI: false` never has it enabled by the governor,
+ *      even under sustained load (_takeFreeWins must skip pinned keys).
+ *   2. An app that passes nothing still gets the current free-win behaviour
+ *      (regression: pinning must not break the normal path for unpinned options).
+ *   3. An app that passes `restirGI: true` never has it disabled (symmetry: the
+ *      governor must equally not turn OFF a pinned true).
+ *   4. The release path does not resurrect a pinned option (_releaseFreeWins
+ *      never sees a pinned key in `prev`, so it cannot restore it).
+ *
+ * No scene, no render — drives `_takeFreeWins` and `_releaseFreeWins` directly
+ * on a WebGLRenderer-backed instance so `isSupported` and the constructor path
+ * are real, but no frame is ever drawn.
+ *
+ * Emits its verdict into the same #selftest-verdict node the Playwright driver
+ * reads (scripts/selftest.mjs), tagged `governorScene:true`.
+ */
+async function runGovernorSelftest() {
+  const emit = (v) => {
+    const line = JSON.stringify({ governorScene: true, ...v });
+    console.log("[selftest:governor] " + line);
+    let node = document.getElementById("selftest-verdict");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "selftest-verdict";
+      node.style.cssText =
+        "position:fixed;left:-99999px;top:0;white-space:pre;pointer-events:none;";
+      document.body.appendChild(node);
+    }
+    node.textContent = line;
+    node.setAttribute("data-pass", String(!!v.pass));
+  };
+
+  let renderer = null;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+    renderer.setSize(64, 64);
+    const supported = RealtimeRaytracer.isSupported(renderer);
+    const s = (v) => (supported ? v : true);
+    const ok = (cond) => (supported ? (cond === true ? true : cond) : true);
+
+    const now = () => performance.now();
+
+    // --- 1. Pinned false stays false under sustained load -----------------
+    // Construct with restirGI: false (pinned), gi + denoise on so the free win
+    // is otherwise applicable. giHalfRate NOT passed — it should still be taken.
+    const a = new RealtimeRaytracer(renderer, {
+      gi: true, denoise: true, denoiseIterations: 2,
+      restirGI: false,    // pinned false
+      adaptiveQuality: false,
+    });
+    // Set up the GI pass so the restirGI gate would pass if unpinned
+    a._giExternal = false; // inline GI path, so restirGI works
+
+    const took1 = a._takeFreeWins(now());
+    // restirGI must STAY false (pinned), giHalfRate must be taken (not pinned)
+    const pinnedFalseStays = ok(a.restirGI === false);
+    const unpinnedStillTakes = ok(a.giHalfRate === true);
+    // _takeFreeWins returns true because giHalfRate was taken
+    const took1ReturnsTrue = ok(took1 === true);
+
+    // --- 2. Unpinned gets the free wins (regression) -----------------------
+    // Construct with NO pinned options — the normal path must still work.
+    const b = new RealtimeRaytracer(renderer, {
+      gi: true, denoise: true, denoiseIterations: 2,
+      adaptiveQuality: false,
+    });
+    b._giExternal = false;
+
+    const took2 = b._takeFreeWins(now());
+    const unpinnedGetsFreeWins = ok(
+      b.giHalfRate === true && b.restirGI === true
+    );
+
+    // --- 3. Pinned true stays true (symmetry) -----------------------------
+    // restirGI: true pinned — the governor must NOT turn it off.
+    const c = new RealtimeRaytracer(renderer, {
+      gi: true, denoise: true, denoiseIterations: 2,
+      restirGI: true,     // pinned true
+      adaptiveQuality: false,
+    });
+    c._giExternal = false;
+
+    // _takeFreeWins only enables (from false to true), so it naturally won't
+    // touch a true value. The real risk is _releaseFreeWins restoring a false
+    // prev entry. Verify takeFreeWins does NOT record restirGI in prev.
+    const took3 = c._takeFreeWins(now());
+    const pinnedTrueNotRecorded = ok(
+      c._qFreeWins && !("restirGI" in c._qFreeWins)
+    );
+    // And restirGI stays true after the take
+    const pinnedTrueStays = ok(c.restirGI === true);
+
+    // --- 4. Release path does not resurrect a pinned option --------------
+    // Use instance `a` from test 1 (restirGI pinned false). Its prev has
+    // giHalfRate but NOT restirGI. Simulate: after take, release should
+    // restore giHalfRate to false but leave restirGI untouched.
+    const restirGIBefore = a.restirGI;
+    const released = a._releaseFreeWins(now());
+    const releaseRestoresUnpinned = ok(a.giHalfRate === false); // restored
+    const releaseDoesNotTouchPinned = ok(a.restirGI === restirGIBefore);
+    const releaseReturnsTrue = ok(released === true);
+
+    // --- 5. restirMCap pinned ---------------------------------------------
+    const d = new RealtimeRaytracer(renderer, {
+      restirMCap: 40,    // pinned above the governor's target of 16
+      adaptiveQuality: false,
+    });
+    const took5 = d._takeFreeWins(now());
+    const restirMCapPinned = ok(d.restirMCap === 40); // must not be lowered
+
+    // Unpinned case: construct without restirMCap, then set it at runtime
+    // (runtime writes do not pin — the governor may still change it).
+    const unpinnedMCap = new RealtimeRaytracer(renderer, {
+      adaptiveQuality: false,
+    });
+    unpinnedMCap.restirMCap = 40;
+    const tookMCapUnpinned = unpinnedMCap._takeFreeWins(now());
+    const restirMCapUnpinnedStillLowers = ok(unpinnedMCap.restirMCap === 16);
+
+    const pass =
+      pinnedFalseStays && unpinnedStillTakes && took1ReturnsTrue &&
+      unpinnedGetsFreeWins &&
+      pinnedTrueNotRecorded && pinnedTrueStays &&
+      releaseRestoresUnpinned && releaseDoesNotTouchPinned && releaseReturnsTrue &&
+      restirMCapPinned && restirMCapUnpinnedStillLowers;
+
+    emit({
+      pass,
+      governorScene: true,
+      threw: false,
+      pinnedFalseStays,
+      unpinnedStillTakes,
+      took1ReturnsTrue,
+      unpinnedGetsFreeWins,
+      pinnedTrueNotRecorded,
+      pinnedTrueStays,
+      releaseRestoresUnpinned,
+      releaseDoesNotTouchPinned,
+      releaseReturnsTrue,
+      restirMCapPinned,
+      restirMCapUnpinnedStillLowers,
+    });
+  } catch (err) {
+    emit({
+      pass: false,
+      governorScene: true,
+      threw: true,
+      error: String((err && err.message) || err),
+    });
+  } finally {
+    if (renderer) renderer.dispose();
+  }
+}
+
+/**
+ * Quality-presets API check (?selftest=presets).
+ *
+ * Guards the two contracts the presets round is built on, WITHOUT rendering a
+ * scene (pure construction + applyPreset, so it is fast and focused):
  *
  * Emits its verdict into the same #selftest-verdict node the Playwright driver
  * reads (scripts/selftest.mjs), tagged `presetsScene:true`.

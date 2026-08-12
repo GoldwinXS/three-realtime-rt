@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.14.1
+
+- **The adaptive governor now respects explicitly-pinned options.** `_takeFreeWins`
+  unconditionally turned on `giHalfRate` and `restirGI` and lowered `restirMCap`
+  to 16, with no record of whether those values were the library's defaults or
+  the application's deliberate choice — an app that passed `restirGI: false` (or
+  `true`) watched the governor silently override it. The constructor now records
+  which of the free-win options were passed explicitly (`options.key !==
+  undefined`), and `_takeFreeWins` skips any pinned key. Because a pinned option
+  never enters the `prev` record, `_releaseFreeWins` cannot resurrect it either.
+  The rule is symmetric: pinning means "the governor may not change this," so an
+  explicit `restirGI: true` is equally protected. The three pinnable options are
+  `restirGI`, `giHalfRate`, and `restirMCap` — every option the governor's free
+  wins may modify. Pinning is a constructor contract: a runtime write
+  (`rt.restirGI = false` after construction) does **not** pin, because the
+  governor itself writes these properties and a naive "any write pins" rule would
+  have it pin its own changes. If you need to change a pinned option at runtime,
+  turn `adaptiveQuality` off, set the property, then turn it back on. A new
+  `?selftest=governor` check guards the four invariants: pinned `false` stays
+  false under sustained load; pinned `true` stays true; unpinned still gets the
+  free wins; and the release path does not resurrect a pinned option.
+
 ## 0.14.0
 
 - **Moving lights no longer drag a tail.** Every temporal validation in the

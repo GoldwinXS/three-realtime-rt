@@ -6,10 +6,16 @@ was required to carry a file:line citation; the judge independently re-verified
 the load-bearing ones and re-fitted the cost model against this repo's own
 quality-campaign ladder data.
 
-STATUS: partially implemented in 0.14.0. What shipped is the warm-up gate that
-stops the governor deciding from shader-compile frames (the boot free-wins
-bug). The control-law replacement below (QualityGovernor, the cadence spine,
-the timer-query tier) is NOT implemented and is the next round.
+STATUS: partially implemented in 0.14.0 and 0.14.1. What shipped is the warm-up gate
+that stops the governor deciding from shader-compile frames (the boot free-wins
+bug), and **option pinning** (0.14.1): an app can pass `restirGI`, `giHalfRate`,
+or `restirMCap` explicitly at construction and the governor will never change
+that value — `_takeFreeWins` skips pinned keys and never records them in
+`_qFreeWins`, so `_releaseFreeWins` cannot resurrect them either. Runtime writes
+do not pin (the governor itself writes these properties, so a naive "any write
+pins" rule would have the governor pin its own changes). The control-law
+replacement below (QualityGovernor, the cadence spine, the timer-query tier) is
+NOT implemented and is the next round.
 
 # GOVERNOR REWORK: JUDGEMENT AND IMPLEMENTABLE SPEC
 

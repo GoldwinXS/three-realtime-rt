@@ -367,6 +367,27 @@ function describeWarnings(v) {
 }
 
 // Usage-diagnostics / quality-presets describe helpers (examples/main.js
+// Governor-pinning check (examples/main.js ?selftest=governor). Confirms
+// the adaptive governor respects explicitly-pinned constructor options.
+function describeGovernor(v) {
+  if (v.threw) return `governor scene threw: ${v.error}`;
+  const gates = [
+    ["pinnedFalseStays", v.pinnedFalseStays],
+    ["unpinnedStillTakes", v.unpinnedStillTakes],
+    ["took1ReturnsTrue", v.took1ReturnsTrue],
+    ["unpinnedGetsFreeWins", v.unpinnedGetsFreeWins],
+    ["pinnedTrueNotRecorded", v.pinnedTrueNotRecorded],
+    ["pinnedTrueStays", v.pinnedTrueStays],
+    ["releaseRestoresUnpinned", v.releaseRestoresUnpinned],
+    ["releaseDoesNotTouchPinned", v.releaseDoesNotTouchPinned],
+    ["releaseReturnsTrue", v.releaseReturnsTrue],
+    ["restirMCapPinned", v.restirMCapPinned],
+    ["restirMCapUnpinnedStillLowers", v.restirMCapUnpinnedStillLowers],
+  ];
+  const bad = gates.filter(([, ok]) => !ok).map(([n]) => n);
+  return `gate(s): ${bad.join(", ") || "unknown"}`;
+}
+
 // ?selftest=warnings / ?selftest=presets). Both pages are single-page loads
 // that build their own renderer and write ONE JSON verdict into
 // #selftest-verdict; `describe` turns a failing verdict into a human sentence.
@@ -487,6 +508,7 @@ async function main() {
   let empty = null;
   let warnings = null;
   let presets = null;
+  let governor = null;
   try {
     results.push(["chromium", await runChromiumLeg("chromium", base)]);
     for (const [name, launcher] of [["firefox", firefox], ["webkit", webkit]]) {
@@ -529,6 +551,15 @@ async function main() {
         (presets.reason ? `\n     reason: ${presets.reason}` : "") +
         (presets.verdict ? `\n     ${JSON.stringify(presets.verdict)}` : "")
     );
+
+    // Governor-pinning check (chromium, default three).
+    console.log(`\n=== governor pinning (chromium, ?selftest=governor) ===`);
+    governor = await driveCheck(base, "governor", describeGovernor);
+    console.log(
+      `  -> ${governor.status.toUpperCase()} (${governor.ms}ms)` +
+        (governor.reason ? `\n     reason: ${governor.reason}` : "") +
+        (governor.verdict ? `\n     ${JSON.stringify(governor.verdict)}` : "")
+    );
   } finally {
     cleanup();
   }
@@ -552,12 +583,14 @@ async function main() {
   console.log(pad("empty-scene", 18) + pad(empty ? empty.status : "-", 8) + "(compileScene no-op + render fallback)");
   console.log(pad("warnings", 18) + pad(warnings ? warnings.status : "-", 8) + "(usage diagnostics fire once, status.warnings)");
   console.log(pad("presets", 18) + pad(presets ? presets.status : "-", 8) + "(preset API: defaults byte-identity + balanced no-op)");
+  console.log(pad("governor", 18) + pad(governor ? governor.status : "-", 8) + "(option pinning: _takeFreeWins + _releaseFreeWins invariants)");
   for (const [name, r] of results) {
     if (r.status !== "pass" && r.reason) console.log(`  ${name}: ${r.reason}`);
   }
   if (empty && empty.status !== "pass" && empty.reason) console.log(`  empty-scene: ${empty.reason}`);
   if (warnings && warnings.status !== "pass" && warnings.reason) console.log(`  warnings: ${warnings.reason}`);
   if (presets && presets.status !== "pass" && presets.reason) console.log(`  presets: ${presets.reason}`);
+  if (governor && governor.status !== "pass" && governor.reason) console.log(`  governor: ${governor.reason}`);
   console.log("========================================================");
 
   // Gate: BOTH chromium legs (default three AND three@latest) must PASS, and the
@@ -571,6 +604,7 @@ async function main() {
   if (!empty || empty.status !== "pass") problems.push(`empty-scene (${empty ? empty.status : "missing"})`);
   if (!warnings || warnings.status !== "pass") problems.push(`warnings (${warnings ? warnings.status : "missing"})`);
   if (!presets || presets.status !== "pass") problems.push(`presets (${presets ? presets.status : "missing"})`);
+  if (!governor || governor.status !== "pass") problems.push(`governor (${governor ? governor.status : "missing"})`);
   const failed = results.filter(([, r]) => r.status === "fail").map(([n]) => n);
   for (const n of failed) if (!problems.some((p) => p.startsWith(n))) problems.push(`${n} (fail)`);
 

@@ -453,6 +453,15 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
 
   constructor(renderer, options = {}) {
     this.renderer = renderer;
+    // Snapshot the caller's own options before the preset merge, so we know
+    // which keys the caller PASSED EXPLICITLY (as opposed to defaulted). Used
+    // by the adaptive governor to honour pinned options — see _takeFreeWins.
+    // `!== undefined` rather than Object.hasOwn because an explicit `undefined`
+    // is indistinguishable from "not passed" in intent: spreading defaults with
+    // `{ ...base, key: undefined }` is a common erase pattern, and `??` treats
+    // undefined the same way, so this is consistent with every default in the
+    // constructor.
+    const _userOpts = options;
 
     /**
      * False when the platform can't run the tracer — render() then simply
@@ -494,6 +503,24 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
         );
       }
       options = { ...RealtimeRaytracer.PRESETS[presetName], ...options };
+    }
+
+    /**
+     * Governor-pinned options: keys the caller passed explicitly at construction,
+     * which the adaptive governor must never change (neither take as a free win
+     * nor restore on the way back up). Detected as `_userOpts[key] !== undefined`
+     * rather than Object.hasOwn, so `restirGI: undefined` (an erase pattern) does
+     * not pin. Includes every option `_takeFreeWins` may modify.
+     *
+     * RUNTIME WRITES (rt.restirGI = false after construction) do NOT pin. The
+     * governor itself writes these properties, so a naive "any write pins" rule
+     * would have the governor pin its own changes. Pinning is a constructor
+     * contract: set it at construction to declare "never touch this." To change
+     * at runtime, turn adaptiveQuality off, set the property, and turn it back on.
+     */
+    this._qPinned = new Set();
+    for (const key of ["restirGI", "giHalfRate", "restirMCap"]) {
+      if (_userOpts[key] !== undefined) this._qPinned.add(key);
     }
 
     const size = renderer.getSize(new THREE.Vector2());
@@ -1889,9 +1916,16 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // Nothing to take in a scene without GI: giHalfRate and restirGI both act on
     // the indirect bounce. Recorded as an empty take so the check is not redone
     // every adaptation (and so the ascent still has something to release).
+    //
+    // PINNED options: an option passed explicitly at construction (e.g. restirGI:
+    // false) is recorded in _qPinned and must never be changed by the governor —
+    // not taken as a free win, and not restored on the way back up. The simplest
+    // rule that also meets the symmetry requirement ("pinned true must equally
+    // not be turned off") is: never write a pinned key. That means never recording
+    // it in `prev`, so _releaseFreeWins has nothing to restore for it either.
     const prev = { scale: this._renderScale };
     let took = false;
-    if (this.gi && !this.giHalfRate) {
+    if (this.gi && !this.giHalfRate && !this._qPinned.has("giHalfRate")) {
       prev.giHalfRate = false;
       this.giHalfRate = true;
       took = true;
@@ -1900,7 +1934,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // worst in colourful-bounce scenes), reinstated the same day after the
     // Rao-Blackwellized chroma resolve fixed it and on-device review approved
     // the look. History in docs/QUALITY_CAMPAIGN_2026-07.md.
-    if (this.gi && this.denoise && this.denoiseIterations > 0 && !this.restirGI) {
+    if (this.gi && this.denoise && this.denoiseIterations > 0 && !this.restirGI && !this._qPinned.has("restirGI")) {
       prev.restirGI = false;
       this.restirGI = true;
       took = true;
@@ -1909,7 +1943,12 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
         this.denoiseIterations = RealtimeRaytracer.GOVERNOR_MAX_DENOISE;
       }
     }
-    if (this.restirMCap > 16) {
+    // restirMCap: the campaign's one unconditional win (better on every metric),
+    // so the governor lowers it from the old default 40 to 16. Unlike the two
+    // boolean toggles above, this is a numeric quality knob, but the principle is
+    // the same: if the caller explicitly picked a value, the governor must not
+    // override it.
+    if (this.restirMCap > 16 && !this._qPinned.has("restirMCap")) {
       prev.restirMCap = this.restirMCap;
       this.restirMCap = 16;
       took = true;

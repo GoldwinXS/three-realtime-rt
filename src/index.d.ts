@@ -278,6 +278,16 @@ export interface RealtimeRaytracerOptions {
   /** 1-bounce global illumination (traced indirect). Toggle for a direct-only look. */
   gi?: boolean;
   /**
+   * Half-rate GI: trace the bounce on alternating checkerboard parity each
+   * frame (doubled — unbiased, temporal accumulation converges to the same
+   * brightness). Halves GI's ray cost. Default `false`.
+   *
+   * Passing this option explicitly **pins** it against the adaptive quality
+   * governor: the governor will neither take it as a free win nor release it
+   * on recovery. Omit it (or pass `undefined`) to let the governor decide.
+   */
+  giHalfRate?: boolean;
+  /**
    * Sample static emissive meshes as area lights (next-event estimation).
    * Dramatically less noise than waiting for GI rays to hit the emitter.
    */
@@ -337,6 +347,18 @@ export interface RealtimeRaytracerOptions {
    */
   restir?: boolean;
   /**
+   * ReSTIR reservoir staleness cap — how many samples' worth of confidence a
+   * direct-lighting reservoir may carry before new candidates stop displacing it.
+   * Default `16` (the quality campaign's one unconditional win — better on every
+   * metric for ~0.3 ms). The old default was 40; a 40-sample reservoir is staler
+   * than the irradiance EMA it feeds.
+   *
+   * Passing this option explicitly **pins** it against the adaptive quality
+   * governor: the governor will not lower it to 16. Omit it (or pass `undefined`)
+   * to let the governor decide.
+   */
+  restirMCap?: number;
+  /**
    * EXPERIMENTAL — ReSTIR GI (v1, temporal-only): per-pixel reservoirs reuse the
    * 1-bounce global-illumination sample across frames (at the reprojected
    * same-surface point; no spatial reuse). When on, the lighting pass skips its
@@ -344,6 +366,10 @@ export interface RealtimeRaytracerOptions {
    * stage — so it only takes effect when `gi` and `denoise` are also on. Its
    * mean matches the inline GI path; convergence character differs. Default
    * `false`. Live-toggleable.
+   *
+   * Passing this option explicitly **pins** it against the adaptive quality
+   * governor: the governor will neither take it as a free win nor release it
+   * on recovery. Omit it (or pass `undefined`) to let the governor decide.
    */
   restirGI?: boolean;
   /** EXPERIMENTAL — temporal M-cap for the ReSTIR GI reservoir (default 20). */
@@ -839,6 +865,8 @@ export class RealtimeRaytracer {
   fireflyClamp: number;
   /** 1-bounce global illumination. */
   gi: boolean;
+  /** Half-rate GI: alternating checkerboard temporal amortisation. Pass this option explicitly at construction to pin it against the adaptive governor. */
+  giHalfRate: boolean;
   /** Sample static emissive meshes as area lights (NEE). */
   emissiveNEE: boolean;
   /** Importance-sample emissive triangles by power (see the option of the same name). */
@@ -938,9 +966,12 @@ export class RealtimeRaytracer {
   taaBlend: number;
   /** ReSTIR direct lighting toggle. */
   restir: boolean;
+  /** ReSTIR reservoir staleness cap (default 16). Pass this option explicitly at construction to pin it against the adaptive governor. */
+  restirMCap: number;
   /**
    * EXPERIMENTAL — ReSTIR GI (temporal-only) toggle. Only takes effect when
    * `gi` and `denoise` are also on (injected at the à-trous stage). Default false.
+   * Pass this option explicitly at construction to pin it against the adaptive governor.
    */
   restirGI: boolean;
   /** EXPERIMENTAL — temporal M-cap for the ReSTIR GI reservoir. */
