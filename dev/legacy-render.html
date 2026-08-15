@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>three-realtime-rt — frozen legacy render (release check 3)</title>
+  <style>
+    html, body { margin: 0; background: #06090d; color: #cfe0ea;
+      font: 12px/1.6 ui-monospace, Consolas, monospace; }
+    #verdict { padding: 10px; white-space: pre-wrap; }
+    /* The canvas must EXIST (readPixels needs a real drawing buffer) but does
+       not need to be looked at; keep it on-screen but out of the way. */
+    #app { position: fixed; left: 0; top: 40px; transform: scale(0.5); transform-origin: 0 0; }
+  </style>
+</head>
+<body>
+  <div id="verdict"></div>
+  <div id="app"></div>
+  <script type="module" src="/dev/legacy-render.js"></script>
+</body>
+</html>

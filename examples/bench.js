@@ -46,6 +46,11 @@ const setStatus = (t) => { statusEl.textContent = t; };
 // ?presets=1: after the standard configs, run the four quality presets (+ the
 // no-preset defaults row) on the museum scene and append the table section.
 const PRESET_BENCH = new URLSearchParams(location.search).has("presets");
+// ?defaults=1: what the 0.15.0 DEFAULTS CHANGE costs, on the museum, at 720p.
+// Two constructions of the same scene — one at the 0.14.1 constructor defaults
+// written out, one at whatever the constructor now ships — timed with the same
+// fence, each arm run TWICE so the delta has its own run-to-run floor beside it.
+const DEFAULTS_BENCH = new URLSearchParams(location.search).has("defaults");
 
 // --- renderer (fixed size, no MSAA, no pixel-ratio scaling) ------------------
 const renderer = new THREE.WebGLRenderer({ antialias: false });
@@ -243,6 +248,64 @@ async function benchScene(label, scene, sky, opts, camPos, camLook, withGhost) {
   return result;
 }
 
+// --- the defaults change (bench.html?defaults=1) -----------------------------
+// The 0.14.1 constructor defaults, written out. Everything 0.15.0 introduced is
+// off and everything it flipped is back; the keys the OLD library never had are
+// passed anyway, because the point is that both arms are handed one object and
+// differ only in its values.
+const DEFAULTS_014 = {
+  gi: true,
+  stochasticLights: true,
+  ambient: false,
+  motionVectors: false,
+  restirWarmAge: 0,
+  restirDirectionalBypass: false,
+  restirReprojectionRescue: false,
+  restirCandidateImportance: false,
+  restirClampRel: 0,
+  restirSamples: 1,
+  restirDynamicAccept: false,
+  restirDynamicFreeze: false,
+};
+
+/**
+ * Time ONE defaults arm on the museum at 1280x720. `old` selects the 0.14.1
+ * option set; otherwise the constructor's own defaults are used, which is the
+ * arm under test. adaptiveQuality and overloadProtection are off in BOTH so the
+ * governor cannot move the configuration underneath the timer — a mistake that
+ * has produced incoherent numbers in this project before.
+ */
+async function benchDefaults(scene, arm) {
+  const rt = new RealtimeRaytracer(renderer, {
+    sky: { enabled: false },
+    envColor: new THREE.Color(0x121821),
+    envIntensity: 1.0,
+    adaptiveQuality: false,
+    overloadProtection: false,
+    ...(arm === "0.14.1" ? DEFAULTS_014 : {}),
+    // The third arm exists to answer "what DRIVES the delta". It is the 0.15.0
+    // defaults with the one expensive flip put back, so:
+    //   0.15.0+gi  vs 0.14.1     = everything except gi (the correctness fixes)
+    //   0.15.0     vs 0.15.0+gi  = gi, and nothing else
+    ...(arm === "0.15.0+gi" ? { gi: true } : {}),
+  });
+  rt.compileScene(scene);
+  scene.traverse((o) => { if (o.isLight) o.visible = true; });
+  rt.updateLights(scene);
+  setCam([6, 3.8, 8], [0, 1.2, 0]);
+  const ms = timeConfig(() => rt.render(scene, camera));
+  const shape = {
+    renderScale: rt.renderScale,
+    gi: rt.gi,
+    stochasticLights: rt.stochasticLights,
+    restir: rt.restir,
+    lights: rt.compiled.lightCount,
+    emissiveTris: rt.compiled.emissiveTriCount,
+  };
+  rt.dispose();
+  return { ms, fps: 1000 / ms, ...shape };
+}
+
 // --- quality presets (bench.html?presets=1) ---------------------------------
 const PRESET_NAMES = ["quality", "balanced", "performance", "motion"];
 
@@ -305,6 +368,45 @@ function renderTable(results) {
       `${fmt(g.g10).padStart(6)}   ${fmt(g.g20).padStart(6)}   ${fmt(g.g40).padStart(6)}`
     );
   }
+  if (results.defaults) {
+    lines.push("");
+    lines.push(`the 0.15.0 defaults change (${SCENES.museum.key}, 1280x720, adaptiveQuality OFF)`);
+    lines.push(`  arm       run   ms/frame   fps     renderScale  gi     fastLights`);
+    for (const r of results.defaults) {
+      lines.push(
+        `  ${r.arm.padEnd(9)} ${String(r.run).padStart(3)}   ${fmt(r.ms).padStart(7)}  ${fmt(r.fps).padStart(6)}  ` +
+        `${String(r.renderScale).padStart(11)}  ${String(r.gi).padEnd(6)} ${String(r.stochasticLights)}`
+      );
+    }
+    const arm = (a, run) => results.defaults.find((r) => r.arm === a && r.run === run);
+    const runs = [...new Set(results.defaults.map((r) => r.run))];
+    const med = (xs) => [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)];
+    const spread = (xs) => Math.max(...xs) - Math.min(...xs);
+    const ratios = runs.map((n) => arm("0.15.0", n).ms / arm("0.14.1", n).ms);
+    const deltas = runs.map((n) => arm("0.15.0", n).ms - arm("0.14.1", n).ms);
+    const oldMs = runs.map((n) => arm("0.14.1", n).ms);
+    const newMs = runs.map((n) => arm("0.15.0", n).ms);
+    const pairRatio = (a, b) => runs.map((n) => arm(a, n).ms / arm(b, n).ms);
+    const show = (label, xs) => {
+      lines.push(`  ${label}`);
+      lines.push(`    ${xs.map((r) => r.toFixed(3)).join("  ")}`);
+      lines.push(`    median ${med(xs).toFixed(3)}, spread ${spread(xs).toFixed(3)}`);
+    };
+    lines.push("");
+    lines.push(`  per-PAIR ratios, each pair measured back to back so drift cancels:`);
+    show(`0.15.0 / 0.14.1        (the whole defaults change)`, ratios);
+    if (arm("0.15.0+gi", runs[0])) {
+      show(`0.15.0+gi / 0.14.1     (everything EXCEPT gi)`, pairRatio("0.15.0+gi", "0.14.1"));
+      show(`0.15.0 / 0.15.0+gi     (gi, and nothing else)`, pairRatio("0.15.0", "0.15.0+gi"));
+    }
+    lines.push(`  per-pair delta (new - old), ms: ${deltas.map((d) => d.toFixed(1)).join("  ")}`);
+    lines.push(`    median ${med(deltas).toFixed(2)} ms`);
+    lines.push(
+      `  ACROSS-pair spread of the SAME arm, which is the contention and not the ` +
+      `change: old ${spread(oldMs).toFixed(1)} ms, new ${spread(newMs).toFixed(1)} ms`
+    );
+    lines.push(`  read the RATIO. The absolute ms carry whatever else is on this GPU.`);
+  }
   if (results.presets) {
     lines.push("");
     lines.push(`quality presets (${SCENES.museum.key}, 1280x720, adaptiveQuality OFF, ghost probe at preset settings)`);
@@ -348,6 +450,29 @@ async function run() {
     // Quality-presets row: time + ghost each preset (and the no-preset defaults)
     // on the SAME museum scene. Uses a fresh constructor per preset so the
     // `preset` option path itself is exercised, not just applyPreset.
+    // The defaults A/B, on the SAME museum scene. Each arm twice, interleaved
+    // old/new/old/new rather than old/old/new/new, so a slow drift on this GPU
+    // (which is routinely shared with other work) lands on both arms equally
+    // instead of on whichever ran second.
+    if (DEFAULTS_BENCH) {
+      results.defaults = [];
+      // FIVE pairs, not one. On this machine the GPU is routinely shared with
+      // other sessions, and a first attempt at two passes produced a run-to-run
+      // floor of 158 ms against a 77 ms delta: the drift between the two halves
+      // of the run was twice the size of the effect. A PAIR measured back to
+      // back sees the same contention on both arms, so the per-pair RATIO
+      // survives what the absolute milliseconds cannot, and five of them give
+      // that ratio a spread instead of one number to take on faith.
+      for (const pass of [1, 2, 3, 4, 5]) {
+        for (const arm of ["0.14.1", "0.15.0+gi", "0.15.0"]) {
+          setStatus(`defaults: ${arm} (pair ${pass}/5)…`);
+          await nextFrame();
+          results.defaults.push({ arm, run: pass, ...(await benchDefaults(built.scene, arm)) });
+        }
+      }
+      setStatus("defaults A/B done.");
+    }
+
     if (PRESET_BENCH) {
       setStatus("quality presets: timing + ghost per preset…");
       results.presets = [];

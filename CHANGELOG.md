@@ -1,5 +1,232 @@
 # Changelog
 
+## 0.15.0
+
+**The defaults philosophy of this release, in the owner's words:** *"I would
+like the default settings for the library to just work so that anyone can
+simply add the RT library to their three js projects and see a beautiful result
+right away."* The split is by KIND, not by taste: the algorithm being right is
+cheap and is now the default, and the things that cost rays are opt-in.
+
+Everything below the first two sections was proven in a game (the Hangar) against
+a measurement gate before it was promoted here; every number quoted was measured
+beside its own floor, and a difference under twice its floor is not reported as a
+finding.
+
+### Defaults
+
+- **`gi` now defaults to `false`.** It is the most expensive thing in the
+  renderer — one extra traced ray per pixel per frame, shaded with the full
+  direct + NEE stack — and the one feature a scene can be authored around.
+  Measured on the museum at 1280x720, over five back-to-back A/B pairs:
+  **0.72x frame time with GI off** (median, spread 0.23). Turn it on for colour
+  bleed; it is one line.
+- **`ambient` is new and defaults to `true`**, and it is what makes the line
+  above safe. See the next section.
+- **`stochasticLights` now defaults to `false`.** It only ever applies when
+  ReSTIR is off, and ReSTIR is the cheap many-light path and is on by default.
+  What the old default really did was redefine `restir: false` to mean *one
+  random light per pixel per frame* — the noisiest estimator in the renderer —
+  rather than the exact per-light loop, so every "estimator off" reference taken
+  by flipping one flag was measuring the wrong thing. The governor still turns
+  it on when it needs the rays back.
+- **Four ReSTIR correctness fixes and `motionVectors` now default to `true`.**
+  Each is the estimator being right rather than fast, and together they measured
+  at **1.01x** the 0.14.1 frame time on the museum (median of five pairs, spread
+  0.19) — free. Details in the ReSTIR section below.
+- `PRESETS.balanced` follows `stochasticLights` to `false`. That preset is
+  defined as "the constructor defaults, written out", and `?selftest=presets`
+  asserts it is a no-op on a fresh instance.
+- **New static `RealtimeRaytracer.DEFAULTS`**: the constructor's defaults for
+  every live-assignable option, as one frozen flat object, so an app can offer a
+  "reset to defaults" button without hard-coding this library's opinions. It
+  excludes options that need a `compileScene()`, scene description
+  (`envColor`/`sky`/`fog`/`ior`) and constructor-only wiring — a reset button
+  should not recompile your scene or repaint your sky. `?selftest=presets`
+  asserts every key in it equals the same-named property on a fresh instance.
+
+### Ambient and hemisphere lights (new)
+
+- **`AmbientLight` and `HemisphereLight` are honoured**, as an unoccluded flat
+  term. They were ignored before: neither has a position to aim a shadow ray at,
+  so neither can be a row in the light table, and there was no non-traced light
+  path at all. That was survivable while `gi` defaulted on, because a GI ray that
+  escapes returns `envColor`. With `gi: false` it is not — **a scene whose only
+  light was an `AmbientLight` rendered pure black**, and nothing caught it,
+  because every demo scene has a traceable light in it.
+- `SceneCompiler` sums the visible ones and `RTLightingPass` adds
+  `flat + mix(ground, sky, 0.5·dot(N, up) + 0.5)` to the **direct** irradiance —
+  demodulated, so the composite multiplies it by albedo exactly as three's own
+  lights do. Three uniforms and a dot product: no ray, no shadow, no loop, **no
+  new `traceRadiance` call site** (still 4) and **no new sampler** (still 16).
+  Several hemisphere lights combine as an intensity-weighted mean axis.
+- Option `ambient`, default `true`. `false` uploads zeros, which the shader adds
+  unconditionally, so the off state is bit-for-bit the pre-0.15 result.
+- **It is not global illumination and is not sold as one.** Nothing occludes it,
+  nothing carries colour between surfaces, and GI bounces do not pick it up.
+  `gi: true` remains the real thing.
+- New gate `?selftest=ambient` in `npm run test:render`: an AmbientLight-only
+  scene is not black (mean luma **235.00**), the same scene with `ambient: false`
+  is (**0.00**), a HemisphereLight-only scene is not black (**213.00**) and its
+  up-facing and down-facing surfaces differ (**213.00 vs 38.76**), so the blend
+  is a real function of the normal.
+
+### ReSTIR: the estimator, corrected
+
+- **`restirDirectionalBypass` (new, default `true`).** The sun does not go in the
+  reservoir. A reservoir scores its candidates **unshadowed**, and a directional
+  light is bright on every surface facing it while being occluded on most
+  interior ones — so the reservoir elects it again and again, spends its one
+  visibility ray on the wall in between, and the pixel resolves to black with the
+  odd frame's runner-up as a bright speck. Measured on a doorway turn, over the
+  region stock breaks: **18.67 → 10.90**, against **10.69** for the same scene
+  with the sun's intensity zeroed. The sun is counted exactly once (checked
+  against the true sun contribution, which in that interior is +0.12 of 255 —
+  it contributes almost nothing and cost the reservoir almost everything). Cost:
+  one shadow ray per pixel, **+8.7%** in that view.
+- **`restirReprojectionRescue` (new, default `true`).** The sub-texel correction
+  the irradiance accumulator already applied, plus a four-neighbour rescue when
+  the plane test fails. Without them TAA jitter walks the lighting-res G-buffer
+  sample across a baluster every frame and the reservoir restarts from eight
+  uniform candidates forever. Share of shaded pixels that never warm up at a
+  settled pose: **9.81 / 3.28 / 13.37% → 0.51 / 0.17 / 0.82%** across three
+  views; in a scene with no thin geometry the permanent 3.2–3.8% floor goes to
+  **0.00%**. ALU only. In *motion* it cannot help — a genuinely disoccluded pixel
+  has no history anywhere — and that is stated rather than glossed.
+- **`restirCandidateImportance` (new, default `true`).** Candidates are drawn the
+  way NEE draws them: pool by power, then that pool's own CDF. Uniformly, **91%
+  of the candidate budget went to a pool carrying 3.7% of the light** (98% for 2%
+  in a smaller scene). Doorway turn at default settings, whole-frame error
+  against the exact path, with a run-to-run floor of exactly 0.000:
+  **14.24 / 13.09 / 8.29 / 4.90 → 7.00 / 5.62 / 5.41 / 2.06**, and a signed error
+  of **−0.001 of 255** at convergence, which is the unbiasedness check. Measured
+  **free**, and slightly cheaper: an 8-step binary search on 10% of candidates
+  costs less than four texelFetches on 91% of them.
+- **`restirClampRel` (new, default `2`).** The firefly cap on the ReSTIR direct
+  term is now relative to the pixel's own reservoir estimate of the unshadowed
+  total, not an absolute constant. One sample carries the *whole* light sum, so
+  the term is bimodal and an absolute cap clips the peaks while nothing lifts the
+  zeros: bright surfaces converged **dark**, as a halo of missing light around
+  every bulb. Converged signed error **−2.52 → −0.23** (gallery) and
+  **−4.75 → −3.80** (great hall), against signed floors of 0.02–0.21.
+- **`restirWarmAge` (new, default `0` = off).** A pixel younger than N frames of
+  validated reservoir history is shaded by the exact per-light loop. It removes
+  reveal speckle outright — a whole-screen reveal at one frame goes **51.80 →
+  11.51**, landing on the ReSTIR-off curve — but the exact path is 5–6× a ReSTIR
+  frame, and because the cold pixels are a fine **stipple** rather than a region
+  the branch is billed at warp granularity: **2.2× the frame in motion** even
+  after the reprojection rescue cut the settled cold fraction below 1%. Shipped
+  off, with the measurement that says why.
+- **`restirSamples` / `restirSampleRadius` (new, default `1` / `10`).** Shade N
+  reservoir winners per pixel, each with its own visibility ray, averaged.
+  Estimator noise 16.81 → 11.13 from N=1 to N=4 — real, but sub-`1/√N`, because
+  neighbouring reservoirs were merged from overlapping taps one stage earlier.
+  Through the shipped denoiser the win mostly disappears, so it is a lever for a
+  weaker denoiser or a machine with headroom.
+- **`restirDynamicAccept` / `restirDynamicFreeze` (new, both default `false`).**
+  Two treatments for pixels on a moving mesh. Both work at the mechanism level
+  (reservoir M on the mover 17.97 → 23.14, starved pixels 38% → 5%) and **neither
+  moved the visible noise**, because the shimmer there is dominated by the
+  irradiance EMA. Off, because a change with no measured visible benefit should
+  not be on.
+- **Stable light slots** (behaviour, not an option). `syncLights` cleared the
+  light table and re-pushed only the visible lights, so an index meant "position
+  in traversal order over the active set" — and a ReSTIR reservoir stores a light
+  INDEX. Any change to which lights are active therefore silently repointed every
+  reservoir on screen. Slots are now sticky: a light active before and after a
+  re-sync keeps its index. Measured across a room crossing: survivors keeping
+  their slot **0/17 → 14/17**, residual spike **3.70 → 1.94**.
+
+### Temporal
+
+- **`motionVectors` (new, default `true`).** The G-buffer writes each fragment's
+  previous screen position into a fifth `RG32F` attachment, and the irradiance
+  EMA and the ReSTIR reservoir look up history *there* instead of reprojecting
+  the current world position through the previous view-projection. That
+  camera-only reprojection is correct for static geometry and simply wrong for a
+  moving mesh. Residual on a moving mesh **5.39 → 4.70** mean, **8.69 → 6.57**
+  p95. **TAA deliberately does not consume it** — it measured as a clear
+  regression on its own (7.81 mean). A static mesh's motion vector collapses
+  exactly to camera-only reprojection, so a static scene renders byte-identically
+  either way. Needs ≥ 5 draw buffers (WebGL2 guarantees 4); without them the
+  option is ignored with a one-time warning — read `rt.motionVectorsSupported`.
+
+### The adaptive governor is two-way
+
+- **It could lower quality and never raise it.** Its only signal was wall-clock
+  frame time, and a vsync-capped display pins that at the refresh period no
+  matter how much GPU headroom exists, so every gate that RAISES quality was
+  unreachable. Measured before the fix: renderScale 0.5 at load, the 0.2 floor
+  plus a 0.75 canvas by twelve seconds, then 0.20 for every one of the next 63
+  one-second samples at a steady 16.7 ms. Any transient — a shader link, an asset
+  load, another window taking the GPU — cost lighting resolution *for the life of
+  the page*.
+- DOWN is still judged on the wall clock. **UP is now judged on measured GPU
+  milliseconds**, through the `GpuTimer` this package already shipped **but never
+  imported**. That timer had a deadlock of its own: `end()` returned early when
+  `begin()` had been skipped, so once queries were outstanding nothing was ever
+  drained and the cost read null forever. Both fixed.
+- Where the extension is withheld (Safari, iOS), UP falls back to raising one
+  rung and reverting if the wall clock degrades, with per-rung exponential
+  backoff. New option `gpuTiming` (`"auto"` | `false`); new read-only
+  `gpuCostMs`, `gpuTimingSupported`, `gpuTimingActive`.
+- Validated against a readPixels-synchronised ground truth: the timer tracks the
+  wall clock to a flat ~0.85 ms across 27–258 ms frames. With a GPU hog run for
+  20 s, quality falls to the floor and then **climbs all the way back within 20 s
+  of the hog stopping, with exactly one direction reversal**; 150 s of steady
+  flight after settling produced four changes, all in the first fourteen seconds.
+
+### Materials
+
+- **`material.userData.rtNoAreaLight = true`** keeps a material's triangles out
+  of the emissive NEE list without changing anything else — it still renders at
+  its full emissive value and still appears in reflections, it simply is not an
+  area light. The case is unlit SCENERY: a backdrop carrying its diffuse map as
+  an emissiveMap is emissive by construction, and because the list keeps the
+  largest 256 triangles by area, one ground quad evicts every real lamp.
+  Measured before the flag: of 77,535 candidates the kept 256 were 255 garden and
+  1 hedge, and every chandelier, lamp, bulb, TV and candle was evicted. After:
+  132 chandelier, 48 lamp shades, 40 bulbs, 36 TV, no outdoor triangle at all.
+- `compiled.emissivePower` is exposed (the power CDF's own normaliser), so
+  "power" is defined once for both NEE and the ReSTIR candidate split.
+
+### Demos
+
+- **Every new option has a control**, grouped under the ReSTIR toggle it
+  modifies, plus ambient with the lights and motion vectors with the temporal
+  dials.
+- **A "Reset to defaults" button** in both the demo panel and the gallery strip.
+  It reads `RealtimeRaytracer.DEFAULTS`, drives the scene-revealing features
+  through their own handlers so a room really does hide its pieces, re-syncs
+  every control, clears the tour's `sessionStorage` snapshot and restarts the
+  image. Verified by changing eight settings by hand, pressing it, and reading
+  all seventeen values back.
+- **The demo now boots on the library's defaults** on a desktop tier. Its old
+  "tested MINIMAL" block pinned renderScale 0.375, five denoise passes,
+  stochastic lights and the governor OFF — every one of those a reaction to
+  defaults that were heavy in the wrong places. Worse, an explicitly-passed
+  option is *pinned against the governor*, so that block also forbade the
+  governor from using its own levers. Phones and tablets keep a lean start.
+- **New gallery scene: "Waterfall"**, after the Cornell box. Forty pooled bodies
+  falling through a peg board forever, six of them emissive area lights and four
+  carrying point lights, in a shaft with no floor — the catalogue's only moving
+  scene, and the only way to show a dynamic BVH refit, emitters that travel, and
+  reservoirs surviving lights in motion. Verified: 36/40 bodies still moving
+  after a minute, dynamic bounds stable at 5.70 × 12.27 × 2.65 across 30 frames
+  with one compile and no rebuild storm, and the emissive set measurably lighting
+  the walls (wall-region luma **69.31 with `emissiveNEE` on vs 59.72 off**,
+  against run-to-run floors of 0.12 and 0.05).
+
+### Types
+
+- `index.d.ts` declared six `restirSpatial*` options that **no implementation
+  has** — they arrived from an increment whose code did not, and passing one did
+  nothing at all. Removed. The four options the library *does* implement but
+  never declared (`restirSamples`, `restirSampleRadius`, `restirDynamicAccept`,
+  `restirDynamicFreeze`) are declared instead, along with everything above.
+  Verified with `tsc --strict` against a consumer-shaped construction, including
+  a negative control that the removed options are now a type error.
+
 ## 0.14.1
 
 - **The adaptive governor now respects explicitly-pinned options.** `_takeFreeWins`
