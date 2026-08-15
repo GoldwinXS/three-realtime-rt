@@ -115,6 +115,11 @@ controls.enableDamping = true;
 
 let rt = null;
 let scene = null;
+// The catalogue is almost all STILL LIFES, but not quite: a scene may hand back
+// `dynamicMeshes` (meshes whose transforms change every frame, refitted into the
+// BVH rather than recompiled) and an `update()` the render loop calls before
+// each frame. `sceneDef` holds whichever scene is loaded so the loop can ask.
+let sceneDef = null;
 let rtEnabled = true;
 let forceRaster = false; // momentary "hold: raster" override (see holdBtn below)
 let triCount = 0;
@@ -175,6 +180,7 @@ async function switchScene(key) {
   if (!first) hudEl.classList.add("busy");
   if (rt) { rt.dispose(); rt = null; }
   const def = await SCENES[key]();
+  sceneDef = def;
   scene = def.scene;
   camera.position.set(...def.cam);
   controls.target.set(...def.target);
@@ -204,7 +210,10 @@ async function switchScene(key) {
   // read the renderer size, but be explicit in case scale changed mid-session).
   rt.setSize(...bufferSize());
   const t0 = performance.now();
-  rt.compileScene(scene);
+  // A moving scene declares its movers ONCE, here. compileScene bakes them into
+  // a separate small BVH that updateDynamic() refits per frame, so nothing about
+  // the layout changes while the scene runs and there is no recompile hitch.
+  rt.compileScene(scene, def.dynamicMeshes ? { dynamicMeshes: def.dynamicMeshes } : undefined);
   triCount = rt.compiled.triangleCount;
   console.log(
     `[gallery] ${key}: compiled ${triCount.toLocaleString()} tris in ` +
@@ -320,6 +329,16 @@ function animate() {
   else requestAnimationFrame(animate);
   if (!scene || !rt) return;
   controls.update();
+  // A moving scene steps its own simulation, then the tracer re-bakes the
+  // dynamic BVH from the fresh transforms and re-reads the light table. Lights
+  // are re-read every frame because this scene's lights RIDE the bodies, and
+  // 0.15.0's stable light slots are what keep each one's table index (and so
+  // every reservoir pointing at it) valid while it moves.
+  if (sceneDef && sceneDef.update) {
+    sceneDef.update();
+    rt.updateDynamic();
+    rt.updateLights(scene);
+  }
   if (rtEnabled && !forceRaster) rt.render(scene, camera);
   else renderer.render(scene, camera);
 
@@ -339,6 +358,7 @@ function animate() {
 Object.defineProperties(window, {
   RT: { get: () => rt },
   SCENE: { get: () => scene },
+  SCENE_DEF: { get: () => sceneDef },
 });
 Object.assign(window, { CAMERA: camera, SWITCH: switchScene });
 const wanted = (location.hash || "").replace(/^#/, "");

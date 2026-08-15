@@ -20,6 +20,13 @@ export class Physics {
     this.props = []; // { mesh, body, home:{p,q} }
     this.meshes = []; // just the meshes, for compileScene({dynamicMeshes})
     this._q = new THREE.Quaternion();
+    // Kill-plane behaviour, overridable per scene. The museum wants an escapee
+    // dropped back in above its home spot; the waterfall wants it teleported to
+    // the hopper line with a fresh x, which is what makes that scene a LOOP
+    // rather than a pile. Left null = the original museum behaviour, so nothing
+    // that does not set them changes.
+    this.killY = -10;
+    this.respawn = null; // (prop, physics) => void
   }
 
   static async create() {
@@ -52,8 +59,15 @@ export class Physics {
   /**
    * Create `count` dynamic props (mixed boxes + low-poly spheres), add their
    * meshes to `scene`, and rest them in a tidy pyramid on the given pad.
+   *
+   * `opts.size` scales both shapes (default 1 = the museum's 0.5 cube / 0.32
+   * sphere). `opts.segments` lowers the sphere tessellation, which matters when
+   * the props are EMISSIVE: the NEE area-light list caps at 256 triangles for
+   * the whole scene, so a 14x10 sphere would spend two thirds of it on one prop.
    */
-  spawnPool(scene, count, pad) {
+  spawnPool(scene, count, pad, opts = {}) {
+    const size = opts.size ?? 1;
+    const seg = opts.segments ?? [14, 10];
     for (let i = 0; i < count; i++) {
       const color = PROP_COLORS[i % PROP_COLORS.length];
       const isBox = i % 3 !== 0; // ~2/3 boxes, 1/3 spheres
@@ -64,12 +78,12 @@ export class Physics {
         metalness: 0.0,
       });
       if (isBox) {
-        const s = 0.5;
+        const s = 0.5 * size;
         geo = new THREE.BoxGeometry(s, s, s);
         colliderDesc = RAPIER.ColliderDesc.cuboid(s / 2, s / 2, s / 2);
       } else {
-        const r = 0.32;
-        geo = new THREE.SphereGeometry(r, 14, 10);
+        const r = 0.32 * size;
+        geo = new THREE.SphereGeometry(r, seg[0], seg[1]);
         colliderDesc = RAPIER.ColliderDesc.ball(r);
       }
       const mesh = new THREE.Mesh(geo, mat);
@@ -187,13 +201,42 @@ export class Physics {
     // it falls forever — hundreds of units below the room it still bloats the
     // dynamic BVH's bounds (and its shadow rays). Drop escapees back in from
     // above their home spot instead.
+    //
+    // A scene with NO floor (the waterfall's open bottom) uses the same
+    // machinery as its main loop rather than as an exception handler: set
+    // `killY` and a `respawn` hook and every body that leaves the bottom is put
+    // back at the top. Keeping it here, in the step, is what makes the dynamic
+    // BVH's bounds stay tight — a body 200 units below the scene costs every
+    // shadow ray in the frame.
     for (const prop of this.props) {
-      if (prop.body.translation().y < -10) {
-        this._place(prop, prop.home.x, 8, prop.home.z);
+      if (prop.body.translation().y < this.killY) {
+        if (this.respawn) this.respawn(prop, this);
+        else this._place(prop, prop.home.x, 8, prop.home.z);
         prop.body.wakeUp();
       }
     }
     this.sync();
+  }
+
+  /**
+   * A FIXED collider of arbitrary shape and orientation, for scenes whose static
+   * geometry is not the museum's box of walls: `kind` is "cuboid" (args are half
+   * extents) or "cylinder" (args are halfHeight, radius). `quat` is a
+   * THREE.Quaternion, or omitted for axis-aligned.
+   *
+   * Only the COLLIDER — the visible mesh is the caller's, and stays out of
+   * `dynamicMeshes` so it compiles into the static BVH where it belongs.
+   */
+  addFixed(kind, args, pos, quat = null, { friction = 0.4, restitution = 0.45 } = {}) {
+    let desc = RAPIER.RigidBodyDesc.fixed().setTranslation(pos.x, pos.y, pos.z);
+    if (quat) desc = desc.setRotation({ x: quat.x, y: quat.y, z: quat.z, w: quat.w });
+    const rb = this.world.createRigidBody(desc);
+    const cd =
+      kind === "cylinder"
+        ? RAPIER.ColliderDesc.cylinder(args[0], args[1])
+        : RAPIER.ColliderDesc.cuboid(args[0], args[1], args[2]);
+    this.world.createCollider(cd.setFriction(friction).setRestitution(restitution), rb);
+    return rb;
   }
 
   /**
