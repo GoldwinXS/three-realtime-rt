@@ -191,6 +191,11 @@ export const SCENES = {
       cam: [0, 2.8, 7.8],
       target: [0, 2.7, 0],
       env: { color: new THREE.Color(0.0, 0.0, 0.0), intensity: 0.0 },
+      // The one scene whose whole point is the bounce: 0.15 ships gi OFF by
+      // default (the owner's "expense off" rule), so entering the Cornell box
+      // turns it on for you, and the strip's checkbox says so. Reset restores
+      // the library defaults like everywhere else.
+      settingsOnEnter: { gi: true },
     };
   },
   // A tall open-fronted shaft with pegs in it, and forty bodies falling through

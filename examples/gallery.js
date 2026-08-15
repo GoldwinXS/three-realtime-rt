@@ -182,6 +182,16 @@ async function switchScene(key) {
   const def = await SCENES[key]();
   sceneDef = def;
   scene = def.scene;
+  // A scene may ask for a setting on entry (the Cornell box wants gi, which
+  // 0.15 ships off by default). It writes the strip's own state and re-reads
+  // the checkboxes, so what the strip shows is what the scene runs; leaving the
+  // scene keeps whatever is set, and Reset returns everything to the defaults.
+  if (def.settingsOnEnter) {
+    Object.assign(settings, def.settingsOnEnter);
+    document.querySelectorAll("#options input[data-flag]").forEach((box) => {
+      if (box.dataset.flag in def.settingsOnEnter) box.checked = settings[box.dataset.flag];
+    });
+  }
   camera.position.set(...def.cam);
   controls.target.set(...def.target);
   // Portrait viewports frame the same position too tightly (the narrow aspect
