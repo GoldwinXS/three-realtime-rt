@@ -19,6 +19,15 @@ out vec3 vWorldPos;
 out vec3 vWorldNormal;
 out vec2 vUvCoord;
 out vec3 vColor;
+#ifdef RT_MOTION_VECTORS
+// Previous-frame WORLD position of this vertex: the same local position under
+// LAST frame's model matrix. For a static mesh uPrevModelMatrix === modelMatrix
+// (identical 16 values), so this is computed by the exact same instructions as
+// vWorldPos and interpolates bit-identically — the motion vector then collapses
+// to camera-only reprojection with zero rounding difference.
+out vec3 vPrevWorldPos;
+uniform mat4 uPrevModelMatrix;
+#endif
 
 uniform mat3 uNormalMatrixWorld;
 
@@ -31,6 +40,9 @@ void main() {
 
   vec4 wp = modelMatrix * vec4(transformed, 1.0);
   vWorldPos = wp.xyz;
+#ifdef RT_MOTION_VECTORS
+  vPrevWorldPos = (uPrevModelMatrix * vec4(transformed, 1.0)).xyz;
+#endif
   vWorldNormal = normalize(uNormalMatrixWorld * objectNormal);
   vUvCoord = uv;
   // Geometry vertex colours. three's shader prefix declares the built-in
@@ -57,11 +69,18 @@ layout(location = 0) out vec4 gAlbedoRough;
 layout(location = 1) out vec4 gNormalMetal;
 layout(location = 2) out vec4 gWorldPos;
 layout(location = 3) out vec4 gEmissive;
+#ifdef RT_MOTION_VECTORS
+layout(location = 4) out vec4 gMotion;
+#endif
 
 in vec3 vWorldPos;
 in vec3 vWorldNormal;
 in vec2 vUvCoord;
 in vec3 vColor;
+#ifdef RT_MOTION_VECTORS
+in vec3 vPrevWorldPos;
+uniform mat4 uPrevViewProj;
+#endif
 
 uniform vec3 uColor;
 uniform float uRoughness;
@@ -85,6 +104,7 @@ uniform sampler2D uMetalnessMap;
 uniform bool uHasMetalnessMap;
 uniform bool uBlend;
 uniform float uOpacity;
+uniform float uIsDynamic; // 1.0 while rendering a dynamic-mesh surface (see setDynamicMeshes)
 
 // World-space 3D-texture albedo ("volumetric surface albedo"), compiled in ONLY
 // when a scene registers a material with userData.rtVolumeAlbedo (the whole block
@@ -184,7 +204,37 @@ void main() {
   // .a is normally the constant 1.0 (CompositePass reads only .rgb). A blend
   // surface carries its opacity here; the packed word above also encodes it, so
   // the sampler-bound lighting pass reads opacity without a gEmissive fetch.
-  gEmissive = vec4(emissive, uBlend ? uOpacity : 1.0);
+  // Dynamic-mesh surfaces instead write -1.0: a per-pixel flag the reservoir
+  // passes read to know which pixels belong to moving geometry (dynamicMeshes
+  // are not visible from inside a shader). Opacity is never negative and dynamic
+  // meshes are never blend (transparent meshes are dropped from dynamicMeshes),
+  // so the sentinel cannot collide with either consumer.
+  gEmissive = vec4(emissive, uIsDynamic > 0.5 ? -1.0 : (uBlend ? uOpacity : 1.0));
+#ifdef RT_MOTION_VECTORS
+  // Previous-frame screen position of this surface point, in [0,1] UV. For a
+  // static mesh (vPrevWorldPos === vWorldPos) this is the camera-only
+  // reprojection the consumers would otherwise compute, so the static path
+  // reduces to it (the ReSTIR stage, which samples this value directly, is
+  // bit-identical; the accumulate/TAA stages re-derive the same clip.xy/clip.w
+  // division inside their own program and can differ by 1 ULP on a tiny
+  // fraction of fragments — a 1-LSB, 0.1% mismatch, not a functional one).
+  // Storing the raw previous UV (rather than a pre-subtracted prevUv - currUv
+  // delta) is what keeps that reduction exact enough to be byte-identical:
+  // a pre-subtracted delta would force the consumer to reassociate
+  // currUv + (prevUv - currUv) back to prevUv, a 1-ULP error that showed up as
+  // a 1-LSB mismatch in 0.23% of channels. prevClip.w <= 0 means the surface
+  // was behind last frame's camera — no valid history position exists, so write
+  // an out-of-bounds sentinel (not NaN: NaN comparison falls through the
+  // consumers' bounds checks) that every consumer's existing bounds test drops.
+  {
+    vec4 prevClip = uPrevViewProj * vec4(vPrevWorldPos, 1.0);
+    if (prevClip.w > 0.0) {
+      gMotion = vec4((prevClip.xy / prevClip.w) * 0.5 + 0.5, 0.0, 0.0);
+    } else {
+      gMotion = vec4(1e4, 1e4, 0.0, 0.0);
+    }
+  }
+#endif
 }
 `;
 
@@ -204,6 +254,8 @@ export class GBufferPass {
     this._mixedPrecision = mixedPrecision;
     // Two G-buffers, ping-ponged each frame: the previous frame's worldPos +
     // normals are needed to validate reprojected history (stage 2).
+    this._width = width;
+    this._height = height;
     this._targets = [
       this._makeTarget(width, height),
       this._makeTarget(width, height),
@@ -219,6 +271,22 @@ export class GBufferPass {
     // compiled WITHOUT the RT_VOLUME_ALBEDO define — no sampler3D, byte-identical.
     this._volumeEnabled = false;
     this._dummyVolumeTex = null; // 1x1x1 fallback bound to non-volume meshes when on
+    this._dynamicMeshes = null; // Set of dynamic meshes (see setDynamicMeshes)
+    // Motion-vector state (see setMotionVectors). Off, the G-buffer is the
+    // exact 4-attachment target it has always been.
+    this._motionEnabled = false;
+    this._prevModelMatrices = null; // Map<mesh, Matrix4> filled by the tracer
+    this._motionPrevViewProj = new THREE.Matrix4();
+  }
+
+  /**
+   * Mark the meshes whose surfaces are dynamic (re-baked each frame via
+   * updateDynamic). Their pixels write a -1.0 flag into gEmissive.a so the
+   * reservoir passes can tell moving geometry from the static world. Pass null
+   * (or omit) to flag nothing — gEmissive.a then keeps its pre-feature values.
+   */
+  setDynamicMeshes(meshes) {
+    this._dynamicMeshes = meshes && meshes.length ? new Set(meshes) : null;
   }
 
   // A valid 1x1x1 3D texture to bind on gbuffer materials whose mesh is NOT a
@@ -252,8 +320,44 @@ export class GBufferPass {
     this._materialCache = new WeakMap(); // force recompile with the new define
   }
 
+  /**
+   * Enable/disable the motion-vector attachment. On, the G-buffer becomes a
+   * 5-attachment MRT (the extra RG32F target holds the screen-space motion
+   * vector) and the per-mesh programs recompile with RT_MOTION_VECTORS. Off is
+   * byte-identical to the pre-feature 4-attachment G-buffer. Rebuilds the
+   * ping-pong targets and clears the material cache (a size/toggle, so the
+   * caller should reset temporal history).
+   */
+  setMotionVectors(enabled) {
+    const on = !!enabled;
+    if (on === this._motionEnabled) return;
+    this._motionEnabled = on;
+    for (const t of this._targets) t.dispose();
+    this._targets = [
+      this._makeTarget(this._width, this._height),
+      this._makeTarget(this._width, this._height),
+    ];
+    this._current = 0;
+    this._materialCache = new WeakMap(); // force recompile with the new define
+  }
+
+  /**
+   * Previous-frame model matrices per dynamic mesh, captured by the tracer at
+   * the END of the previous frame (rigid transforms only). A mesh without an
+   * entry (first frame) falls back to its current matrixWorld, i.e. a
+   * camera-only motion vector.
+   */
+  setPrevModelMatrices(map) {
+    this._prevModelMatrices = map;
+  }
+
+  /** Previous view-projection matrix for the motion-vector path. */
+  setMotionMatrices(prevViewProj) {
+    this._motionPrevViewProj.copy(prevViewProj);
+  }
+
   _makeTarget(width, height) {
-    const t = makeMRT(width, height, 4, {
+    const t = makeMRT(width, height, this._motionEnabled ? 5 : 4, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       type: THREE.FloatType,
@@ -267,6 +371,14 @@ export class GBufferPass {
       t.texture[0].type = THREE.HalfFloatType; // albedo + roughness
       t.texture[1].type = THREE.HalfFloatType; // normal + packed material word
       t.texture[3].type = THREE.HalfFloatType; // emissive
+    }
+    if (this._motionEnabled) {
+      // Motion vector: 2-channel RG32F holding the surface's PREVIOUS screen UV.
+      // Two channels are enough (a screen position is 2D), and fp32 (not fp16)
+      // keeps sub-pixel precision — fp16 would quantize a half-screen position to
+      // ~0.2px at 960 wide and make TAA shimmer.
+      t.texture[4].format = THREE.RGFormat;
+      t.texture[4].type = THREE.FloatType;
     }
     return t;
   }
@@ -296,8 +408,14 @@ export class GBufferPass {
   get prevWorldPos() {
     return this._prev.texture[2];
   }
+  /** Motion-vector attachment of the current G-buffer (null when disabled). */
+  get motion() {
+    return this._motionEnabled ? this.target.texture[4] : null;
+  }
 
   setSize(width, height) {
+    this._width = width;
+    this._height = height;
     for (const t of this._targets) t.setSize(width, height);
   }
 
@@ -310,8 +428,13 @@ export class GBufferPass {
       glslVersion: THREE.GLSL3,
       // RT_VOLUME_ALBEDO is present only while a scene uses the volumetric-albedo
       // feature (see setVolume); absent, the compiled program is identical to the
-      // pre-feature G-buffer (no sampler3D, no volume branch).
-      defines: this._volumeEnabled ? { RT_VOLUME_ALBEDO: "1" } : {},
+      // pre-feature G-buffer (no sampler3D, no volume branch). RT_MOTION_VECTORS
+      // likewise appears only while motion vectors are enabled (see
+      // setMotionVectors).
+      defines: {
+        ...(this._volumeEnabled ? { RT_VOLUME_ALBEDO: "1" } : {}),
+        ...(this._motionEnabled ? { RT_MOTION_VECTORS: "1" } : {}),
+      },
       vertexShader: gbufferVert,
       fragmentShader: gbufferFrag,
       uniforms: {
@@ -335,6 +458,13 @@ export class GBufferPass {
         uHasMetalnessMap: { value: false },
         uBlend: { value: false },
         uOpacity: { value: 1.0 },
+        uIsDynamic: { value: 0.0 },
+        // Motion-vector uniforms are always present in the JS uniform object
+        // (harmless when the define is off — three uploads only uniforms that
+        // exist in the compiled program, so a non-motion scene never touches
+        // these).
+        uPrevModelMatrix: { value: new THREE.Matrix4() },
+        uPrevViewProj: { value: new THREE.Matrix4() },
         // Volume-albedo uniforms are always present in the JS uniform object
         // (harmless when the define is off — three uploads only uniforms that
         // exist in the compiled program, so a non-volume scene never touches
@@ -390,6 +520,16 @@ export class GBufferPass {
     // lighting pass. opacity 1 renders opaque, matching the old force-opaque path.
     u.uBlend.value = !!src.transparent;
     u.uOpacity.value = src.opacity ?? 1.0;
+    u.uIsDynamic.value = this._dynamicMeshes && this._dynamicMeshes.has(mesh) ? 1.0 : 0.0;
+    // Motion-vector inputs. Static meshes use their (constant) matrixWorld as
+    // the previous model — identical to modelMatrix, so the motion vector
+    // collapses to camera-only reprojection exactly. Dynamic meshes use the
+    // previous frame's captured matrix (see setPrevModelMatrices).
+    if (this._motionEnabled) {
+      const prev = this._prevModelMatrices ? this._prevModelMatrices.get(mesh) : null;
+      u.uPrevModelMatrix.value.copy(prev || mesh.matrixWorld);
+      u.uPrevViewProj.value.copy(this._motionPrevViewProj);
+    }
     // World-space 3D-texture albedo. Only meshes whose material opted in via
     // userData.rtVolumeAlbedo get uHasVolume=true; every other mesh keeps the
     // dummy sampler (branch never taken) so its albedo is byte-identical. This is

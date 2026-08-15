@@ -72,6 +72,47 @@ uniform float uIor;         // index of refraction for transmissive materials
 uniform float uDispersion;  // chromatic dispersion strength for glass (0 = off)
 uniform bool uLightStochastic; // 1 direct shadow ray/pixel/frame instead of 1/light
 uniform bool uRestirEnabled;   // shade the reservoir winner instead of sampling
+// >>> RT_RESTIR_MULTISAMPLE
+// How many reservoir winners this pixel shades per frame, each with its own
+// visibility ray. 1 = the shipped single-sample path, bit-identical. Sample 0
+// is always THIS pixel's reservoir; the rest are neighbouring pixels'
+// reservoirs, validated the way RestirPass's spatial stage validates a tap.
+// The cap is a compile-time constant so the loop bound is constant (the driver
+// sees the same shape as the existing per-light loop), but the count itself is
+// a uniform, so one program serves every setting — nothing recompiles and the
+// iOS translation risk is a single yes/no rather than one per value.
+#define RESTIR_MAX_SAMPLES 4
+uniform int uRestirSamples;
+uniform float uRestirTapRadius; // neighbour tap radius ceiling, lighting texels
+// <<< RT_RESTIR_MULTISAMPLE
+// >>> RT_RESTIR_COLD_FALLBACK
+// Frames of validated reservoir history a pixel must have before it is shaded
+// FROM that reservoir. Younger pixels take the exact per-light path instead.
+// 0 = off = the shipped behaviour, and the reservoir stage writes the age
+// regardless, so nothing about the estimator changes when this is 0.
+uniform float uRestirWarmAge;
+// <<< RT_RESTIR_COLD_FALLBACK
+// >>> RT_RESTIR_CLAMP_REL
+// Firefly cap on the ReSTIR direct term, RELATIVE to the pixel's own reservoir
+// estimate of the unshadowed light total (the spatial stage writes it into the
+// reservoir's .g). The cap is max(2 * fireflyClamp, this * p̂_total), so
+// 0 = off = the absolute cap alone = the shipped behaviour, byte for byte. See
+// the note in shadeReservoir for why an absolute cap darkens bright surfaces.
+uniform float uRestirClampRel;
+// <<< RT_RESTIR_CLAMP_REL
+// >>> RT_RESTIR_DIR_BYPASS
+// Directional lights are shaded EXACTLY, always, and are kept out of the ReSTIR
+// reservoir (RestirPass.uDirBypass must be set to match). A directional light
+// has a large unshadowed target score on every surface facing it and is
+// occluded on most interior ones, so a reservoir keeps electing it, spends its
+// one visibility ray on a wall, and the pixel goes black — with the odd frame's
+// runner-up showing through as a bright speck. Production ReSTIR renderers keep
+// directional lights out of the reservoir for this reason. The cost is one
+// extra shadow ray per pixel per directional light, which is the smallest light
+// class in any scene here (one sun).
+// false = the shipped behaviour, byte for byte.
+uniform bool uDirBypass;
+// <<< RT_RESTIR_DIR_BYPASS
 uniform bool uGIHalfRate;      // GI ray on alternating checkerboard, doubled
 
 uniform vec3 uEnvColor;
@@ -676,11 +717,20 @@ vec3 lightContribution(int i, vec3 P, vec3 N) {
 }
 
 // Direct light at a GI bounce hit: sample ONE random light (weighted by count).
-vec3 sampleOneLight(vec3 P, vec3 N) {
+// >>> RT_RESTIR_DIR_BYPASS
+// skipDir drops a directional pick (returns 0 for it, keeps the 1/N pick pdf),
+// which stays unbiased for the lights that remain: the estimator's expectation
+// becomes the sum over the non-directional lights, which is exactly what the
+// caller wants when it is adding the directional ones exactly. GI bounces pass
+// false and are untouched.
+vec3 sampleOneLight(vec3 P, vec3 N, bool skipDir) {
   if (uLightCount == 0) return vec3(0.0);
   int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
+  float lw = uLightPosType[i].w;
+  if (skipDir && lw >= 0.5 && lw < 1.5) return vec3(0.0);
   return lightContribution(i, P, N) * float(uLightCount);
 }
+// <<< RT_RESTIR_DIR_BYPASS
 
 // Next-event estimation on emissive-mesh triangles (row 1 of uMaterialsTex):
 // pick one triangle, sample a point on it, cast one shadow ray, convert the
@@ -783,9 +833,17 @@ vec3 sampleEmissiveTri(vec3 P, vec3 N) {
 // re-draw their soft-radius jitter here (the reservoir stores which light,
 // not the jitter). The estimator inherently tames near-emitter spikes: a huge
 // contribution comes with a proportionally huge p̂, and W divides it out.
-vec3 shadeReservoir(vec3 P, vec3 N) {
+// >>> RT_RESTIR_MULTISAMPLE
+// One reservoir, shaded at THIS pixel's surface and scaled by wgt (1/N when N
+// winners are averaged). Split out of shadeReservoir so the multi-sample loop
+// below has exactly ONE call site — see the Metal call-site note in main().
+// The reservoir may be this pixel's own or a validated neighbour's: the RIS
+// estimator f(Y)·W is unbiased for ANY target function with sufficient support
+// (the target only steers which sample is picked), so a neighbour's W applied
+// to the contribution recomputed HERE still estimates this pixel's integral.
+vec3 shadeReservoirSample(vec4 res, vec3 P, vec3 N, float wgt) {
+// <<< RT_RESTIR_MULTISAMPLE
   // Spatial-stage encoding: r = id, a = precomputed W (vs. centroid score).
-  vec4 res = texture(uReservoir, vUv);
   if (res.a <= 0.0) return vec3(0.0);
   float id = res.r;
 
@@ -844,29 +902,140 @@ vec3 shadeReservoir(vec3 P, vec3 N) {
   if (occluded(P + N * uEps, wi, maxDist)) return vec3(0.0);
   // Dielectric highlight from the reservoir winner (C = li * cos, shared with
   // the diffuse term; W = res.a is applied to both).
-  if (gWantSpec) gSpec += C * (ggxSpec(N, wi) * res.a);
-  vec3 e = C * res.a;
-  // Safety clamp, same budget as the emissive direct clamp elsewhere.
-  float l = dot(e, vec3(0.299, 0.587, 0.114));
-  float cap = uFireflyClamp * 2.0;
-  if (l > cap) e *= cap / l;
-  return e;
+  if (gWantSpec) gSpec += C * (ggxSpec(N, wi) * res.a * wgt);
+  // The safety clamp is NOT applied here: it belongs to the pixel's direct
+  // term as a whole, and the caller applies it to the average. Clamping each
+  // sample first would be a one-sided energy loss that grows with N — a spike
+  // is already suppressed N-fold by the averaging, so clamping it again
+  // darkens exactly the bright spots the extra samples were bought for. With
+  // N = 1 the average IS the sample, so the arithmetic is unchanged.
+  return C * res.a * wgt;
 }
+
+// >>> RT_RESTIR_MULTISAMPLE
+// Shade N reservoir winners and average them. Sample 0 is this pixel's own
+// reservoir (so N = 1 reduces to the shipped path, same RNG draws in the same
+// order, same arithmetic times 1.0); samples 1..N-1 read a NEIGHBOUR pixel's
+// reservoir, which cost the spatial stage nothing extra to produce.
+//
+// WHY AVERAGING IS NOT DOUBLE COUNTING: each term is an independent unbiased
+// estimate of the SAME quantity — this pixel's full direct-lighting integral,
+// not "the light that term picked". The mean of N unbiased estimates is
+// unbiased whatever they select, including when two of them select the same
+// light. (Summing them without the 1/N is what would double count.) Two
+// samples landing on the same light is therefore a VARIANCE issue, not a bias
+// one: the pair only averages the soft-shadow jitter and the area-light point,
+// so N correlated samples reduce noise by less than sqrt(N).
+//
+// An unvalidated neighbour falls back to this pixel's own reservoir instead of
+// being dropped: dropping it while still dividing by N would darken every
+// geometry edge, trading noise for a visible bias.
+vec3 shadeReservoir(vec3 P, vec3 N) {
+  vec4 own = texture(uReservoir, vUv);
+  int n = clamp(uRestirSamples, 1, RESTIR_MAX_SAMPLES);
+  float wgt = 1.0 / float(n);
+  // Taps use the SAME validation and radius as the spatial stage: a neighbour
+  // on another surface would import light across a geometry edge, which is
+  // bias, not noise.
+  vec2 ts = 1.0 / vec2(textureSize(uReservoir, 0));
+  float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
+  float dA = (2.0 * PI) / float(max(n - 1, 1)); // stratify the N-1 taps
+  vec3 sum = vec3(0.0);
+  for (int k = 0; k < RESTIR_MAX_SAMPLES; k++) {
+    if (k >= n) break;
+    vec4 res = own;
+    if (k > 0) {
+      float ang = (float(k - 1) + rand()) * dA;
+      float rad = 2.0 + rand() * max(uRestirTapRadius - 2.0, 0.0);
+      vec2 nUv = vUv + vec2(cos(ang), sin(ang)) * rad * ts;
+      vec4 nwp = texture(uGWorldPos, nUv);
+      bool ok = nUv.x >= 0.0 && nUv.x <= 1.0 && nUv.y >= 0.0 && nUv.y <= 1.0
+        && nwp.w >= 0.5
+        && abs(dot(nwp.xyz - P, N)) <= tol
+        && dot(N, normalize(texture(uGNormalMetal, nUv).xyz)) >= 0.9;
+      if (ok) res = texture(uReservoir, nUv);
+    }
+    sum += shadeReservoirSample(res, P, N, wgt);
+  }
+  // Safety clamp, same budget as the emissive direct clamp elsewhere. At N = 1
+  // this is byte-for-byte the clamp that used to sit inside the sample.
+  float l = dot(sum, vec3(0.299, 0.587, 0.114));
+  // >>> RT_RESTIR_CLAMP_REL
+  // AN ABSOLUTE CAP IS THE WRONG SHAPE FOR THIS ESTIMATOR, and it costs
+  // brightness rather than saving it. The exact path spends one shadow ray PER
+  // light and caps analytic lights nowhere; ReSTIR spends ONE ray on the whole
+  // sum, so f(Y)·W lands near the TOTAL when the winner turns out to be visible
+  // and on zero when it does not. That distribution is bimodal, the absolute cap
+  // clips the peaks, and nothing lifts the zeros, so a surface bright enough to
+  // exceed the cap converges DARK. Measured converged at 90 renders against a
+  // 250-render exact reference, this cap alone (dev/candidates-REPORT.md, gate
+  // 2): gallery mean 6.037 -> 4.540 and SIGNED -2.520 -> -0.233; great hall
+  // 6.353 -> 5.857 and -4.752 -> -3.802. Signed floors 0.02 to 0.21.
+  //
+  // uRestirClampRel scales THIS PIXEL'S OWN estimate of the unshadowed total
+  // (RestirPass's spatial stage writes wSum/M into .g), so the cap tracks what
+  // the pixel could plausibly receive instead of a scene-wide constant. 0 = off
+  // = exactly the absolute cap above, byte for byte. 2 means "no more than twice
+  // the whole light sum", which still catches a genuine 1/d^2 firefly (those run
+  // to 100x) while letting a fully lit surface reach its own total.
+  float cap = max(uFireflyClamp * 2.0, uRestirClampRel * own.g);
+  // <<< RT_RESTIR_CLAMP_REL
+  if (l > cap) sum *= cap / l;
+  return sum;
+}
+// <<< RT_RESTIR_MULTISAMPLE
+
+// >>> RT_RESTIR_COLD_FALLBACK
+// The EXACT direct-lighting path: one shadow ray per analytic light plus one
+// for the emissive set. This is what the owner calls "a perfect result" and it
+// is the fallback a cold ReSTIR pixel takes. Factored out of main() so the loop
+// exists ONCE in this shader — main() now reaches it from two branches (ReSTIR
+// on but this pixel cold, and ReSTIR off entirely), and a second copy of a
+// twenty-line loop is how the two paths drift apart.
+// >>> RT_RESTIR_DIR_BYPASS
+// ONE loop, one call site, a subset predicate. The spec's shape was a second
+// helper (shadeDirectionalLights) beside this one, which would have put a
+// THIRD lightContribution body in the shader (this loop, sampleOneLight, and
+// the new one) — the same register wall that made two shadeAllLights call sites
+// fail to link. So the directional subset is a MODE of this function instead:
+//   0 = every light + the emissive set (the exact path, unchanged)
+//   1 = the directional lights only, no emissive (the bypass sum)
+//   2 = nothing at all, and no RNG consumed
+// Mode 0 keeps the original light ORDER, so with the bypass on the exact path
+// is still byte-for-byte the exact path (the sun is shaded in its own slot, not
+// hoisted in front), which is what makes the cold-fallback arm comparable.
+vec3 shadeLightSet(vec3 P, vec3 N, int mode) {
+  if (mode == 2) return vec3(0.0);
+  vec3 d = vec3(0.0);
+  for (int i = 0; i < MAX_LIGHTS; i++) {
+    if (i >= uLightCount) break;
+    if (mode == 1) {
+      float lw = uLightPosType[i].w;
+      if (lw < 0.5 || lw >= 1.5) continue;   // not directional
+    }
+    d += lightContribution(i, P, N);
+  }
+  if (mode == 1) return d;
+  // Emissive meshes as area lights (next-event estimation, one shadow ray).
+  return d + sampleEmissiveTri(P, N);
+}
+// <<< RT_RESTIR_DIR_BYPASS
+// <<< RT_RESTIR_COLD_FALLBACK
 
 // ONE light sample for secondary path vertices: stochastically pick either the
 // analytic lights or the emissive set (weighted 1/p). Costs a single shadow
 // ray — same ray budget the GI bounce had before emissive NEE existed —
 // instead of two; the estimator stays unbiased and temporal accumulation
 // averages out the extra variance.
-vec3 sampleOneAny(vec3 P, vec3 N) {
+vec3 sampleOneAny(vec3 P, vec3 N, bool skipDir) {
   bool hasL = uLightCount > 0;
   bool hasE = uEmissiveCount > 0;
   if (hasL && hasE) {
     return rand() < 0.5
-      ? sampleOneLight(P, N) * 2.0
+      ? sampleOneLight(P, N, skipDir) * 2.0
       : sampleEmissiveTri(P, N) * 2.0;
   }
-  if (hasL) return sampleOneLight(P, N);
+  if (hasL) return sampleOneLight(P, N, skipDir);
   if (hasE) return sampleEmissiveTri(P, N);
   return vec3(0.0);
 }
@@ -921,7 +1090,9 @@ vec3 traceRadiance(vec3 ro, vec3 rd, bool specular) {
     if (_emissiveTile >= 0.0) hEmissive *= tileSample(_emissiveTile, _tileUv).rgb;
   }
 // <<< RT_TEXTURE_TILES
-  vec3 Ld = sampleOneAny(hP + hN * uEps, hN);
+  // GI/secondary vertices keep the sun: the bypass is about the PRIMARY
+  // surface's reservoir, and a bounce has no reservoir to poison.
+  vec3 Ld = sampleOneAny(hP + hN * uEps, hN, false);
   vec3 hLe = (!specular && uEmissiveCount > 0) ? vec3(0.0) : hEmissive;
   return hLe + hAlbedo * Ld * (1.0 / PI);
 }
@@ -1241,19 +1412,48 @@ void main() {
   // ReSTIR: shade the reservoir's winner with one visibility ray (flat cost in
   // light count). Stochastic: one blind random sample. Full: one shadow ray
   // per light + one for the emissive set.
-  vec3 direct = vec3(0.0);
-  if (uRestirEnabled) {
-    direct = shadeReservoir(P, N);
-  } else if (uLightStochastic) {
-    direct = sampleOneAny(P, N);
-  } else {
-    for (int i = 0; i < MAX_LIGHTS; i++) {
-      if (i >= uLightCount) break;
-      direct += lightContribution(i, P, N);
-    }
-    // Emissive meshes as area lights (next-event estimation, one shadow ray).
-    direct += sampleEmissiveTri(P, N);
+  // >>> RT_RESTIR_COLD_FALLBACK
+  // A pixel the camera or a moving object has JUST revealed has no reservoir
+  // history: 8 uniform candidates out of S (282 in the great hall), one
+  // visibility ray on the RIS winner, and neighbouring cold pixels landing on
+  // different winners. That is a bimodal estimate of a 26-light sum, and it is
+  // the blotching the owner sees at wall tops, baluster gaps and stair nosings.
+  // It converges in about a second of temporal accumulation; that second IS the
+  // artefact. So a pixel younger than uRestirWarmAge frames pays the exact path
+  // instead, and the reservoir keeps building underneath it, so by the time it
+  // crosses the threshold it has age x 8 candidates of history behind it.
+  // The reservoir tap carries that age in .b (RestirPass writes it in the
+  // temporal stage, the spatial stage passes it through untouched).
+  //
+  // CALL-SITE BUDGET, and this one cost a black screen before it was written
+  // down: the per-light loop (now shadeLightSet) may appear exactly ONCE in this
+  // shader. The obvious shape — reservoir-warm / reservoir-cold / stochastic /
+  // full, with the exact path in two of the four arms — compiles as GLSL and
+  // then fails to LINK on ANGLE/GL with "error: too many temporaries". The
+  // driver inlines the helper at every call site, and a second copy of the
+  // per-light loop's live ranges puts this megakernel over the register file.
+  // Same family as the three-site traceRadiance limit below. So the two exact
+  // arms are merged into one else, and the directional-bypass sum is a MODE of
+  // the same single call rather than a second loop.
+  vec4 resTap = uRestirEnabled ? texture(uReservoir, vUv) : vec4(0.0);
+  bool restirWarm = uRestirWarmAge <= 0.0 || resTap.b >= uRestirWarmAge;
+  // >>> RT_RESTIR_DIR_BYPASS
+  // The three estimators are unchanged; what is new is that the directional
+  // lights are lifted out of whichever one runs and shaded exactly, once, in
+  // the SAME single call site that serves the exact path. mode 0 already
+  // includes them, so the exact arm adds nothing.
+  bool useReservoir = uRestirEnabled && restirWarm;
+  bool useStochastic = !uRestirEnabled && uLightStochastic;
+  bool useExact = !useReservoir && !useStochastic;
+  int lightMode = useExact ? 0 : (uDirBypass ? 1 : 2);
+  vec3 direct = shadeLightSet(P, N, lightMode);
+  if (useReservoir) {
+    direct += shadeReservoir(P, N);
+  } else if (useStochastic) {
+    direct += sampleOneAny(P, N, uDirBypass);
   }
+  // <<< RT_RESTIR_DIR_BYPASS
+  // <<< RT_RESTIR_COLD_FALLBACK
 
   // --- 1-bounce indirect (cosine-weighted; pdf cancels the NdotL/PI).
   // traceRadiance shades the hit with direct + NEE light, or returns the
@@ -1683,6 +1883,19 @@ export class RTLightingPass {
         uPrevGWorldPos: { value: null },
         uReservoir: { value: null },
         uRestirEnabled: { value: false },
+        // Reservoir winners shaded per pixel (1 = shipped behaviour) and the
+        // neighbour-tap radius the extra ones are drawn from.
+        uRestirSamples: { value: 1 },
+        uRestirTapRadius: { value: 10 },
+        // Frames of reservoir history required before a pixel is shaded from
+        // its reservoir; below it, the exact per-light path. 0 = off = shipped.
+        uRestirWarmAge: { value: 0 },
+        // Firefly cap on the ReSTIR direct term relative to the pixel's own
+        // reservoir total. 0 = off = the absolute cap alone = shipped.
+        uRestirClampRel: { value: 0 },
+        // Directional lights shaded exactly and kept out of the reservoir
+        // (RestirPass.uDirBypass must agree). false = shipped.
+        uDirBypass: { value: false },
         uPrevViewProj: { value: new THREE.Matrix4() },
         uViewProj: { value: new THREE.Matrix4() },
         uCameraPos: { value: new THREE.Vector3() },

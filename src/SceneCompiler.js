@@ -118,6 +118,14 @@ export class CompiledScene {
     this.lightDirCone = []; // spot direction.xyz + cos(outer angle)
     this.lightCount = 0;
     this.emissiveTriCount = 0;
+    // >>> RT_RESTIR_CAND_CDF
+    // Total power of the emissive NEE set, in the power CDF's own units (area x
+    // Rec.709 luminance), i.e. the normaliser row 66 divides by. Exposed because
+    // the ReSTIR candidate sampler splits its draws between the analytic lights
+    // and the emissive set in proportion to their powers, and computing this a
+    // second time in that pass is how the two definitions drift apart.
+    this.emissivePower = 0;
+    // <<< RT_RESTIR_CAND_CDF
     this.triangleCount = 0;
 
     // Dynamic emissive area lights: the final (post-cap) emissive triangle list
@@ -382,7 +390,12 @@ export class CompiledScene {
       data[o + 12] = nx; data[o + 13] = ny; data[o + 14] = nz; data[o + 15] = emit[2];
     }
     // Areas (and therefore pick probabilities) may have changed — rebuild the CDF.
-    writeEmissiveCdf(data, row, tris);
+    // >>> RT_RESTIR_CAND_CDF
+    // ... and with them the set's total power, which is half of the reservoir's
+    // pool split. A moving emitter changes it every frame, so it is refreshed
+    // here rather than left at its compile-time value.
+    this.emissivePower = writeEmissiveCdf(data, row, tris);
+    // <<< RT_RESTIR_CAND_CDF
     tex.needsUpdate = true;
     this.lastEmissiveRefreshMs = now.now() - t0;
   }
@@ -680,6 +693,29 @@ function averageEmissiveMap(map) {
   }
   _emissiveMapAvgCache.set(map, result);
   return result;
+}
+
+// Opt a material OUT of next-event estimation: `userData.rtNoAreaLight = true`
+// keeps its triangles out of the emissive NEE list while leaving everything else
+// about the material alone. It still renders at its full emissive value — the
+// G-buffer reads material.emissive/emissiveMap directly, and the material table
+// keeps its emissive so specular secondary rays still see it — it simply is not
+// registered as an area light and casts nothing.
+//
+// The case this exists for: UNLIT SCENERY. A backdrop painted with its own
+// diffuse map as an emissiveMap (so a backlit face is not pure black when GI is
+// off) is emissive by construction, but it is a picture of a place, not a lamp.
+// Such surfaces are also enormous, and the NEE cap keeps the LARGEST triangles
+// by area, so without this flag one lawn quad evicts every real light in the
+// scene: measured here, 255 of 256 kept slots were garden, and the chandelier,
+// the lamps, the TV and the candle flames were all dropped.
+//
+// The alternative — an emissiveMap the CPU cannot read (see averageEmissiveMap)
+// — has the same NEE effect by accident, but it zeroes the material table's
+// emissive too (so reflections of the scenery go black) and it cannot be asked
+// for, only suffered. This is the explicit form of the same intent.
+function noAreaLight(mat) {
+  return !!(mat && mat.userData && mat.userData.rtNoAreaLight === true);
 }
 
 // Effective emissive colour (already scaled by intensity), or null if the
@@ -1206,14 +1242,38 @@ function buildSceneDataTexture(materials, emissiveTris, absorption, scattering, 
 // area x emitted luminance; degenerate totals fall back to the uniform pick.
 // The layout matches the row-66 comment in buildSceneDataTexture. `row` is the
 // texture width in floats (width * 4). Reused by updateDynamic's in-place refresh.
+//
+// >>> RT_RESTIR_CAND_CDF
+// RETURNS the normaliser (the emissive set's total power in these units). It was
+// a local before: the reservoir's candidate sampler needs it to decide how often
+// to draw from the emissive pool rather than the analytic-light pool, and
+// recomputing it there would be a second definition of "power" that could drift
+// from this one. Callers store it on the compiled scene as `emissivePower`.
+// <<< RT_RESTIR_CAND_CDF
+// >>> RT_RESTIR_CAND_CDF
+// ONE definition of "how much light does this triangle put out": area x emitted
+// luminance (Rec.709). The CDF's per-triangle probabilities and the set's total
+// power are the same quantity normalised two ways, and the reservoir's candidate
+// sampler needs the total, so the formula may not exist twice.
+function emissiveWeight(t) {
+  return t.area * (0.2126 * t.emit[0] + 0.7152 * t.emit[1] + 0.0722 * t.emit[2]);
+}
+
+/** Total emissive power of a triangle list, in the CDF's own units. */
+function emissivePowerTotal(emissiveTris) {
+  let total = 0;
+  for (let i = 0; i < emissiveTris.length; i++) total += emissiveWeight(emissiveTris[i]);
+  return total;
+}
+// <<< RT_RESTIR_CAND_CDF
+
 function writeEmissiveCdf(data, row, emissiveTris) {
-  if (emissiveTris.length === 0) return;
+  if (emissiveTris.length === 0) return 0;
   const cdfRow = (2 + BLUE_NOISE_SIZE) * row;
   let total = 0;
   const w = new Array(emissiveTris.length);
   for (let i = 0; i < emissiveTris.length; i++) {
-    const t = emissiveTris[i];
-    w[i] = t.area * (0.2126 * t.emit[0] + 0.7152 * t.emit[1] + 0.0722 * t.emit[2]);
+    w[i] = emissiveWeight(emissiveTris[i]);
     total += w[i];
   }
   let cum = 0;
@@ -1223,6 +1283,7 @@ function writeEmissiveCdf(data, row, emissiveTris) {
     data[cdfRow + i * 4 + 0] = i === emissiveTris.length - 1 ? 1.0 : cum;
     data[cdfRow + i * 4 + 1] = p;
   }
+  return total;
 }
 
 // Collect world-space triangles of an emissive mesh for the NEE light list.
@@ -1433,7 +1494,7 @@ export function compileScene(scene, options = {}) {
       const segStart = dynVertexOffset; // this segment's vertex base in the merged array
       dynamicGeoms.push(extracted.geo);
       for (const r of ranges) {
-        const emit = emissiveColor(r.material);
+        const emit = noAreaLight(r.material) ? null : emissiveColor(r.material);
         if (emit)
           collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount, segStart * 3);
       }
@@ -1466,7 +1527,7 @@ export function compileScene(scene, options = {}) {
     } else {
       staticGeoms.push(extracted.geo);
       for (const r of ranges) {
-        const emit = emissiveColor(r.material);
+        const emit = noAreaLight(r.material) ? null : emissiveColor(r.material);
         if (emit) collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount);
       }
       // Fingerprint this static source so a later edit (vertices moved, mesh
@@ -1585,6 +1646,12 @@ export function compileScene(scene, options = {}) {
     emissiveTris.length = MAX_EMISSIVE_TRIS;
   }
   compiled.emissiveTriCount = emissiveTris.length;
+  // >>> RT_RESTIR_CAND_CDF
+  // The post-cap set's total power, from the same weight the CDF uses. Computed
+  // here rather than inside buildSceneDataTexture only because that function
+  // returns a texture; _refreshDynamicEmissive keeps it current afterwards.
+  compiled.emissivePower = emissivePowerTotal(emissiveTris);
+  // <<< RT_RESTIR_CAND_CDF
   // Keep the final (post-cap) emissive list so updateDynamic can rebuild the
   // power CDF, and record which surviving rows belong to dynamic emitters (with
   // their merged-position offset) so their world-space triangles can be
@@ -1634,21 +1701,33 @@ export function compileScene(scene, options = {}) {
   return compiled;
 }
 
-/** (Re)scan the scene's lights into the compiled light tables. Cheap; call anytime. */
+/**
+ * (Re)scan the scene's lights into the compiled light tables. Cheap; call anytime.
+ *
+ * SLOT ASSIGNMENT IS STABLE ACROSS RE-SYNCS. A ReSTIR reservoir stores the light
+ * TABLE INDEX of its chosen light, so if re-scanning reassigns indices in
+ * traversal order every time the active light set changes, every reservoir on
+ * screen silently resolves to a DIFFERENT light for several frames — the
+ * "doorway flash". Stable slots fix that with no shader change: a light that is
+ * active both before and after a re-sync keeps its index, so every reservoir
+ * pointing at a surviving light stays valid, and only the few pixels pointing at
+ * a light that genuinely left are wrong. The map lives on the compiled scene (not
+ * a module global) so a full recompile starts from a clean, consistent table.
+ */
 export function syncLights(scene, compiled) {
   const posType = compiled.lightPosType;
   const colorRadius = compiled.lightColorRadius;
   const dirCone = compiled.lightDirCone;
-  posType.length = 0;
-  colorRadius.length = 0;
-  dirCone.length = 0;
-  let count = 0;
+  const slots = compiled._lightSlots || (compiled._lightSlots = new Map());
   const tmpP = new THREE.Vector3();
   const tmpT = new THREE.Vector3();
 
+  // 1. Gather the active lights in traversal order, computing each one's table
+  //    row up front. (The previous code pushed straight into the arrays; doing
+  //    the scan first is what lets us seat survivors in their old slots.)
+  const active = [];
   scene.traverse((obj) => {
     if (!obj.isLight || !obj.visible || obj.intensity <= 0) return;
-    if (count >= MAX_LIGHTS) return;
     if (obj.isSpotLight) {
       // posType.w encodes type AND the inner-cone cosine: w = 2 + cosInner
       // (any w >= 1.5 is a spot). Direction + outer cosine live in dirCone.
@@ -1657,48 +1736,100 @@ export function syncLights(scene, compiled) {
       const dir = tmpT.sub(tmpP).normalize();
       const cosOuter = Math.cos(obj.angle);
       const cosInner = Math.cos(obj.angle * (1 - (obj.penumbra ?? 0)));
-      posType.push(tmpP.x, tmpP.y, tmpP.z, 2 + cosInner);
-      colorRadius.push(
-        obj.color.r * obj.intensity,
-        obj.color.g * obj.intensity,
-        obj.color.b * obj.intensity,
-        obj.userData.rtRadius ?? 0.1
-      );
-      dirCone.push(dir.x, dir.y, dir.z, cosOuter);
-      count++;
+      active.push({
+        obj,
+        pt: [tmpP.x, tmpP.y, tmpP.z, 2 + cosInner],
+        cr: [
+          obj.color.r * obj.intensity,
+          obj.color.g * obj.intensity,
+          obj.color.b * obj.intensity,
+          obj.userData.rtRadius ?? 0.1,
+        ],
+        dc: [dir.x, dir.y, dir.z, cosOuter],
+      });
     } else if (obj.isPointLight) {
       obj.getWorldPosition(tmpP);
-      posType.push(tmpP.x, tmpP.y, tmpP.z, 0);
-      colorRadius.push(
-        obj.color.r * obj.intensity,
-        obj.color.g * obj.intensity,
-        obj.color.b * obj.intensity,
-        obj.userData.rtRadius ?? 0.15
-      );
-      dirCone.push(0, 0, 0, 0);
-      count++;
+      active.push({
+        obj,
+        pt: [tmpP.x, tmpP.y, tmpP.z, 0],
+        cr: [
+          obj.color.r * obj.intensity,
+          obj.color.g * obj.intensity,
+          obj.color.b * obj.intensity,
+          obj.userData.rtRadius ?? 0.15,
+        ],
+        dc: [0, 0, 0, 0],
+      });
     } else if (obj.isDirectionalLight) {
       obj.getWorldPosition(tmpP);
       obj.target.getWorldPosition(tmpT);
       const dir = tmpT.sub(tmpP).normalize();
-      posType.push(dir.x, dir.y, dir.z, 1);
-      colorRadius.push(
-        obj.color.r * obj.intensity,
-        obj.color.g * obj.intensity,
-        obj.color.b * obj.intensity,
-        obj.userData.rtRadius ?? 0.02
-      );
-      dirCone.push(0, 0, 0, 0);
-      count++;
+      active.push({
+        obj,
+        pt: [dir.x, dir.y, dir.z, 1],
+        cr: [
+          obj.color.r * obj.intensity,
+          obj.color.g * obj.intensity,
+          obj.color.b * obj.intensity,
+          obj.userData.rtRadius ?? 0.02,
+        ],
+        dc: [0, 0, 0, 0],
+      });
     }
   });
 
-  compiled.lightCount = count;
-  while (posType.length < MAX_LIGHTS * 4) {
-    posType.push(0, 0, 0, 0);
-    colorRadius.push(0, 0, 0, 0);
-    dirCone.push(0, 0, 0, 0);
+  // 2. Seat the survivors first — every still-active light re-takes the slot it
+  //    held last sync — then hand the freed slots to the newly active lights in
+  //    traversal order. A survivor only keeps its slot when that slot still lies
+  //    within the COMPACT table (0..N-1, N = min(active, MAX_LIGHTS)): the
+  //    sampling paths draw candidate ids from 0..lightCount-1, so the table must
+  //    stay hole-free. In the doorway case the active set barely shrinks (portal
+  //    symmetry keeps the room you left lit), so nearly every survivor is under N
+  //    and keeps its slot; only a wholesale shrink — far rarer and unavoidably a
+  //    re-light — re-seats the tail. With more active lights than slots, survivors
+  //    are always kept and the overflow of new lights is dropped, so a surviving
+  //    light deep in the traversal order no longer loses its slot to a newcomer.
+  const N = Math.min(active.length, MAX_LIGHTS);
+  const seat = new Array(MAX_LIGHTS).fill(null);
+  const seated = new Set();
+  for (const a of active) {
+    const old = slots.get(a.obj);
+    if (old !== undefined && old >= 0 && old < N && seat[old] === null) {
+      seat[old] = a;
+      seated.add(a);
+    }
   }
+  let next = 0;
+  for (const a of active) {
+    if (seated.has(a)) continue; // already in its old slot
+    while (next < N && seat[next] !== null) next++;
+    if (next >= N) break; // out of slots; the rest stay unlit
+    seat[next] = a;
+    next++;
+  }
+
+  // 3. Write the table (seated rows then padding) and record the new assignment.
+  posType.length = 0;
+  colorRadius.length = 0;
+  dirCone.length = 0;
+  slots.clear();
+  let count = 0;
+  for (let i = 0; i < MAX_LIGHTS; i++) {
+    const a = seat[i];
+    if (a) {
+      posType.push(a.pt[0], a.pt[1], a.pt[2], a.pt[3]);
+      colorRadius.push(a.cr[0], a.cr[1], a.cr[2], a.cr[3]);
+      dirCone.push(a.dc[0], a.dc[1], a.dc[2], a.dc[3]);
+      slots.set(a.obj, i);
+      count++;
+    } else {
+      posType.push(0, 0, 0, 0);
+      colorRadius.push(0, 0, 0, 0);
+      dirCone.push(0, 0, 0, 0);
+    }
+  }
+
+  compiled.lightCount = count;
 }
 
 export { MAX_LIGHTS };

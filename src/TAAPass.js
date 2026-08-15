@@ -25,6 +25,8 @@ in vec2 vUv;
 uniform sampler2D uCurrent;        // this frame's composited LDR colour
 uniform sampler2D uHistory;        // previous resolved colour
 uniform sampler2D uGWorldPos;      // current full-res G-buffer
+uniform sampler2D uGMotion;        // G-buffer previous-screen-UV texture (RG32F)
+uniform float uUseMotion;          // 1 = reproject via motion vector, 0 = camera-only
 uniform mat4 uPrevViewProj;
 uniform vec2 uTexelSize;
 uniform vec2 uJitter;              // this frame's projection jitter (UV space)
@@ -70,10 +72,20 @@ void main() {
 
   // Reproject this pixel's world point into the previous frame. The history is
   // a STABILIZED (unjittered-grid) image, so remove last frame's jitter from
-  // the projected position before sampling it.
-  vec4 clip = uPrevViewProj * vec4(P, 1.0);
-  if (clip.w <= 0.0) { outColor = vec4(current, 1.0); return; }
-  vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5 - uPrevJitter;
+  // the projected position before sampling it. With motion vectors (uUseMotion)
+  // the surface's own screen motion replaces the camera-only reprojection: the
+  // G-buffer stores the surface's PREVIOUS screen UV directly, so prevUv is that
+  // minus last frame's jitter — bit-identical to the camera-only path for static
+  // geometry. The stored sentinel (behind last frame's camera) lands out of
+  // bounds and is dropped below.
+  vec2 prevUv;
+  if (uUseMotion > 0.5) {
+    prevUv = texture(uGMotion, vUv + uJitter).xy - uPrevJitter;
+  } else {
+    vec4 clip = uPrevViewProj * vec4(P, 1.0);
+    if (clip.w <= 0.0) { outColor = vec4(current, 1.0); return; }
+    prevUv = (clip.xy / clip.w) * 0.5 + 0.5 - uPrevJitter;
+  }
   if (prevUv.x < 0.0 || prevUv.x > 1.0 || prevUv.y < 0.0 || prevUv.y > 1.0) {
     outColor = vec4(current, 1.0);
     return;
@@ -138,6 +150,8 @@ export class TAAPass {
         uCurrent: { value: null },
         uHistory: { value: null },
         uGWorldPos: { value: null },
+        uGMotion: { value: null },
+        uUseMotion: { value: 0.0 },
         uPrevViewProj: { value: new THREE.Matrix4() },
         uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) },
         uJitter: { value: new THREE.Vector2() },
@@ -223,6 +237,11 @@ export class TAAPass {
     this._reset = true;
   }
 
+  /** Toggle motion-vector reprojection (default off = camera-only). */
+  setMotionVectors(enabled) {
+    this.material.uniforms.uUseMotion.value = enabled ? 1.0 : 0.0;
+  }
+
   /**
    * @param currentColor tonemapped LDR colour texture for this frame
    * @param gbuffer      current GBufferPass (provides the world-pos guide)
@@ -241,6 +260,7 @@ export class TAAPass {
     u.uCurrent.value = currentColor;
     u.uHistory.value = this.targetB.texture; // previous resolved
     u.uGWorldPos.value = gbuffer.worldPos;
+    u.uGMotion.value = gbuffer.motion;
     u.uPrevViewProj.value.copy(prevViewProj);
     u.uJitter.value.copy(jitterUv);
     u.uPrevJitter.value.copy(prevJitterUv);

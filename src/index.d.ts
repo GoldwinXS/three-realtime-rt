@@ -264,6 +264,20 @@ export interface RealtimeRaytracerOptions {
   /** Frame-rate target for the adaptive governor. */
   targetFps?: number;
   /**
+   * GPU-cost timing for the adaptive governor
+   * (EXT_disjoint_timer_query_webgl2). "auto" (default) uses it where the
+   * browser exposes it and falls back to speculative probing where it does not
+   * (Safari and iOS withhold the extension). `false` forces the probe path and
+   * builds no timer at all.
+   *
+   * It is what makes the quality ladder two-way. Wall-clock frame time is pinned
+   * to the display's refresh period by vsync, so it can prove a frame is too
+   * slow but never that there is headroom to spend — without a GPU measurement
+   * the governor can only ever walk quality DOWN, and any transient costs
+   * quality permanently.
+   */
+  gpuTiming?: "auto" | boolean;
+  /**
    * Emergency crash guard, ON by default: clamps oversized first buffers and
    * cuts quality after consecutive >400ms frames (weak GPUs fed high settings
    * can hang the whole machine). Set false to opt out.
@@ -358,6 +372,113 @@ export interface RealtimeRaytracerOptions {
    * to let the governor decide.
    */
   restirMCap?: number;
+  /**
+   * Cold-pixel exact fallback: frames of validated temporal history a pixel's
+   * reservoir must have carried before that reservoir may shade it. Default `0`
+   * = off = the shipped behaviour.
+   *
+   * A just-revealed pixel has no history — 8 uniform candidates out of the whole
+   * light set, shaded with one visibility ray on the winner — so it speckles for
+   * about a second while temporal accumulation converges. Below this age the
+   * pixel is shaded by the exact per-light loop (one shadow ray per light plus
+   * one for the emissive set) instead, at that path's cost, and only for the
+   * minority of pixels that are actually cold. The reservoir keeps building
+   * underneath regardless.
+   */
+  restirWarmAge?: number;
+  /**
+   * Keep DIRECTIONAL lights out of the ReSTIR reservoir and shade them exactly
+   * instead. Default `false` = the shipped behaviour.
+   *
+   * The reservoir's target function is unshadowed, and a directional light has
+   * a large unshadowed contribution on every surface facing it while being
+   * occluded on most interior surfaces — so the reservoir keeps electing the
+   * sun, spends its single visibility ray on the wall in between, and the pixel
+   * resolves to black with the odd frame's runner-up as a bright speck. With
+   * this on, directional lights are never candidates and never survive as
+   * inherited winners, and the lighting pass adds them with one exact shadow
+   * ray each. Unbiased either way; costs one ray per directional light.
+   */
+  restirDirectionalBypass?: boolean;
+  /**
+   * ReSTIR temporal reprojection that survives TAA jitter and thin geometry.
+   * Default `false` = the shipped behaviour. Two halves of one fix: the
+   * sub-texel correction the irradiance accumulator already applies
+   * (`prevUv -= currUv - vUv`), and a four-neighbour rescue when the plane test
+   * at the reprojected texel fails. Without them a baluster's pixels reject
+   * their history every frame and their reservoirs never accumulate.
+   */
+  restirReprojectionRescue?: boolean;
+  /**
+   * Draw ReSTIR candidates the way next-event estimation draws them, instead of
+   * uniformly over (lights + emissive triangles). Default `false` = the shipped
+   * behaviour, byte for byte.
+   *
+   * Uniformly, a bulb's triangle in a room of 26 lights and 256 emissive
+   * triangles is a 1-in-282 pick and most of the 8 candidates land on surfaces
+   * that contribute nothing to the pixel, so a cold reservoir has nothing worth
+   * keeping. With this on, each candidate picks a POOL by power (analytic lights
+   * with probability PL/(PL+PE), clamped to [0.1, 0.9]) and then a member by that
+   * pool's own power CDF (the emissive half being the very CDF
+   * `emissiveImportance` already uses), and the RIS weight divides by that pdf.
+   * Unbiased: RIS holds for any source pdf whose support covers the target's.
+   *
+   * ALU only: no extra rays. One extra `rand()` per candidate and, for emissive
+   * candidates, the same 8-step binary search the exact path runs.
+   */
+  restirCandidateImportance?: boolean;
+  /**
+   * Cap the ReSTIR direct term at `restirClampRel` x the pixel's own reservoir
+   * estimate of the unshadowed light total, or at the absolute
+   * `2 x fireflyClamp`, whichever is larger. Default `0` = off = the absolute cap
+   * alone = the shipped behaviour.
+   *
+   * The absolute cap is the wrong shape for a one-sample-per-pixel estimator:
+   * f(Y)·W lands near the whole light sum when the winner is visible and on zero
+   * when it is not, so the cap clips the peaks while nothing lifts the zeros and
+   * bright surfaces converge DARK. `2` means "no more than twice everything this
+   * pixel could receive", which still catches a genuine 1/d^2 spike.
+   */
+  restirClampRel?: number;
+  /**
+   * ReSTIR spatial-reuse taps for a pixel that kept its temporal history
+   * (M > `restirSpatialLowM`). Default `4` — the value shipped before the
+   * adaptive stage, so a confident pixel's cost is unchanged.
+   */
+  restirSpatialTaps?: number;
+  /**
+   * ReSTIR spatial-reuse max tap radius in lighting-res texels for a confident
+   * pixel. Default `8` — taps land within ~10 texels, the shipped reach.
+   */
+  restirSpatialRadius?: number;
+  /**
+   * ReSTIR reservoir-confidence threshold. A pixel whose temporal stage
+   * rejected the reprojected history collapses to the fresh-candidate count
+   * (8 with the default 8-candidate temporal stage), so `M <= 8` means the
+   * temporal pass contributed nothing — the disoccluded / moving-mesh case.
+   * Such pixels take the low-confidence path. Default `8`.
+   */
+  restirSpatialLowM?: number;
+  /**
+   * ReSTIR spatial-reuse taps for a low-confidence pixel (`M <=
+   * restirSpatialLowM`). Spatial reuse is the only information a just-
+   * disoccluded pixel has, so it spends far more taps than the confident 4;
+   * only the disoccluded minority pays. Default `24`.
+   */
+  restirSpatialTapsLow?: number;
+  /**
+   * ReSTIR spatial-reuse max tap radius for a low-confidence pixel. Starved
+   * neighbours are nearby, so a wider reach finds pixels that did keep history;
+   * validation stays radius-independent so widening cannot leak across an edge.
+   * Default `32` lighting-res texels.
+   */
+  restirSpatialRadiusLow?: number;
+  /**
+   * ReSTIR spatial-reuse iterations. `1` (default) = one adaptive pass; `2` =
+   * a second pass that re-taps only pixels still low-confidence after the
+   * first, with fresh decorrelated samples.
+   */
+  restirSpatialIterations?: number;
   /**
    * EXPERIMENTAL — ReSTIR GI (v1, temporal-only): per-pixel reservoirs reuse the
    * 1-bounce global-illumination sample across frames (at the reprojected
@@ -498,6 +619,22 @@ export interface RealtimeRaytracerOptions {
   costScale?: number;
   /** Reproject accumulated lighting through camera motion. */
   temporalReprojection?: boolean;
+  /**
+   * Motion vectors for temporal reprojection (default `false`). The G-buffer
+   * writes each fragment's previous screen position into a fifth RG32F
+   * attachment, and the irradiance EMA, the ReSTIR reservoir, and the TAA
+   * resolve look up history at that position instead of reprojecting the
+   * CURRENT world position through the previous view-projection. That
+   * camera-only reprojection is wrong for MOVING meshes (a point on them
+   * occupied different world space last frame, so its history is rejected every
+   * frame) and correct for static geometry — for a static mesh the motion vector
+   * collapses exactly to camera-only reprojection, so a static scene renders
+   * byte-identically on or off. Rigid transforms only; deforming/skinned meshes
+   * still use a rigid previous matrix (they need per-vertex history, which is
+   * out of scope). Requires a GPU with >= 5 draw buffers (WebGL2 guarantees only
+   * 4); on a device without one the option is ignored with a one-time warning.
+   */
+  motionVectors?: boolean;
   /**
    * Temporal anti-aliasing: sub-pixel projection jitter + a full-res history
    * resolve with neighbourhood clamp.
@@ -671,8 +808,25 @@ export class CompiledScene {
   triangleCount: number;
   /** Number of lights scanned into the compiled light tables. */
   lightCount: number;
-  /** Number of emissive triangles registered as NEE area lights (static + dynamic). */
+  /**
+   * Number of emissive triangles registered as NEE area lights (static +
+   * dynamic). A material can stay out of this list with
+   * `material.userData.rtNoAreaLight = true`: it still renders at its full
+   * emissive value (the G-buffer reads the material directly, and specular
+   * secondary rays still see it) but casts no light. That is what unlit
+   * SCENERY wants — a backdrop carrying its diffuse map as an emissiveMap is
+   * emissive by construction, and because the list keeps the LARGEST triangles
+   * by area, a single ground quad will otherwise evict every real lamp.
+   */
   emissiveTriCount: number;
+  /**
+   * Total power of the emissive NEE set in the power CDF's own units (triangle
+   * area x Rec.709 emitted luminance): the normaliser row 66 of the scene-data
+   * texture divides by, refreshed with the CDF when a dynamic emitter moves.
+   * Exposed for `restirCandidateImportance`, which splits its candidate draws
+   * between the analytic lights and the emissive set in proportion to power.
+   */
+  emissivePower: number;
   /** World-space diagonal of the static level (used to auto-scale ray epsilon). */
   sceneDiagonal: number;
   /** True when any dynamic emitter contributes NEE rows refreshed each frame. */
@@ -843,6 +997,10 @@ export class RealtimeRaytracer {
   eps: number;
   /** Reproject accumulated lighting through camera motion. */
   temporalReprojection: boolean;
+  /** Motion vectors for temporal reprojection (see the option of the same name). Live-assignable. */
+  motionVectors: boolean;
+  /** Whether this GPU supports the 5-attachment motion-vector MRT (read-only). */
+  readonly motionVectorsSupported: boolean;
   /** History length cap. */
   maxHistory: number;
   /** Split accumulation pass in use (see the option of the same name). */
@@ -952,6 +1110,20 @@ export class RealtimeRaytracer {
   adaptiveQuality: boolean;
   /** Frame-rate target for the adaptive governor. */
   targetFps: number;
+  /** GPU-cost timing mode (see RealtimeRaytracerOptions.gpuTiming). Live: set
+   *  false at runtime to move the governor onto the probe fallback. */
+  gpuTiming: "auto" | boolean;
+  /**
+   * Median GPU milliseconds the tracer spent over the recent window, or null
+   * where the platform has no timer extension or no stable sample yet. The
+   * governor's headroom signal, and readable for diagnostics.
+   */
+  readonly gpuCostMs: number | null;
+  /** True where EXT_disjoint_timer_query_webgl2 is available and enabled. */
+  readonly gpuTimingSupported: boolean;
+  /** True when the governor is steering on GPU milliseconds rather than on the
+   *  speculative-probe fallback. */
+  readonly gpuTimingActive: boolean;
   /** Emergency crash guard (see RealtimeRaytracerOptions.overloadProtection). */
   overloadProtection: boolean;
   /** App-owned canvas-scale setter driven by the governor; null disables it. */
@@ -968,6 +1140,28 @@ export class RealtimeRaytracer {
   restir: boolean;
   /** ReSTIR reservoir staleness cap (default 16). Pass this option explicitly at construction to pin it against the adaptive governor. */
   restirMCap: number;
+  /** Cold-pixel exact fallback: frames of reservoir history required before the reservoir shades the pixel; below it, the exact per-light loop (default 0 = off). */
+  restirWarmAge: number;
+  /** Directional lights bypass the reservoir and are shaded exactly (default false = shipped). */
+  restirDirectionalBypass: boolean;
+  /** Sub-texel + four-neighbour ReSTIR temporal reprojection (default false = shipped). */
+  restirReprojectionRescue: boolean;
+  /** ReSTIR candidates drawn by power (pool split + per-pool CDF) instead of uniformly over S (default false = shipped). */
+  restirCandidateImportance: boolean;
+  /** ReSTIR direct-term firefly cap relative to the pixel's own reservoir total; 0 = the absolute cap alone (default 0 = shipped). */
+  restirClampRel: number;
+  /** ReSTIR spatial-reuse taps for a confident pixel (default 4). */
+  restirSpatialTaps: number;
+  /** ReSTIR spatial-reuse max tap radius (texels) for a confident pixel (default 8). */
+  restirSpatialRadius: number;
+  /** ReSTIR reservoir-confidence threshold; M at/below this takes the low-confidence path (default 8). */
+  restirSpatialLowM: number;
+  /** ReSTIR spatial-reuse taps for a low-confidence pixel (default 24). */
+  restirSpatialTapsLow: number;
+  /** ReSTIR spatial-reuse max tap radius (texels) for a low-confidence pixel (default 32). */
+  restirSpatialRadiusLow: number;
+  /** ReSTIR spatial-reuse iterations, 1 or 2 (default 1). */
+  restirSpatialIterations: number;
   /**
    * EXPERIMENTAL — ReSTIR GI (temporal-only) toggle. Only takes effect when
    * `gi` and `denoise` are also on (injected at the à-trous stage). Default false.

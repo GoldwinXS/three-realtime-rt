@@ -10,6 +10,7 @@ import { VolumetricPass } from "./VolumetricPass.js";
 import { RestirPass } from "./RestirPass.js";
 import { GIReservoirPass } from "./GIReservoirPass.js";
 import { CopyPass } from "./CopyPass.js";
+import { GpuTimer } from "./GpuTimer.js";
 import { makeMRT } from "./mrtCompat.js";
 
 // Van der Corput / Halton radical inverse — deterministic low-discrepancy
@@ -312,6 +313,80 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   }
 
   /**
+   * FUNCTIONAL probe for the motion-vector MRT: can this context DRAW into a
+   * FIVE-attachment G-buffer whose fifth target is RG32F? WebGL2 only
+   * guarantees 4 draw buffers (MAX_DRAW_BUFFERS >= 4), so a 5-attachment MRT is
+   * NOT guaranteed — check the count, then do a real draw + readback (a
+   * checkFramebufferStatus probe alone is what misleads on WebKit/iOS). If this
+   * returns false, `motionVectors` degrades to camera-only reprojection.
+   */
+  static _motionMrtSupported(renderer) {
+    const gl = renderer.getContext();
+    if (gl.getParameter(gl.MAX_DRAW_BUFFERS) < 5) return false;
+    let mrt, out, mat, copy, quad, scene2, cam;
+    const prevTarget = renderer.getRenderTarget();
+    try {
+      mrt = makeMRT(2, 2, 5, {
+        format: THREE.RGBAFormat,
+        type: THREE.HalfFloatType,
+        depthBuffer: false,
+        stencilBuffer: false,
+      });
+      for (const tex of mrt.texture) tex.generateMipmaps = false;
+      mrt.texture[4].format = THREE.RGFormat;
+      mrt.texture[4].type = THREE.FloatType;
+      out = new THREE.WebGLRenderTarget(2, 2, { depthBuffer: false, stencilBuffer: false });
+      const vert = `out vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+      mat = new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: vert,
+        fragmentShader: `precision highp float;
+layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2; layout(location = 3) out vec4 o3;
+layout(location = 4) out vec4 o4;
+void main(){
+  o0 = vec4(0.5); o1 = vec4(0.25); o2 = vec4(0.125); o3 = vec4(0.0625);
+  o4 = vec4(0.375, 0.625, 0.0, 1.0);
+}`,
+        depthTest: false,
+        depthWrite: false,
+      });
+      copy = new THREE.ShaderMaterial({
+        glslVersion: THREE.GLSL3,
+        vertexShader: vert,
+        fragmentShader: `precision highp float; in vec2 vUv; out vec4 outColor;
+uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0, 1.0); }`,
+        uniforms: { uTex: { value: mrt.texture[4] } },
+        depthTest: false,
+        depthWrite: false,
+      });
+      scene2 = new THREE.Scene();
+      cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+      quad.frustumCulled = false;
+      scene2.add(quad);
+      renderer.setRenderTarget(mrt);
+      renderer.render(scene2, cam);
+      quad.material = copy;
+      renderer.setRenderTarget(out);
+      renderer.render(scene2, cam);
+      const px = new Uint8Array(4);
+      renderer.readRenderTargetPixels(out, 0, 0, 1, 1, px);
+      // 0.375 -> ~96, 0.625 -> ~159 through the RGBA8 round-trip.
+      return Math.abs(px[0] - 96) < 24 && Math.abs(px[1] - 159) < 24;
+    } catch {
+      return false;
+    } finally {
+      renderer.setRenderTarget(prevTarget);
+      if (quad) quad.geometry.dispose();
+      if (mat) mat.dispose();
+      if (copy) copy.dispose();
+      if (mrt) mrt.dispose();
+      if (out) out.dispose();
+    }
+  }
+
+  /**
    * Companion settings for a given lighting resolution, and the governor's
    * denoise-pass CAP.
    *
@@ -388,6 +463,143 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   static GOVERNOR_WARMUP_FRAMES = 60;
 
   static MAX_SCALE_STEP = 0.25;
+
+  /**
+   * Largest renderScale change the governor may commit UPWARD in one step. One
+   * 0.05 rung, against the 0.25 (five rungs) it may drop in one step. The
+   * asymmetry is deliberate and is the whole reason a raise is safe to enable at
+   * all: a drop that is one rung too deep costs a little sharpness for two
+   * seconds, whereas a raise that is one rung too high costs dropped frames, so
+   * the ladder is climbed one rung at a time and fallen down five at a time.
+   */
+  static MAX_SCALE_UP_STEP = 0.05;
+
+  /**
+   * The tracer's GPU cost as a fraction of the frame period, at which the
+   * governor calls the frame OVER budget. Deliberately 1.0, i.e. "the whole
+   * period": this is a safety net behind the wall clock, not a second opinion
+   * about how much resolution to keep.
+   *
+   * Measured on an RTX 3060 at 960x600 (dev/gpu-budget-sweep.py, rAF-paced as
+   * the game runs, great hall at canvas 0.75): traced GPU 15.96ms / wall 16.80,
+   * 19.55 / 20.40, 24.55 / 25.30, 28.43 / 29.30. The wall clock is the GPU cost
+   * plus a flat ~0.85ms of non-tracer work, so once the GPU cost passes the
+   * period the wall clock passes it too and the ORIGINAL wall-clock gate fires
+   * on its own. A lower threshold here would take real resolution away from
+   * scenes the display is currently keeping up with: the great hall's settled
+   * 15.96ms is 96% of a 60Hz period and delivers a 16.8ms frame, and a governor
+   * that dropped the canvas a rung for that would be optimising its own proxy
+   * rather than the frame rate it was asked for.
+   */
+  static GPU_BUDGET_DROP = 1.0;
+  /** As above, while the governor knows it is hunting a boundary. */
+  static GPU_BUDGET_DROP_OSC = 1.15;
+
+  /**
+   * The highest GPU utilisation the governor will COMMIT to outright when it
+   * raises quality. Not a trigger — a predicted-cost ceiling: a step predicted
+   * to land under this is taken on the model's word (see _takeUpStep), and one
+   * predicted above it is either probed or refused. 0.85 keeps roughly a sixth
+   * of the period in hand for scene variation (the aeroplane flying into a lit
+   * room, a door opening onto more lights) so a committed raise does not have to
+   * be undone the moment the view changes.
+   *
+   * The gap between this and GPU_BUDGET_DROP is the anti-oscillation deadband:
+   * the governor never commits a step it can predict will need undoing, and the
+   * borderline band above it is entered only through a probe that carries its
+   * own undo and its own backoff.
+   */
+  static GPU_TARGET_UTIL = 0.85;
+  /** Stricter while hunting: only an obviously affordable step gets through. */
+  static GPU_TARGET_UTIL_OSC = 0.6;
+
+  /**
+   * Predicted utilisation above which an up-step is refused outright rather than
+   * verified by probing it.
+   *
+   * Between GPU_TARGET_UTIL and this, the model is not confident enough to
+   * commit and not confident enough to refuse — so the step is TAKEN AS A PROBE
+   * and judged on what it actually costs 1.5s later. That band matters: this
+   * game's great hall settles at 96% utilisation, so a governor that only ever
+   * committed steps predicted under 85% could never climb back to the level it
+   * was already running at before a transient, and every hitch would cost a
+   * permanent rung. Measurement decides; the model only decides what is worth
+   * measuring.
+   */
+  static GPU_PROBE_CEIL = 1.05;
+
+  /**
+   * Cost model for an up-step, used to refuse steps that would overshoot.
+   *
+   * Canvas scale is quadratic on EVERY pass and measures as such: great hall,
+   * renderScale 0.2, canvas 1.0 = 27.06ms against canvas 0.75 = 15.96ms, a ratio
+   * of 1.70 where the quadratic says 1.78. So canvas steps are charged the
+   * quadratic, which is right and marginally conservative.
+   *
+   * renderScale is quadratic only on the TRACED LIGHTING, which is a fraction of
+   * the frame — the G-buffer raster, TAA and the resolve are full-resolution
+   * whatever it is set to. Measured share of frame cost that actually scales
+   * with renderScale (dev/gpu-budget-sweep.py): 0.40 at 0.2->0.25, 0.35 at
+   * 0.2->0.3, 0.80 at 0.5->0.6, 0.84 at 0.75->1.0 — it grows as the lighting
+   * comes to dominate. SCALE_COST_SHARE is the top of that range, so the model
+   * `1 + share*(area - 1)` is exact at the top of the ladder and conservative
+   * everywhere below it. A flat quadratic was tried first and over-charged a
+   * 0.30->0.35 step by 15%, which left the last rung of a recovery dependent on
+   * catching a low sample — it got there, in 32 seconds instead of 4.
+   */
+  static SCALE_COST_SHARE = 0.85;
+  static STOCHASTIC_STEP_FACTOR = 1.5;
+
+  /**
+   * Adaptations a "there is headroom" reading must survive before the governor
+   * acts on it. At the 2s cooldown this is a ~4s dwell before the first up-step,
+   * and it is what keeps a single quiet moment in a heavy scene from starting a
+   * climb the scene cannot pay for.
+   */
+  static GOVERNOR_UP_DWELL = 2;
+
+  /**
+   * How long the governor waits for a GPU timing result before giving up on the
+   * timer and falling back to probing. GPU_DISJOINT (a driver clock change, a
+   * context switch away from the tab) empties the sample window legitimately, so
+   * a gap is not a fault; a permanent one is, and a governor that simply waited
+   * for a number that never came would be worse than the bug being fixed.
+   */
+  static GPU_STALE_MS = 5000;
+
+  /**
+   * How long a direction reversal keeps the governor in its cautious
+   * "oscillating" mode (wider deadband, longer cooldown, stricter raise).
+   *
+   * The flag is set by ONE reversal, which is right for catching a hunt early
+   * and wrong as a permanent state: a descent followed by a recovery is a single
+   * reversal too, and before this timeout existed the first step back up latched
+   * the strict thresholds for the rest of the page. Observed exactly that —
+   * after a transient the canvas recovered one rung, that recovery counted as a
+   * reversal, and the stricter raise threshold (0.6) then refused every further
+   * step at a measured 0.67 utilisation, permanently. Fifteen seconds of no
+   * changes at all is not a hunt; three normal cooldowns is long enough that a
+   * real ping-pong (which changes something every 5s) never sees this expire.
+   */
+  static OSCILLATION_FORGET_MS = 15000;
+
+  /**
+   * Speculative up-probe (used only where the GPU timer is unavailable — Safari
+   * and iOS withhold the extension, and the owner ships to iPad).
+   *
+   * PROBE_BASE_MS is the quiet period before the first probe, doubling to
+   * PROBE_MAX_MS after each failure and resetting to base after each success, so
+   * a machine that genuinely has headroom finds it in tens of seconds while a
+   * machine that does not stops asking. PROBE_SETTLE_MS is how long the raised
+   * level runs before the verdict: the wall-clock EMA is reseeded from scratch
+   * after a quality change (alpha 0.1, so ~90% converged in 22 frames) and a
+   * missed vsync has to actually happen to be seen.
+   */
+  static PROBE_BASE_MS = 8000;
+  static PROBE_MAX_MS = 120000;
+  static PROBE_SETTLE_MS = 1500;
+  /** A probe fails if the wall clock got this much worse than before it. */
+  static PROBE_FAIL_RATIO = 1.1;
 
   /**
    * Named quality presets: flat maps of EXISTING option values, for an app that
@@ -878,6 +1090,40 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.overloadProtection = options.overloadProtection ?? true;
     this._overloadStrikes = 0;
     this._obLastT = null;
+    /**
+     * GPU-cost timing for the adaptive governor (EXT_disjoint_timer_query_webgl2).
+     *
+     * "auto" (default) uses the extension where the browser exposes it and falls
+     * back to speculative probing where it does not (Safari/iOS withhold it).
+     * `false` forces the probe path — useful for testing the fallback on hardware
+     * that HAS the extension, and for an app that would rather not issue timer
+     * queries at all. `true` is the same as "auto" (there is nothing to force:
+     * where the extension is missing there is no measurement to be had).
+     *
+     * WHY IT MATTERS. The governor's only signal used to be wall-clock frame
+     * time, and a vsync-capped display pins that at the refresh period no matter
+     * how much GPU headroom exists — so every gate that RAISES quality was
+     * unreachable and the ladder was one-way. See _adaptQuality.
+     */
+    this.gpuTiming = options.gpuTiming ?? "auto";
+    this._gpuTimer = this.gpuTiming === false ? null : new GpuTimer(renderer);
+    // supported AND not disabled AND not given up on (see the staleness guard in
+    // _adaptQuality: a timer that stops producing results must not freeze the
+    // governor, so it degrades to the probe path rather than blocking).
+    this._gpuActive = !!(this._gpuTimer && this._gpuTimer.supported);
+    this._gpuNullSince = null;  // when costMs first went null (staleness guard)
+    this._gpuGaveUp = false;
+    /**
+     * Speculative up-probe (the fallback when there is no GPU timer). Null when
+     * none is in flight; otherwise { kind, from, at, ema } — see _adaptQuality's
+     * probe section for why this exists and how a failed probe is unwound.
+     */
+    this._qProbe = null;
+    this._qProbeBackoff = RealtimeRaytracer.PROBE_BASE_MS;
+    /** The last up-step a probe tried and had to undo, as { kind, from, at }.
+     *  Keyed by the STEP, so backing off a rung the scene cannot afford does not
+     *  also slow down the climb back to it from further down. */
+    this._qProbeFail = null;
     this._qEma = null;
     this._qLastT = null;
     this._qLastChange = 0;
@@ -968,7 +1214,211 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
      * area-light noise. On by default — turn off to compare estimators.
      */
     this.restir = options.restir ?? true;
+    /**
+     * How many reservoir winners the lighting pass shades per pixel, each with
+     * its own visibility ray. DEFAULT 1 = the shipped behaviour, bit-identical.
+     *
+     * ReSTIR is not noisier than the full per-light loop because it samples
+     * badly — it picks its one sample well. It is noisier because it spends ONE
+     * sample where the full loop spends one per light plus one for the emissive
+     * set. This is the dial for that: 2..4 shade the pixel's own winner plus
+     * 1..3 NEIGHBOURING pixels' winners (the spatial stage already produced a
+     * reservoir per pixel, so the extra winners are free to obtain — only the
+     * extra shadow ray is paid for), averaged with a 1/N weight.
+     *
+     * Neighbours are validated exactly as the spatial stage validates a tap
+     * (same plane, normal within ~26 degrees); an invalid tap falls back to the
+     * pixel's own reservoir rather than being dropped, because dropping it
+     * while still dividing by N would darken geometry edges.
+     */
+    this.restirSamples = options.restirSamples ?? 1;
+    /** Neighbour-tap radius ceiling for restirSamples > 1, in lighting-buffer
+     *  texels. 10 matches the spatial stage's own tap radius; larger taps
+     *  decorrelate the extra samples more but fail validation more often. */
+    this.restirSampleRadius = options.restirSampleRadius ?? 10;
+    /**
+     * COLD-PIXEL EXACT FALLBACK. Frames of validated temporal history a pixel's
+     * reservoir must have carried before that reservoir is allowed to shade it.
+     * DEFAULT 0 = off = the shipped behaviour.
+     *
+     * A just-revealed pixel — a camera move, an object sliding aside, a doorway
+     * crossing — has no history at all: its reservoir is 8 uniform candidates
+     * out of S = lights + emissive triangles, and shading it means one
+     * visibility ray on the RIS winner. That is a bimodal estimate of the whole
+     * light sum, neighbouring cold pixels pick different winners, and it takes
+     * roughly a second of temporal accumulation to converge. That second is the
+     * speckle people see at newly revealed edges.
+     *
+     * With this set, a pixel younger than N frames is shaded by the EXACT
+     * per-light loop (one shadow ray per light plus one for the emissive set) —
+     * the same path `restir: false` with `stochasticLights: false` uses. That
+     * path is NOT cheap: measured 5-6x a ReSTIR frame at 29 lights (449 vs 74 ms
+     * at rs 0.5, 124 vs 25 at rs 0.2, RTX 3060 under load), so this only pays
+     * while the cold pixels are a small minority, and it is only a win once the
+     * reprojection keeps thin-geometry pixels warm (see the game's notes). The reservoir
+     * keeps streaming candidates underneath, so a pixel crossing the threshold
+     * arrives with N x 8 candidates of history behind it.
+     */
+    this.restirWarmAge = options.restirWarmAge ?? 0;
+    /**
+     * DIRECTIONAL LIGHTS BYPASS THE RESERVOIR (default false = shipped
+     * behaviour). With it on, a directional light is never a ReSTIR candidate
+     * and never survives as an inherited winner; the lighting pass shades every
+     * directional light exactly instead, once, in the same single call site the
+     * exact path uses.
+     *
+     * WHY. A reservoir's target function is UNSHADOWED, and a directional light
+     * has a large unshadowed contribution on every surface facing it while
+     * being occluded on most interior surfaces. So the reservoir keeps electing
+     * the sun, spends its one visibility ray on the wall between, and the pixel
+     * resolves to zero — with the odd frame's runner-up showing through as a
+     * bright speck. Measured in this game (dev/sun-edges-REPORT.md): turning
+     * into the great-hall doorway, the entering wall renders nearly black with
+     * bright specks under stock ReSTIR and cleanly with the sun's intensity
+     * zeroed. Production ReSTIR renderers exclude directional lights for the
+     * same reason.
+     *
+     * COST is one extra shadow ray per pixel per directional light — the
+     * smallest light class in any scene here — and the RIS estimator stays
+     * unbiased: the source pdf is untouched, the target function simply
+     * excludes those lights, so a candidate slot spent on one is wasted rather
+     * than wrong (one sun among 16-29 lights = 3-6% of candidates).
+     */
+    this.restirDirectionalBypass = options.restirDirectionalBypass ?? false;
+    /**
+     * RESERVOIR REPROJECTION THAT SURVIVES JITTER AND THIN GEOMETRY (default
+     * false = shipped behaviour). Two halves of one fix in the ReSTIR temporal
+     * stage, both gated by this switch:
+     *   1. the SUB-TEXEL correction AccumulatePass has always applied
+     *      (`prevUv -= currUv - vUv`), because the G-buffer sample under a
+     *      reservoir texel is TAA-jittered and so P does not project to the
+     *      texel centre;
+     *   2. a four-neighbour RESCUE: if the plane test at the reprojected texel
+     *      fails, try the four axis neighbours and take the one whose surface
+     *      agrees best, before declaring the history invalid.
+     *
+     * WHY. Without them, thin geometry never accumulates: TAA jitter walks the
+     * lighting-res G-buffer sample across a baluster, the single-texel lookup
+     * lands on the other surface, the plane test rejects it, and the reservoir
+     * restarts from eight uniform candidates every frame. Measured before this
+     * change: 22% of shaded pixels never reached age 12 at a frozen pose, as a
+     * stipple tracing the balusters, the handrail, the chandelier arms and the
+     * picture frames.
+     *
+     * COST is bounded and ALU-only: at most four extra uPrevGWorldPos fetches
+     * and still exactly one uPrevReservoir fetch, on the pixels that failed.
+     */
+    this.restirReprojectionRescue = options.restirReprojectionRescue ?? false;
+    /**
+     * RESERVOIR CANDIDATES ARE DRAWN THE WAY NEE DRAWS THEM (default false =
+     * shipped behaviour, byte for byte).
+     *
+     * WHY. The temporal stage streams 8 candidates UNIFORMLY out of S = analytic
+     * lights + emissive NEE triangles. In a room with 26 lights and 256 emissive
+     * triangles a light bulb's triangle is a 1-in-282 pick, and most picks land
+     * on lampshade, television and candle triangles that contribute nothing to
+     * the pixel being shaded, so a cold reservoir holds 8 near-useless
+     * candidates and needs a second of temporal reuse to find anything. The
+     * EXACT path never had this problem: sampleEmissiveTri importance-samples the
+     * emissive set through the power CDF the scene compiler already writes.
+     *
+     * With this on, each candidate first picks a POOL (analytic lights with
+     * probability PL/(PL+PE), by power, clamped to [0.1, 0.9]) and then a member
+     * of it by that pool's own power CDF, and the RIS weight divides by the
+     * resulting pdf instead of by 1/S. RIS is unbiased for any source pdf whose
+     * support covers the target's, and this one covers every candidate the
+     * uniform pick could produce.
+     *
+     * COST is the 8-step binary search per emissive candidate plus one extra
+     * rand() per candidate (pool choice), all ALU: no extra rays, no extra
+     * texture rows. Measured in this game: see dev/candidates-REPORT.md.
+     */
+    this.restirCandidateImportance = options.restirCandidateImportance ?? false;
+    /**
+     * FIREFLY CAP ON THE RESTIR DIRECT TERM, RELATIVE TO THE PIXEL'S OWN
+     * RESERVOIR TOTAL (default 0 = off = the absolute cap alone = shipped).
+     *
+     * WHY. The direct term out of a reservoir is capped at 2 x fireflyClamp,
+     * while the exact per-light loop caps analytic lights nowhere. Because ReSTIR
+     * spends ONE sample on the WHOLE light sum, f(Y)·W lands near the total when
+     * the winner is visible and on zero when it is not: the distribution is
+     * bimodal, the cap clips the peaks, nothing lifts the zeros, and a bright
+     * surface converges DARK: the halo of missing light around each bulb.
+     *
+     * The reservoir already knows the answer: wSum/M is its own estimate of the
+     * unshadowed light total at this pixel, so the cap becomes
+     * max(2 x fireflyClamp, restirClampRel x that). 2 is "no more than twice
+     * everything this pixel could receive", which still catches a genuine 1/d^2
+     * spike (those are 100x) and lets a fully lit surface reach its own total.
+     */
+    this.restirClampRel = options.restirClampRel ?? 0;
     this.restirPass = new RestirPass(this._scaledW, this._scaledH);
+    /**
+     * Dynamic-mesh reservoir treatments, both DEFAULT OFF (nothing changes until
+     * switched on). A moving mesh's pixels reject their reprojected history every
+     * frame (camera-only reprojection lands on whatever was behind it last frame,
+     * the plane test fails, M collapses to the fresh-candidate count), so the
+     * moving aeroplane is permanently the noisiest thing on screen. Two fixes:
+     *   restirDynamicAccept — on a dynamic-mesh pixel, skip the plane test and
+     *     offer the co-located previous reservoir as a candidate (its light is
+     *     re-evaluated at the true surface, so a wrong one loses on weight).
+     *   restirDynamicFreeze — on a dynamic-mesh pixel, pass the previous
+     *     reservoir through to history instead of overwriting it, so the wall
+     *     behind the aeroplane keeps its history and the trailing edge stops
+     *     disoccluding. Only sound for a SMALL dynamic object against a broadly
+     *     similar background.
+     */
+    this.restirDynamicAccept = options.restirDynamicAccept ?? false;
+    this.restirDynamicFreeze = options.restirDynamicFreeze ?? false;
+
+    /**
+     * MOTION VECTORS for temporal reprojection (DEFAULT OFF). The G-buffer
+     * writes, into a fifth RG32F attachment, each fragment's PREVIOUS screen
+     * position (its last-frame clip position from the dynamic mesh's PREVIOUS
+     * model matrix and uPrevViewProj), and the three temporal stages — the
+     * irradiance EMA (AccumulatePass), the ReSTIR reservoir, and the TAA resolve
+     * — look up history at that previous position instead of reprojecting the
+     * CURRENT world position through uPrevViewProj.
+     *
+     * That camera-only reprojection is the bug for MOVING meshes: a point on
+     * the aeroplane occupied different world space last frame, so the
+     * reprojected history lands on whatever was behind it and every validation
+     * test fails. For STATIC geometry the motion vector reduces exactly to the
+     * camera-only path (the previous model matrix IS the current one), so a
+     * static scene renders byte-identically with the option on or off.
+     *
+     * Rigid transforms only: a DEFORMING mesh (userData.rtDeforming) or a
+     * SkinnedMesh needs previous-frame VERTEX positions, not a previous matrix,
+     * so its motion vector uses the rigid previous matrix — it degrades to
+     * today's camera-only-style reprojection for those vertices rather than
+     * producing a wrong vector.
+     *
+     * Requires a GPU with >= 5 draw buffers (WebGL2 guarantees only 4). On a
+     * device without it the option is ignored with a one-time warning and every
+     * stage keeps camera-only reprojection.
+     */
+    this.motionVectors = options.motionVectors ?? false;
+    this.motionVectorsSupported = RealtimeRaytracer._motionMrtSupported(renderer);
+    this._motionVectorsActive = false;
+    this._motionWarned = false;
+    this._prevModelMatrices = new Map(); // dynamic mesh -> previous Matrix4
+    // Per-stage consumption switches. NOT all on: measured on the Hangar great
+    // hall, frame-to-frame residual in a crop that follows the moving aircraft,
+    // mean / p95 over 61 frames —
+    //
+    //   off                5.39 / 8.69
+    //   accumulation only  4.70 / 6.57     <- the win: -13% mean, -24% p95
+    //   all three          6.44 / 7.69     <- WORSE on the mean than off
+    //
+    // The accumulation stage (the irradiance EMA) is where moving-object noise
+    // actually lives, which is why it is the one that pays. TAA consuming the
+    // same vectors is a clear regression here (taa-only measured 7.81 mean,
+    // +46%) and raising taaBlend makes it worse, not better, so it is not a
+    // simple history-lag. Until that is understood TAA stays on camera-only
+    // reprojection, which is exactly what it did before motion vectors existed.
+    this._motionAccum = true;
+    this._motionRestir = true;
+    this._motionTaa = false;
 
     /**
      * EXPERIMENTAL — ReSTIR GI (v1, temporal-only): per-pixel reservoirs reuse
@@ -1204,13 +1654,19 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
   // adaptation measures the new settings fresh instead of comparing them to an
   // average from before the switch.
   _rearmGovernor() {
-    this._qEma = null;
+    this._freshMeasurement();
     this._qLastT = null;
     this._qLastChange = 0;
     this._qLastDir = 0;
     this._qOscillating = false;
     this._qFastStreak = 0;
     this._qFreeWins = null;
+    // An in-flight probe belonged to the OLD baseline; its "from" state is no
+    // longer the thing to revert to, so drop it rather than let it undo a step
+    // of the new preset.
+    this._qProbe = null;
+    this._qProbeBackoff = RealtimeRaytracer.PROBE_BASE_MS;
+    this._qProbeFail = null;
     if (this.adaptiveQuality) {
       console.info(
         `three-realtime-rt: preset "${this._presetName}" applied  -  ` +
@@ -1554,6 +2010,11 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
     this.giReservoirPass.setCompiledScene(this.compiled);
+    // Tell the G-buffer which meshes are dynamic so it can flag their pixels
+    // (gEmissive.a) for the reservoir passes.
+    this.gbuffer.setDynamicMeshes(
+      this.compiled.hasDynamic ? this.compiled.dynamic.map((s) => s.mesh) : null
+    );
     this._syncVolumeAlbedo();
     this.resetAccumulation();
     return this.compiled;
@@ -1956,7 +2417,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this._qFreeWins = prev; // even when empty: the check is now settled
     if (!took) return false;
     this._recordChange(-1, now);
-    this._qEma = null; // cost profile changed — measure fresh
+    this._freshMeasurement(); // cost profile changed — measure fresh
     console.info(
       "three-realtime-rt: adaptive quality → free wins first (" +
         Object.keys(prev).filter((k) => k !== "scale").join(", ") +
@@ -1974,18 +2435,37 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     if (!keys.length) return false;
     for (const k of keys) this[k] = prev[k];
     this._recordChange(1, now);
-    this._qEma = null;
+    this._freshMeasurement();
     console.info(`three-realtime-rt: adaptive quality → returned ${keys.join(", ")}`);
     return true;
   }
 
   // ---- adaptive quality governor: continuous dynamic resolution scaling ----
-  // Measures real call-to-call frame time (EMA) and steers renderScale
-  // proportionally toward targetFps, in 0.05 steps with a cooldown so target
-  // reallocation and accumulation resets stay rare. Lighting cost ≈ scale², so
-  // the correction uses a damped power of the error. Limitation: under a vsync
-  // cap the frame time can't reveal headroom, so upscaling only happens when
-  // frames are measurably faster than the target — it never thrashes.
+  // Measures the frame's cost and steers renderScale toward targetFps, in 0.05
+  // steps with a cooldown so target reallocation and accumulation resets stay
+  // rare.
+  //
+  // TWO CLOCKS, AND WHY. Wall-clock frame time is what the user experiences, and
+  // it is the right signal for "we are too slow" — but under a vsync cap it is
+  // the ONLY thing it can say. A 60Hz display returns 16.7ms whether the GPU
+  // spent 3ms or 16ms on the frame, so every gate that RAISED quality
+  // (`ratio < dbLo`, and the free-win release's `ratio < 0.5`) was unreachable
+  // on ordinary hardware and the ladder was one-way: any transient — a shader
+  // compile, an asset load, another window taking the GPU — cost quality that
+  // was never given back for the life of the page. Measured in this game before
+  // the fix: renderScale 0.5 at load, 0.2 (the floor) plus a 0.75 canvas within
+  // twelve seconds, and then 0.20 for every one of the next sixty-three samples
+  // at a steady 16.7ms. 0.2 means the ray traced LIGHTING was being solved at a
+  // twenty-fifth of the pixels, permanently, on a card with headroom to spare.
+  //
+  // So DOWN is judged on the wall clock exactly as before (plus a GPU safety
+  // net), and UP is judged on measured GPU milliseconds — the one number a
+  // vsync cap cannot flatten. Where the timer extension is missing (Safari and
+  // iOS withhold it) UP falls back to speculative probing: raise one rung, keep
+  // it if the wall clock does not degrade, put it back and wait longer if it
+  // does. Both paths are asymmetric by construction — a raise needs a dwell, a
+  // predicted-cost check and one rung at a time; a drop needs one measurement
+  // and may take five rungs at once.
   //
   // SPENDING ORDER (down), cheapest-in-quality first:
   //   1. free wins            _takeFreeWins — no resolution given up at all
@@ -2034,6 +2514,29 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     // catastrophic frames from the very first one.
     this._qSamples = (this._qSamples || 0) + 1;
     if (this._qSamples < RealtimeRaytracer.GOVERNOR_WARMUP_FRAMES) return;
+    // A reversal marks the governor as hunting a boundary; a long quiet spell
+    // un-marks it. See OSCILLATION_FORGET_MS — without this, one recovery step
+    // after a transient pins the cautious thresholds on for the whole page.
+    if (
+      this._qOscillating &&
+      now - this._qLastChange > RealtimeRaytracer.OSCILLATION_FORGET_MS
+    ) {
+      this._qOscillating = false;
+    }
+
+    const budget = 1000 / this.targetFps;
+    const wall = this._qEma / budget;
+    const util = this._gpuUtilisation(now, budget);
+
+    // A probe in flight is judged on its OWN clock, which is shorter than the
+    // cooldown, and nothing else may move until it has been judged: the probe
+    // is a controlled experiment and a second change during it would make the
+    // result unattributable.
+    if (this._qProbe) {
+      this._judgeProbe(now, wall, util);
+      return;
+    }
+
     // Calmness: normally 2s between changes. When the last two steps reversed
     // direction the governor is hunting the boundary, so hold for 5s AND widen
     // the "comfortable" deadband — both push it to commit to a level instead of
@@ -2041,108 +2544,366 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     const cooldown = this._qOscillating ? 5000 : 2000;
     if (now - this._qLastChange < cooldown) return;
 
-    const ratio = this._qEma / (1000 / this.targetFps);
     const dbLo = this._qOscillating ? 0.6 : 0.8;
     const dbHi = this._qOscillating ? 1.24 : 1.12;
-    if (ratio < dbHi && ratio > dbLo) return; // comfortable — leave it alone
+    const dropUtil = this._qOscillating
+      ? RealtimeRaytracer.GPU_BUDGET_DROP_OSC
+      : RealtimeRaytracer.GPU_BUDGET_DROP;
 
-    // STEP 1 (down): the free wins, before any resolution is given up.
-    if (ratio > dbHi && this._takeFreeWins(now)) return;
+    // SLOW is the wall clock's call, exactly as it always was, with the GPU
+    // clock as a second opinion that can only ever ADD a drop. Note the wall
+    // clock is deliberately never overruled by a comfortable GPU reading: a
+    // CPU-bound frame is still a slow frame, and while dropping resolution will
+    // not fix it, the alternative (a governor that decides the problem is not
+    // its department) is how a scene becomes unplayable.
+    const slow = wall > dbHi || (util != null && util > dropUtil);
+    // FAST — meaning "there is headroom worth spending" — cannot be read off a
+    // vsync-capped wall clock at all. With a GPU measurement it is a real
+    // question; without one, wall < dbLo still detects headroom on an UNCAPPED
+    // display (a 144Hz panel, a headless capture), and the probe path covers
+    // the capped case.
+    const raiseUtil = this._qOscillating
+      ? RealtimeRaytracer.GPU_TARGET_UTIL_OSC
+      : RealtimeRaytracer.GPU_TARGET_UTIL;
+    const fast = util != null ? util < raiseUtil : wall < dbLo;
 
-    let s = this._renderScale * Math.pow(1 / ratio, 0.35);
-    // Per-step clamp. Now that multi-hundred-millisecond frames feed the EMA, a
-    // single very slow measurement (ratio can reach ~100 at dt 2s) would
-    // otherwise slam the scale from 1.0 to the 0.2 floor in ONE step and throw
-    // away the image on a transient. Move at most MAX_SCALE_STEP per adaptation
-    // (5 ladder steps) and let the cooldown take the next one if it is still slow.
-    const step = RealtimeRaytracer.MAX_SCALE_STEP;
-    s = Math.min(this._renderScale + step, Math.max(this._renderScale - step, s));
-    s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
-
-    // When we're fast, give back the deepest lever FIRST: restore canvas scale
-    // one step before touching renderScale, since canvas is the coarsest/most
-    // valuable resolution to recover and it's quadratic on every pass.
-    if (ratio < dbLo && this.canvasScaleHook && this._canvasLevelIdx > 0) {
-      this._canvasLevelIdx--;
-      this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx]);
-      this._recordChange(1, now); // restoring resolution = quality up
-      this._qEma = null; // cost profile changed — measure fresh
-      console.info(
-        `three-realtime-rt: adaptive quality → ${Math.round(
-          RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx] * 100
-        )}% canvas`
-      );
+    if (!slow && !fast) {
+      this._qFastStreak = 0;
+      // Comfortable. On a capped display with NO GPU timer this is the only
+      // place the governor can ever be — "fast" is unreachable there — so it is
+      // where the speculative climb has to be driven from. Gated on
+      // gpuTimingActive rather than on `util == null` so a momentary gap in the
+      // timer's samples (a GPU_DISJOINT, the window just after a quality step)
+      // does not start a probe on a machine that has a real measurement coming.
+      if (!this.gpuTimingActive) this._raiseQuality(now, null, wall);
       return;
     }
 
-    // When we're slow and renderScale has ALREADY BOTTOMED OUT — it is at the
-    // 0.2 floor, not merely near it — step DOWN the canvas ladder, the deepest,
-    // quadratic-on-every-pass lever. The old condition fired at renderScale
-    // 0.25, one rung early; the campaign's cost-matched A/B says that rung
-    // belongs to renderScale (full canvas at renderScale 0.2 beats canvas 0.85
-    // at renderScale 0.2: rmse 9.53 vs 11.42 museum, 7.05 vs 8.98 tokyo, and
-    // sharpRatio 0.96 vs 0.65-0.69 in both), so renderScale now walks all the
-    // way to its floor before the canvas is touched at all.
+    if (slow) {
+      this._qFastStreak = 0;
+      // STEP 1 (down): the free wins, before any resolution is given up.
+      if (this._takeFreeWins(now)) return;
+
+      // Proportional step, on whichever clock is the more alarmed. Lighting cost
+      // ≈ scale², so the correction is a damped power of the error.
+      const err = Math.max(wall, util == null ? 0 : util);
+      let s = this._renderScale * Math.pow(1 / err, 0.35);
+      // Per-step clamp. Now that multi-hundred-millisecond frames feed the EMA, a
+      // single very slow measurement (err can reach ~100 at dt 2s) would
+      // otherwise slam the scale from 1.0 to the 0.2 floor in ONE step and throw
+      // away the image on a transient. Move at most MAX_SCALE_STEP per adaptation
+      // (5 ladder steps) and let the cooldown take the next one if it is still slow.
+      s = Math.max(this._renderScale - RealtimeRaytracer.MAX_SCALE_STEP, s);
+      s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
+
+      // When renderScale has ALREADY BOTTOMED OUT — it is at the 0.2 floor, not
+      // merely near it — step DOWN the canvas ladder, the deepest,
+      // quadratic-on-every-pass lever. The old condition fired at renderScale
+      // 0.25, one rung early; the campaign's cost-matched A/B says that rung
+      // belongs to renderScale (full canvas at renderScale 0.2 beats canvas 0.85
+      // at renderScale 0.2: rmse 9.53 vs 11.42 museum, 7.05 vs 8.98 tokyo, and
+      // sharpRatio 0.96 vs 0.65-0.69 in both), so renderScale walks all the way
+      // to its floor before the canvas is touched at all.
+      if (
+        s <= 0.2 &&
+        this._renderScale <= 0.2 &&
+        this.canvasScaleHook &&
+        this._canvasLevelIdx < RealtimeRaytracer.CANVAS_LEVELS.length - 1
+      ) {
+        this._setCanvasLevel(this._canvasLevelIdx + 1, -1, now);
+        return;
+      }
+      if (this._renderScale - s < 0.045) return;
+      this._commitScale(s, -1, now);
+      return;
+    }
+
+    // UP. A dwell first: the headroom has to still be there on the next
+    // adaptation (~2s later) before anything moves. One quiet moment in a heavy
+    // scene is not headroom, it is a pause between two hard frames.
+    this._qFastStreak = (this._qFastStreak || 0) + 1;
+    if (this._qFastStreak < RealtimeRaytracer.GOVERNOR_UP_DWELL) return;
+    this._raiseQuality(now, util, wall);
+  }
+
+  /**
+   * The tracer's GPU cost as a fraction of the frame budget, or null when there
+   * is no usable measurement — which is the fallback path's cue, not an error.
+   *
+   * A timer that is SUPPORTED but silent is treated as broken after
+   * GPU_STALE_MS and abandoned for good, because the alternative is a governor
+   * that waits forever for a number and never adapts again. GPU_DISJOINT (a
+   * clock change, a context switch away from the tab) legitimately empties the
+   * window, so short gaps are normal and only a sustained one counts.
+   */
+  _gpuUtilisation(now, budget) {
+    // gpuTimingActive (not the raw _gpuActive) so that `rt.gpuTiming = false` at
+    // runtime really does move the governor onto the probe path: the two must
+    // agree, or the governor lands in a dead zone where it has no measurement
+    // AND does not think it needs to probe. Observed exactly that. Turning it
+    // off leaves the timer allocated and running (one begin/end pair per frame);
+    // pass gpuTiming: false to the constructor to not build it at all.
+    if (!this.gpuTimingActive) return null;
+    const ms = this._gpuTimer.costMs;
+    if (ms == null) {
+      if (this._gpuNullSince == null) this._gpuNullSince = now;
+      else if (now - this._gpuNullSince > RealtimeRaytracer.GPU_STALE_MS) {
+        this._gpuGaveUp = true;
+        console.info(
+          "three-realtime-rt: GPU timing stopped returning results — adaptive " +
+            "quality falls back to speculative probing for headroom."
+        );
+      }
+      return null;
+    }
+    this._gpuNullSince = null;
+    return ms / budget;
+  }
+
+  /** Predicted cost multiplier of moving renderScale from `from` to `to`. */
+  static _scaleStepCost(from, to) {
+    let m = 1 + RealtimeRaytracer.SCALE_COST_SHARE * ((to / from) ** 2 - 1);
+    // Crossing 0.55 also switches direct lighting from stochastic (one light per
+    // pixel per frame) to the full per-light loop, which no resolution model
+    // sees. Charge for it, generously: in this game's great hall the full loop
+    // against stochastic is the difference between one shadow ray and 23.
     if (
-      ratio > dbHi &&
-      s <= 0.2 &&
-      this._renderScale <= 0.2 &&
-      this.canvasScaleHook &&
-      this._canvasLevelIdx < RealtimeRaytracer.CANVAS_LEVELS.length - 1
+      RealtimeRaytracer._qualityFor(to).stochasticLights !==
+      RealtimeRaytracer._qualityFor(from).stochasticLights
     ) {
-      this._canvasLevelIdx++;
-      this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx]);
-      this._recordChange(-1, now); // deeper downscale = quality down
-      this._qEma = null; // cost profile changed — measure fresh
+      m *= RealtimeRaytracer.STOCHASTIC_STEP_FACTOR;
+    }
+    return m;
+  }
+
+  /**
+   * One rung UP, in the exact reverse of the descent's spending order, and at
+   * most one rung per call. Returns true if anything moved.
+   *
+   * LIFO with the descent: canvas scale is restored first (the coarsest and
+   * most valuable resolution, quadratic on every pass), then renderScale one
+   * 0.05 rung at a time, and the free wins last of all — they are cheaper AND
+   * no worse than what they replace, so they are the last thing worth paying
+   * resolution for.
+   */
+  _raiseQuality(now, util, wall) {
+    const L = RealtimeRaytracer.CANVAS_LEVELS;
+    if (this.canvasScaleHook && this._canvasLevelIdx > 0) {
+      const from = this._canvasLevelIdx;
+      return this._takeUpStep("canvas", from, (L[from - 1] / L[from]) ** 2, util, now);
+    }
+    if (this._renderScale < 1) {
+      const from = this._renderScale;
+      const to = RealtimeRaytracer._scaleUpFrom(from);
+      return this._takeUpStep("scale", from, RealtimeRaytracer._scaleStepCost(from, to), util, now);
+    }
+    // The free wins are the LAST thing handed back, and the bar is deliberately
+    // much higher than for any other step: nothing cheaper is left to restore
+    // (canvas whole, renderScale at its ceiling) AND the frame is running at
+    // DOUBLE the headroom an ordinary up-step needs. Measured, not guessed:
+    // with a plain "we are fast" test this oscillated — take, return, take,
+    // return, three cycles in twenty seconds on the tokyo scene — because giving
+    // the wins back makes the frame 10-27% slower, which lands straight back in
+    // "slow". They are cheaper AND no worse, so holding them one level too long
+    // costs nothing and churning them costs a reset every two seconds.
+    const doubled = util != null ? util < 0.5 : wall < 0.5;
+    if (doubled && this._qFreeWins && this._canvasLevelIdx === 0 && this._renderScale >= 1) {
+      return this._releaseFreeWins(now);
+    }
+    return false;
+  }
+
+  /** The next renderScale rung above `from`, on the 0.05 ladder. */
+  static _scaleUpFrom(from) {
+    return Math.min(1, Math.round((from + RealtimeRaytracer.MAX_SCALE_UP_STEP) * 20) / 20);
+  }
+
+  /**
+   * Take one up-step — either committed on the strength of the prediction, or
+   * TAKEN AS A PROBE and judged on what it actually costs. Returns true if
+   * anything moved.
+   *
+   * Three outcomes, and which one applies is the whole ascent policy:
+   *
+   *   predicted <= target        commit. The measurement says this fits with
+   *                              room to spare; there is nothing to find out.
+   *   target < predicted <= ceil commit AS A PROBE. The model is not accurate
+   *                              enough to settle a borderline step (it is
+   *                              deliberately conservative: a quadratic charged
+   *                              for a renderScale rung that measures 0.35-0.84
+   *                              quadratic), so measure the real thing and put
+   *                              it back if the answer is no. Rate-limited by
+   *                              the same exponential backoff the no-timer path
+   *                              uses, so a step that keeps failing stops being
+   *                              retried.
+   *   predicted > ceil           refuse. Even a generous reading of the model
+   *                              says this does not fit; probing it would just
+   *                              be 1.5s of dropped frames to learn that.
+   *
+   * With no GPU measurement at all (Safari/iOS) every up-step lands in the
+   * middle case: trying it IS the only test available.
+   */
+  _takeUpStep(kind, from, mult, util, now) {
+    const target = this._qOscillating
+      ? RealtimeRaytracer.GPU_TARGET_UTIL_OSC
+      : RealtimeRaytracer.GPU_TARGET_UTIL;
+    const predicted = util == null ? null : util * mult;
+    const speculative = predicted == null || predicted > target;
+    if (speculative) {
+      if (predicted != null && predicted > RealtimeRaytracer.GPU_PROBE_CEIL) return false;
+      // Re-probing THE SAME rung that just failed is what would turn probing
+      // into oscillation, so that case waits out the doubling backoff measured
+      // from the failure. Any OTHER step only waits the base quiet period —
+      // which is what lets a recovery from a transient climb 0.20 -> 0.25 ->
+      // 0.30 -> 0.35 briskly and then stop, rather than being slowed by a
+      // backoff earned at a rung it has not reached yet.
+      const f = this._qProbeFail;
+      const repeat = !!f && f.kind === kind && f.from === from;
+      const since = now - (repeat ? f.at : this._qLastChange);
+      if (since < (repeat ? this._qProbeBackoff : RealtimeRaytracer.PROBE_BASE_MS)) {
+        return false;
+      }
+    }
+    const ema = this._qEma;
+    if (kind === "canvas") this._setCanvasLevel(from - 1, 1, now);
+    else this._commitScale(RealtimeRaytracer._scaleUpFrom(from), 1, now);
+    if (speculative) {
+      this._qProbe = { kind, from, at: now, ema };
       console.info(
-        `three-realtime-rt: adaptive quality → ${Math.round(
-          RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx] * 100
-        )}% canvas`
+        `three-realtime-rt: adaptive quality → that ${kind} step is a PROBE ` +
+          `(predicted ${predicted == null ? "unknown" : Math.round(predicted * 100) + "%"} ` +
+          "of frame budget); it will be reverted if it does not pay"
       );
-      return;
     }
+    return true;
+  }
 
-    // STEP 3 (up): the free wins are the LAST thing handed back, and the bar for
-    // handing them back is deliberately much higher than for any other step:
-    //
-    //   - the canvas is whole and renderScale is at its CEILING, so there is
-    //     nothing cheaper left to restore (LIFO with the descent), and
-    //   - the frame is running at DOUBLE the headroom an ordinary up-step needs
-    //     (ratio < 0.5, i.e. under half the target frame period), for two
-    //     consecutive adaptations.
-    //
-    // Measured, not guessed: with a plain `ratio < dbLo` test this oscillated —
-    // take, return, take, return, three cycles in twenty seconds on the tokyo
-    // scene — because giving the wins back makes the frame 10-27% slower, which
-    // lands straight back in "slow". They are cheaper AND no worse, so holding
-    // them one level too long costs nothing and churning them costs a reset
-    // every two seconds.
-    if (ratio < dbLo) this._qFastStreak = (this._qFastStreak || 0) + 1;
-    else this._qFastStreak = 0;
-    if (
-      ratio < 0.5 &&
-      this._qFastStreak >= 2 &&
-      this._qFreeWins &&
-      this._canvasLevelIdx === 0 &&
-      this._renderScale >= 1 &&
-      this._releaseFreeWins(now)
-    ) {
-      return;
-    }
-
-    if (Math.abs(s - this._renderScale) < 0.045) return;
-
-    const dir = Math.sign(s - this._renderScale);
+  /** Commit a renderScale rung, with the quality ladder that goes with it. */
+  _commitScale(s, dir, now) {
     const q = RealtimeRaytracer._qualityFor(s);
     this.denoiseIterations = q.denoiseIterations;
     this.stochasticLights = q.stochasticLights;
     this.renderScale = s; // reallocates targets, carrying history over (no reset)
     this._recordChange(dir, now);
-    this._qEma = null; // cost profile changed — measure fresh
+    this._freshMeasurement();
     console.info(
       `three-realtime-rt: adaptive quality → ${Math.round(s * 100)}% lighting, ` +
         `${q.denoiseIterations} denoise passes, ` +
         `${q.stochasticLights ? "stochastic" : "full"} direct light`
+    );
+  }
+
+  /** Commit a canvas-ladder rung through the app's hook. */
+  _setCanvasLevel(idx, dir, now) {
+    this._canvasLevelIdx = idx;
+    this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[idx]);
+    this._recordChange(dir, now);
+    this._freshMeasurement();
+    console.info(
+      `three-realtime-rt: adaptive quality → ${Math.round(
+        RealtimeRaytracer.CANVAS_LEVELS[idx] * 100
+      )}% canvas`
+    );
+  }
+
+  /** The cost profile just changed: throw away both clocks' history so the next
+   *  decision measures the new regime rather than a blend of both. */
+  _freshMeasurement() {
+    this._qEma = null;
+    this._gpuNullSince = null;
+    if (this._gpuTimer) this._gpuTimer.reset();
+  }
+
+  /**
+   * Verdict on an in-flight probe: keep it, or put it back and wait longer.
+   *
+   * WHY PROBING EXISTS AT ALL. On a platform with no timer extension — Safari
+   * and iOS withhold EXT_disjoint_timer_query_webgl2, and this library ships to
+   * iPad — raising one rung and looking at what happens is the only test
+   * available. Under a vsync cap it is a better test than it sounds, because the
+   * cap quantises the answer: a step the GPU can absorb leaves the frame time at
+   * the refresh period, and a step it cannot immediately doubles it. The cost of
+   * being wrong is bounded to PROBE_SETTLE_MS of degraded frames, and the
+   * exponential backoff means a machine with nothing to spare stops paying that
+   * cost within a minute.
+   *
+   * Not probed: the free wins. They are cheaper AND no worse than what they
+   * replace, so the only thing a probe could discover is that giving them back
+   * made the frame slower, which is already known.
+   */
+  _judgeProbe(now, wall, util) {
+    const p = this._qProbe;
+    if (now - p.at < RealtimeRaytracer.PROBE_SETTLE_MS) return;
+    if (this._qEma == null) return; // no post-probe measurement yet
+    // Where a GPU measurement exists it is the verdict, because it is the
+    // quantity the step actually changed: the wall clock at the new level is
+    // pinned to the refresh period again the moment the step fits, so it cannot
+    // tell "fits comfortably" from "fits by a hair".
+    if (util != null) {
+      const overUtil = util > (this._qOscillating
+        ? RealtimeRaytracer.GPU_BUDGET_DROP_OSC
+        : RealtimeRaytracer.GPU_BUDGET_DROP);
+      this._qProbe = null;
+      if (!overUtil && wall <= (this._qOscillating ? 1.24 : 1.12)) {
+        this._acceptProbe(p, now);
+        console.info(
+          "three-realtime-rt: adaptive quality → probe held at " +
+            `${Math.round(util * 100)}% of the GPU frame budget`
+        );
+        return;
+      }
+      this._revertProbe(p, now);
+      return;
+    }
+    // No GPU measurement: two ways to fail, because either alone misses a case.
+    // An absolute test (the frame is now over budget) catches a probe that
+    // pushed a comfortable frame over the line, and a relative one (the frame
+    // got materially slower than it was) catches a display whose cap is well
+    // above targetFps, where a real slowdown can happen without ever crossing
+    // the budget.
+    const overBudget = wall > (this._qOscillating ? 1.24 : 1.12);
+    const degraded =
+      p.ema != null && this._qEma > p.ema * RealtimeRaytracer.PROBE_FAIL_RATIO;
+    this._qProbe = null;
+    if (!overBudget && !degraded) {
+      this._acceptProbe(p, now);
+      console.info("three-realtime-rt: adaptive quality → probe held (no frame-time cost)");
+      return;
+    }
+    this._revertProbe(p, now);
+  }
+
+  /** Keep a probe. The backoff is only forgiven if THIS was the step that had
+   *  been failing — a success one rung lower says nothing about the rung above,
+   *  and clearing it there is what made a failing rung get retried every 16s. */
+  _acceptProbe(p, now) {
+    const f = this._qProbeFail;
+    if (f && f.kind === p.kind && f.from === p.from) {
+      this._qProbeFail = null;
+      this._qProbeBackoff = RealtimeRaytracer.PROBE_BASE_MS;
+    }
+    // Start the next quiet period from the VERDICT, not from the step, so a
+    // successful probe is followed by a full interval at the new level before
+    // the next one is attempted.
+    this._qLastChange = now;
+  }
+
+  /** Undo a failed probe and back off, so a step that cannot be paid for is
+   *  retried at 8s, 16s, 32s ... rather than every quiet moment. */
+  _revertProbe(p, now) {
+    if (p.kind === "canvas") this._setCanvasLevel(p.from, -1, now);
+    else this._commitScale(p.from, -1, now);
+    const repeat =
+      this._qProbeFail && this._qProbeFail.kind === p.kind && this._qProbeFail.from === p.from;
+    this._qProbeBackoff = repeat
+      ? Math.min(RealtimeRaytracer.PROBE_MAX_MS, this._qProbeBackoff * 2)
+      : RealtimeRaytracer.PROBE_BASE_MS * 2;
+    this._qProbeFail = { kind: p.kind, from: p.from, at: now };
+    console.info(
+      "three-realtime-rt: adaptive quality → probe reverted (frame time " +
+        `${p.ema == null ? "?" : p.ema.toFixed(1)} → ` +
+        `${this._qEma == null ? "?" : this._qEma.toFixed(1)} ms); ` +
+        `next probe in ${Math.round(this._qProbeBackoff / 1000)}s`
     );
   }
 
@@ -2203,6 +2964,37 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this._qLastChange = now;
   }
 
+  // Apply the motion-vector option to every stage. The G-buffer (the expensive
+  // part — it reallocates targets and recompiles programs) is only touched when
+  // the effective on/off state changes; the per-stage consumer switches are a
+  // cheap uniform write and are pushed every frame so `_motionAccum/_motionRestir/
+  // _motionTaa` (measurement isolation) and the live `motionVectors` toggle both
+  // take effect.
+  _syncMotionVectors() {
+    const want = !!(this.motionVectors && this.motionVectorsSupported);
+    if (want !== this._motionVectorsActive) {
+      this._motionVectorsActive = want;
+      this.gbuffer.setMotionVectors(want);
+      if (!want) this._prevModelMatrices.clear();
+      this.resetAccumulation();
+      if (this.motionVectors && !this.motionVectorsSupported && !this._motionWarned) {
+        this._motionWarned = true;
+        console.warn(
+          "three-realtime-rt: motionVectors requested but this GPU lacks the " +
+            "5-attachment motion MRT (needs MAX_DRAW_BUFFERS >= 5) — falling back " +
+            "to camera-only reprojection."
+        );
+      }
+    }
+    if (this._motionVectorsActive) {
+      this.gbuffer.setPrevModelMatrices(this._prevModelMatrices);
+      this.gbuffer.setMotionMatrices(this._prevViewProj);
+    }
+    this.accumulatePass.setMotionVectors(this._motionVectorsActive && this._motionAccum);
+    this.restirPass.setMotionVectors(this._motionVectorsActive && this._motionRestir);
+    this.taaPass.setMotionVectors(this._motionVectorsActive && this._motionTaa);
+  }
+
   render(scene, camera) {
     if (!this.supported) {
       this.renderer.render(scene, camera);
@@ -2236,6 +3028,12 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     }
 
     this.frame += 1;
+    // Open the GPU timing region around EVERYTHING this renderer submits. It
+    // measures the tracer's own GPU milliseconds, which is the quantity the
+    // governor actually controls; the browser's compositing and any draws the
+    // app makes outside render() are deliberately outside it and are paid for
+    // out of the budget margin (GPU_BUDGET_DROP < 1). No-op when unsupported.
+    if (this._gpuTimer) this._gpuTimer.begin();
     // Cheap periodic check that no STATIC mesh was edited behind the BVH's back.
     if (this.frame % RealtimeRaytracer.STALE_CHECK_FRAMES === 0) this._checkStale();
     camera.updateMatrixWorld();
@@ -2291,6 +3089,10 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this._jitteredViewProj
       .copy(proj)
       .multiply(camera.matrixWorldInverse);
+
+    // Motion-vector plumbing: needs this frame's VP (above) and last frame's
+    // (still in _prevViewProj, copied at the END of the previous render).
+    this._syncMotionVectors();
 
     const prevAutoClear = this.renderer.autoClear;
     this.renderer.autoClear = false;
@@ -2358,6 +3160,23 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     rtU.uIor.value = this.ior;
     rtU.uDispersion.value = Math.min(0.5, Math.max(0, this.dispersion));
     rtU.uLightStochastic.value = this.stochasticLights;
+    // ReSTIR direct samples per pixel (1 = one winner, one shadow ray — the
+    // shipped behaviour). Read every frame so it can be changed at runtime.
+    rtU.uRestirSamples.value = Math.max(1, Math.min(4, this.restirSamples | 0));
+    rtU.uRestirTapRadius.value = Math.max(2, this.restirSampleRadius);
+    // Cold-pixel exact fallback threshold, in frames of reservoir history. Read
+    // every frame like the two above, so it is a live knob rather than a
+    // construction-time one. 0 = off.
+    rtU.uRestirWarmAge.value = Math.max(0, this.restirWarmAge || 0);
+    // Relative firefly cap on the ReSTIR direct term, same live-knob treatment.
+    // 0 = off = the absolute cap alone. The reservoir pass writes the p̂ total
+    // this scales unconditionally, so nothing has to be kept in step.
+    rtU.uRestirClampRel.value = Math.max(0, this.restirClampRel || 0);
+    // Directional-light bypass, read every frame so it is a live A/B knob. The
+    // lighting pass and the reservoir pass MUST agree: the shader shades
+    // directional lights exactly whenever this is on, and the reservoir must
+    // then refuse to select them, or the sun is counted twice.
+    rtU.uDirBypass.value = !!this.restirDirectionalBypass;
     rtU.uSkyEnabled.value = this.sky.enabled;
     rtU.uSunDir.value.copy(this.sky.sunDir);
     rtU.uSunColor.value.copy(this.sky.sunColor);
@@ -2375,6 +3194,15 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
       // Emissive candidates follow the emissiveNEE toggle — without this the
       // reservoir keeps proposing panel samples the user has switched off.
       this.restirPass.setEmissiveCount(this.emissiveNEE ? this.compiled.emissiveTriCount : 0);
+      this.restirPass.setDynamic(this.restirDynamicAccept, this.restirDynamicFreeze);
+      this.restirPass.setDirectionalBypass(this.restirDirectionalBypass);
+      this.restirPass.setReprojectionRescue(this.restirReprojectionRescue);
+      // Candidates drawn by power instead of uniformly, and the emissive half of
+      // that following the SAME importance toggle the exact path uses. If the
+      // two disagree about a triangle's pick probability, the reservoir weights
+      // by one pdf and the estimator converges to the other one's answer.
+      this.restirPass.setCandidateImportance(this.restirCandidateImportance);
+      this.restirPass.setEmissiveImportance(this.emissiveImportance);
       reservoirTex = this.restirPass.render(
         this.renderer,
         this.gbuffer,
@@ -2382,7 +3210,10 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
         this._camWorldPos,
         this.frame,
         this.eps,
-        this.restirMCap + (this.restirMCapMoving - this.restirMCap) * mt
+        this.restirMCap + (this.restirMCapMoving - this.restirMCap) * mt,
+        // THIS frame's jittered VP, for the sub-texel reprojection correction
+        // (the same matrix AccumulatePass gets, for the same reason).
+        this._jitteredViewProj
       );
     }
     // 2b. ReSTIR GI reservoirs (experimental). Runs after the lighting pass's
@@ -2589,11 +3420,56 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this._prevViewProj.copy(this._jitteredViewProj);
     this._prevJitterUv.copy(this._jitterUv);
 
+    // Capture each dynamic mesh's world matrix as its "previous-frame model"
+    // for the motion-vector path (rigid transforms only). Done AFTER every pass
+    // so next frame's G-buffer sees THIS frame's transform as "previous". A mesh
+    // the app moves without calling updateDynamic() still updates matrixWorld
+    // inside renderer.render, so the raster stays coherent here even though its
+    // traced BVH is (by contract) stale.
+    if (this._motionVectorsActive && this.compiled && this.compiled.hasDynamic) {
+      for (const seg of this.compiled.dynamic) {
+        let m = this._prevModelMatrices.get(seg.mesh);
+        if (!m) {
+          m = new THREE.Matrix4();
+          this._prevModelMatrices.set(seg.mesh, m);
+        }
+        m.copy(seg.mesh.matrixWorld);
+      }
+    }
+
+    // Close the GPU timing region and harvest whatever results are ready. Never
+    // blocks: GpuTimer only reads a query once the driver reports it available.
+    if (this._gpuTimer) this._gpuTimer.end();
+
     // Compile-failure diagnosis: every pass program used this frame has now had
     // its link status checked by three (diagnostics populated on first use), so
     // scan for failures. Runs at frame END (downstream of the passes) and only
     // until the polling window settles — a no-op on the healthy steady state.
     if (!this._diagDone) this._scanPrograms();
+  }
+
+  /**
+   * Median GPU milliseconds the tracer spent over the recent window, or null
+   * when the platform has no timer extension (Safari/iOS) or no stable sample
+   * yet. This is the governor's honest headroom signal: unlike the wall-clock
+   * frame time it is not pinned to the display's refresh period.
+   */
+  get gpuCostMs() {
+    return this._gpuTimer ? this._gpuTimer.costMs : null;
+  }
+
+  /** True where EXT_disjoint_timer_query_webgl2 is available and enabled. */
+  get gpuTimingSupported() {
+    return !!(this._gpuTimer && this._gpuTimer.supported);
+  }
+
+  /**
+   * True when the governor is steering on GPU milliseconds. False means it is on
+   * the speculative-probe fallback — either the extension is missing, gpuTiming
+   * was set false, or the timer stopped producing results and was given up on.
+   */
+  get gpuTimingActive() {
+    return this.gpuTiming !== false && this._gpuActive && !this._gpuGaveUp;
   }
 
   dispose() {
@@ -2609,6 +3485,7 @@ uniform sampler2D uTex; void main(){ outColor = texture(uTex, vUv); }`,
     this.giReservoirPass.dispose();
     this._sceneColor.dispose();
     this._copyPass.dispose();
+    if (this._gpuTimer) this._gpuTimer.dispose();
     if (this.compiled) this.compiled.dispose();
   }
 }

@@ -104,12 +104,24 @@ export class GpuTimer {
     return true;
   }
 
-  /** Close the timed region opened by begin(), then harvest what is ready. */
+  /**
+   * Close the timed region opened by begin(), then harvest what is ready.
+   *
+   * The harvest runs even when THIS frame was not sampled, and that is not a
+   * detail. Draining only after a successful begin() deadlocks: once POOL
+   * queries are outstanding begin() returns false, so _active is null, so the
+   * old early-return skipped end() entirely, so nothing was ever drained and
+   * begin() never succeeded again. Observed exactly that in the game — two
+   * samples harvested in the first frames, then `pending: 4, free: 0` and
+   * costMs null forever after.
+   */
   end() {
-    if (!this.supported || !this._active) return;
-    this._gl.endQuery(this._ext.TIME_ELAPSED_EXT);
-    this._pending.push(this._active);
-    this._active = null;
+    if (!this.supported) return;
+    if (this._active) {
+      this._gl.endQuery(this._ext.TIME_ELAPSED_EXT);
+      this._pending.push(this._active);
+      this._active = null;
+    }
     this._drain();
   }
 
@@ -136,7 +148,12 @@ export class GpuTimer {
       // reasons; the values stay monotonic in real cost, which is all the
       // controller needs.
       const ms = ns / 1e6;
-      if (ms > 0 && ms < 10000) {
+      // Upper bound matches the governor's own stall rule (_adaptQuality
+      // discards intervals over 2s): a frame that long is a shader link or a
+      // BVH upload, not the steady-state cost the controller is steering. The
+      // old 10s window let a 2195ms first-frame compile into the sample set,
+      // where — with only two other samples — it WAS the median.
+      if (ms > 0 && ms < 2000) {
         this._samples.push(ms);
         if (this._samples.length > WINDOW) this._samples.shift();
       }

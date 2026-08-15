@@ -28,6 +28,8 @@ uniform sampler2D uGNormalMetal;
 uniform sampler2D uPrevGWorldPos;
 uniform mat4 uPrevViewProj;
 uniform mat4 uViewProj;
+uniform sampler2D uGMotion;      // G-buffer motion vector (RG32F)
+uniform float uUseMotion;        // 1 = reproject via motion vector, 0 = camera-only
 uniform float uMaxHistory;
 uniform float uPreFireflyClamp;
 uniform float uHistoryClampK;
@@ -108,13 +110,33 @@ void main() {
   vec3 histSpec = vec3(0.0);
   vec4 histMom = vec4(0.0);
 
-  vec4 clip = uPrevViewProj * vec4(P, 1.0);
-  vec4 clipC = uViewProj * vec4(P, 1.0);
-  if (clip.w > 0.0 && clipC.w > 0.0) {
-    vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
-    vec2 currUv = (clipC.xy / clipC.w) * 0.5 + 0.5;
-    prevUv -= currUv - vUv;
-    if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
+  // Motion vector (uUseMotion) vs camera-only reprojection (uPrevViewProj * P).
+  // Both produce prevUv; the bilinear block below is shared. The G-buffer stores
+  // the surface's PREVIOUS screen UV (see GBufferPass), so this pass applies the
+  // exact same jitter correction as the camera-only path — prevRaw - (cu - vUv)
+  // is bit-identical to pu -= (cu - vUv) when prevRaw === pu (static geometry).
+  // The stored sentinel (out-of-bounds for surfaces behind last frame's camera)
+  // is dropped by the bounds test below. prevUv = -1 is the camera-only path's
+  // "no valid history" marker.
+  vec2 prevUv = vec2(-1.0);
+  if (uUseMotion > 0.5) {
+    vec2 prevRaw = texelFetch(uGMotion, gbPx, 0).xy;
+    vec4 clipC = uViewProj * vec4(P, 1.0);
+    if (clipC.w > 0.0) {
+      vec2 cu = (clipC.xy / clipC.w) * 0.5 + 0.5;
+      prevUv = prevRaw - (cu - vUv);
+    }
+  } else {
+    vec4 clip = uPrevViewProj * vec4(P, 1.0);
+    vec4 clipC = uViewProj * vec4(P, 1.0);
+    if (clip.w > 0.0 && clipC.w > 0.0) {
+      vec2 pu = (clip.xy / clip.w) * 0.5 + 0.5;
+      vec2 cu = (clipC.xy / clipC.w) * 0.5 + 0.5;
+      pu -= cu - vUv;
+      prevUv = pu;
+    }
+  }
+  if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
       // Bilinear: sample the FOUR nearest history texels around prevUv.
       vec2 texPos = prevUv * vec2(uTexSize) - 0.5;
       ivec2 basePx = ivec2(floor(texPos));
@@ -186,8 +208,6 @@ void main() {
         histMom = hm;
       }
     }
-  }
-
   // --- TEMPORAL GRADIENT: per-pixel history rejection on a lighting change ---
   // Every other validation in this pass asks a GEOMETRIC question, so a static
   // wall under a light that just moved passes them all and keeps averaging
@@ -296,6 +316,8 @@ export class AccumulatePass {
         uEps: { value: 1e-3 },
         uTexSize: { value: new THREE.Vector2(width, height) },
         uGbSize: { value: new THREE.Vector2() },
+        uGMotion: { value: null },
+        uUseMotion: { value: 0.0 },
       },
       depthTest: false,
       depthWrite: false,
@@ -306,6 +328,11 @@ export class AccumulatePass {
     this.quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.material);
     this.quad.frustumCulled = false;
     this.scene.add(this.quad);
+  }
+
+  /** Toggle motion-vector reprojection (default off = camera-only). */
+  setMotionVectors(enabled) {
+    this.material.uniforms.uUseMotion.value = enabled ? 1.0 : 0.0;
   }
 
   setSize(w, h) {
@@ -338,6 +365,7 @@ export class AccumulatePass {
     u.uGWorldPos.value = gbuffer.worldPos;
     u.uGNormalMetal.value = gbuffer.normalMetal;
     u.uPrevGWorldPos.value = gbuffer.prevWorldPos;
+    u.uGMotion.value = gbuffer.motion;
     u.uPrevViewProj.value.copy(prevViewProj);
     u.uViewProj.value.copy(viewProj);
     u.uMaxHistory.value = maxHistory;
