@@ -1,0 +1,3266 @@
+diff -ruN --strip-trailing-cr rt-pristine/src/AccumulatePass.js rt-local/src/AccumulatePass.js
+--- rt-pristine/src/AccumulatePass.js	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/AccumulatePass.js	2026-08-15 17:08:25.718602700 -0400
+@@ -28,6 +28,8 @@
+ uniform sampler2D uPrevGWorldPos;
+ uniform mat4 uPrevViewProj;
+ uniform mat4 uViewProj;
++uniform sampler2D uGMotion;      // G-buffer motion vector (RG32F)
++uniform float uUseMotion;        // 1 = reproject via motion vector, 0 = camera-only
+ uniform float uMaxHistory;
+ uniform float uPreFireflyClamp;
+ uniform float uHistoryClampK;
+@@ -108,13 +110,33 @@
+   vec3 histSpec = vec3(0.0);
+   vec4 histMom = vec4(0.0);
+ 
+-  vec4 clip = uPrevViewProj * vec4(P, 1.0);
+-  vec4 clipC = uViewProj * vec4(P, 1.0);
+-  if (clip.w > 0.0 && clipC.w > 0.0) {
+-    vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
+-    vec2 currUv = (clipC.xy / clipC.w) * 0.5 + 0.5;
+-    prevUv -= currUv - vUv;
+-    if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
++  // Motion vector (uUseMotion) vs camera-only reprojection (uPrevViewProj * P).
++  // Both produce prevUv; the bilinear block below is shared. The G-buffer stores
++  // the surface's PREVIOUS screen UV (see GBufferPass), so this pass applies the
++  // exact same jitter correction as the camera-only path — prevRaw - (cu - vUv)
++  // is bit-identical to pu -= (cu - vUv) when prevRaw === pu (static geometry).
++  // The stored sentinel (out-of-bounds for surfaces behind last frame's camera)
++  // is dropped by the bounds test below. prevUv = -1 is the camera-only path's
++  // "no valid history" marker.
++  vec2 prevUv = vec2(-1.0);
++  if (uUseMotion > 0.5) {
++    vec2 prevRaw = texelFetch(uGMotion, gbPx, 0).xy;
++    vec4 clipC = uViewProj * vec4(P, 1.0);
++    if (clipC.w > 0.0) {
++      vec2 cu = (clipC.xy / clipC.w) * 0.5 + 0.5;
++      prevUv = prevRaw - (cu - vUv);
++    }
++  } else {
++    vec4 clip = uPrevViewProj * vec4(P, 1.0);
++    vec4 clipC = uViewProj * vec4(P, 1.0);
++    if (clip.w > 0.0 && clipC.w > 0.0) {
++      vec2 pu = (clip.xy / clip.w) * 0.5 + 0.5;
++      vec2 cu = (clipC.xy / clipC.w) * 0.5 + 0.5;
++      pu -= cu - vUv;
++      prevUv = pu;
++    }
++  }
++  if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
+       // Bilinear: sample the FOUR nearest history texels around prevUv.
+       vec2 texPos = prevUv * vec2(uTexSize) - 0.5;
+       ivec2 basePx = ivec2(floor(texPos));
+@@ -186,8 +208,6 @@
+         histMom = hm;
+       }
+     }
+-  }
+-
+   // --- TEMPORAL GRADIENT: per-pixel history rejection on a lighting change ---
+   // Every other validation in this pass asks a GEOMETRIC question, so a static
+   // wall under a light that just moved passes them all and keeps averaging
+@@ -296,6 +316,8 @@
+         uEps: { value: 1e-3 },
+         uTexSize: { value: new THREE.Vector2(width, height) },
+         uGbSize: { value: new THREE.Vector2() },
++        uGMotion: { value: null },
++        uUseMotion: { value: 0.0 },
+       },
+       depthTest: false,
+       depthWrite: false,
+@@ -308,6 +330,11 @@
+     this.scene.add(this.quad);
+   }
+ 
++  /** Toggle motion-vector reprojection (default off = camera-only). */
++  setMotionVectors(enabled) {
++    this.material.uniforms.uUseMotion.value = enabled ? 1.0 : 0.0;
++  }
++
+   setSize(w, h) {
+     this._width = w;
+     this._height = h;
+@@ -338,6 +365,7 @@
+     u.uGWorldPos.value = gbuffer.worldPos;
+     u.uGNormalMetal.value = gbuffer.normalMetal;
+     u.uPrevGWorldPos.value = gbuffer.prevWorldPos;
++    u.uGMotion.value = gbuffer.motion;
+     u.uPrevViewProj.value.copy(prevViewProj);
+     u.uViewProj.value.copy(viewProj);
+     u.uMaxHistory.value = maxHistory;
+diff -ruN --strip-trailing-cr rt-pristine/src/GBufferPass.js rt-local/src/GBufferPass.js
+--- rt-pristine/src/GBufferPass.js	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/GBufferPass.js	2026-08-15 17:08:25.714566600 -0400
+@@ -19,6 +19,15 @@
+ out vec3 vWorldNormal;
+ out vec2 vUvCoord;
+ out vec3 vColor;
++#ifdef RT_MOTION_VECTORS
++// Previous-frame WORLD position of this vertex: the same local position under
++// LAST frame's model matrix. For a static mesh uPrevModelMatrix === modelMatrix
++// (identical 16 values), so this is computed by the exact same instructions as
++// vWorldPos and interpolates bit-identically — the motion vector then collapses
++// to camera-only reprojection with zero rounding difference.
++out vec3 vPrevWorldPos;
++uniform mat4 uPrevModelMatrix;
++#endif
+ 
+ uniform mat3 uNormalMatrixWorld;
+ 
+@@ -31,6 +40,9 @@
+ 
+   vec4 wp = modelMatrix * vec4(transformed, 1.0);
+   vWorldPos = wp.xyz;
++#ifdef RT_MOTION_VECTORS
++  vPrevWorldPos = (uPrevModelMatrix * vec4(transformed, 1.0)).xyz;
++#endif
+   vWorldNormal = normalize(uNormalMatrixWorld * objectNormal);
+   vUvCoord = uv;
+   // Geometry vertex colours. three's shader prefix declares the built-in
+@@ -57,11 +69,18 @@
+ layout(location = 1) out vec4 gNormalMetal;
+ layout(location = 2) out vec4 gWorldPos;
+ layout(location = 3) out vec4 gEmissive;
++#ifdef RT_MOTION_VECTORS
++layout(location = 4) out vec4 gMotion;
++#endif
+ 
+ in vec3 vWorldPos;
+ in vec3 vWorldNormal;
+ in vec2 vUvCoord;
+ in vec3 vColor;
++#ifdef RT_MOTION_VECTORS
++in vec3 vPrevWorldPos;
++uniform mat4 uPrevViewProj;
++#endif
+ 
+ uniform vec3 uColor;
+ uniform float uRoughness;
+@@ -85,6 +104,7 @@
+ uniform bool uHasMetalnessMap;
+ uniform bool uBlend;
+ uniform float uOpacity;
++uniform float uIsDynamic; // 1.0 while rendering a dynamic-mesh surface (see setDynamicMeshes)
+ 
+ // World-space 3D-texture albedo ("volumetric surface albedo"), compiled in ONLY
+ // when a scene registers a material with userData.rtVolumeAlbedo (the whole block
+@@ -184,7 +204,37 @@
+   // .a is normally the constant 1.0 (CompositePass reads only .rgb). A blend
+   // surface carries its opacity here; the packed word above also encodes it, so
+   // the sampler-bound lighting pass reads opacity without a gEmissive fetch.
+-  gEmissive = vec4(emissive, uBlend ? uOpacity : 1.0);
++  // Dynamic-mesh surfaces instead write -1.0: a per-pixel flag the reservoir
++  // passes read to know which pixels belong to moving geometry (dynamicMeshes
++  // are not visible from inside a shader). Opacity is never negative and dynamic
++  // meshes are never blend (transparent meshes are dropped from dynamicMeshes),
++  // so the sentinel cannot collide with either consumer.
++  gEmissive = vec4(emissive, uIsDynamic > 0.5 ? -1.0 : (uBlend ? uOpacity : 1.0));
++#ifdef RT_MOTION_VECTORS
++  // Previous-frame screen position of this surface point, in [0,1] UV. For a
++  // static mesh (vPrevWorldPos === vWorldPos) this is the camera-only
++  // reprojection the consumers would otherwise compute, so the static path
++  // reduces to it (the ReSTIR stage, which samples this value directly, is
++  // bit-identical; the accumulate/TAA stages re-derive the same clip.xy/clip.w
++  // division inside their own program and can differ by 1 ULP on a tiny
++  // fraction of fragments — a 1-LSB, 0.1% mismatch, not a functional one).
++  // Storing the raw previous UV (rather than a pre-subtracted prevUv - currUv
++  // delta) is what keeps that reduction exact enough to be byte-identical:
++  // a pre-subtracted delta would force the consumer to reassociate
++  // currUv + (prevUv - currUv) back to prevUv, a 1-ULP error that showed up as
++  // a 1-LSB mismatch in 0.23% of channels. prevClip.w <= 0 means the surface
++  // was behind last frame's camera — no valid history position exists, so write
++  // an out-of-bounds sentinel (not NaN: NaN comparison falls through the
++  // consumers' bounds checks) that every consumer's existing bounds test drops.
++  {
++    vec4 prevClip = uPrevViewProj * vec4(vPrevWorldPos, 1.0);
++    if (prevClip.w > 0.0) {
++      gMotion = vec4((prevClip.xy / prevClip.w) * 0.5 + 0.5, 0.0, 0.0);
++    } else {
++      gMotion = vec4(1e4, 1e4, 0.0, 0.0);
++    }
++  }
++#endif
+ }
+ `;
+ 
+@@ -204,6 +254,8 @@
+     this._mixedPrecision = mixedPrecision;
+     // Two G-buffers, ping-ponged each frame: the previous frame's worldPos +
+     // normals are needed to validate reprojected history (stage 2).
++    this._width = width;
++    this._height = height;
+     this._targets = [
+       this._makeTarget(width, height),
+       this._makeTarget(width, height),
+@@ -219,6 +271,22 @@
+     // compiled WITHOUT the RT_VOLUME_ALBEDO define — no sampler3D, byte-identical.
+     this._volumeEnabled = false;
+     this._dummyVolumeTex = null; // 1x1x1 fallback bound to non-volume meshes when on
++    this._dynamicMeshes = null; // Set of dynamic meshes (see setDynamicMeshes)
++    // Motion-vector state (see setMotionVectors). Off, the G-buffer is the
++    // exact 4-attachment target it has always been.
++    this._motionEnabled = false;
++    this._prevModelMatrices = null; // Map<mesh, Matrix4> filled by the tracer
++    this._motionPrevViewProj = new THREE.Matrix4();
++  }
++
++  /**
++   * Mark the meshes whose surfaces are dynamic (re-baked each frame via
++   * updateDynamic). Their pixels write a -1.0 flag into gEmissive.a so the
++   * reservoir passes can tell moving geometry from the static world. Pass null
++   * (or omit) to flag nothing — gEmissive.a then keeps its pre-feature values.
++   */
++  setDynamicMeshes(meshes) {
++    this._dynamicMeshes = meshes && meshes.length ? new Set(meshes) : null;
+   }
+ 
+   // A valid 1x1x1 3D texture to bind on gbuffer materials whose mesh is NOT a
+@@ -252,8 +320,44 @@
+     this._materialCache = new WeakMap(); // force recompile with the new define
+   }
+ 
++  /**
++   * Enable/disable the motion-vector attachment. On, the G-buffer becomes a
++   * 5-attachment MRT (the extra RG32F target holds the screen-space motion
++   * vector) and the per-mesh programs recompile with RT_MOTION_VECTORS. Off is
++   * byte-identical to the pre-feature 4-attachment G-buffer. Rebuilds the
++   * ping-pong targets and clears the material cache (a size/toggle, so the
++   * caller should reset temporal history).
++   */
++  setMotionVectors(enabled) {
++    const on = !!enabled;
++    if (on === this._motionEnabled) return;
++    this._motionEnabled = on;
++    for (const t of this._targets) t.dispose();
++    this._targets = [
++      this._makeTarget(this._width, this._height),
++      this._makeTarget(this._width, this._height),
++    ];
++    this._current = 0;
++    this._materialCache = new WeakMap(); // force recompile with the new define
++  }
++
++  /**
++   * Previous-frame model matrices per dynamic mesh, captured by the tracer at
++   * the END of the previous frame (rigid transforms only). A mesh without an
++   * entry (first frame) falls back to its current matrixWorld, i.e. a
++   * camera-only motion vector.
++   */
++  setPrevModelMatrices(map) {
++    this._prevModelMatrices = map;
++  }
++
++  /** Previous view-projection matrix for the motion-vector path. */
++  setMotionMatrices(prevViewProj) {
++    this._motionPrevViewProj.copy(prevViewProj);
++  }
++
+   _makeTarget(width, height) {
+-    const t = makeMRT(width, height, 4, {
++    const t = makeMRT(width, height, this._motionEnabled ? 5 : 4, {
+       minFilter: THREE.NearestFilter,
+       magFilter: THREE.NearestFilter,
+       type: THREE.FloatType,
+@@ -268,6 +372,14 @@
+       t.texture[1].type = THREE.HalfFloatType; // normal + packed material word
+       t.texture[3].type = THREE.HalfFloatType; // emissive
+     }
++    if (this._motionEnabled) {
++      // Motion vector: 2-channel RG32F holding the surface's PREVIOUS screen UV.
++      // Two channels are enough (a screen position is 2D), and fp32 (not fp16)
++      // keeps sub-pixel precision — fp16 would quantize a half-screen position to
++      // ~0.2px at 960 wide and make TAA shimmer.
++      t.texture[4].format = THREE.RGFormat;
++      t.texture[4].type = THREE.FloatType;
++    }
+     return t;
+   }
+ 
+@@ -296,8 +408,14 @@
+   get prevWorldPos() {
+     return this._prev.texture[2];
+   }
++  /** Motion-vector attachment of the current G-buffer (null when disabled). */
++  get motion() {
++    return this._motionEnabled ? this.target.texture[4] : null;
++  }
+ 
+   setSize(width, height) {
++    this._width = width;
++    this._height = height;
+     for (const t of this._targets) t.setSize(width, height);
+   }
+ 
+@@ -310,8 +428,13 @@
+       glslVersion: THREE.GLSL3,
+       // RT_VOLUME_ALBEDO is present only while a scene uses the volumetric-albedo
+       // feature (see setVolume); absent, the compiled program is identical to the
+-      // pre-feature G-buffer (no sampler3D, no volume branch).
+-      defines: this._volumeEnabled ? { RT_VOLUME_ALBEDO: "1" } : {},
++      // pre-feature G-buffer (no sampler3D, no volume branch). RT_MOTION_VECTORS
++      // likewise appears only while motion vectors are enabled (see
++      // setMotionVectors).
++      defines: {
++        ...(this._volumeEnabled ? { RT_VOLUME_ALBEDO: "1" } : {}),
++        ...(this._motionEnabled ? { RT_MOTION_VECTORS: "1" } : {}),
++      },
+       vertexShader: gbufferVert,
+       fragmentShader: gbufferFrag,
+       uniforms: {
+@@ -335,6 +458,13 @@
+         uHasMetalnessMap: { value: false },
+         uBlend: { value: false },
+         uOpacity: { value: 1.0 },
++        uIsDynamic: { value: 0.0 },
++        // Motion-vector uniforms are always present in the JS uniform object
++        // (harmless when the define is off — three uploads only uniforms that
++        // exist in the compiled program, so a non-motion scene never touches
++        // these).
++        uPrevModelMatrix: { value: new THREE.Matrix4() },
++        uPrevViewProj: { value: new THREE.Matrix4() },
+         // Volume-albedo uniforms are always present in the JS uniform object
+         // (harmless when the define is off — three uploads only uniforms that
+         // exist in the compiled program, so a non-volume scene never touches
+@@ -390,6 +520,16 @@
+     // lighting pass. opacity 1 renders opaque, matching the old force-opaque path.
+     u.uBlend.value = !!src.transparent;
+     u.uOpacity.value = src.opacity ?? 1.0;
++    u.uIsDynamic.value = this._dynamicMeshes && this._dynamicMeshes.has(mesh) ? 1.0 : 0.0;
++    // Motion-vector inputs. Static meshes use their (constant) matrixWorld as
++    // the previous model — identical to modelMatrix, so the motion vector
++    // collapses to camera-only reprojection exactly. Dynamic meshes use the
++    // previous frame's captured matrix (see setPrevModelMatrices).
++    if (this._motionEnabled) {
++      const prev = this._prevModelMatrices ? this._prevModelMatrices.get(mesh) : null;
++      u.uPrevModelMatrix.value.copy(prev || mesh.matrixWorld);
++      u.uPrevViewProj.value.copy(this._motionPrevViewProj);
++    }
+     // World-space 3D-texture albedo. Only meshes whose material opted in via
+     // userData.rtVolumeAlbedo get uHasVolume=true; every other mesh keeps the
+     // dummy sampler (branch never taken) so its albedo is byte-identical. This is
+diff -ruN --strip-trailing-cr rt-pristine/src/GpuTimer.js rt-local/src/GpuTimer.js
+--- rt-pristine/src/GpuTimer.js	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/GpuTimer.js	2026-08-15 17:08:25.716090400 -0400
+@@ -104,12 +104,24 @@
+     return true;
+   }
+ 
+-  /** Close the timed region opened by begin(), then harvest what is ready. */
++  /**
++   * Close the timed region opened by begin(), then harvest what is ready.
++   *
++   * The harvest runs even when THIS frame was not sampled, and that is not a
++   * detail. Draining only after a successful begin() deadlocks: once POOL
++   * queries are outstanding begin() returns false, so _active is null, so the
++   * old early-return skipped end() entirely, so nothing was ever drained and
++   * begin() never succeeded again. Observed exactly that in the game — two
++   * samples harvested in the first frames, then `pending: 4, free: 0` and
++   * costMs null forever after.
++   */
+   end() {
+-    if (!this.supported || !this._active) return;
+-    this._gl.endQuery(this._ext.TIME_ELAPSED_EXT);
+-    this._pending.push(this._active);
+-    this._active = null;
++    if (!this.supported) return;
++    if (this._active) {
++      this._gl.endQuery(this._ext.TIME_ELAPSED_EXT);
++      this._pending.push(this._active);
++      this._active = null;
++    }
+     this._drain();
+   }
+ 
+@@ -136,7 +148,12 @@
+       // reasons; the values stay monotonic in real cost, which is all the
+       // controller needs.
+       const ms = ns / 1e6;
+-      if (ms > 0 && ms < 10000) {
++      // Upper bound matches the governor's own stall rule (_adaptQuality
++      // discards intervals over 2s): a frame that long is a shader link or a
++      // BVH upload, not the steady-state cost the controller is steering. The
++      // old 10s window let a 2195ms first-frame compile into the sample set,
++      // where — with only two other samples — it WAS the median.
++      if (ms > 0 && ms < 2000) {
+         this._samples.push(ms);
+         if (this._samples.length > WINDOW) this._samples.shift();
+       }
+diff -ruN --strip-trailing-cr rt-pristine/src/RTLightingPass.js rt-local/src/RTLightingPass.js
+--- rt-pristine/src/RTLightingPass.js	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/RTLightingPass.js	2026-08-15 17:08:25.721128600 -0400
+@@ -72,6 +72,47 @@
+ uniform float uDispersion;  // chromatic dispersion strength for glass (0 = off)
+ uniform bool uLightStochastic; // 1 direct shadow ray/pixel/frame instead of 1/light
+ uniform bool uRestirEnabled;   // shade the reservoir winner instead of sampling
++// >>> RT_RESTIR_MULTISAMPLE
++// How many reservoir winners this pixel shades per frame, each with its own
++// visibility ray. 1 = the shipped single-sample path, bit-identical. Sample 0
++// is always THIS pixel's reservoir; the rest are neighbouring pixels'
++// reservoirs, validated the way RestirPass's spatial stage validates a tap.
++// The cap is a compile-time constant so the loop bound is constant (the driver
++// sees the same shape as the existing per-light loop), but the count itself is
++// a uniform, so one program serves every setting — nothing recompiles and the
++// iOS translation risk is a single yes/no rather than one per value.
++#define RESTIR_MAX_SAMPLES 4
++uniform int uRestirSamples;
++uniform float uRestirTapRadius; // neighbour tap radius ceiling, lighting texels
++// <<< RT_RESTIR_MULTISAMPLE
++// >>> RT_RESTIR_COLD_FALLBACK
++// Frames of validated reservoir history a pixel must have before it is shaded
++// FROM that reservoir. Younger pixels take the exact per-light path instead.
++// 0 = off = the shipped behaviour, and the reservoir stage writes the age
++// regardless, so nothing about the estimator changes when this is 0.
++uniform float uRestirWarmAge;
++// <<< RT_RESTIR_COLD_FALLBACK
++// >>> RT_RESTIR_CLAMP_REL
++// Firefly cap on the ReSTIR direct term, RELATIVE to the pixel's own reservoir
++// estimate of the unshadowed light total (the spatial stage writes it into the
++// reservoir's .g). The cap is max(2 * fireflyClamp, this * p̂_total), so
++// 0 = off = the absolute cap alone = the shipped behaviour, byte for byte. See
++// the note in shadeReservoir for why an absolute cap darkens bright surfaces.
++uniform float uRestirClampRel;
++// <<< RT_RESTIR_CLAMP_REL
++// >>> RT_RESTIR_DIR_BYPASS
++// Directional lights are shaded EXACTLY, always, and are kept out of the ReSTIR
++// reservoir (RestirPass.uDirBypass must be set to match). A directional light
++// has a large unshadowed target score on every surface facing it and is
++// occluded on most interior ones, so a reservoir keeps electing it, spends its
++// one visibility ray on a wall, and the pixel goes black — with the odd frame's
++// runner-up showing through as a bright speck. Production ReSTIR renderers keep
++// directional lights out of the reservoir for this reason. The cost is one
++// extra shadow ray per pixel per directional light, which is the smallest light
++// class in any scene here (one sun).
++// false = the shipped behaviour, byte for byte.
++uniform bool uDirBypass;
++// <<< RT_RESTIR_DIR_BYPASS
+ uniform bool uGIHalfRate;      // GI ray on alternating checkerboard, doubled
+ 
+ uniform vec3 uEnvColor;
+@@ -676,11 +717,20 @@
+ }
+ 
+ // Direct light at a GI bounce hit: sample ONE random light (weighted by count).
+-vec3 sampleOneLight(vec3 P, vec3 N) {
++// >>> RT_RESTIR_DIR_BYPASS
++// skipDir drops a directional pick (returns 0 for it, keeps the 1/N pick pdf),
++// which stays unbiased for the lights that remain: the estimator's expectation
++// becomes the sum over the non-directional lights, which is exactly what the
++// caller wants when it is adding the directional ones exactly. GI bounces pass
++// false and are untouched.
++vec3 sampleOneLight(vec3 P, vec3 N, bool skipDir) {
+   if (uLightCount == 0) return vec3(0.0);
+   int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
++  float lw = uLightPosType[i].w;
++  if (skipDir && lw >= 0.5 && lw < 1.5) return vec3(0.0);
+   return lightContribution(i, P, N) * float(uLightCount);
+ }
++// <<< RT_RESTIR_DIR_BYPASS
+ 
+ // Next-event estimation on emissive-mesh triangles (row 1 of uMaterialsTex):
+ // pick one triangle, sample a point on it, cast one shadow ray, convert the
+@@ -783,9 +833,17 @@
+ // re-draw their soft-radius jitter here (the reservoir stores which light,
+ // not the jitter). The estimator inherently tames near-emitter spikes: a huge
+ // contribution comes with a proportionally huge p̂, and W divides it out.
+-vec3 shadeReservoir(vec3 P, vec3 N) {
++// >>> RT_RESTIR_MULTISAMPLE
++// One reservoir, shaded at THIS pixel's surface and scaled by wgt (1/N when N
++// winners are averaged). Split out of shadeReservoir so the multi-sample loop
++// below has exactly ONE call site — see the Metal call-site note in main().
++// The reservoir may be this pixel's own or a validated neighbour's: the RIS
++// estimator f(Y)·W is unbiased for ANY target function with sufficient support
++// (the target only steers which sample is picked), so a neighbour's W applied
++// to the contribution recomputed HERE still estimates this pixel's integral.
++vec3 shadeReservoirSample(vec4 res, vec3 P, vec3 N, float wgt) {
++// <<< RT_RESTIR_MULTISAMPLE
+   // Spatial-stage encoding: r = id, a = precomputed W (vs. centroid score).
+-  vec4 res = texture(uReservoir, vUv);
+   if (res.a <= 0.0) return vec3(0.0);
+   float id = res.r;
+ 
+@@ -844,29 +902,140 @@
+   if (occluded(P + N * uEps, wi, maxDist)) return vec3(0.0);
+   // Dielectric highlight from the reservoir winner (C = li * cos, shared with
+   // the diffuse term; W = res.a is applied to both).
+-  if (gWantSpec) gSpec += C * (ggxSpec(N, wi) * res.a);
+-  vec3 e = C * res.a;
+-  // Safety clamp, same budget as the emissive direct clamp elsewhere.
+-  float l = dot(e, vec3(0.299, 0.587, 0.114));
+-  float cap = uFireflyClamp * 2.0;
+-  if (l > cap) e *= cap / l;
+-  return e;
++  if (gWantSpec) gSpec += C * (ggxSpec(N, wi) * res.a * wgt);
++  // The safety clamp is NOT applied here: it belongs to the pixel's direct
++  // term as a whole, and the caller applies it to the average. Clamping each
++  // sample first would be a one-sided energy loss that grows with N — a spike
++  // is already suppressed N-fold by the averaging, so clamping it again
++  // darkens exactly the bright spots the extra samples were bought for. With
++  // N = 1 the average IS the sample, so the arithmetic is unchanged.
++  return C * res.a * wgt;
+ }
+ 
++// >>> RT_RESTIR_MULTISAMPLE
++// Shade N reservoir winners and average them. Sample 0 is this pixel's own
++// reservoir (so N = 1 reduces to the shipped path, same RNG draws in the same
++// order, same arithmetic times 1.0); samples 1..N-1 read a NEIGHBOUR pixel's
++// reservoir, which cost the spatial stage nothing extra to produce.
++//
++// WHY AVERAGING IS NOT DOUBLE COUNTING: each term is an independent unbiased
++// estimate of the SAME quantity — this pixel's full direct-lighting integral,
++// not "the light that term picked". The mean of N unbiased estimates is
++// unbiased whatever they select, including when two of them select the same
++// light. (Summing them without the 1/N is what would double count.) Two
++// samples landing on the same light is therefore a VARIANCE issue, not a bias
++// one: the pair only averages the soft-shadow jitter and the area-light point,
++// so N correlated samples reduce noise by less than sqrt(N).
++//
++// An unvalidated neighbour falls back to this pixel's own reservoir instead of
++// being dropped: dropping it while still dividing by N would darken every
++// geometry edge, trading noise for a visible bias.
++vec3 shadeReservoir(vec3 P, vec3 N) {
++  vec4 own = texture(uReservoir, vUv);
++  int n = clamp(uRestirSamples, 1, RESTIR_MAX_SAMPLES);
++  float wgt = 1.0 / float(n);
++  // Taps use the SAME validation and radius as the spatial stage: a neighbour
++  // on another surface would import light across a geometry edge, which is
++  // bias, not noise.
++  vec2 ts = 1.0 / vec2(textureSize(uReservoir, 0));
++  float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
++  float dA = (2.0 * PI) / float(max(n - 1, 1)); // stratify the N-1 taps
++  vec3 sum = vec3(0.0);
++  for (int k = 0; k < RESTIR_MAX_SAMPLES; k++) {
++    if (k >= n) break;
++    vec4 res = own;
++    if (k > 0) {
++      float ang = (float(k - 1) + rand()) * dA;
++      float rad = 2.0 + rand() * max(uRestirTapRadius - 2.0, 0.0);
++      vec2 nUv = vUv + vec2(cos(ang), sin(ang)) * rad * ts;
++      vec4 nwp = texture(uGWorldPos, nUv);
++      bool ok = nUv.x >= 0.0 && nUv.x <= 1.0 && nUv.y >= 0.0 && nUv.y <= 1.0
++        && nwp.w >= 0.5
++        && abs(dot(nwp.xyz - P, N)) <= tol
++        && dot(N, normalize(texture(uGNormalMetal, nUv).xyz)) >= 0.9;
++      if (ok) res = texture(uReservoir, nUv);
++    }
++    sum += shadeReservoirSample(res, P, N, wgt);
++  }
++  // Safety clamp, same budget as the emissive direct clamp elsewhere. At N = 1
++  // this is byte-for-byte the clamp that used to sit inside the sample.
++  float l = dot(sum, vec3(0.299, 0.587, 0.114));
++  // >>> RT_RESTIR_CLAMP_REL
++  // AN ABSOLUTE CAP IS THE WRONG SHAPE FOR THIS ESTIMATOR, and it costs
++  // brightness rather than saving it. The exact path spends one shadow ray PER
++  // light and caps analytic lights nowhere; ReSTIR spends ONE ray on the whole
++  // sum, so f(Y)·W lands near the TOTAL when the winner turns out to be visible
++  // and on zero when it does not. That distribution is bimodal, the absolute cap
++  // clips the peaks, and nothing lifts the zeros, so a surface bright enough to
++  // exceed the cap converges DARK. Measured converged at 90 renders against a
++  // 250-render exact reference, this cap alone (dev/candidates-REPORT.md, gate
++  // 2): gallery mean 6.037 -> 4.540 and SIGNED -2.520 -> -0.233; great hall
++  // 6.353 -> 5.857 and -4.752 -> -3.802. Signed floors 0.02 to 0.21.
++  //
++  // uRestirClampRel scales THIS PIXEL'S OWN estimate of the unshadowed total
++  // (RestirPass's spatial stage writes wSum/M into .g), so the cap tracks what
++  // the pixel could plausibly receive instead of a scene-wide constant. 0 = off
++  // = exactly the absolute cap above, byte for byte. 2 means "no more than twice
++  // the whole light sum", which still catches a genuine 1/d^2 firefly (those run
++  // to 100x) while letting a fully lit surface reach its own total.
++  float cap = max(uFireflyClamp * 2.0, uRestirClampRel * own.g);
++  // <<< RT_RESTIR_CLAMP_REL
++  if (l > cap) sum *= cap / l;
++  return sum;
++}
++// <<< RT_RESTIR_MULTISAMPLE
++
++// >>> RT_RESTIR_COLD_FALLBACK
++// The EXACT direct-lighting path: one shadow ray per analytic light plus one
++// for the emissive set. This is what the owner calls "a perfect result" and it
++// is the fallback a cold ReSTIR pixel takes. Factored out of main() so the loop
++// exists ONCE in this shader — main() now reaches it from two branches (ReSTIR
++// on but this pixel cold, and ReSTIR off entirely), and a second copy of a
++// twenty-line loop is how the two paths drift apart.
++// >>> RT_RESTIR_DIR_BYPASS
++// ONE loop, one call site, a subset predicate. The spec's shape was a second
++// helper (shadeDirectionalLights) beside this one, which would have put a
++// THIRD lightContribution body in the shader (this loop, sampleOneLight, and
++// the new one) — the same register wall that made two shadeAllLights call sites
++// fail to link. So the directional subset is a MODE of this function instead:
++//   0 = every light + the emissive set (the exact path, unchanged)
++//   1 = the directional lights only, no emissive (the bypass sum)
++//   2 = nothing at all, and no RNG consumed
++// Mode 0 keeps the original light ORDER, so with the bypass on the exact path
++// is still byte-for-byte the exact path (the sun is shaded in its own slot, not
++// hoisted in front), which is what makes the cold-fallback arm comparable.
++vec3 shadeLightSet(vec3 P, vec3 N, int mode) {
++  if (mode == 2) return vec3(0.0);
++  vec3 d = vec3(0.0);
++  for (int i = 0; i < MAX_LIGHTS; i++) {
++    if (i >= uLightCount) break;
++    if (mode == 1) {
++      float lw = uLightPosType[i].w;
++      if (lw < 0.5 || lw >= 1.5) continue;   // not directional
++    }
++    d += lightContribution(i, P, N);
++  }
++  if (mode == 1) return d;
++  // Emissive meshes as area lights (next-event estimation, one shadow ray).
++  return d + sampleEmissiveTri(P, N);
++}
++// <<< RT_RESTIR_DIR_BYPASS
++// <<< RT_RESTIR_COLD_FALLBACK
++
+ // ONE light sample for secondary path vertices: stochastically pick either the
+ // analytic lights or the emissive set (weighted 1/p). Costs a single shadow
+ // ray — same ray budget the GI bounce had before emissive NEE existed —
+ // instead of two; the estimator stays unbiased and temporal accumulation
+ // averages out the extra variance.
+-vec3 sampleOneAny(vec3 P, vec3 N) {
++vec3 sampleOneAny(vec3 P, vec3 N, bool skipDir) {
+   bool hasL = uLightCount > 0;
+   bool hasE = uEmissiveCount > 0;
+   if (hasL && hasE) {
+     return rand() < 0.5
+-      ? sampleOneLight(P, N) * 2.0
++      ? sampleOneLight(P, N, skipDir) * 2.0
+       : sampleEmissiveTri(P, N) * 2.0;
+   }
+-  if (hasL) return sampleOneLight(P, N);
++  if (hasL) return sampleOneLight(P, N, skipDir);
+   if (hasE) return sampleEmissiveTri(P, N);
+   return vec3(0.0);
+ }
+@@ -921,7 +1090,9 @@
+     if (_emissiveTile >= 0.0) hEmissive *= tileSample(_emissiveTile, _tileUv).rgb;
+   }
+ // <<< RT_TEXTURE_TILES
+-  vec3 Ld = sampleOneAny(hP + hN * uEps, hN);
++  // GI/secondary vertices keep the sun: the bypass is about the PRIMARY
++  // surface's reservoir, and a bounce has no reservoir to poison.
++  vec3 Ld = sampleOneAny(hP + hN * uEps, hN, false);
+   vec3 hLe = (!specular && uEmissiveCount > 0) ? vec3(0.0) : hEmissive;
+   return hLe + hAlbedo * Ld * (1.0 / PI);
+ }
+@@ -1241,19 +1412,48 @@
+   // ReSTIR: shade the reservoir's winner with one visibility ray (flat cost in
+   // light count). Stochastic: one blind random sample. Full: one shadow ray
+   // per light + one for the emissive set.
+-  vec3 direct = vec3(0.0);
+-  if (uRestirEnabled) {
+-    direct = shadeReservoir(P, N);
+-  } else if (uLightStochastic) {
+-    direct = sampleOneAny(P, N);
+-  } else {
+-    for (int i = 0; i < MAX_LIGHTS; i++) {
+-      if (i >= uLightCount) break;
+-      direct += lightContribution(i, P, N);
+-    }
+-    // Emissive meshes as area lights (next-event estimation, one shadow ray).
+-    direct += sampleEmissiveTri(P, N);
++  // >>> RT_RESTIR_COLD_FALLBACK
++  // A pixel the camera or a moving object has JUST revealed has no reservoir
++  // history: 8 uniform candidates out of S (282 in the great hall), one
++  // visibility ray on the RIS winner, and neighbouring cold pixels landing on
++  // different winners. That is a bimodal estimate of a 26-light sum, and it is
++  // the blotching the owner sees at wall tops, baluster gaps and stair nosings.
++  // It converges in about a second of temporal accumulation; that second IS the
++  // artefact. So a pixel younger than uRestirWarmAge frames pays the exact path
++  // instead, and the reservoir keeps building underneath it, so by the time it
++  // crosses the threshold it has age x 8 candidates of history behind it.
++  // The reservoir tap carries that age in .b (RestirPass writes it in the
++  // temporal stage, the spatial stage passes it through untouched).
++  //
++  // CALL-SITE BUDGET, and this one cost a black screen before it was written
++  // down: the per-light loop (now shadeLightSet) may appear exactly ONCE in this
++  // shader. The obvious shape — reservoir-warm / reservoir-cold / stochastic /
++  // full, with the exact path in two of the four arms — compiles as GLSL and
++  // then fails to LINK on ANGLE/GL with "error: too many temporaries". The
++  // driver inlines the helper at every call site, and a second copy of the
++  // per-light loop's live ranges puts this megakernel over the register file.
++  // Same family as the three-site traceRadiance limit below. So the two exact
++  // arms are merged into one else, and the directional-bypass sum is a MODE of
++  // the same single call rather than a second loop.
++  vec4 resTap = uRestirEnabled ? texture(uReservoir, vUv) : vec4(0.0);
++  bool restirWarm = uRestirWarmAge <= 0.0 || resTap.b >= uRestirWarmAge;
++  // >>> RT_RESTIR_DIR_BYPASS
++  // The three estimators are unchanged; what is new is that the directional
++  // lights are lifted out of whichever one runs and shaded exactly, once, in
++  // the SAME single call site that serves the exact path. mode 0 already
++  // includes them, so the exact arm adds nothing.
++  bool useReservoir = uRestirEnabled && restirWarm;
++  bool useStochastic = !uRestirEnabled && uLightStochastic;
++  bool useExact = !useReservoir && !useStochastic;
++  int lightMode = useExact ? 0 : (uDirBypass ? 1 : 2);
++  vec3 direct = shadeLightSet(P, N, lightMode);
++  if (useReservoir) {
++    direct += shadeReservoir(P, N);
++  } else if (useStochastic) {
++    direct += sampleOneAny(P, N, uDirBypass);
+   }
++  // <<< RT_RESTIR_DIR_BYPASS
++  // <<< RT_RESTIR_COLD_FALLBACK
+ 
+   // --- 1-bounce indirect (cosine-weighted; pdf cancels the NdotL/PI).
+   // traceRadiance shades the hit with direct + NEE light, or returns the
+@@ -1683,6 +1883,19 @@
+         uPrevGWorldPos: { value: null },
+         uReservoir: { value: null },
+         uRestirEnabled: { value: false },
++        // Reservoir winners shaded per pixel (1 = shipped behaviour) and the
++        // neighbour-tap radius the extra ones are drawn from.
++        uRestirSamples: { value: 1 },
++        uRestirTapRadius: { value: 10 },
++        // Frames of reservoir history required before a pixel is shaded from
++        // its reservoir; below it, the exact per-light path. 0 = off = shipped.
++        uRestirWarmAge: { value: 0 },
++        // Firefly cap on the ReSTIR direct term relative to the pixel's own
++        // reservoir total. 0 = off = the absolute cap alone = shipped.
++        uRestirClampRel: { value: 0 },
++        // Directional lights shaded exactly and kept out of the reservoir
++        // (RestirPass.uDirBypass must agree). false = shipped.
++        uDirBypass: { value: false },
+         uPrevViewProj: { value: new THREE.Matrix4() },
+         uViewProj: { value: new THREE.Matrix4() },
+         uCameraPos: { value: new THREE.Vector3() },
+diff -ruN --strip-trailing-cr rt-pristine/src/RealtimeRaytracer.js rt-local/src/RealtimeRaytracer.js
+--- rt-pristine/src/RealtimeRaytracer.js	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/RealtimeRaytracer.js	2026-08-15 17:08:25.718602700 -0400
+@@ -10,6 +10,7 @@
+ import { RestirPass } from "./RestirPass.js";
+ import { GIReservoirPass } from "./GIReservoirPass.js";
+ import { CopyPass } from "./CopyPass.js";
++import { GpuTimer } from "./GpuTimer.js";
+ import { makeMRT } from "./mrtCompat.js";
+ 
+ // Van der Corput / Halton radical inverse — deterministic low-discrepancy
+@@ -312,6 +313,80 @@
+   }
+ 
+   /**
++   * FUNCTIONAL probe for the motion-vector MRT: can this context DRAW into a
++   * FIVE-attachment G-buffer whose fifth target is RG32F? WebGL2 only
++   * guarantees 4 draw buffers (MAX_DRAW_BUFFERS >= 4), so a 5-attachment MRT is
++   * NOT guaranteed — check the count, then do a real draw + readback (a
++   * checkFramebufferStatus probe alone is what misleads on WebKit/iOS). If this
++   * returns false, `motionVectors` degrades to camera-only reprojection.
++   */
++  static _motionMrtSupported(renderer) {
++    const gl = renderer.getContext();
++    if (gl.getParameter(gl.MAX_DRAW_BUFFERS) < 5) return false;
++    let mrt, out, mat, copy, quad, scene2, cam;
++    const prevTarget = renderer.getRenderTarget();
++    try {
++      mrt = makeMRT(2, 2, 5, {
++        format: THREE.RGBAFormat,
++        type: THREE.HalfFloatType,
++        depthBuffer: false,
++        stencilBuffer: false,
++      });
++      for (const tex of mrt.texture) tex.generateMipmaps = false;
++      mrt.texture[4].format = THREE.RGFormat;
++      mrt.texture[4].type = THREE.FloatType;
++      out = new THREE.WebGLRenderTarget(2, 2, { depthBuffer: false, stencilBuffer: false });
++      const vert = `out vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
++      mat = new THREE.ShaderMaterial({
++        glslVersion: THREE.GLSL3,
++        vertexShader: vert,
++        fragmentShader: `precision highp float;
++layout(location = 0) out vec4 o0; layout(location = 1) out vec4 o1;
++layout(location = 2) out vec4 o2; layout(location = 3) out vec4 o3;
++layout(location = 4) out vec4 o4;
++void main(){
++  o0 = vec4(0.5); o1 = vec4(0.25); o2 = vec4(0.125); o3 = vec4(0.0625);
++  o4 = vec4(0.375, 0.625, 0.0, 1.0);
++}`,
++        depthTest: false,
++        depthWrite: false,
++      });
++      copy = new THREE.ShaderMaterial({
++        glslVersion: THREE.GLSL3,
++        vertexShader: vert,
++        fragmentShader: `precision highp float; in vec2 vUv; out vec4 outColor;
++uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0, 1.0); }`,
++        uniforms: { uTex: { value: mrt.texture[4] } },
++        depthTest: false,
++        depthWrite: false,
++      });
++      scene2 = new THREE.Scene();
++      cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
++      quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
++      quad.frustumCulled = false;
++      scene2.add(quad);
++      renderer.setRenderTarget(mrt);
++      renderer.render(scene2, cam);
++      quad.material = copy;
++      renderer.setRenderTarget(out);
++      renderer.render(scene2, cam);
++      const px = new Uint8Array(4);
++      renderer.readRenderTargetPixels(out, 0, 0, 1, 1, px);
++      // 0.375 -> ~96, 0.625 -> ~159 through the RGBA8 round-trip.
++      return Math.abs(px[0] - 96) < 24 && Math.abs(px[1] - 159) < 24;
++    } catch {
++      return false;
++    } finally {
++      renderer.setRenderTarget(prevTarget);
++      if (quad) quad.geometry.dispose();
++      if (mat) mat.dispose();
++      if (copy) copy.dispose();
++      if (mrt) mrt.dispose();
++      if (out) out.dispose();
++    }
++  }
++
++  /**
+    * Companion settings for a given lighting resolution, and the governor's
+    * denoise-pass CAP.
+    *
+@@ -390,6 +465,143 @@
+   static MAX_SCALE_STEP = 0.25;
+ 
+   /**
++   * Largest renderScale change the governor may commit UPWARD in one step. One
++   * 0.05 rung, against the 0.25 (five rungs) it may drop in one step. The
++   * asymmetry is deliberate and is the whole reason a raise is safe to enable at
++   * all: a drop that is one rung too deep costs a little sharpness for two
++   * seconds, whereas a raise that is one rung too high costs dropped frames, so
++   * the ladder is climbed one rung at a time and fallen down five at a time.
++   */
++  static MAX_SCALE_UP_STEP = 0.05;
++
++  /**
++   * The tracer's GPU cost as a fraction of the frame period, at which the
++   * governor calls the frame OVER budget. Deliberately 1.0, i.e. "the whole
++   * period": this is a safety net behind the wall clock, not a second opinion
++   * about how much resolution to keep.
++   *
++   * Measured on an RTX 3060 at 960x600 (dev/gpu-budget-sweep.py, rAF-paced as
++   * the game runs, great hall at canvas 0.75): traced GPU 15.96ms / wall 16.80,
++   * 19.55 / 20.40, 24.55 / 25.30, 28.43 / 29.30. The wall clock is the GPU cost
++   * plus a flat ~0.85ms of non-tracer work, so once the GPU cost passes the
++   * period the wall clock passes it too and the ORIGINAL wall-clock gate fires
++   * on its own. A lower threshold here would take real resolution away from
++   * scenes the display is currently keeping up with: the great hall's settled
++   * 15.96ms is 96% of a 60Hz period and delivers a 16.8ms frame, and a governor
++   * that dropped the canvas a rung for that would be optimising its own proxy
++   * rather than the frame rate it was asked for.
++   */
++  static GPU_BUDGET_DROP = 1.0;
++  /** As above, while the governor knows it is hunting a boundary. */
++  static GPU_BUDGET_DROP_OSC = 1.15;
++
++  /**
++   * The highest GPU utilisation the governor will COMMIT to outright when it
++   * raises quality. Not a trigger — a predicted-cost ceiling: a step predicted
++   * to land under this is taken on the model's word (see _takeUpStep), and one
++   * predicted above it is either probed or refused. 0.85 keeps roughly a sixth
++   * of the period in hand for scene variation (the aeroplane flying into a lit
++   * room, a door opening onto more lights) so a committed raise does not have to
++   * be undone the moment the view changes.
++   *
++   * The gap between this and GPU_BUDGET_DROP is the anti-oscillation deadband:
++   * the governor never commits a step it can predict will need undoing, and the
++   * borderline band above it is entered only through a probe that carries its
++   * own undo and its own backoff.
++   */
++  static GPU_TARGET_UTIL = 0.85;
++  /** Stricter while hunting: only an obviously affordable step gets through. */
++  static GPU_TARGET_UTIL_OSC = 0.6;
++
++  /**
++   * Predicted utilisation above which an up-step is refused outright rather than
++   * verified by probing it.
++   *
++   * Between GPU_TARGET_UTIL and this, the model is not confident enough to
++   * commit and not confident enough to refuse — so the step is TAKEN AS A PROBE
++   * and judged on what it actually costs 1.5s later. That band matters: this
++   * game's great hall settles at 96% utilisation, so a governor that only ever
++   * committed steps predicted under 85% could never climb back to the level it
++   * was already running at before a transient, and every hitch would cost a
++   * permanent rung. Measurement decides; the model only decides what is worth
++   * measuring.
++   */
++  static GPU_PROBE_CEIL = 1.05;
++
++  /**
++   * Cost model for an up-step, used to refuse steps that would overshoot.
++   *
++   * Canvas scale is quadratic on EVERY pass and measures as such: great hall,
++   * renderScale 0.2, canvas 1.0 = 27.06ms against canvas 0.75 = 15.96ms, a ratio
++   * of 1.70 where the quadratic says 1.78. So canvas steps are charged the
++   * quadratic, which is right and marginally conservative.
++   *
++   * renderScale is quadratic only on the TRACED LIGHTING, which is a fraction of
++   * the frame — the G-buffer raster, TAA and the resolve are full-resolution
++   * whatever it is set to. Measured share of frame cost that actually scales
++   * with renderScale (dev/gpu-budget-sweep.py): 0.40 at 0.2->0.25, 0.35 at
++   * 0.2->0.3, 0.80 at 0.5->0.6, 0.84 at 0.75->1.0 — it grows as the lighting
++   * comes to dominate. SCALE_COST_SHARE is the top of that range, so the model
++   * `1 + share*(area - 1)` is exact at the top of the ladder and conservative
++   * everywhere below it. A flat quadratic was tried first and over-charged a
++   * 0.30->0.35 step by 15%, which left the last rung of a recovery dependent on
++   * catching a low sample — it got there, in 32 seconds instead of 4.
++   */
++  static SCALE_COST_SHARE = 0.85;
++  static STOCHASTIC_STEP_FACTOR = 1.5;
++
++  /**
++   * Adaptations a "there is headroom" reading must survive before the governor
++   * acts on it. At the 2s cooldown this is a ~4s dwell before the first up-step,
++   * and it is what keeps a single quiet moment in a heavy scene from starting a
++   * climb the scene cannot pay for.
++   */
++  static GOVERNOR_UP_DWELL = 2;
++
++  /**
++   * How long the governor waits for a GPU timing result before giving up on the
++   * timer and falling back to probing. GPU_DISJOINT (a driver clock change, a
++   * context switch away from the tab) empties the sample window legitimately, so
++   * a gap is not a fault; a permanent one is, and a governor that simply waited
++   * for a number that never came would be worse than the bug being fixed.
++   */
++  static GPU_STALE_MS = 5000;
++
++  /**
++   * How long a direction reversal keeps the governor in its cautious
++   * "oscillating" mode (wider deadband, longer cooldown, stricter raise).
++   *
++   * The flag is set by ONE reversal, which is right for catching a hunt early
++   * and wrong as a permanent state: a descent followed by a recovery is a single
++   * reversal too, and before this timeout existed the first step back up latched
++   * the strict thresholds for the rest of the page. Observed exactly that —
++   * after a transient the canvas recovered one rung, that recovery counted as a
++   * reversal, and the stricter raise threshold (0.6) then refused every further
++   * step at a measured 0.67 utilisation, permanently. Fifteen seconds of no
++   * changes at all is not a hunt; three normal cooldowns is long enough that a
++   * real ping-pong (which changes something every 5s) never sees this expire.
++   */
++  static OSCILLATION_FORGET_MS = 15000;
++
++  /**
++   * Speculative up-probe (used only where the GPU timer is unavailable — Safari
++   * and iOS withhold the extension, and the owner ships to iPad).
++   *
++   * PROBE_BASE_MS is the quiet period before the first probe, doubling to
++   * PROBE_MAX_MS after each failure and resetting to base after each success, so
++   * a machine that genuinely has headroom finds it in tens of seconds while a
++   * machine that does not stops asking. PROBE_SETTLE_MS is how long the raised
++   * level runs before the verdict: the wall-clock EMA is reseeded from scratch
++   * after a quality change (alpha 0.1, so ~90% converged in 22 frames) and a
++   * missed vsync has to actually happen to be seen.
++   */
++  static PROBE_BASE_MS = 8000;
++  static PROBE_MAX_MS = 120000;
++  static PROBE_SETTLE_MS = 1500;
++  /** A probe fails if the wall clock got this much worse than before it. */
++  static PROBE_FAIL_RATIO = 1.1;
++
++  /**
+    * Named quality presets: flat maps of EXISTING option values, for an app that
+    * wants "quality", "balanced", "performance" or "motion" without understanding
+    * fifteen sliders. Four presets, each a plain, inspectable object:
+@@ -878,6 +1090,40 @@
+     this.overloadProtection = options.overloadProtection ?? true;
+     this._overloadStrikes = 0;
+     this._obLastT = null;
++    /**
++     * GPU-cost timing for the adaptive governor (EXT_disjoint_timer_query_webgl2).
++     *
++     * "auto" (default) uses the extension where the browser exposes it and falls
++     * back to speculative probing where it does not (Safari/iOS withhold it).
++     * `false` forces the probe path — useful for testing the fallback on hardware
++     * that HAS the extension, and for an app that would rather not issue timer
++     * queries at all. `true` is the same as "auto" (there is nothing to force:
++     * where the extension is missing there is no measurement to be had).
++     *
++     * WHY IT MATTERS. The governor's only signal used to be wall-clock frame
++     * time, and a vsync-capped display pins that at the refresh period no matter
++     * how much GPU headroom exists — so every gate that RAISES quality was
++     * unreachable and the ladder was one-way. See _adaptQuality.
++     */
++    this.gpuTiming = options.gpuTiming ?? "auto";
++    this._gpuTimer = this.gpuTiming === false ? null : new GpuTimer(renderer);
++    // supported AND not disabled AND not given up on (see the staleness guard in
++    // _adaptQuality: a timer that stops producing results must not freeze the
++    // governor, so it degrades to the probe path rather than blocking).
++    this._gpuActive = !!(this._gpuTimer && this._gpuTimer.supported);
++    this._gpuNullSince = null;  // when costMs first went null (staleness guard)
++    this._gpuGaveUp = false;
++    /**
++     * Speculative up-probe (the fallback when there is no GPU timer). Null when
++     * none is in flight; otherwise { kind, from, at, ema } — see _adaptQuality's
++     * probe section for why this exists and how a failed probe is unwound.
++     */
++    this._qProbe = null;
++    this._qProbeBackoff = RealtimeRaytracer.PROBE_BASE_MS;
++    /** The last up-step a probe tried and had to undo, as { kind, from, at }.
++     *  Keyed by the STEP, so backing off a rung the scene cannot afford does not
++     *  also slow down the climb back to it from further down. */
++    this._qProbeFail = null;
+     this._qEma = null;
+     this._qLastT = null;
+     this._qLastChange = 0;
+@@ -968,7 +1214,211 @@
+      * area-light noise. On by default — turn off to compare estimators.
+      */
+     this.restir = options.restir ?? true;
++    /**
++     * How many reservoir winners the lighting pass shades per pixel, each with
++     * its own visibility ray. DEFAULT 1 = the shipped behaviour, bit-identical.
++     *
++     * ReSTIR is not noisier than the full per-light loop because it samples
++     * badly — it picks its one sample well. It is noisier because it spends ONE
++     * sample where the full loop spends one per light plus one for the emissive
++     * set. This is the dial for that: 2..4 shade the pixel's own winner plus
++     * 1..3 NEIGHBOURING pixels' winners (the spatial stage already produced a
++     * reservoir per pixel, so the extra winners are free to obtain — only the
++     * extra shadow ray is paid for), averaged with a 1/N weight.
++     *
++     * Neighbours are validated exactly as the spatial stage validates a tap
++     * (same plane, normal within ~26 degrees); an invalid tap falls back to the
++     * pixel's own reservoir rather than being dropped, because dropping it
++     * while still dividing by N would darken geometry edges.
++     */
++    this.restirSamples = options.restirSamples ?? 1;
++    /** Neighbour-tap radius ceiling for restirSamples > 1, in lighting-buffer
++     *  texels. 10 matches the spatial stage's own tap radius; larger taps
++     *  decorrelate the extra samples more but fail validation more often. */
++    this.restirSampleRadius = options.restirSampleRadius ?? 10;
++    /**
++     * COLD-PIXEL EXACT FALLBACK. Frames of validated temporal history a pixel's
++     * reservoir must have carried before that reservoir is allowed to shade it.
++     * DEFAULT 0 = off = the shipped behaviour.
++     *
++     * A just-revealed pixel — a camera move, an object sliding aside, a doorway
++     * crossing — has no history at all: its reservoir is 8 uniform candidates
++     * out of S = lights + emissive triangles, and shading it means one
++     * visibility ray on the RIS winner. That is a bimodal estimate of the whole
++     * light sum, neighbouring cold pixels pick different winners, and it takes
++     * roughly a second of temporal accumulation to converge. That second is the
++     * speckle people see at newly revealed edges.
++     *
++     * With this set, a pixel younger than N frames is shaded by the EXACT
++     * per-light loop (one shadow ray per light plus one for the emissive set) —
++     * the same path `restir: false` with `stochasticLights: false` uses. That
++     * path is NOT cheap: measured 5-6x a ReSTIR frame at 29 lights (449 vs 74 ms
++     * at rs 0.5, 124 vs 25 at rs 0.2, RTX 3060 under load), so this only pays
++     * while the cold pixels are a small minority, and it is only a win once the
++     * reprojection keeps thin-geometry pixels warm (see the game's notes). The reservoir
++     * keeps streaming candidates underneath, so a pixel crossing the threshold
++     * arrives with N x 8 candidates of history behind it.
++     */
++    this.restirWarmAge = options.restirWarmAge ?? 0;
++    /**
++     * DIRECTIONAL LIGHTS BYPASS THE RESERVOIR (default false = shipped
++     * behaviour). With it on, a directional light is never a ReSTIR candidate
++     * and never survives as an inherited winner; the lighting pass shades every
++     * directional light exactly instead, once, in the same single call site the
++     * exact path uses.
++     *
++     * WHY. A reservoir's target function is UNSHADOWED, and a directional light
++     * has a large unshadowed contribution on every surface facing it while
++     * being occluded on most interior surfaces. So the reservoir keeps electing
++     * the sun, spends its one visibility ray on the wall between, and the pixel
++     * resolves to zero — with the odd frame's runner-up showing through as a
++     * bright speck. Measured in this game (dev/sun-edges-REPORT.md): turning
++     * into the great-hall doorway, the entering wall renders nearly black with
++     * bright specks under stock ReSTIR and cleanly with the sun's intensity
++     * zeroed. Production ReSTIR renderers exclude directional lights for the
++     * same reason.
++     *
++     * COST is one extra shadow ray per pixel per directional light — the
++     * smallest light class in any scene here — and the RIS estimator stays
++     * unbiased: the source pdf is untouched, the target function simply
++     * excludes those lights, so a candidate slot spent on one is wasted rather
++     * than wrong (one sun among 16-29 lights = 3-6% of candidates).
++     */
++    this.restirDirectionalBypass = options.restirDirectionalBypass ?? false;
++    /**
++     * RESERVOIR REPROJECTION THAT SURVIVES JITTER AND THIN GEOMETRY (default
++     * false = shipped behaviour). Two halves of one fix in the ReSTIR temporal
++     * stage, both gated by this switch:
++     *   1. the SUB-TEXEL correction AccumulatePass has always applied
++     *      (`prevUv -= currUv - vUv`), because the G-buffer sample under a
++     *      reservoir texel is TAA-jittered and so P does not project to the
++     *      texel centre;
++     *   2. a four-neighbour RESCUE: if the plane test at the reprojected texel
++     *      fails, try the four axis neighbours and take the one whose surface
++     *      agrees best, before declaring the history invalid.
++     *
++     * WHY. Without them, thin geometry never accumulates: TAA jitter walks the
++     * lighting-res G-buffer sample across a baluster, the single-texel lookup
++     * lands on the other surface, the plane test rejects it, and the reservoir
++     * restarts from eight uniform candidates every frame. Measured before this
++     * change: 22% of shaded pixels never reached age 12 at a frozen pose, as a
++     * stipple tracing the balusters, the handrail, the chandelier arms and the
++     * picture frames.
++     *
++     * COST is bounded and ALU-only: at most four extra uPrevGWorldPos fetches
++     * and still exactly one uPrevReservoir fetch, on the pixels that failed.
++     */
++    this.restirReprojectionRescue = options.restirReprojectionRescue ?? false;
++    /**
++     * RESERVOIR CANDIDATES ARE DRAWN THE WAY NEE DRAWS THEM (default false =
++     * shipped behaviour, byte for byte).
++     *
++     * WHY. The temporal stage streams 8 candidates UNIFORMLY out of S = analytic
++     * lights + emissive NEE triangles. In a room with 26 lights and 256 emissive
++     * triangles a light bulb's triangle is a 1-in-282 pick, and most picks land
++     * on lampshade, television and candle triangles that contribute nothing to
++     * the pixel being shaded, so a cold reservoir holds 8 near-useless
++     * candidates and needs a second of temporal reuse to find anything. The
++     * EXACT path never had this problem: sampleEmissiveTri importance-samples the
++     * emissive set through the power CDF the scene compiler already writes.
++     *
++     * With this on, each candidate first picks a POOL (analytic lights with
++     * probability PL/(PL+PE), by power, clamped to [0.1, 0.9]) and then a member
++     * of it by that pool's own power CDF, and the RIS weight divides by the
++     * resulting pdf instead of by 1/S. RIS is unbiased for any source pdf whose
++     * support covers the target's, and this one covers every candidate the
++     * uniform pick could produce.
++     *
++     * COST is the 8-step binary search per emissive candidate plus one extra
++     * rand() per candidate (pool choice), all ALU: no extra rays, no extra
++     * texture rows. Measured in this game: see dev/candidates-REPORT.md.
++     */
++    this.restirCandidateImportance = options.restirCandidateImportance ?? false;
++    /**
++     * FIREFLY CAP ON THE RESTIR DIRECT TERM, RELATIVE TO THE PIXEL'S OWN
++     * RESERVOIR TOTAL (default 0 = off = the absolute cap alone = shipped).
++     *
++     * WHY. The direct term out of a reservoir is capped at 2 x fireflyClamp,
++     * while the exact per-light loop caps analytic lights nowhere. Because ReSTIR
++     * spends ONE sample on the WHOLE light sum, f(Y)·W lands near the total when
++     * the winner is visible and on zero when it is not: the distribution is
++     * bimodal, the cap clips the peaks, nothing lifts the zeros, and a bright
++     * surface converges DARK: the halo of missing light around each bulb.
++     *
++     * The reservoir already knows the answer: wSum/M is its own estimate of the
++     * unshadowed light total at this pixel, so the cap becomes
++     * max(2 x fireflyClamp, restirClampRel x that). 2 is "no more than twice
++     * everything this pixel could receive", which still catches a genuine 1/d^2
++     * spike (those are 100x) and lets a fully lit surface reach its own total.
++     */
++    this.restirClampRel = options.restirClampRel ?? 0;
+     this.restirPass = new RestirPass(this._scaledW, this._scaledH);
++    /**
++     * Dynamic-mesh reservoir treatments, both DEFAULT OFF (nothing changes until
++     * switched on). A moving mesh's pixels reject their reprojected history every
++     * frame (camera-only reprojection lands on whatever was behind it last frame,
++     * the plane test fails, M collapses to the fresh-candidate count), so the
++     * moving aeroplane is permanently the noisiest thing on screen. Two fixes:
++     *   restirDynamicAccept — on a dynamic-mesh pixel, skip the plane test and
++     *     offer the co-located previous reservoir as a candidate (its light is
++     *     re-evaluated at the true surface, so a wrong one loses on weight).
++     *   restirDynamicFreeze — on a dynamic-mesh pixel, pass the previous
++     *     reservoir through to history instead of overwriting it, so the wall
++     *     behind the aeroplane keeps its history and the trailing edge stops
++     *     disoccluding. Only sound for a SMALL dynamic object against a broadly
++     *     similar background.
++     */
++    this.restirDynamicAccept = options.restirDynamicAccept ?? false;
++    this.restirDynamicFreeze = options.restirDynamicFreeze ?? false;
++
++    /**
++     * MOTION VECTORS for temporal reprojection (DEFAULT OFF). The G-buffer
++     * writes, into a fifth RG32F attachment, each fragment's PREVIOUS screen
++     * position (its last-frame clip position from the dynamic mesh's PREVIOUS
++     * model matrix and uPrevViewProj), and the three temporal stages — the
++     * irradiance EMA (AccumulatePass), the ReSTIR reservoir, and the TAA resolve
++     * — look up history at that previous position instead of reprojecting the
++     * CURRENT world position through uPrevViewProj.
++     *
++     * That camera-only reprojection is the bug for MOVING meshes: a point on
++     * the aeroplane occupied different world space last frame, so the
++     * reprojected history lands on whatever was behind it and every validation
++     * test fails. For STATIC geometry the motion vector reduces exactly to the
++     * camera-only path (the previous model matrix IS the current one), so a
++     * static scene renders byte-identically with the option on or off.
++     *
++     * Rigid transforms only: a DEFORMING mesh (userData.rtDeforming) or a
++     * SkinnedMesh needs previous-frame VERTEX positions, not a previous matrix,
++     * so its motion vector uses the rigid previous matrix — it degrades to
++     * today's camera-only-style reprojection for those vertices rather than
++     * producing a wrong vector.
++     *
++     * Requires a GPU with >= 5 draw buffers (WebGL2 guarantees only 4). On a
++     * device without it the option is ignored with a one-time warning and every
++     * stage keeps camera-only reprojection.
++     */
++    this.motionVectors = options.motionVectors ?? false;
++    this.motionVectorsSupported = RealtimeRaytracer._motionMrtSupported(renderer);
++    this._motionVectorsActive = false;
++    this._motionWarned = false;
++    this._prevModelMatrices = new Map(); // dynamic mesh -> previous Matrix4
++    // Per-stage consumption switches. NOT all on: measured on the Hangar great
++    // hall, frame-to-frame residual in a crop that follows the moving aircraft,
++    // mean / p95 over 61 frames —
++    //
++    //   off                5.39 / 8.69
++    //   accumulation only  4.70 / 6.57     <- the win: -13% mean, -24% p95
++    //   all three          6.44 / 7.69     <- WORSE on the mean than off
++    //
++    // The accumulation stage (the irradiance EMA) is where moving-object noise
++    // actually lives, which is why it is the one that pays. TAA consuming the
++    // same vectors is a clear regression here (taa-only measured 7.81 mean,
++    // +46%) and raising taaBlend makes it worse, not better, so it is not a
++    // simple history-lag. Until that is understood TAA stays on camera-only
++    // reprojection, which is exactly what it did before motion vectors existed.
++    this._motionAccum = true;
++    this._motionRestir = true;
++    this._motionTaa = false;
+ 
+     /**
+      * EXPERIMENTAL — ReSTIR GI (v1, temporal-only): per-pixel reservoirs reuse
+@@ -1204,13 +1654,19 @@
+   // adaptation measures the new settings fresh instead of comparing them to an
+   // average from before the switch.
+   _rearmGovernor() {
+-    this._qEma = null;
++    this._freshMeasurement();
+     this._qLastT = null;
+     this._qLastChange = 0;
+     this._qLastDir = 0;
+     this._qOscillating = false;
+     this._qFastStreak = 0;
+     this._qFreeWins = null;
++    // An in-flight probe belonged to the OLD baseline; its "from" state is no
++    // longer the thing to revert to, so drop it rather than let it undo a step
++    // of the new preset.
++    this._qProbe = null;
++    this._qProbeBackoff = RealtimeRaytracer.PROBE_BASE_MS;
++    this._qProbeFail = null;
+     if (this.adaptiveQuality) {
+       console.info(
+         `three-realtime-rt: preset "${this._presetName}" applied  -  ` +
+@@ -1554,6 +2010,11 @@
+     this.volumetricPass.setCompiledScene(this.compiled);
+     this.restirPass.setCompiledScene(this.compiled);
+     this.giReservoirPass.setCompiledScene(this.compiled);
++    // Tell the G-buffer which meshes are dynamic so it can flag their pixels
++    // (gEmissive.a) for the reservoir passes.
++    this.gbuffer.setDynamicMeshes(
++      this.compiled.hasDynamic ? this.compiled.dynamic.map((s) => s.mesh) : null
++    );
+     this._syncVolumeAlbedo();
+     this.resetAccumulation();
+     return this.compiled;
+@@ -1956,7 +2417,7 @@
+     this._qFreeWins = prev; // even when empty: the check is now settled
+     if (!took) return false;
+     this._recordChange(-1, now);
+-    this._qEma = null; // cost profile changed — measure fresh
++    this._freshMeasurement(); // cost profile changed — measure fresh
+     console.info(
+       "three-realtime-rt: adaptive quality → free wins first (" +
+         Object.keys(prev).filter((k) => k !== "scale").join(", ") +
+@@ -1974,18 +2435,37 @@
+     if (!keys.length) return false;
+     for (const k of keys) this[k] = prev[k];
+     this._recordChange(1, now);
+-    this._qEma = null;
++    this._freshMeasurement();
+     console.info(`three-realtime-rt: adaptive quality → returned ${keys.join(", ")}`);
+     return true;
+   }
+ 
+   // ---- adaptive quality governor: continuous dynamic resolution scaling ----
+-  // Measures real call-to-call frame time (EMA) and steers renderScale
+-  // proportionally toward targetFps, in 0.05 steps with a cooldown so target
+-  // reallocation and accumulation resets stay rare. Lighting cost ≈ scale², so
+-  // the correction uses a damped power of the error. Limitation: under a vsync
+-  // cap the frame time can't reveal headroom, so upscaling only happens when
+-  // frames are measurably faster than the target — it never thrashes.
++  // Measures the frame's cost and steers renderScale toward targetFps, in 0.05
++  // steps with a cooldown so target reallocation and accumulation resets stay
++  // rare.
++  //
++  // TWO CLOCKS, AND WHY. Wall-clock frame time is what the user experiences, and
++  // it is the right signal for "we are too slow" — but under a vsync cap it is
++  // the ONLY thing it can say. A 60Hz display returns 16.7ms whether the GPU
++  // spent 3ms or 16ms on the frame, so every gate that RAISED quality
++  // (`ratio < dbLo`, and the free-win release's `ratio < 0.5`) was unreachable
++  // on ordinary hardware and the ladder was one-way: any transient — a shader
++  // compile, an asset load, another window taking the GPU — cost quality that
++  // was never given back for the life of the page. Measured in this game before
++  // the fix: renderScale 0.5 at load, 0.2 (the floor) plus a 0.75 canvas within
++  // twelve seconds, and then 0.20 for every one of the next sixty-three samples
++  // at a steady 16.7ms. 0.2 means the ray traced LIGHTING was being solved at a
++  // twenty-fifth of the pixels, permanently, on a card with headroom to spare.
++  //
++  // So DOWN is judged on the wall clock exactly as before (plus a GPU safety
++  // net), and UP is judged on measured GPU milliseconds — the one number a
++  // vsync cap cannot flatten. Where the timer extension is missing (Safari and
++  // iOS withhold it) UP falls back to speculative probing: raise one rung, keep
++  // it if the wall clock does not degrade, put it back and wait longer if it
++  // does. Both paths are asymmetric by construction — a raise needs a dwell, a
++  // predicted-cost check and one rung at a time; a drop needs one measurement
++  // and may take five rungs at once.
+   //
+   // SPENDING ORDER (down), cheapest-in-quality first:
+   //   1. free wins            _takeFreeWins — no resolution given up at all
+@@ -2034,6 +2514,29 @@
+     // catastrophic frames from the very first one.
+     this._qSamples = (this._qSamples || 0) + 1;
+     if (this._qSamples < RealtimeRaytracer.GOVERNOR_WARMUP_FRAMES) return;
++    // A reversal marks the governor as hunting a boundary; a long quiet spell
++    // un-marks it. See OSCILLATION_FORGET_MS — without this, one recovery step
++    // after a transient pins the cautious thresholds on for the whole page.
++    if (
++      this._qOscillating &&
++      now - this._qLastChange > RealtimeRaytracer.OSCILLATION_FORGET_MS
++    ) {
++      this._qOscillating = false;
++    }
++
++    const budget = 1000 / this.targetFps;
++    const wall = this._qEma / budget;
++    const util = this._gpuUtilisation(now, budget);
++
++    // A probe in flight is judged on its OWN clock, which is shorter than the
++    // cooldown, and nothing else may move until it has been judged: the probe
++    // is a controlled experiment and a second change during it would make the
++    // result unattributable.
++    if (this._qProbe) {
++      this._judgeProbe(now, wall, util);
++      return;
++    }
++
+     // Calmness: normally 2s between changes. When the last two steps reversed
+     // direction the governor is hunting the boundary, so hold for 5s AND widen
+     // the "comfortable" deadband — both push it to commit to a level instead of
+@@ -2041,104 +2544,248 @@
+     const cooldown = this._qOscillating ? 5000 : 2000;
+     if (now - this._qLastChange < cooldown) return;
+ 
+-    const ratio = this._qEma / (1000 / this.targetFps);
+     const dbLo = this._qOscillating ? 0.6 : 0.8;
+     const dbHi = this._qOscillating ? 1.24 : 1.12;
+-    if (ratio < dbHi && ratio > dbLo) return; // comfortable — leave it alone
+-
+-    // STEP 1 (down): the free wins, before any resolution is given up.
+-    if (ratio > dbHi && this._takeFreeWins(now)) return;
+-
+-    let s = this._renderScale * Math.pow(1 / ratio, 0.35);
+-    // Per-step clamp. Now that multi-hundred-millisecond frames feed the EMA, a
+-    // single very slow measurement (ratio can reach ~100 at dt 2s) would
+-    // otherwise slam the scale from 1.0 to the 0.2 floor in ONE step and throw
+-    // away the image on a transient. Move at most MAX_SCALE_STEP per adaptation
+-    // (5 ladder steps) and let the cooldown take the next one if it is still slow.
+-    const step = RealtimeRaytracer.MAX_SCALE_STEP;
+-    s = Math.min(this._renderScale + step, Math.max(this._renderScale - step, s));
+-    s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
+-
+-    // When we're fast, give back the deepest lever FIRST: restore canvas scale
+-    // one step before touching renderScale, since canvas is the coarsest/most
+-    // valuable resolution to recover and it's quadratic on every pass.
+-    if (ratio < dbLo && this.canvasScaleHook && this._canvasLevelIdx > 0) {
+-      this._canvasLevelIdx--;
+-      this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx]);
+-      this._recordChange(1, now); // restoring resolution = quality up
+-      this._qEma = null; // cost profile changed — measure fresh
+-      console.info(
+-        `three-realtime-rt: adaptive quality → ${Math.round(
+-          RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx] * 100
+-        )}% canvas`
+-      );
++    const dropUtil = this._qOscillating
++      ? RealtimeRaytracer.GPU_BUDGET_DROP_OSC
++      : RealtimeRaytracer.GPU_BUDGET_DROP;
++
++    // SLOW is the wall clock's call, exactly as it always was, with the GPU
++    // clock as a second opinion that can only ever ADD a drop. Note the wall
++    // clock is deliberately never overruled by a comfortable GPU reading: a
++    // CPU-bound frame is still a slow frame, and while dropping resolution will
++    // not fix it, the alternative (a governor that decides the problem is not
++    // its department) is how a scene becomes unplayable.
++    const slow = wall > dbHi || (util != null && util > dropUtil);
++    // FAST — meaning "there is headroom worth spending" — cannot be read off a
++    // vsync-capped wall clock at all. With a GPU measurement it is a real
++    // question; without one, wall < dbLo still detects headroom on an UNCAPPED
++    // display (a 144Hz panel, a headless capture), and the probe path covers
++    // the capped case.
++    const raiseUtil = this._qOscillating
++      ? RealtimeRaytracer.GPU_TARGET_UTIL_OSC
++      : RealtimeRaytracer.GPU_TARGET_UTIL;
++    const fast = util != null ? util < raiseUtil : wall < dbLo;
++
++    if (!slow && !fast) {
++      this._qFastStreak = 0;
++      // Comfortable. On a capped display with NO GPU timer this is the only
++      // place the governor can ever be — "fast" is unreachable there — so it is
++      // where the speculative climb has to be driven from. Gated on
++      // gpuTimingActive rather than on `util == null` so a momentary gap in the
++      // timer's samples (a GPU_DISJOINT, the window just after a quality step)
++      // does not start a probe on a machine that has a real measurement coming.
++      if (!this.gpuTimingActive) this._raiseQuality(now, null, wall);
+       return;
+     }
+ 
+-    // When we're slow and renderScale has ALREADY BOTTOMED OUT — it is at the
+-    // 0.2 floor, not merely near it — step DOWN the canvas ladder, the deepest,
+-    // quadratic-on-every-pass lever. The old condition fired at renderScale
+-    // 0.25, one rung early; the campaign's cost-matched A/B says that rung
+-    // belongs to renderScale (full canvas at renderScale 0.2 beats canvas 0.85
+-    // at renderScale 0.2: rmse 9.53 vs 11.42 museum, 7.05 vs 8.98 tokyo, and
+-    // sharpRatio 0.96 vs 0.65-0.69 in both), so renderScale now walks all the
+-    // way to its floor before the canvas is touched at all.
+-    if (
+-      ratio > dbHi &&
+-      s <= 0.2 &&
+-      this._renderScale <= 0.2 &&
+-      this.canvasScaleHook &&
+-      this._canvasLevelIdx < RealtimeRaytracer.CANVAS_LEVELS.length - 1
+-    ) {
+-      this._canvasLevelIdx++;
+-      this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx]);
+-      this._recordChange(-1, now); // deeper downscale = quality down
+-      this._qEma = null; // cost profile changed — measure fresh
+-      console.info(
+-        `three-realtime-rt: adaptive quality → ${Math.round(
+-          RealtimeRaytracer.CANVAS_LEVELS[this._canvasLevelIdx] * 100
+-        )}% canvas`
+-      );
++    if (slow) {
++      this._qFastStreak = 0;
++      // STEP 1 (down): the free wins, before any resolution is given up.
++      if (this._takeFreeWins(now)) return;
++
++      // Proportional step, on whichever clock is the more alarmed. Lighting cost
++      // ≈ scale², so the correction is a damped power of the error.
++      const err = Math.max(wall, util == null ? 0 : util);
++      let s = this._renderScale * Math.pow(1 / err, 0.35);
++      // Per-step clamp. Now that multi-hundred-millisecond frames feed the EMA, a
++      // single very slow measurement (err can reach ~100 at dt 2s) would
++      // otherwise slam the scale from 1.0 to the 0.2 floor in ONE step and throw
++      // away the image on a transient. Move at most MAX_SCALE_STEP per adaptation
++      // (5 ladder steps) and let the cooldown take the next one if it is still slow.
++      s = Math.max(this._renderScale - RealtimeRaytracer.MAX_SCALE_STEP, s);
++      s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
++
++      // When renderScale has ALREADY BOTTOMED OUT — it is at the 0.2 floor, not
++      // merely near it — step DOWN the canvas ladder, the deepest,
++      // quadratic-on-every-pass lever. The old condition fired at renderScale
++      // 0.25, one rung early; the campaign's cost-matched A/B says that rung
++      // belongs to renderScale (full canvas at renderScale 0.2 beats canvas 0.85
++      // at renderScale 0.2: rmse 9.53 vs 11.42 museum, 7.05 vs 8.98 tokyo, and
++      // sharpRatio 0.96 vs 0.65-0.69 in both), so renderScale walks all the way
++      // to its floor before the canvas is touched at all.
++      if (
++        s <= 0.2 &&
++        this._renderScale <= 0.2 &&
++        this.canvasScaleHook &&
++        this._canvasLevelIdx < RealtimeRaytracer.CANVAS_LEVELS.length - 1
++      ) {
++        this._setCanvasLevel(this._canvasLevelIdx + 1, -1, now);
++        return;
++      }
++      if (this._renderScale - s < 0.045) return;
++      this._commitScale(s, -1, now);
+       return;
+     }
+ 
+-    // STEP 3 (up): the free wins are the LAST thing handed back, and the bar for
+-    // handing them back is deliberately much higher than for any other step:
+-    //
+-    //   - the canvas is whole and renderScale is at its CEILING, so there is
+-    //     nothing cheaper left to restore (LIFO with the descent), and
+-    //   - the frame is running at DOUBLE the headroom an ordinary up-step needs
+-    //     (ratio < 0.5, i.e. under half the target frame period), for two
+-    //     consecutive adaptations.
+-    //
+-    // Measured, not guessed: with a plain `ratio < dbLo` test this oscillated —
+-    // take, return, take, return, three cycles in twenty seconds on the tokyo
+-    // scene — because giving the wins back makes the frame 10-27% slower, which
+-    // lands straight back in "slow". They are cheaper AND no worse, so holding
+-    // them one level too long costs nothing and churning them costs a reset
+-    // every two seconds.
+-    if (ratio < dbLo) this._qFastStreak = (this._qFastStreak || 0) + 1;
+-    else this._qFastStreak = 0;
++    // UP. A dwell first: the headroom has to still be there on the next
++    // adaptation (~2s later) before anything moves. One quiet moment in a heavy
++    // scene is not headroom, it is a pause between two hard frames.
++    this._qFastStreak = (this._qFastStreak || 0) + 1;
++    if (this._qFastStreak < RealtimeRaytracer.GOVERNOR_UP_DWELL) return;
++    this._raiseQuality(now, util, wall);
++  }
++
++  /**
++   * The tracer's GPU cost as a fraction of the frame budget, or null when there
++   * is no usable measurement — which is the fallback path's cue, not an error.
++   *
++   * A timer that is SUPPORTED but silent is treated as broken after
++   * GPU_STALE_MS and abandoned for good, because the alternative is a governor
++   * that waits forever for a number and never adapts again. GPU_DISJOINT (a
++   * clock change, a context switch away from the tab) legitimately empties the
++   * window, so short gaps are normal and only a sustained one counts.
++   */
++  _gpuUtilisation(now, budget) {
++    // gpuTimingActive (not the raw _gpuActive) so that `rt.gpuTiming = false` at
++    // runtime really does move the governor onto the probe path: the two must
++    // agree, or the governor lands in a dead zone where it has no measurement
++    // AND does not think it needs to probe. Observed exactly that. Turning it
++    // off leaves the timer allocated and running (one begin/end pair per frame);
++    // pass gpuTiming: false to the constructor to not build it at all.
++    if (!this.gpuTimingActive) return null;
++    const ms = this._gpuTimer.costMs;
++    if (ms == null) {
++      if (this._gpuNullSince == null) this._gpuNullSince = now;
++      else if (now - this._gpuNullSince > RealtimeRaytracer.GPU_STALE_MS) {
++        this._gpuGaveUp = true;
++        console.info(
++          "three-realtime-rt: GPU timing stopped returning results — adaptive " +
++            "quality falls back to speculative probing for headroom."
++        );
++      }
++      return null;
++    }
++    this._gpuNullSince = null;
++    return ms / budget;
++  }
++
++  /** Predicted cost multiplier of moving renderScale from `from` to `to`. */
++  static _scaleStepCost(from, to) {
++    let m = 1 + RealtimeRaytracer.SCALE_COST_SHARE * ((to / from) ** 2 - 1);
++    // Crossing 0.55 also switches direct lighting from stochastic (one light per
++    // pixel per frame) to the full per-light loop, which no resolution model
++    // sees. Charge for it, generously: in this game's great hall the full loop
++    // against stochastic is the difference between one shadow ray and 23.
+     if (
+-      ratio < 0.5 &&
+-      this._qFastStreak >= 2 &&
+-      this._qFreeWins &&
+-      this._canvasLevelIdx === 0 &&
+-      this._renderScale >= 1 &&
+-      this._releaseFreeWins(now)
++      RealtimeRaytracer._qualityFor(to).stochasticLights !==
++      RealtimeRaytracer._qualityFor(from).stochasticLights
+     ) {
+-      return;
++      m *= RealtimeRaytracer.STOCHASTIC_STEP_FACTOR;
+     }
++    return m;
++  }
+ 
+-    if (Math.abs(s - this._renderScale) < 0.045) return;
++  /**
++   * One rung UP, in the exact reverse of the descent's spending order, and at
++   * most one rung per call. Returns true if anything moved.
++   *
++   * LIFO with the descent: canvas scale is restored first (the coarsest and
++   * most valuable resolution, quadratic on every pass), then renderScale one
++   * 0.05 rung at a time, and the free wins last of all — they are cheaper AND
++   * no worse than what they replace, so they are the last thing worth paying
++   * resolution for.
++   */
++  _raiseQuality(now, util, wall) {
++    const L = RealtimeRaytracer.CANVAS_LEVELS;
++    if (this.canvasScaleHook && this._canvasLevelIdx > 0) {
++      const from = this._canvasLevelIdx;
++      return this._takeUpStep("canvas", from, (L[from - 1] / L[from]) ** 2, util, now);
++    }
++    if (this._renderScale < 1) {
++      const from = this._renderScale;
++      const to = RealtimeRaytracer._scaleUpFrom(from);
++      return this._takeUpStep("scale", from, RealtimeRaytracer._scaleStepCost(from, to), util, now);
++    }
++    // The free wins are the LAST thing handed back, and the bar is deliberately
++    // much higher than for any other step: nothing cheaper is left to restore
++    // (canvas whole, renderScale at its ceiling) AND the frame is running at
++    // DOUBLE the headroom an ordinary up-step needs. Measured, not guessed:
++    // with a plain "we are fast" test this oscillated — take, return, take,
++    // return, three cycles in twenty seconds on the tokyo scene — because giving
++    // the wins back makes the frame 10-27% slower, which lands straight back in
++    // "slow". They are cheaper AND no worse, so holding them one level too long
++    // costs nothing and churning them costs a reset every two seconds.
++    const doubled = util != null ? util < 0.5 : wall < 0.5;
++    if (doubled && this._qFreeWins && this._canvasLevelIdx === 0 && this._renderScale >= 1) {
++      return this._releaseFreeWins(now);
++    }
++    return false;
++  }
++
++  /** The next renderScale rung above `from`, on the 0.05 ladder. */
++  static _scaleUpFrom(from) {
++    return Math.min(1, Math.round((from + RealtimeRaytracer.MAX_SCALE_UP_STEP) * 20) / 20);
++  }
++
++  /**
++   * Take one up-step — either committed on the strength of the prediction, or
++   * TAKEN AS A PROBE and judged on what it actually costs. Returns true if
++   * anything moved.
++   *
++   * Three outcomes, and which one applies is the whole ascent policy:
++   *
++   *   predicted <= target        commit. The measurement says this fits with
++   *                              room to spare; there is nothing to find out.
++   *   target < predicted <= ceil commit AS A PROBE. The model is not accurate
++   *                              enough to settle a borderline step (it is
++   *                              deliberately conservative: a quadratic charged
++   *                              for a renderScale rung that measures 0.35-0.84
++   *                              quadratic), so measure the real thing and put
++   *                              it back if the answer is no. Rate-limited by
++   *                              the same exponential backoff the no-timer path
++   *                              uses, so a step that keeps failing stops being
++   *                              retried.
++   *   predicted > ceil           refuse. Even a generous reading of the model
++   *                              says this does not fit; probing it would just
++   *                              be 1.5s of dropped frames to learn that.
++   *
++   * With no GPU measurement at all (Safari/iOS) every up-step lands in the
++   * middle case: trying it IS the only test available.
++   */
++  _takeUpStep(kind, from, mult, util, now) {
++    const target = this._qOscillating
++      ? RealtimeRaytracer.GPU_TARGET_UTIL_OSC
++      : RealtimeRaytracer.GPU_TARGET_UTIL;
++    const predicted = util == null ? null : util * mult;
++    const speculative = predicted == null || predicted > target;
++    if (speculative) {
++      if (predicted != null && predicted > RealtimeRaytracer.GPU_PROBE_CEIL) return false;
++      // Re-probing THE SAME rung that just failed is what would turn probing
++      // into oscillation, so that case waits out the doubling backoff measured
++      // from the failure. Any OTHER step only waits the base quiet period —
++      // which is what lets a recovery from a transient climb 0.20 -> 0.25 ->
++      // 0.30 -> 0.35 briskly and then stop, rather than being slowed by a
++      // backoff earned at a rung it has not reached yet.
++      const f = this._qProbeFail;
++      const repeat = !!f && f.kind === kind && f.from === from;
++      const since = now - (repeat ? f.at : this._qLastChange);
++      if (since < (repeat ? this._qProbeBackoff : RealtimeRaytracer.PROBE_BASE_MS)) {
++        return false;
++      }
++    }
++    const ema = this._qEma;
++    if (kind === "canvas") this._setCanvasLevel(from - 1, 1, now);
++    else this._commitScale(RealtimeRaytracer._scaleUpFrom(from), 1, now);
++    if (speculative) {
++      this._qProbe = { kind, from, at: now, ema };
++      console.info(
++        `three-realtime-rt: adaptive quality → that ${kind} step is a PROBE ` +
++          `(predicted ${predicted == null ? "unknown" : Math.round(predicted * 100) + "%"} ` +
++          "of frame budget); it will be reverted if it does not pay"
++      );
++    }
++    return true;
++  }
+ 
+-    const dir = Math.sign(s - this._renderScale);
++  /** Commit a renderScale rung, with the quality ladder that goes with it. */
++  _commitScale(s, dir, now) {
+     const q = RealtimeRaytracer._qualityFor(s);
+     this.denoiseIterations = q.denoiseIterations;
+     this.stochasticLights = q.stochasticLights;
+     this.renderScale = s; // reallocates targets, carrying history over (no reset)
+     this._recordChange(dir, now);
+-    this._qEma = null; // cost profile changed — measure fresh
++    this._freshMeasurement();
+     console.info(
+       `three-realtime-rt: adaptive quality → ${Math.round(s * 100)}% lighting, ` +
+         `${q.denoiseIterations} denoise passes, ` +
+@@ -2146,6 +2793,120 @@
+     );
+   }
+ 
++  /** Commit a canvas-ladder rung through the app's hook. */
++  _setCanvasLevel(idx, dir, now) {
++    this._canvasLevelIdx = idx;
++    this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[idx]);
++    this._recordChange(dir, now);
++    this._freshMeasurement();
++    console.info(
++      `three-realtime-rt: adaptive quality → ${Math.round(
++        RealtimeRaytracer.CANVAS_LEVELS[idx] * 100
++      )}% canvas`
++    );
++  }
++
++  /** The cost profile just changed: throw away both clocks' history so the next
++   *  decision measures the new regime rather than a blend of both. */
++  _freshMeasurement() {
++    this._qEma = null;
++    this._gpuNullSince = null;
++    if (this._gpuTimer) this._gpuTimer.reset();
++  }
++
++  /**
++   * Verdict on an in-flight probe: keep it, or put it back and wait longer.
++   *
++   * WHY PROBING EXISTS AT ALL. On a platform with no timer extension — Safari
++   * and iOS withhold EXT_disjoint_timer_query_webgl2, and this library ships to
++   * iPad — raising one rung and looking at what happens is the only test
++   * available. Under a vsync cap it is a better test than it sounds, because the
++   * cap quantises the answer: a step the GPU can absorb leaves the frame time at
++   * the refresh period, and a step it cannot immediately doubles it. The cost of
++   * being wrong is bounded to PROBE_SETTLE_MS of degraded frames, and the
++   * exponential backoff means a machine with nothing to spare stops paying that
++   * cost within a minute.
++   *
++   * Not probed: the free wins. They are cheaper AND no worse than what they
++   * replace, so the only thing a probe could discover is that giving them back
++   * made the frame slower, which is already known.
++   */
++  _judgeProbe(now, wall, util) {
++    const p = this._qProbe;
++    if (now - p.at < RealtimeRaytracer.PROBE_SETTLE_MS) return;
++    if (this._qEma == null) return; // no post-probe measurement yet
++    // Where a GPU measurement exists it is the verdict, because it is the
++    // quantity the step actually changed: the wall clock at the new level is
++    // pinned to the refresh period again the moment the step fits, so it cannot
++    // tell "fits comfortably" from "fits by a hair".
++    if (util != null) {
++      const overUtil = util > (this._qOscillating
++        ? RealtimeRaytracer.GPU_BUDGET_DROP_OSC
++        : RealtimeRaytracer.GPU_BUDGET_DROP);
++      this._qProbe = null;
++      if (!overUtil && wall <= (this._qOscillating ? 1.24 : 1.12)) {
++        this._acceptProbe(p, now);
++        console.info(
++          "three-realtime-rt: adaptive quality → probe held at " +
++            `${Math.round(util * 100)}% of the GPU frame budget`
++        );
++        return;
++      }
++      this._revertProbe(p, now);
++      return;
++    }
++    // No GPU measurement: two ways to fail, because either alone misses a case.
++    // An absolute test (the frame is now over budget) catches a probe that
++    // pushed a comfortable frame over the line, and a relative one (the frame
++    // got materially slower than it was) catches a display whose cap is well
++    // above targetFps, where a real slowdown can happen without ever crossing
++    // the budget.
++    const overBudget = wall > (this._qOscillating ? 1.24 : 1.12);
++    const degraded =
++      p.ema != null && this._qEma > p.ema * RealtimeRaytracer.PROBE_FAIL_RATIO;
++    this._qProbe = null;
++    if (!overBudget && !degraded) {
++      this._acceptProbe(p, now);
++      console.info("three-realtime-rt: adaptive quality → probe held (no frame-time cost)");
++      return;
++    }
++    this._revertProbe(p, now);
++  }
++
++  /** Keep a probe. The backoff is only forgiven if THIS was the step that had
++   *  been failing — a success one rung lower says nothing about the rung above,
++   *  and clearing it there is what made a failing rung get retried every 16s. */
++  _acceptProbe(p, now) {
++    const f = this._qProbeFail;
++    if (f && f.kind === p.kind && f.from === p.from) {
++      this._qProbeFail = null;
++      this._qProbeBackoff = RealtimeRaytracer.PROBE_BASE_MS;
++    }
++    // Start the next quiet period from the VERDICT, not from the step, so a
++    // successful probe is followed by a full interval at the new level before
++    // the next one is attempted.
++    this._qLastChange = now;
++  }
++
++  /** Undo a failed probe and back off, so a step that cannot be paid for is
++   *  retried at 8s, 16s, 32s ... rather than every quiet moment. */
++  _revertProbe(p, now) {
++    if (p.kind === "canvas") this._setCanvasLevel(p.from, -1, now);
++    else this._commitScale(p.from, -1, now);
++    const repeat =
++      this._qProbeFail && this._qProbeFail.kind === p.kind && this._qProbeFail.from === p.from;
++    this._qProbeBackoff = repeat
++      ? Math.min(RealtimeRaytracer.PROBE_MAX_MS, this._qProbeBackoff * 2)
++      : RealtimeRaytracer.PROBE_BASE_MS * 2;
++    this._qProbeFail = { kind: p.kind, from: p.from, at: now };
++    console.info(
++      "three-realtime-rt: adaptive quality → probe reverted (frame time " +
++        `${p.ema == null ? "?" : p.ema.toFixed(1)} → ` +
++        `${this._qEma == null ? "?" : this._qEma.toFixed(1)} ms); ` +
++        `next probe in ${Math.round(this._qProbeBackoff / 1000)}s`
++    );
++  }
++
+   /**
+    * Normalized screen motion for this frame, 0 (parked) .. 1 (>= motionRefUv).
+    *
+@@ -2203,6 +2964,37 @@
+     this._qLastChange = now;
+   }
+ 
++  // Apply the motion-vector option to every stage. The G-buffer (the expensive
++  // part — it reallocates targets and recompiles programs) is only touched when
++  // the effective on/off state changes; the per-stage consumer switches are a
++  // cheap uniform write and are pushed every frame so `_motionAccum/_motionRestir/
++  // _motionTaa` (measurement isolation) and the live `motionVectors` toggle both
++  // take effect.
++  _syncMotionVectors() {
++    const want = !!(this.motionVectors && this.motionVectorsSupported);
++    if (want !== this._motionVectorsActive) {
++      this._motionVectorsActive = want;
++      this.gbuffer.setMotionVectors(want);
++      if (!want) this._prevModelMatrices.clear();
++      this.resetAccumulation();
++      if (this.motionVectors && !this.motionVectorsSupported && !this._motionWarned) {
++        this._motionWarned = true;
++        console.warn(
++          "three-realtime-rt: motionVectors requested but this GPU lacks the " +
++            "5-attachment motion MRT (needs MAX_DRAW_BUFFERS >= 5) — falling back " +
++            "to camera-only reprojection."
++        );
++      }
++    }
++    if (this._motionVectorsActive) {
++      this.gbuffer.setPrevModelMatrices(this._prevModelMatrices);
++      this.gbuffer.setMotionMatrices(this._prevViewProj);
++    }
++    this.accumulatePass.setMotionVectors(this._motionVectorsActive && this._motionAccum);
++    this.restirPass.setMotionVectors(this._motionVectorsActive && this._motionRestir);
++    this.taaPass.setMotionVectors(this._motionVectorsActive && this._motionTaa);
++  }
++
+   render(scene, camera) {
+     if (!this.supported) {
+       this.renderer.render(scene, camera);
+@@ -2236,6 +3028,12 @@
+     }
+ 
+     this.frame += 1;
++    // Open the GPU timing region around EVERYTHING this renderer submits. It
++    // measures the tracer's own GPU milliseconds, which is the quantity the
++    // governor actually controls; the browser's compositing and any draws the
++    // app makes outside render() are deliberately outside it and are paid for
++    // out of the budget margin (GPU_BUDGET_DROP < 1). No-op when unsupported.
++    if (this._gpuTimer) this._gpuTimer.begin();
+     // Cheap periodic check that no STATIC mesh was edited behind the BVH's back.
+     if (this.frame % RealtimeRaytracer.STALE_CHECK_FRAMES === 0) this._checkStale();
+     camera.updateMatrixWorld();
+@@ -2292,6 +3090,10 @@
+       .copy(proj)
+       .multiply(camera.matrixWorldInverse);
+ 
++    // Motion-vector plumbing: needs this frame's VP (above) and last frame's
++    // (still in _prevViewProj, copied at the END of the previous render).
++    this._syncMotionVectors();
++
+     const prevAutoClear = this.renderer.autoClear;
+     this.renderer.autoClear = false;
+ 
+@@ -2358,6 +3160,23 @@
+     rtU.uIor.value = this.ior;
+     rtU.uDispersion.value = Math.min(0.5, Math.max(0, this.dispersion));
+     rtU.uLightStochastic.value = this.stochasticLights;
++    // ReSTIR direct samples per pixel (1 = one winner, one shadow ray — the
++    // shipped behaviour). Read every frame so it can be changed at runtime.
++    rtU.uRestirSamples.value = Math.max(1, Math.min(4, this.restirSamples | 0));
++    rtU.uRestirTapRadius.value = Math.max(2, this.restirSampleRadius);
++    // Cold-pixel exact fallback threshold, in frames of reservoir history. Read
++    // every frame like the two above, so it is a live knob rather than a
++    // construction-time one. 0 = off.
++    rtU.uRestirWarmAge.value = Math.max(0, this.restirWarmAge || 0);
++    // Relative firefly cap on the ReSTIR direct term, same live-knob treatment.
++    // 0 = off = the absolute cap alone. The reservoir pass writes the p̂ total
++    // this scales unconditionally, so nothing has to be kept in step.
++    rtU.uRestirClampRel.value = Math.max(0, this.restirClampRel || 0);
++    // Directional-light bypass, read every frame so it is a live A/B knob. The
++    // lighting pass and the reservoir pass MUST agree: the shader shades
++    // directional lights exactly whenever this is on, and the reservoir must
++    // then refuse to select them, or the sun is counted twice.
++    rtU.uDirBypass.value = !!this.restirDirectionalBypass;
+     rtU.uSkyEnabled.value = this.sky.enabled;
+     rtU.uSunDir.value.copy(this.sky.sunDir);
+     rtU.uSunColor.value.copy(this.sky.sunColor);
+@@ -2375,6 +3194,15 @@
+       // Emissive candidates follow the emissiveNEE toggle — without this the
+       // reservoir keeps proposing panel samples the user has switched off.
+       this.restirPass.setEmissiveCount(this.emissiveNEE ? this.compiled.emissiveTriCount : 0);
++      this.restirPass.setDynamic(this.restirDynamicAccept, this.restirDynamicFreeze);
++      this.restirPass.setDirectionalBypass(this.restirDirectionalBypass);
++      this.restirPass.setReprojectionRescue(this.restirReprojectionRescue);
++      // Candidates drawn by power instead of uniformly, and the emissive half of
++      // that following the SAME importance toggle the exact path uses. If the
++      // two disagree about a triangle's pick probability, the reservoir weights
++      // by one pdf and the estimator converges to the other one's answer.
++      this.restirPass.setCandidateImportance(this.restirCandidateImportance);
++      this.restirPass.setEmissiveImportance(this.emissiveImportance);
+       reservoirTex = this.restirPass.render(
+         this.renderer,
+         this.gbuffer,
+@@ -2382,7 +3210,10 @@
+         this._camWorldPos,
+         this.frame,
+         this.eps,
+-        this.restirMCap + (this.restirMCapMoving - this.restirMCap) * mt
++        this.restirMCap + (this.restirMCapMoving - this.restirMCap) * mt,
++        // THIS frame's jittered VP, for the sub-texel reprojection correction
++        // (the same matrix AccumulatePass gets, for the same reason).
++        this._jitteredViewProj
+       );
+     }
+     // 2b. ReSTIR GI reservoirs (experimental). Runs after the lighting pass's
+@@ -2589,6 +3420,27 @@
+     this._prevViewProj.copy(this._jitteredViewProj);
+     this._prevJitterUv.copy(this._jitterUv);
+ 
++    // Capture each dynamic mesh's world matrix as its "previous-frame model"
++    // for the motion-vector path (rigid transforms only). Done AFTER every pass
++    // so next frame's G-buffer sees THIS frame's transform as "previous". A mesh
++    // the app moves without calling updateDynamic() still updates matrixWorld
++    // inside renderer.render, so the raster stays coherent here even though its
++    // traced BVH is (by contract) stale.
++    if (this._motionVectorsActive && this.compiled && this.compiled.hasDynamic) {
++      for (const seg of this.compiled.dynamic) {
++        let m = this._prevModelMatrices.get(seg.mesh);
++        if (!m) {
++          m = new THREE.Matrix4();
++          this._prevModelMatrices.set(seg.mesh, m);
++        }
++        m.copy(seg.mesh.matrixWorld);
++      }
++    }
++
++    // Close the GPU timing region and harvest whatever results are ready. Never
++    // blocks: GpuTimer only reads a query once the driver reports it available.
++    if (this._gpuTimer) this._gpuTimer.end();
++
+     // Compile-failure diagnosis: every pass program used this frame has now had
+     // its link status checked by three (diagnostics populated on first use), so
+     // scan for failures. Runs at frame END (downstream of the passes) and only
+@@ -2596,6 +3448,30 @@
+     if (!this._diagDone) this._scanPrograms();
+   }
+ 
++  /**
++   * Median GPU milliseconds the tracer spent over the recent window, or null
++   * when the platform has no timer extension (Safari/iOS) or no stable sample
++   * yet. This is the governor's honest headroom signal: unlike the wall-clock
++   * frame time it is not pinned to the display's refresh period.
++   */
++  get gpuCostMs() {
++    return this._gpuTimer ? this._gpuTimer.costMs : null;
++  }
++
++  /** True where EXT_disjoint_timer_query_webgl2 is available and enabled. */
++  get gpuTimingSupported() {
++    return !!(this._gpuTimer && this._gpuTimer.supported);
++  }
++
++  /**
++   * True when the governor is steering on GPU milliseconds. False means it is on
++   * the speculative-probe fallback — either the extension is missing, gpuTiming
++   * was set false, or the timer stopped producing results and was given up on.
++   */
++  get gpuTimingActive() {
++    return this.gpuTiming !== false && this._gpuActive && !this._gpuGaveUp;
++  }
++
+   dispose() {
+     if (!this.supported) return;
+     this.gbuffer.dispose();
+@@ -2609,6 +3485,7 @@
+     this.giReservoirPass.dispose();
+     this._sceneColor.dispose();
+     this._copyPass.dispose();
++    if (this._gpuTimer) this._gpuTimer.dispose();
+     if (this.compiled) this.compiled.dispose();
+   }
+ }
+diff -ruN --strip-trailing-cr rt-pristine/src/RestirPass.js rt-local/src/RestirPass.js
+--- rt-pristine/src/RestirPass.js	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/RestirPass.js	2026-08-15 17:08:25.703506800 -0400
+@@ -1,5 +1,6 @@
+ import * as THREE from "three";
+ import { MAX_LIGHTS } from "./SceneCompiler.js";
++import { makeMRT } from "./mrtCompat.js";
+ 
+ const fullscreenVert = /* glsl */ `
+ out vec2 vUv;
+@@ -18,7 +19,9 @@
+ 
+ uniform sampler2D uGWorldPos;
+ uniform sampler2D uGNormalMetal;
+-uniform sampler2D uMaterialsTex;  // row 1: emissive tris, rows 2..65: blue noise
++uniform sampler2D uMaterialsTex;  // row 1: emissive tris, rows 2..65: blue noise,
++                                  // row 66: the emissive POWER CDF (.x cumulative,
++                                  // .y the triangle's pick probability)
+ uniform vec4 uLightPosType[MAX_LIGHTS];
+ uniform vec4 uLightColorRadius[MAX_LIGHTS];
+ uniform vec4 uLightDirCone[MAX_LIGHTS]; // spot: direction.xyz + cos(outer)
+@@ -27,6 +30,25 @@
+ uniform float uFrame;
+ uniform vec3 uCameraPos;
+ uniform float uEps;
++// >>> RT_RESTIR_DIR_BYPASS
++// Keep DIRECTIONAL lights out of the reservoir entirely (1 = out, 0 = the
++// shipped behaviour). A directional light has a large UNSHADOWED contribution
++// on every surface facing it and is occluded on most interior ones, so its
++// target score wins the RIS draw again and again, the pixel's one visibility
++// ray hits the wall, and the pixel renders black with the odd frame's other
++// winner as a bright speck. The lighting pass shades directional lights
++// exactly instead (RTLightingPass, uDirBypass), so this is not "the sun is
++// dropped", it is "the sun is not gambled on".
++//
++// Zeroing the CONTRIBUTION rather than skipping the pick is deliberate: it
++// zeroes the candidate's weight AND its p̂ as an inherited history or
++// neighbour winner, so a directional light already sitting in a reservoir
++// loses on weight next frame instead of surviving. A wasted uniform pick keeps
++// RIS unbiased (the source pdf is unchanged, the target simply excludes those
++// lights); one directional light in 16-29 wastes 3-6% of candidates. Skipping
++// them at pick time needs a reordered light table and belongs to the port.
++uniform float uDirBypass;
++// <<< RT_RESTIR_DIR_BYPASS
+ 
+ uint gSeed;
+ int gBnDim;
+@@ -93,6 +115,12 @@
+       }
+       return colRad.rgb * (cone * NdotL / (dl * dl)) * (1.0 + restirSpecBoost(N, d / dl, P));
+     }
++    // >>> RT_RESTIR_DIR_BYPASS
++    // Directional light. Zero contribution => zero weight => never selected,
++    // and any history/neighbour reservoir still holding one is re-scored to
++    // zero here and loses. RTLightingPass adds these lights exactly.
++    if (uDirBypass > 0.5) return vec3(0.0);
++    // <<< RT_RESTIR_DIR_BYPASS
+     float NdotL = dot(N, -posType.xyz);
+     if (NdotL <= 0.0) return vec3(0.0);
+     return colRad.rgb * NdotL * (1.0 + restirSpecBoost(N, -posType.xyz, P));
+@@ -131,7 +159,17 @@
+ // TEMPORAL stage. Streams K fresh candidates through a weighted reservoir,
+ // merges with the reprojected previous frame's reservoir. Output encoding
+ // (fed back as history next frame):
+-//   r = candidateId * 64 + min(M, 63), g,b = unused, a = wSum
++//   r = candidateId * 64 + min(M, 63), g = unused, b = age, a = wSum
++//
++// >>> RT_RESTIR_COLD_FALLBACK
++// `age` is the number of CONSECUTIVE frames this reservoir has carried
++// validated history: 0 on the frame a pixel is revealed or its reprojected
++// history is rejected, +1 for every frame the history is actually merged. It is
++// not part of the estimator — nothing here reads it — it exists so the lighting
++// pass can tell a converged reservoir from a newborn one and shade the newborn
++// exactly instead of gambling one visibility ray on 8 uniform candidates out of
++// S. `.g` stays unused and is reserved.
++// <<< RT_RESTIR_COLD_FALLBACK
+ const temporalFrag = /* glsl */ `
+ precision highp float;
+ 
+@@ -140,6 +178,7 @@
+ #define CANDIDATES 8
+ 
+ layout(location = 0) out vec4 outReservoir;
++layout(location = 1) out vec4 outHistory;
+ 
+ in vec2 vUv;
+ 
+@@ -151,16 +190,65 @@
+ // for post-motion ghosting — the reservoir is the pipeline's SECOND temporal
+ // accumulator (after the irradiance EMA) and measurably the slower one.
+ uniform float uMCap;
++// Dynamic-mesh treatments (both default off). uGDynamic is the G-buffer's
++// emissive target: its .a is -1.0 on dynamic-mesh pixels, else 1.0 (or the
++// blend opacity, which is never negative).
++uniform sampler2D uGDynamic;
++uniform float uAcceptDynamic; // change 1: skip the plane test on dynamic pixels
++uniform float uFreezeDynamic; // change 2: pass the prev reservoir through on dynamic pixels
++uniform sampler2D uGMotion;   // G-buffer previous-screen-UV texture (RG32F)
++uniform float uUseMotion;     // 1 = reproject via motion vector, 0 = camera-only
++// >>> RT_RESTIR_REPROJ
++// THIS frame's view-projection, for the sub-texel jitter correction below.
++// AccumulatePass has carried one for the same reason since motion vectors
++// landed; the reservoir never did, which is half of why its history dies on
++// thin geometry.
++uniform mat4 uViewProj;
++// Neighbourhood rescue (1 = on). When the plane test at the reprojected texel
++// fails, try the four axis neighbours before declaring the history dead.
++uniform float uReprojRescue;
++uniform vec2 uTexelSizeT;     // 1 / reservoir resolution
++// <<< RT_RESTIR_REPROJ
++// >>> RT_RESTIR_CAND_CDF
++// CANDIDATES DRAWN THE WAY NEE DRAWS THEM (1 = on, 0 = the shipped uniform pick,
++// byte for byte). Stock streams its 8 candidates UNIFORMLY out of S = lights +
++// emissive triangles, so in the great hall a bulb triangle is a 1-in-282 pick and
++// most picks are shade / TV / candle triangles that contribute nothing to this
++// pixel: a cold reservoir holds 8 near-useless candidates. The exact path has
++// never had that problem: sampleEmissiveTri importance-samples the emissive set
++// through the power CDF on row 66, so this makes the reservoir draw from the
++// same distribution: pick the POOL by power, then the member by its own CDF.
++//
++// RIS stays unbiased for ANY source pdf whose support covers the target's, and
++// this one does: every candidate the uniform pick could produce still has
++// non-zero probability, except directional lights when uDirBypass is on, which
++// score p_hat = 0 anyway (candidateContribution returns zero for them). Those two
++// facts are wired to the same switch on purpose. See RestirPass._rebuildPools,
++// which zeroes exactly the lights candidateContribution zeroes.
++uniform float uCandidateCDF;
++// P(draw from the analytic-light pool) = PL / (PL + PE), clamped to [0.1, 0.9]
++// when both pools carry power, 1 or 0 when only one does. Computed CPU-side.
++uniform float uPoolSplit;
++// Per-light power CDF: .x cumulative (the last active light is forced to 1.0),
++// .y that light's pick probability. Same layout as row 66, deliberately.
++uniform vec2 uLightCdf[MAX_LIGHTS];
++// Mirrors RTLightingPass.uEmissiveCDF: when the game switches emissive
++// importance sampling off, the reservoir's emissive picks go uniform too, so the
++// two estimators keep agreeing about what a triangle's pick probability is.
++uniform bool uEmissiveCDF;
++// <<< RT_RESTIR_CAND_CDF
+ 
+ void main() {
+   vec4 wp = texture(uGWorldPos, vUv);
+   if (wp.w < 0.5) {
+     outReservoir = vec4(0.0);
++    outHistory = vec4(0.0);
+     return;
+   }
+   vec3 P = wp.xyz;
+   vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
+   gRestirRough = clamp(wp.w - 1.0, 0.0, 1.0);
++  float isDynamic = texture(uGDynamic, vUv).a < 0.0 ? 1.0 : 0.0;
+ 
+   ivec2 px = ivec2(gl_FragCoord.xy);
+   gSeed = uint(px.x) * 3079u + uint(px.y) * 9277u + uint(uFrame) * 26699u;
+@@ -171,6 +259,7 @@
+   int S = uLightCount + uEmissiveCount; // uniform source pool
+   if (S == 0) {
+     outReservoir = vec4(0.0);
++    outHistory = vec4(0.0);
+     return;
+   }
+ 
+@@ -178,44 +267,179 @@
+   float wSum = 0.0;
+   float M = 0.0;
+   for (int k = 0; k < CANDIDATES; k++) {
+-    int pick = min(int(rand() * float(S)), S - 1);
+-    float id = pick < uLightCount
+-      ? float(pick)
+-      : float(MAX_LIGHTS + (pick - uLightCount));
+-    // source pdf = 1/S -> RIS weight = p̂ * S
+-    float w = phatOf(id, P, N) * float(S);
++    float id;
++    // 1 / source pdf, kept as the reciprocal so the stock branch is literally
++    // the multiply it always was (p̂ * S) rather than a divide that rounds
++    // differently. ONE phatOf call site, as ever.
++    float invPdf;
++    // >>> RT_RESTIR_CAND_CDF
++    if (uCandidateCDF > 0.5) {
++      // RNG BUDGET: 3 draws per candidate (pool, member, reservoir selection)
++      // instead of 2. The blue-noise tile only carries 4 dimensions, so it runs
++      // out one candidate sooner and PCG takes over; that is fine, the first
++      // candidate is the one worth decorrelating.
++      if (rand() < uPoolSplit) {
++        // ANALYTIC LIGHT, by the power CDF. Linear scan with a running compare:
++        // MAX_LIGHTS is 32 and this is a uniform array, so a binary search would
++        // index it dynamically too and buy nothing. The last active entry is
++        // 1.0 and rand() < 1.0, so this always terminates on a real light.
++        float u = rand();
++        int li = 0;
++        for (int j = 0; j < MAX_LIGHTS; j++) {
++          if (j >= uLightCount) break;
++          li = j;
++          if (u <= uLightCdf[j].x) break;
++        }
++        id = float(li);
++        invPdf = 1.0 / max(uPoolSplit * uLightCdf[li].y, 1e-12);
++      } else {
++        // EMISSIVE TRIANGLE, by the SAME 8-step binary search over row 66 that
++        // RTLightingPass.sampleEmissiveTri runs, and honouring uEmissiveCDF the
++        // same way it does.
++        int idx;
++        float pTri;
++        if (uEmissiveCDF) {
++          float u = rand();
++          int lo = 0;
++          int hi = uEmissiveCount - 1;
++          for (int s = 0; s < 8; s++) {
++            if (lo >= hi) break;
++            int mid = (lo + hi) >> 1;
++            if (u > texelFetch(uMaterialsTex, ivec2(mid, 66), 0).x) lo = mid + 1;
++            else hi = mid;
++          }
++          idx = lo;
++          pTri = texelFetch(uMaterialsTex, ivec2(idx, 66), 0).y;
++        } else {
++          idx = min(int(rand() * float(uEmissiveCount)), uEmissiveCount - 1);
++          pTri = 1.0 / float(uEmissiveCount);
++        }
++        id = float(MAX_LIGHTS + idx);
++        invPdf = 1.0 / max((1.0 - uPoolSplit) * pTri, 1e-12);
++      }
++    } else {
++    // <<< RT_RESTIR_CAND_CDF
++      int pick = min(int(rand() * float(S)), S - 1);
++      id = pick < uLightCount
++        ? float(pick)
++        : float(MAX_LIGHTS + (pick - uLightCount));
++      invPdf = float(S); // source pdf = 1/S -> RIS weight = p̂ * S
++    }
++    float w = phatOf(id, P, N) * invPdf;
+     wSum += w;
+     M += 1.0;
+     if (w > 0.0 && rand() * wSum < w) { rId = id; }
+   }
+ 
+-  // temporal reuse: previous reservoir as ONE candidate carrying its history
+-  vec4 clip = uPrevViewProj * vec4(P, 1.0);
+-  if (clip.w > 0.0) {
+-    vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5;
+-    if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
+-      vec4 prevPos = texture(uPrevGWorldPos, prevUv);
+-      float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
+-      if (prevPos.w > 0.5 && abs(dot(P - prevPos.xyz, N)) < tol) {
+-        vec4 h = texture(uPrevReservoir, prevUv);
+-        // Staleness cap; ALSO keeps total M within the 6 bits the encoding
+-        // stores (8 fresh + 40 history < 64).
+-        float hM = min(mod(h.r, 64.0), uMCap);
+-        float hId = floor(h.r / 64.0);
+-        if (hM > 0.0 && h.a > 0.0) {
+-          // RIS weight = p̂_now · W_prev · M_prev; with p̂_prev ≈ p̂_now on a
+-          // validated surface this reduces to (wSum/M)·M.
+-          float hPhat = phatOf(hId, P, N);
+-          float w = hPhat > 0.0 ? (h.a / max(mod(h.r, 64.0), 1.0)) * hM : 0.0;
+-          wSum += w;
+-          M += hM;
+-          if (w > 0.0 && rand() * wSum < w) { rId = hId; }
+-        }
++  // temporal reuse: previous reservoir as ONE candidate carrying its history.
++  // Reprojection is via the G-buffer motion vector (uUseMotion) or camera-only
++  // (uPrevViewProj * P); both yield prevUv for the same validation below. The
++  // G-buffer stores the surface's PREVIOUS screen UV directly, so the reservoir
++  // (which has no vUv-based jitter correction) samples it as-is — bit-identical
++  // to the camera-only path for static geometry. The camera-only branch keeps
++  // the old clip.w guard (prevUv = -1 drops the bounds test), matching stock
++  // byte-for-byte.
++  // >>> RT_RESTIR_COLD_FALLBACK
++  // Age starts at zero every frame and only survives through the merge branch
++  // below, so a rejected history, a reprojection off screen, and a first frame
++  // all read as "cold" without a special case for any of them.
++  float age = 0.0;
++  // <<< RT_RESTIR_COLD_FALLBACK
++  vec2 prevUv;
++  // >>> RT_RESTIR_REPROJ
++  // SUB-TEXEL CORRECTION, mirroring AccumulatePass line for line. The G-buffer
++  // sample under this reservoir texel is TAA-jittered, so P does NOT project to
++  // the centre of this texel: it projects to vUv + (cu - vUv). Reprojecting P
++  // through the previous VP therefore lands up to a texel off the surface it
++  // came from, and at reservoir resolution one texel is the width of a
++  // baluster. Subtracting the offset makes the lookup follow the surface
++  // instead of the grid. Zero when the option is off, which is what keeps the
++  // shipped path byte-identical.
++  vec2 subTexel = vec2(0.0);
++  if (uReprojRescue > 0.5) {
++    vec4 clipC = uViewProj * vec4(P, 1.0);
++    if (clipC.w > 0.0) subTexel = ((clipC.xy / clipC.w) * 0.5 + 0.5) - vUv;
++  }
++  // <<< RT_RESTIR_REPROJ
++  if (uUseMotion > 0.5) {
++    prevUv = texture(uGMotion, vUv).xy - subTexel;
++  } else {
++    vec4 clip = uPrevViewProj * vec4(P, 1.0);
++    prevUv = clip.w > 0.0 ? ((clip.xy / clip.w) * 0.5 + 0.5) - subTexel : vec2(-1.0);
++  }
++  if (prevUv.x >= 0.0 && prevUv.x <= 1.0 && prevUv.y >= 0.0 && prevUv.y <= 1.0) {
++    vec4 prevPos = texture(uPrevGWorldPos, prevUv);
++    float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
++    // The plane test is only a surface-identity check — visibility is resolved
++    // later at shading, so relaxing it for dynamic pixels changes nothing about
++    // correctness of the estimator, only whether the co-located wall's history
++    // may be offered as a candidate. Its light is re-evaluated at THIS surface
++    // below, so a genuinely wrong inherited light loses on weight, not on a
++    // hard test.
++    bool dynOk = (uAcceptDynamic > 0.5 && isDynamic > 0.5);
++    bool surfaceOk = abs(dot(P - prevPos.xyz, N)) < tol || dynOk;
++    bool histOk = prevPos.w > 0.5 && surfaceOk;
++    // >>> RT_RESTIR_REPROJ
++    // NEIGHBOURHOOD RESCUE. Even corrected, one texel of the previous frame is
++    // one sample of a jittered G-buffer: on a baluster or a handrail edge the
++    // surface that owns this pixel now sat in the texel NEXT DOOR last frame,
++    // the plane test fails, and the reservoir restarts from eight uniform
++    // candidates every single frame. (Measured before this: 22% of shaded
++    // pixels never reach age 12 at a frozen pose, as a stipple tracing exactly
++    // the balusters, handrail, chandelier arms and picture frames.) So before
++    // declaring the history dead, look at the four axis neighbours and take the
++    // one whose surface agrees best with this one. Bounded on purpose: four
++    // extra uPrevGWorldPos fetches, still ONE uPrevReservoir fetch, no search.
++    vec2 useUv = prevUv;
++    if (!histOk && uReprojRescue > 0.5) {
++      float best = tol;
++      for (int k = 0; k < 4; k++) {
++        vec2 off = k == 0 ? vec2(1.0, 0.0)
++                 : k == 1 ? vec2(-1.0, 0.0)
++                 : k == 2 ? vec2(0.0, 1.0)
++                 : vec2(0.0, -1.0);
++        vec2 nUv = prevUv + off * uTexelSizeT;
++        if (nUv.x < 0.0 || nUv.x > 1.0 || nUv.y < 0.0 || nUv.y > 1.0) continue;
++        vec4 np = texture(uPrevGWorldPos, nUv);
++        if (np.w < 0.5) continue;
++        float d = abs(dot(P - np.xyz, N));
++        if (d < best) { best = d; useUv = nUv; histOk = true; }
++      }
++    }
++    // <<< RT_RESTIR_REPROJ
++    if (histOk) {
++      vec4 h = texture(uPrevReservoir, useUv);
++      // Staleness cap; ALSO keeps total M within the 6 bits the encoding
++      // stores (8 fresh + 40 history < 64).
++      float hM = min(mod(h.r, 64.0), uMCap);
++      float hId = floor(h.r / 64.0);
++      if (hM > 0.0 && h.a > 0.0) {
++        // RIS weight = p̂_now · W_prev · M_prev; with p̂_prev ≈ p̂_now on a
++        // validated surface this reduces to (wSum/M)·M.
++        float hPhat = phatOf(hId, P, N);
++        float w = hPhat > 0.0 ? (h.a / max(mod(h.r, 64.0), 1.0)) * hM : 0.0;
++        wSum += w;
++        M += hM;
++        if (w > 0.0 && rand() * wSum < w) { rId = hId; }
++        // >>> RT_RESTIR_COLD_FALLBACK
++        // This is the one branch where history genuinely carried over, so it is
++        // the one place age may advance. h.b IS the previous frame's age at the
++        // reprojected texel. 255 is a float ceiling, not an encoding limit.
++        age = min(h.b + 1.0, 255.0);
++        // <<< RT_RESTIR_COLD_FALLBACK
+       }
+     }
+   }
+ 
+-  outReservoir = vec4(rId * 64.0 + min(M, 63.0), 0.0, 0.0, wSum);
++  outReservoir = vec4(rId * 64.0 + min(M, 63.0), 0.0, age, wSum);
++  // History is normally the live reservoir, but a dynamic-mesh pixel must NOT
++  // overwrite the wall's history it is covering: pass the previous reservoir at
++  // this pixel through unchanged, so the wall's history survives the aeroplane
++  // crossing it and the trailing edge stops disoccluding. The live reservoir
++  // (attachment 0) still streams the aeroplane's fresh candidates for shading.
++  outHistory = (uFreezeDynamic > 0.5 && isDynamic > 0.5)
++    ? texture(uPrevReservoir, vUv)
++    : outReservoir;
+ }
+ `;
+ 
+@@ -224,7 +448,8 @@
+ // convergence speed and area-light (emissive) noise. Output is consumed by
+ // the lighting pass THIS frame only (never fed back), so it trades the
+ // history encoding for a precomputed weight:
+-//   r = candidateId, g,b = unused, a = W = wSum / (M · p̂centroid)
++//   r = candidateId, g = p̂_total (RT_RESTIR_CLAMP_REL), b = age (passed
++//   through), a = W = wSum / (M · p̂centroid)
+ const spatialFrag = /* glsl */ `
+ precision highp float;
+ 
+@@ -259,6 +484,16 @@
+   float rId = floor(c.r / 64.0);
+   float M = mod(c.r, 64.0);
+   float wSum = c.a;
++  // >>> RT_RESTIR_CLAMP_REL
++  // THIS PIXEL'S OWN ESTIMATE OF THE WHOLE UNSHADOWED LIGHT SUM, before any
++  // neighbour is merged in. wSum/M is the RIS estimate of the integral of the
++  // target function: E[w] = sum over the light set of p̂, whatever the source
++  // pdf. It is written to the output's unused .g so the lighting pass can cap a
++  // firefly RELATIVE to what this pixel could plausibly receive instead of
++  // against a scene-wide constant. Taken from the OWN reservoir on purpose: a
++  // neighbour's total belongs to the neighbour's surface.
++  float pHatTotal = M > 0.0 ? wSum / M : 0.0;
++  // <<< RT_RESTIR_CLAMP_REL
+ 
+   float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
+   for (int k = 0; k < NEIGHBORS; k++) {
+@@ -289,7 +524,18 @@
+ 
+   float phat = phatOf(rId, P, N);
+   float W = (M > 0.0 && phat > 0.0) ? wSum / (M * phat) : 0.0;
+-  outReservoir = vec4(rId, 0.0, 0.0, W);
++  // >>> RT_RESTIR_COLD_FALLBACK
++  // THIS pixel's age, passed straight through. Neighbours' ages are deliberately
++  // not merged: coldness is a property of the pixel, and a cold pixel that
++  // borrowed a warm neighbour's candidate still has one visibility ray on one
++  // guess, which is exactly the estimate the fallback exists to replace.
++  // <<< RT_RESTIR_COLD_FALLBACK
++  // >>> RT_RESTIR_CLAMP_REL
++  // .g was the reserved channel; it now carries p̂_total (see above). Nothing
++  // reads it unless RTLightingPass.uRestirClampRel is non-zero, so writing it
++  // does not change a single shaded pixel on its own.
++  // <<< RT_RESTIR_CLAMP_REL
++  outReservoir = vec4(rId, pHatTotal, c.b, W);
+ }
+ `;
+ 
+@@ -301,8 +547,12 @@
+  */
+ export class RestirPass {
+   constructor(width, height) {
+-    this.targetA = this._makeTarget(width, height);
+-    this.targetB = this._makeTarget(width, height);
++    // Temporal targets are two-attachment MRTs: [0] = live reservoir (consumed
++    // by the spatial stage THIS frame), [1] = history (fed back next frame).
++    // Keeping them separate is what lets change 2 freeze the history under a
++    // dynamic mesh without corrupting this frame's shading.
++    this.targetA = this._makeTemporalTarget(width, height);
++    this.targetB = this._makeTemporalTarget(width, height);
+     this.spatialTarget = this._makeTarget(width, height);
+ 
+     const mkMaterial = (frag, name) =>
+@@ -326,12 +576,30 @@
+           uFrame: { value: 0 },
+           uCameraPos: { value: new THREE.Vector3() },
+           uEps: { value: 1e-3 },
++          // Declared by RESTIR_COMMON, so BOTH stages carry it.
++          uDirBypass: { value: 0.0 },
+           ...(frag === temporalFrag
+             ? {
++                // >>> RT_RESTIR_CAND_CDF
++                // Temporal stage only: the spatial stage draws no fresh
++                // candidates, it only merges reservoirs that already exist.
++                uCandidateCDF: { value: 0.0 },
++                uPoolSplit: { value: 1.0 },
++                uLightCdf: { value: new Float32Array(MAX_LIGHTS * 2) },
++                uEmissiveCDF: { value: true },
++                // <<< RT_RESTIR_CAND_CDF
+                 uPrevReservoir: { value: null },
+                 uPrevGWorldPos: { value: null },
+                 uPrevViewProj: { value: new THREE.Matrix4() },
++                uViewProj: { value: new THREE.Matrix4() },
++                uReprojRescue: { value: 0.0 },
++                uTexelSizeT: { value: new THREE.Vector2(1 / width, 1 / height) },
+                 uMCap: { value: 40 },
++                uGDynamic: { value: null },
++                uAcceptDynamic: { value: 0.0 },
++                uFreezeDynamic: { value: 0.0 },
++                uGMotion: { value: null },
++                uUseMotion: { value: 0.0 },
+               }
+             : {
+                 uReservoirIn: { value: null },
+@@ -367,6 +635,19 @@
+     return t;
+   }
+ 
++  _makeTemporalTarget(width, height) {
++    const t = makeMRT(width, height, 2, {
++      minFilter: THREE.NearestFilter,
++      magFilter: THREE.NearestFilter,
++      format: THREE.RGBAFormat,
++      type: THREE.FloatType,
++      depthBuffer: false,
++      stencilBuffer: false,
++    });
++    for (const tex of t.texture) tex.generateMipmaps = false;
++    return t;
++  }
++
+   setCompiledScene(compiled) {
+     for (const m of [this.material, this.spatialMaterial]) {
+       const u = m.uniforms;
+@@ -377,6 +658,10 @@
+       u.uLightCount.value = compiled.lightCount;
+       u.uEmissiveCount.value = compiled.emissiveTriCount;
+     }
++    // >>> RT_RESTIR_CAND_CDF
++    this._compiled = compiled;
++    this._rebuildPools();
++    // <<< RT_RESTIR_CAND_CDF
+   }
+ 
+   /** Emissive candidates follow the emissiveNEE toggle (set per frame). */
+@@ -385,6 +670,131 @@
+     this.spatialMaterial.uniforms.uEmissiveCount.value = count;
+   }
+ 
++  // >>> RT_RESTIR_CAND_CDF
++  /**
++   * Draw candidates from the same distribution NEE draws from (default off =
++   * the shipped uniform pick over S, byte for byte). See the shader comment on
++   * uCandidateCDF for why, and _rebuildPools for the tables it needs.
++   */
++  setCandidateImportance(enabled) {
++    this.material.uniforms.uCandidateCDF.value = enabled ? 1.0 : 0.0;
++  }
++
++  /** Emissive picks follow the renderer's emissiveImportance toggle. */
++  setEmissiveImportance(enabled) {
++    this.material.uniforms.uEmissiveCDF.value = !!enabled;
++  }
++
++  /**
++   * Rebuild the analytic-light power CDF and the pool split from the CURRENT
++   * light table, emissive count and directional-bypass flag.
++   *
++   * Called once per render() rather than from each setter, because all three of
++   * its inputs are live knobs: the light table's CONTENTS change under
++   * updateLights() with no call into this pass at all, the emissive count
++   * follows the emissiveNEE toggle every frame, and the bypass is an A/B switch.
++   * It is a 32-iteration loop over an array that is already in cache; measured
++   * against a 25-80 ms frame it is not visible.
++   *
++   * TWO THINGS THIS MUST NOT GET WRONG.
++   *  1. A light's weight is zero EXACTLY when candidateContribution scores it
++   *     zero, that is, a directional light while uDirBypass is on. Support then
++   *     still covers the target (pdf 0 only where p̂ is 0), which is what keeps
++   *     RIS unbiased. Any other reason to zero a weight would be a bug.
++   *  2. Luminance here uses the same Rec.601 weights as the shader's rtLum, so a
++   *     light with a non-zero p̂ can never have a zero pick probability. (The
++   *     emissive side's total comes from the CDF's own Rec.709 weights; the two
++   *     pools' powers are therefore on slightly different photometric scales,
++   *     which biases the SPLIT by a few percent and nothing else. The split is a
++   *     variance knob, clamped to [0.1, 0.9] anyway, not part of the
++   *     estimator's correctness.)
++   */
++  _rebuildPools() {
++    const u = this.material.uniforms;
++    const cdf = u.uLightCdf.value;
++    const c = this._compiled;
++    const n = c ? Math.min(c.lightCount | 0, MAX_LIGHTS) : 0;
++    const skipDir = u.uDirBypass.value > 0.5;
++    const w = this._lightW || (this._lightW = new Float32Array(MAX_LIGHTS));
++    let PL = 0;
++    for (let i = 0; i < n; i++) {
++      const type = c.lightPosType[i * 4 + 3];
++      const isDir = type >= 0.5 && type < 1.5;
++      w[i] = skipDir && isDir
++        ? 0
++        : 0.299 * c.lightColorRadius[i * 4] +
++          0.587 * c.lightColorRadius[i * 4 + 1] +
++          0.114 * c.lightColorRadius[i * 4 + 2];
++      PL += w[i];
++    }
++    let cum = 0;
++    for (let i = 0; i < n; i++) {
++      // PL === 0 means every light is weightless (an empty scene, black lights,
++      // or a sun-only scene with the bypass on). Fall back to the uniform table
++      // so the array is never left holding stale cumulatives; those lights all
++      // have p̂ = 0, so nothing is selected out of it either way.
++      const p = PL > 0 ? w[i] / PL : 1 / n;
++      cum += p;
++      cdf[i * 2] = i === n - 1 ? 1.0 : cum;
++      cdf[i * 2 + 1] = p;
++    }
++    const PE = u.uEmissiveCount.value > 0 && c ? c.emissivePower || 0 : 0;
++    // "Non-empty" means "carries power". A pool with members but no power
++    // contributes nothing to the integral, so spending candidates in it would be
++    // pure waste, the same reason the sun is zeroed above. qL = 1 or 0 is exact
++    // in the shader: rand() is [0, 1), so `rand() < 1.0` never picks the empty
++    // pool and `rand() < 0.0` never picks the other one.
++    let qL;
++    if (n === 0) qL = 0.0;                                   // emissive only
++    else if (PL > 0 && PE > 0) qL = Math.min(0.9, Math.max(0.1, PL / (PL + PE)));
++    else if (PE > 0) qL = 0.0;                               // lights are dark
++    else qL = 1.0;                                           // lights only, or nothing lit
++    u.uPoolSplit.value = qL;
++  }
++  // <<< RT_RESTIR_CAND_CDF
++
++  /**
++   * Toggle the two dynamic-mesh treatments in the temporal stage (both default
++   * off, so a caller that never calls this gets stock behaviour):
++   *   accept — skip the plane test on dynamic pixels, so the co-located
++   *            previous reservoir is offered as a candidate (change 1).
++   *   freeze — pass the previous reservoir through to history on dynamic
++   *            pixels instead of overwriting it (change 2).
++   */
++  setDynamic(accept, freeze) {
++    this.material.uniforms.uAcceptDynamic.value = accept ? 1.0 : 0.0;
++    this.material.uniforms.uFreezeDynamic.value = freeze ? 1.0 : 0.0;
++  }
++
++  /** Toggle motion-vector reprojection in the temporal stage (default off). */
++  setMotionVectors(enabled) {
++    this.material.uniforms.uUseMotion.value = enabled ? 1.0 : 0.0;
++  }
++
++  /**
++   * Keep DIRECTIONAL lights out of the reservoir (default off = shipped). Both
++   * stages take it, because a directional light must score zero as a fresh
++   * candidate, as an inherited history winner and as a neighbour's winner —
++   * anything less leaves the sun in some reservoirs and not others.
++   * RTLightingPass.uDirBypass MUST be set to match, or the sun is dropped from
++   * the frame instead of being shaded exactly.
++   */
++  setDirectionalBypass(enabled) {
++    const v = enabled ? 1.0 : 0.0;
++    this.material.uniforms.uDirBypass.value = v;
++    this.spatialMaterial.uniforms.uDirBypass.value = v;
++  }
++
++  /**
++   * Sub-texel reprojection correction + four-neighbour rescue in the temporal
++   * stage (default off = shipped). One switch for both halves: they are the
++   * same fix (find the history this surface actually left behind) at two
++   * scales, and gating them separately would only make "stock" ambiguous.
++   */
++  setReprojectionRescue(enabled) {
++    this.material.uniforms.uReprojRescue.value = enabled ? 1.0 : 0.0;
++  }
++
+   clearHistory(renderer) {
+     const prev = renderer.getRenderTarget();
+     renderer.setClearColor(0x000000, 0);
+@@ -400,13 +810,17 @@
+     this.targetB.setSize(width, height);
+     this.spatialTarget.setSize(width, height);
+     this.spatialMaterial.uniforms.uTexelSize.value.set(1 / width, 1 / height);
++    this.material.uniforms.uTexelSizeT.value.set(1 / width, 1 / height);
+   }
+ 
+   /**
+    * Temporal → spatial; history feeds back from the TEMPORAL stage only.
+    * `mCap` is the temporal staleness cap (default 40 = shipped behaviour).
++   * `viewProj` is THIS frame's (jittered) view-projection, used only by the
++   * sub-texel reprojection correction; omitting it leaves the correction on
++   * whatever matrix it last saw, so a caller that uses the rescue must pass it.
+    */
+-  render(renderer, gbuffer, prevViewProj, cameraPos, frame, eps, mCap = 40) {
++  render(renderer, gbuffer, prevViewProj, cameraPos, frame, eps, mCap = 40, viewProj = null) {
+     for (const m of [this.material, this.spatialMaterial]) {
+       const u = m.uniforms;
+       u.uGWorldPos.value = gbuffer.worldPos;
+@@ -415,17 +829,26 @@
+       u.uCameraPos.value.copy(cameraPos);
+       u.uEps.value = eps;
+     }
++    // >>> RT_RESTIR_CAND_CDF
++    // Once per frame, after every setter the caller may have used and before
++    // anything reads the tables. See _rebuildPools for why it is here and not in
++    // the setters.
++    this._rebuildPools();
++    // <<< RT_RESTIR_CAND_CDF
+     const tu = this.material.uniforms;
+-    tu.uPrevReservoir.value = this.targetB.texture;
++    tu.uPrevReservoir.value = this.targetB.texture[1];
+     tu.uPrevGWorldPos.value = gbuffer.prevWorldPos;
+     tu.uPrevViewProj.value.copy(prevViewProj);
++    if (viewProj) tu.uViewProj.value.copy(viewProj);
+     tu.uMCap.value = Math.max(1, mCap);
++    tu.uGDynamic.value = gbuffer.emissive;
++    tu.uGMotion.value = gbuffer.motion;
+ 
+     this.quad.material = this.material;
+     renderer.setRenderTarget(this.targetA);
+     renderer.render(this.scene, this.camera);
+ 
+-    this.spatialMaterial.uniforms.uReservoirIn.value = this.targetA.texture;
++    this.spatialMaterial.uniforms.uReservoirIn.value = this.targetA.texture[0];
+     this.quad.material = this.spatialMaterial;
+     renderer.setRenderTarget(this.spatialTarget);
+     renderer.render(this.scene, this.camera);
+diff -ruN --strip-trailing-cr rt-pristine/src/SceneCompiler.js rt-local/src/SceneCompiler.js
+--- rt-pristine/src/SceneCompiler.js	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/SceneCompiler.js	2026-08-15 17:08:25.717096200 -0400
+@@ -118,6 +118,14 @@
+     this.lightDirCone = []; // spot direction.xyz + cos(outer angle)
+     this.lightCount = 0;
+     this.emissiveTriCount = 0;
++    // >>> RT_RESTIR_CAND_CDF
++    // Total power of the emissive NEE set, in the power CDF's own units (area x
++    // Rec.709 luminance), i.e. the normaliser row 66 divides by. Exposed because
++    // the ReSTIR candidate sampler splits its draws between the analytic lights
++    // and the emissive set in proportion to their powers, and computing this a
++    // second time in that pass is how the two definitions drift apart.
++    this.emissivePower = 0;
++    // <<< RT_RESTIR_CAND_CDF
+     this.triangleCount = 0;
+ 
+     // Dynamic emissive area lights: the final (post-cap) emissive triangle list
+@@ -382,7 +390,12 @@
+       data[o + 12] = nx; data[o + 13] = ny; data[o + 14] = nz; data[o + 15] = emit[2];
+     }
+     // Areas (and therefore pick probabilities) may have changed — rebuild the CDF.
+-    writeEmissiveCdf(data, row, tris);
++    // >>> RT_RESTIR_CAND_CDF
++    // ... and with them the set's total power, which is half of the reservoir's
++    // pool split. A moving emitter changes it every frame, so it is refreshed
++    // here rather than left at its compile-time value.
++    this.emissivePower = writeEmissiveCdf(data, row, tris);
++    // <<< RT_RESTIR_CAND_CDF
+     tex.needsUpdate = true;
+     this.lastEmissiveRefreshMs = now.now() - t0;
+   }
+@@ -682,6 +695,29 @@
+   return result;
+ }
+ 
++// Opt a material OUT of next-event estimation: `userData.rtNoAreaLight = true`
++// keeps its triangles out of the emissive NEE list while leaving everything else
++// about the material alone. It still renders at its full emissive value — the
++// G-buffer reads material.emissive/emissiveMap directly, and the material table
++// keeps its emissive so specular secondary rays still see it — it simply is not
++// registered as an area light and casts nothing.
++//
++// The case this exists for: UNLIT SCENERY. A backdrop painted with its own
++// diffuse map as an emissiveMap (so a backlit face is not pure black when GI is
++// off) is emissive by construction, but it is a picture of a place, not a lamp.
++// Such surfaces are also enormous, and the NEE cap keeps the LARGEST triangles
++// by area, so without this flag one lawn quad evicts every real light in the
++// scene: measured here, 255 of 256 kept slots were garden, and the chandelier,
++// the lamps, the TV and the candle flames were all dropped.
++//
++// The alternative — an emissiveMap the CPU cannot read (see averageEmissiveMap)
++// — has the same NEE effect by accident, but it zeroes the material table's
++// emissive too (so reflections of the scenery go black) and it cannot be asked
++// for, only suffered. This is the explicit form of the same intent.
++function noAreaLight(mat) {
++  return !!(mat && mat.userData && mat.userData.rtNoAreaLight === true);
++}
++
+ // Effective emissive colour (already scaled by intensity), or null if the
+ // material doesn't emit. A plain emissive colour is used directly; an
+ // emissiveMap is approximated by its AVERAGE colour (avg(map) x emissive x
+@@ -1206,14 +1242,38 @@
+ // area x emitted luminance; degenerate totals fall back to the uniform pick.
+ // The layout matches the row-66 comment in buildSceneDataTexture. `row` is the
+ // texture width in floats (width * 4). Reused by updateDynamic's in-place refresh.
++//
++// >>> RT_RESTIR_CAND_CDF
++// RETURNS the normaliser (the emissive set's total power in these units). It was
++// a local before: the reservoir's candidate sampler needs it to decide how often
++// to draw from the emissive pool rather than the analytic-light pool, and
++// recomputing it there would be a second definition of "power" that could drift
++// from this one. Callers store it on the compiled scene as `emissivePower`.
++// <<< RT_RESTIR_CAND_CDF
++// >>> RT_RESTIR_CAND_CDF
++// ONE definition of "how much light does this triangle put out": area x emitted
++// luminance (Rec.709). The CDF's per-triangle probabilities and the set's total
++// power are the same quantity normalised two ways, and the reservoir's candidate
++// sampler needs the total, so the formula may not exist twice.
++function emissiveWeight(t) {
++  return t.area * (0.2126 * t.emit[0] + 0.7152 * t.emit[1] + 0.0722 * t.emit[2]);
++}
++
++/** Total emissive power of a triangle list, in the CDF's own units. */
++function emissivePowerTotal(emissiveTris) {
++  let total = 0;
++  for (let i = 0; i < emissiveTris.length; i++) total += emissiveWeight(emissiveTris[i]);
++  return total;
++}
++// <<< RT_RESTIR_CAND_CDF
++
+ function writeEmissiveCdf(data, row, emissiveTris) {
+-  if (emissiveTris.length === 0) return;
++  if (emissiveTris.length === 0) return 0;
+   const cdfRow = (2 + BLUE_NOISE_SIZE) * row;
+   let total = 0;
+   const w = new Array(emissiveTris.length);
+   for (let i = 0; i < emissiveTris.length; i++) {
+-    const t = emissiveTris[i];
+-    w[i] = t.area * (0.2126 * t.emit[0] + 0.7152 * t.emit[1] + 0.0722 * t.emit[2]);
++    w[i] = emissiveWeight(emissiveTris[i]);
+     total += w[i];
+   }
+   let cum = 0;
+@@ -1223,6 +1283,7 @@
+     data[cdfRow + i * 4 + 0] = i === emissiveTris.length - 1 ? 1.0 : cum;
+     data[cdfRow + i * 4 + 1] = p;
+   }
++  return total;
+ }
+ 
+ // Collect world-space triangles of an emissive mesh for the NEE light list.
+@@ -1433,7 +1494,7 @@
+       const segStart = dynVertexOffset; // this segment's vertex base in the merged array
+       dynamicGeoms.push(extracted.geo);
+       for (const r of ranges) {
+-        const emit = emissiveColor(r.material);
++        const emit = noAreaLight(r.material) ? null : emissiveColor(r.material);
+         if (emit)
+           collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount, segStart * 3);
+       }
+@@ -1466,7 +1527,7 @@
+     } else {
+       staticGeoms.push(extracted.geo);
+       for (const r of ranges) {
+-        const emit = emissiveColor(r.material);
++        const emit = noAreaLight(r.material) ? null : emissiveColor(r.material);
+         if (emit) collectEmissiveTriangles(extracted.geo, emit, emissiveTris, r.start, r.vcount);
+       }
+       // Fingerprint this static source so a later edit (vertices moved, mesh
+@@ -1585,6 +1646,12 @@
+     emissiveTris.length = MAX_EMISSIVE_TRIS;
+   }
+   compiled.emissiveTriCount = emissiveTris.length;
++  // >>> RT_RESTIR_CAND_CDF
++  // The post-cap set's total power, from the same weight the CDF uses. Computed
++  // here rather than inside buildSceneDataTexture only because that function
++  // returns a texture; _refreshDynamicEmissive keeps it current afterwards.
++  compiled.emissivePower = emissivePowerTotal(emissiveTris);
++  // <<< RT_RESTIR_CAND_CDF
+   // Keep the final (post-cap) emissive list so updateDynamic can rebuild the
+   // power CDF, and record which surviving rows belong to dynamic emitters (with
+   // their merged-position offset) so their world-space triangles can be
+@@ -1634,21 +1701,33 @@
+   return compiled;
+ }
+ 
+-/** (Re)scan the scene's lights into the compiled light tables. Cheap; call anytime. */
++/**
++ * (Re)scan the scene's lights into the compiled light tables. Cheap; call anytime.
++ *
++ * SLOT ASSIGNMENT IS STABLE ACROSS RE-SYNCS. A ReSTIR reservoir stores the light
++ * TABLE INDEX of its chosen light, so if re-scanning reassigns indices in
++ * traversal order every time the active light set changes, every reservoir on
++ * screen silently resolves to a DIFFERENT light for several frames — the
++ * "doorway flash". Stable slots fix that with no shader change: a light that is
++ * active both before and after a re-sync keeps its index, so every reservoir
++ * pointing at a surviving light stays valid, and only the few pixels pointing at
++ * a light that genuinely left are wrong. The map lives on the compiled scene (not
++ * a module global) so a full recompile starts from a clean, consistent table.
++ */
+ export function syncLights(scene, compiled) {
+   const posType = compiled.lightPosType;
+   const colorRadius = compiled.lightColorRadius;
+   const dirCone = compiled.lightDirCone;
+-  posType.length = 0;
+-  colorRadius.length = 0;
+-  dirCone.length = 0;
+-  let count = 0;
++  const slots = compiled._lightSlots || (compiled._lightSlots = new Map());
+   const tmpP = new THREE.Vector3();
+   const tmpT = new THREE.Vector3();
+ 
++  // 1. Gather the active lights in traversal order, computing each one's table
++  //    row up front. (The previous code pushed straight into the arrays; doing
++  //    the scan first is what lets us seat survivors in their old slots.)
++  const active = [];
+   scene.traverse((obj) => {
+     if (!obj.isLight || !obj.visible || obj.intensity <= 0) return;
+-    if (count >= MAX_LIGHTS) return;
+     if (obj.isSpotLight) {
+       // posType.w encodes type AND the inner-cone cosine: w = 2 + cosInner
+       // (any w >= 1.5 is a spot). Direction + outer cosine live in dirCone.
+@@ -1657,48 +1736,100 @@
+       const dir = tmpT.sub(tmpP).normalize();
+       const cosOuter = Math.cos(obj.angle);
+       const cosInner = Math.cos(obj.angle * (1 - (obj.penumbra ?? 0)));
+-      posType.push(tmpP.x, tmpP.y, tmpP.z, 2 + cosInner);
+-      colorRadius.push(
+-        obj.color.r * obj.intensity,
+-        obj.color.g * obj.intensity,
+-        obj.color.b * obj.intensity,
+-        obj.userData.rtRadius ?? 0.1
+-      );
+-      dirCone.push(dir.x, dir.y, dir.z, cosOuter);
+-      count++;
++      active.push({
++        obj,
++        pt: [tmpP.x, tmpP.y, tmpP.z, 2 + cosInner],
++        cr: [
++          obj.color.r * obj.intensity,
++          obj.color.g * obj.intensity,
++          obj.color.b * obj.intensity,
++          obj.userData.rtRadius ?? 0.1,
++        ],
++        dc: [dir.x, dir.y, dir.z, cosOuter],
++      });
+     } else if (obj.isPointLight) {
+       obj.getWorldPosition(tmpP);
+-      posType.push(tmpP.x, tmpP.y, tmpP.z, 0);
+-      colorRadius.push(
+-        obj.color.r * obj.intensity,
+-        obj.color.g * obj.intensity,
+-        obj.color.b * obj.intensity,
+-        obj.userData.rtRadius ?? 0.15
+-      );
+-      dirCone.push(0, 0, 0, 0);
+-      count++;
++      active.push({
++        obj,
++        pt: [tmpP.x, tmpP.y, tmpP.z, 0],
++        cr: [
++          obj.color.r * obj.intensity,
++          obj.color.g * obj.intensity,
++          obj.color.b * obj.intensity,
++          obj.userData.rtRadius ?? 0.15,
++        ],
++        dc: [0, 0, 0, 0],
++      });
+     } else if (obj.isDirectionalLight) {
+       obj.getWorldPosition(tmpP);
+       obj.target.getWorldPosition(tmpT);
+       const dir = tmpT.sub(tmpP).normalize();
+-      posType.push(dir.x, dir.y, dir.z, 1);
+-      colorRadius.push(
+-        obj.color.r * obj.intensity,
+-        obj.color.g * obj.intensity,
+-        obj.color.b * obj.intensity,
+-        obj.userData.rtRadius ?? 0.02
+-      );
+-      dirCone.push(0, 0, 0, 0);
+-      count++;
++      active.push({
++        obj,
++        pt: [dir.x, dir.y, dir.z, 1],
++        cr: [
++          obj.color.r * obj.intensity,
++          obj.color.g * obj.intensity,
++          obj.color.b * obj.intensity,
++          obj.userData.rtRadius ?? 0.02,
++        ],
++        dc: [0, 0, 0, 0],
++      });
+     }
+   });
+ 
+-  compiled.lightCount = count;
+-  while (posType.length < MAX_LIGHTS * 4) {
+-    posType.push(0, 0, 0, 0);
+-    colorRadius.push(0, 0, 0, 0);
+-    dirCone.push(0, 0, 0, 0);
++  // 2. Seat the survivors first — every still-active light re-takes the slot it
++  //    held last sync — then hand the freed slots to the newly active lights in
++  //    traversal order. A survivor only keeps its slot when that slot still lies
++  //    within the COMPACT table (0..N-1, N = min(active, MAX_LIGHTS)): the
++  //    sampling paths draw candidate ids from 0..lightCount-1, so the table must
++  //    stay hole-free. In the doorway case the active set barely shrinks (portal
++  //    symmetry keeps the room you left lit), so nearly every survivor is under N
++  //    and keeps its slot; only a wholesale shrink — far rarer and unavoidably a
++  //    re-light — re-seats the tail. With more active lights than slots, survivors
++  //    are always kept and the overflow of new lights is dropped, so a surviving
++  //    light deep in the traversal order no longer loses its slot to a newcomer.
++  const N = Math.min(active.length, MAX_LIGHTS);
++  const seat = new Array(MAX_LIGHTS).fill(null);
++  const seated = new Set();
++  for (const a of active) {
++    const old = slots.get(a.obj);
++    if (old !== undefined && old >= 0 && old < N && seat[old] === null) {
++      seat[old] = a;
++      seated.add(a);
++    }
++  }
++  let next = 0;
++  for (const a of active) {
++    if (seated.has(a)) continue; // already in its old slot
++    while (next < N && seat[next] !== null) next++;
++    if (next >= N) break; // out of slots; the rest stay unlit
++    seat[next] = a;
++    next++;
+   }
++
++  // 3. Write the table (seated rows then padding) and record the new assignment.
++  posType.length = 0;
++  colorRadius.length = 0;
++  dirCone.length = 0;
++  slots.clear();
++  let count = 0;
++  for (let i = 0; i < MAX_LIGHTS; i++) {
++    const a = seat[i];
++    if (a) {
++      posType.push(a.pt[0], a.pt[1], a.pt[2], a.pt[3]);
++      colorRadius.push(a.cr[0], a.cr[1], a.cr[2], a.cr[3]);
++      dirCone.push(a.dc[0], a.dc[1], a.dc[2], a.dc[3]);
++      slots.set(a.obj, i);
++      count++;
++    } else {
++      posType.push(0, 0, 0, 0);
++      colorRadius.push(0, 0, 0, 0);
++      dirCone.push(0, 0, 0, 0);
++    }
++  }
++
++  compiled.lightCount = count;
+ }
+ 
+ export { MAX_LIGHTS };
+diff -ruN --strip-trailing-cr rt-pristine/src/TAAPass.js rt-local/src/TAAPass.js
+--- rt-pristine/src/TAAPass.js	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/TAAPass.js	2026-08-15 17:08:25.715574400 -0400
+@@ -25,6 +25,8 @@
+ uniform sampler2D uCurrent;        // this frame's composited LDR colour
+ uniform sampler2D uHistory;        // previous resolved colour
+ uniform sampler2D uGWorldPos;      // current full-res G-buffer
++uniform sampler2D uGMotion;        // G-buffer previous-screen-UV texture (RG32F)
++uniform float uUseMotion;          // 1 = reproject via motion vector, 0 = camera-only
+ uniform mat4 uPrevViewProj;
+ uniform vec2 uTexelSize;
+ uniform vec2 uJitter;              // this frame's projection jitter (UV space)
+@@ -70,10 +72,20 @@
+ 
+   // Reproject this pixel's world point into the previous frame. The history is
+   // a STABILIZED (unjittered-grid) image, so remove last frame's jitter from
+-  // the projected position before sampling it.
+-  vec4 clip = uPrevViewProj * vec4(P, 1.0);
+-  if (clip.w <= 0.0) { outColor = vec4(current, 1.0); return; }
+-  vec2 prevUv = (clip.xy / clip.w) * 0.5 + 0.5 - uPrevJitter;
++  // the projected position before sampling it. With motion vectors (uUseMotion)
++  // the surface's own screen motion replaces the camera-only reprojection: the
++  // G-buffer stores the surface's PREVIOUS screen UV directly, so prevUv is that
++  // minus last frame's jitter — bit-identical to the camera-only path for static
++  // geometry. The stored sentinel (behind last frame's camera) lands out of
++  // bounds and is dropped below.
++  vec2 prevUv;
++  if (uUseMotion > 0.5) {
++    prevUv = texture(uGMotion, vUv + uJitter).xy - uPrevJitter;
++  } else {
++    vec4 clip = uPrevViewProj * vec4(P, 1.0);
++    if (clip.w <= 0.0) { outColor = vec4(current, 1.0); return; }
++    prevUv = (clip.xy / clip.w) * 0.5 + 0.5 - uPrevJitter;
++  }
+   if (prevUv.x < 0.0 || prevUv.x > 1.0 || prevUv.y < 0.0 || prevUv.y > 1.0) {
+     outColor = vec4(current, 1.0);
+     return;
+@@ -138,6 +150,8 @@
+         uCurrent: { value: null },
+         uHistory: { value: null },
+         uGWorldPos: { value: null },
++        uGMotion: { value: null },
++        uUseMotion: { value: 0.0 },
+         uPrevViewProj: { value: new THREE.Matrix4() },
+         uTexelSize: { value: new THREE.Vector2(1 / width, 1 / height) },
+         uJitter: { value: new THREE.Vector2() },
+@@ -223,6 +237,11 @@
+     this._reset = true;
+   }
+ 
++  /** Toggle motion-vector reprojection (default off = camera-only). */
++  setMotionVectors(enabled) {
++    this.material.uniforms.uUseMotion.value = enabled ? 1.0 : 0.0;
++  }
++
+   /**
+    * @param currentColor tonemapped LDR colour texture for this frame
+    * @param gbuffer      current GBufferPass (provides the world-pos guide)
+@@ -241,6 +260,7 @@
+     u.uCurrent.value = currentColor;
+     u.uHistory.value = this.targetB.texture; // previous resolved
+     u.uGWorldPos.value = gbuffer.worldPos;
++    u.uGMotion.value = gbuffer.motion;
+     u.uPrevViewProj.value.copy(prevViewProj);
+     u.uJitter.value.copy(jitterUv);
+     u.uPrevJitter.value.copy(prevJitterUv);
+diff -ruN --strip-trailing-cr rt-pristine/src/index.d.ts rt-local/src/index.d.ts
+--- rt-pristine/src/index.d.ts	1985-10-26 04:15:00.000000000 -0400
++++ rt-local/src/index.d.ts	2026-08-15 17:08:25.720121900 -0400
+@@ -264,6 +264,20 @@
+   /** Frame-rate target for the adaptive governor. */
+   targetFps?: number;
+   /**
++   * GPU-cost timing for the adaptive governor
++   * (EXT_disjoint_timer_query_webgl2). "auto" (default) uses it where the
++   * browser exposes it and falls back to speculative probing where it does not
++   * (Safari and iOS withhold the extension). `false` forces the probe path and
++   * builds no timer at all.
++   *
++   * It is what makes the quality ladder two-way. Wall-clock frame time is pinned
++   * to the display's refresh period by vsync, so it can prove a frame is too
++   * slow but never that there is headroom to spend — without a GPU measurement
++   * the governor can only ever walk quality DOWN, and any transient costs
++   * quality permanently.
++   */
++  gpuTiming?: "auto" | boolean;
++  /**
+    * Emergency crash guard, ON by default: clamps oversized first buffers and
+    * cuts quality after consecutive >400ms frames (weak GPUs fed high settings
+    * can hang the whole machine). Set false to opt out.
+@@ -359,6 +373,113 @@
+    */
+   restirMCap?: number;
+   /**
++   * Cold-pixel exact fallback: frames of validated temporal history a pixel's
++   * reservoir must have carried before that reservoir may shade it. Default `0`
++   * = off = the shipped behaviour.
++   *
++   * A just-revealed pixel has no history — 8 uniform candidates out of the whole
++   * light set, shaded with one visibility ray on the winner — so it speckles for
++   * about a second while temporal accumulation converges. Below this age the
++   * pixel is shaded by the exact per-light loop (one shadow ray per light plus
++   * one for the emissive set) instead, at that path's cost, and only for the
++   * minority of pixels that are actually cold. The reservoir keeps building
++   * underneath regardless.
++   */
++  restirWarmAge?: number;
++  /**
++   * Keep DIRECTIONAL lights out of the ReSTIR reservoir and shade them exactly
++   * instead. Default `false` = the shipped behaviour.
++   *
++   * The reservoir's target function is unshadowed, and a directional light has
++   * a large unshadowed contribution on every surface facing it while being
++   * occluded on most interior surfaces — so the reservoir keeps electing the
++   * sun, spends its single visibility ray on the wall in between, and the pixel
++   * resolves to black with the odd frame's runner-up as a bright speck. With
++   * this on, directional lights are never candidates and never survive as
++   * inherited winners, and the lighting pass adds them with one exact shadow
++   * ray each. Unbiased either way; costs one ray per directional light.
++   */
++  restirDirectionalBypass?: boolean;
++  /**
++   * ReSTIR temporal reprojection that survives TAA jitter and thin geometry.
++   * Default `false` = the shipped behaviour. Two halves of one fix: the
++   * sub-texel correction the irradiance accumulator already applies
++   * (`prevUv -= currUv - vUv`), and a four-neighbour rescue when the plane test
++   * at the reprojected texel fails. Without them a baluster's pixels reject
++   * their history every frame and their reservoirs never accumulate.
++   */
++  restirReprojectionRescue?: boolean;
++  /**
++   * Draw ReSTIR candidates the way next-event estimation draws them, instead of
++   * uniformly over (lights + emissive triangles). Default `false` = the shipped
++   * behaviour, byte for byte.
++   *
++   * Uniformly, a bulb's triangle in a room of 26 lights and 256 emissive
++   * triangles is a 1-in-282 pick and most of the 8 candidates land on surfaces
++   * that contribute nothing to the pixel, so a cold reservoir has nothing worth
++   * keeping. With this on, each candidate picks a POOL by power (analytic lights
++   * with probability PL/(PL+PE), clamped to [0.1, 0.9]) and then a member by that
++   * pool's own power CDF (the emissive half being the very CDF
++   * `emissiveImportance` already uses), and the RIS weight divides by that pdf.
++   * Unbiased: RIS holds for any source pdf whose support covers the target's.
++   *
++   * ALU only: no extra rays. One extra `rand()` per candidate and, for emissive
++   * candidates, the same 8-step binary search the exact path runs.
++   */
++  restirCandidateImportance?: boolean;
++  /**
++   * Cap the ReSTIR direct term at `restirClampRel` x the pixel's own reservoir
++   * estimate of the unshadowed light total, or at the absolute
++   * `2 x fireflyClamp`, whichever is larger. Default `0` = off = the absolute cap
++   * alone = the shipped behaviour.
++   *
++   * The absolute cap is the wrong shape for a one-sample-per-pixel estimator:
++   * f(Y)·W lands near the whole light sum when the winner is visible and on zero
++   * when it is not, so the cap clips the peaks while nothing lifts the zeros and
++   * bright surfaces converge DARK. `2` means "no more than twice everything this
++   * pixel could receive", which still catches a genuine 1/d^2 spike.
++   */
++  restirClampRel?: number;
++  /**
++   * ReSTIR spatial-reuse taps for a pixel that kept its temporal history
++   * (M > `restirSpatialLowM`). Default `4` — the value shipped before the
++   * adaptive stage, so a confident pixel's cost is unchanged.
++   */
++  restirSpatialTaps?: number;
++  /**
++   * ReSTIR spatial-reuse max tap radius in lighting-res texels for a confident
++   * pixel. Default `8` — taps land within ~10 texels, the shipped reach.
++   */
++  restirSpatialRadius?: number;
++  /**
++   * ReSTIR reservoir-confidence threshold. A pixel whose temporal stage
++   * rejected the reprojected history collapses to the fresh-candidate count
++   * (8 with the default 8-candidate temporal stage), so `M <= 8` means the
++   * temporal pass contributed nothing — the disoccluded / moving-mesh case.
++   * Such pixels take the low-confidence path. Default `8`.
++   */
++  restirSpatialLowM?: number;
++  /**
++   * ReSTIR spatial-reuse taps for a low-confidence pixel (`M <=
++   * restirSpatialLowM`). Spatial reuse is the only information a just-
++   * disoccluded pixel has, so it spends far more taps than the confident 4;
++   * only the disoccluded minority pays. Default `24`.
++   */
++  restirSpatialTapsLow?: number;
++  /**
++   * ReSTIR spatial-reuse max tap radius for a low-confidence pixel. Starved
++   * neighbours are nearby, so a wider reach finds pixels that did keep history;
++   * validation stays radius-independent so widening cannot leak across an edge.
++   * Default `32` lighting-res texels.
++   */
++  restirSpatialRadiusLow?: number;
++  /**
++   * ReSTIR spatial-reuse iterations. `1` (default) = one adaptive pass; `2` =
++   * a second pass that re-taps only pixels still low-confidence after the
++   * first, with fresh decorrelated samples.
++   */
++  restirSpatialIterations?: number;
++  /**
+    * EXPERIMENTAL — ReSTIR GI (v1, temporal-only): per-pixel reservoirs reuse the
+    * 1-bounce global-illumination sample across frames (at the reprojected
+    * same-surface point; no spatial reuse). When on, the lighting pass skips its
+@@ -499,6 +620,22 @@
+   /** Reproject accumulated lighting through camera motion. */
+   temporalReprojection?: boolean;
+   /**
++   * Motion vectors for temporal reprojection (default `false`). The G-buffer
++   * writes each fragment's previous screen position into a fifth RG32F
++   * attachment, and the irradiance EMA, the ReSTIR reservoir, and the TAA
++   * resolve look up history at that position instead of reprojecting the
++   * CURRENT world position through the previous view-projection. That
++   * camera-only reprojection is wrong for MOVING meshes (a point on them
++   * occupied different world space last frame, so its history is rejected every
++   * frame) and correct for static geometry — for a static mesh the motion vector
++   * collapses exactly to camera-only reprojection, so a static scene renders
++   * byte-identically on or off. Rigid transforms only; deforming/skinned meshes
++   * still use a rigid previous matrix (they need per-vertex history, which is
++   * out of scope). Requires a GPU with >= 5 draw buffers (WebGL2 guarantees only
++   * 4); on a device without one the option is ignored with a one-time warning.
++   */
++  motionVectors?: boolean;
++  /**
+    * Temporal anti-aliasing: sub-pixel projection jitter + a full-res history
+    * resolve with neighbourhood clamp.
+    */
+@@ -671,8 +808,25 @@
+   triangleCount: number;
+   /** Number of lights scanned into the compiled light tables. */
+   lightCount: number;
+-  /** Number of emissive triangles registered as NEE area lights (static + dynamic). */
++  /**
++   * Number of emissive triangles registered as NEE area lights (static +
++   * dynamic). A material can stay out of this list with
++   * `material.userData.rtNoAreaLight = true`: it still renders at its full
++   * emissive value (the G-buffer reads the material directly, and specular
++   * secondary rays still see it) but casts no light. That is what unlit
++   * SCENERY wants — a backdrop carrying its diffuse map as an emissiveMap is
++   * emissive by construction, and because the list keeps the LARGEST triangles
++   * by area, a single ground quad will otherwise evict every real lamp.
++   */
+   emissiveTriCount: number;
++  /**
++   * Total power of the emissive NEE set in the power CDF's own units (triangle
++   * area x Rec.709 emitted luminance): the normaliser row 66 of the scene-data
++   * texture divides by, refreshed with the CDF when a dynamic emitter moves.
++   * Exposed for `restirCandidateImportance`, which splits its candidate draws
++   * between the analytic lights and the emissive set in proportion to power.
++   */
++  emissivePower: number;
+   /** World-space diagonal of the static level (used to auto-scale ray epsilon). */
+   sceneDiagonal: number;
+   /** True when any dynamic emitter contributes NEE rows refreshed each frame. */
+@@ -843,6 +997,10 @@
+   eps: number;
+   /** Reproject accumulated lighting through camera motion. */
+   temporalReprojection: boolean;
++  /** Motion vectors for temporal reprojection (see the option of the same name). Live-assignable. */
++  motionVectors: boolean;
++  /** Whether this GPU supports the 5-attachment motion-vector MRT (read-only). */
++  readonly motionVectorsSupported: boolean;
+   /** History length cap. */
+   maxHistory: number;
+   /** Split accumulation pass in use (see the option of the same name). */
+@@ -952,6 +1110,20 @@
+   adaptiveQuality: boolean;
+   /** Frame-rate target for the adaptive governor. */
+   targetFps: number;
++  /** GPU-cost timing mode (see RealtimeRaytracerOptions.gpuTiming). Live: set
++   *  false at runtime to move the governor onto the probe fallback. */
++  gpuTiming: "auto" | boolean;
++  /**
++   * Median GPU milliseconds the tracer spent over the recent window, or null
++   * where the platform has no timer extension or no stable sample yet. The
++   * governor's headroom signal, and readable for diagnostics.
++   */
++  readonly gpuCostMs: number | null;
++  /** True where EXT_disjoint_timer_query_webgl2 is available and enabled. */
++  readonly gpuTimingSupported: boolean;
++  /** True when the governor is steering on GPU milliseconds rather than on the
++   *  speculative-probe fallback. */
++  readonly gpuTimingActive: boolean;
+   /** Emergency crash guard (see RealtimeRaytracerOptions.overloadProtection). */
+   overloadProtection: boolean;
+   /** App-owned canvas-scale setter driven by the governor; null disables it. */
+@@ -968,6 +1140,28 @@
+   restir: boolean;
+   /** ReSTIR reservoir staleness cap (default 16). Pass this option explicitly at construction to pin it against the adaptive governor. */
+   restirMCap: number;
++  /** Cold-pixel exact fallback: frames of reservoir history required before the reservoir shades the pixel; below it, the exact per-light loop (default 0 = off). */
++  restirWarmAge: number;
++  /** Directional lights bypass the reservoir and are shaded exactly (default false = shipped). */
++  restirDirectionalBypass: boolean;
++  /** Sub-texel + four-neighbour ReSTIR temporal reprojection (default false = shipped). */
++  restirReprojectionRescue: boolean;
++  /** ReSTIR candidates drawn by power (pool split + per-pool CDF) instead of uniformly over S (default false = shipped). */
++  restirCandidateImportance: boolean;
++  /** ReSTIR direct-term firefly cap relative to the pixel's own reservoir total; 0 = the absolute cap alone (default 0 = shipped). */
++  restirClampRel: number;
++  /** ReSTIR spatial-reuse taps for a confident pixel (default 4). */
++  restirSpatialTaps: number;
++  /** ReSTIR spatial-reuse max tap radius (texels) for a confident pixel (default 8). */
++  restirSpatialRadius: number;
++  /** ReSTIR reservoir-confidence threshold; M at/below this takes the low-confidence path (default 8). */
++  restirSpatialLowM: number;
++  /** ReSTIR spatial-reuse taps for a low-confidence pixel (default 24). */
++  restirSpatialTapsLow: number;
++  /** ReSTIR spatial-reuse max tap radius (texels) for a low-confidence pixel (default 32). */
++  restirSpatialRadiusLow: number;
++  /** ReSTIR spatial-reuse iterations, 1 or 2 (default 1). */
++  restirSpatialIterations: number;
+   /**
+    * EXPERIMENTAL — ReSTIR GI (temporal-only) toggle. Only takes effect when
+    * `gi` and `denoise` are also on (injected at the à-trous stage). Default false.
