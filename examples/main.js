@@ -90,6 +90,12 @@ async function main() {
     await runPresetsSelftest();
     return;
   }
+  // ?selftest=ambient: AmbientLight / HemisphereLight support (see runAmbientSelftest).
+  // Self-contained: it renders a tiny scene lit ONLY by an AmbientLight.
+  if (PARAMS.get("selftest") === "ambient") {
+    await runAmbientSelftest();
+    return;
+  }
 
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
   const { scene, camera, bounds, lights, sky, ready, showcase, water, windows, fox } = buildScene();
@@ -734,6 +740,135 @@ async function runEmptySceneSelftest() {
 }
 
 /**
+ * Ambient-light check (?selftest=ambient).
+ *
+ * The gate for the 0.15.0 `ambient` option, and the safety net under the
+ * `gi: false` default. Before 0.15.0 an AmbientLight was IGNORED, and with no GI
+ * ray there is no other unoccluded term — so a scene whose only light is an
+ * AmbientLight rendered PURE BLACK. That is exactly the failure class the render
+ * self-test exists for, and nothing caught it, because every demo scene has a
+ * traceable light in it.
+ *
+ * Renders a lit box at 64x64 with library defaults except for the one thing
+ * under test, and reads the drawing buffer back. Four assertions:
+ *   ambientLit    a scene lit ONLY by an AmbientLight is not black.
+ *   ambientOffDark  the same scene with `ambient: false` IS black — which is
+ *                 what makes the option's off state the pre-0.15 behaviour
+ *                 rather than a partial one.
+ *   hemiLit       a scene lit ONLY by a HemisphereLight is not black...
+ *   hemiSplit     ...and its up-facing and down-facing surfaces differ, i.e.
+ *                 the sky/ground blend is a real function of the normal and not
+ *                 a flat fill.
+ *
+ * Emits its verdict into the same #selftest-verdict node the Playwright driver
+ * reads (scripts/selftest.mjs), tagged `ambientScene:true`.
+ */
+async function runAmbientSelftest() {
+  const emit = (v) => {
+    const line = JSON.stringify({ ambientScene: true, ...v });
+    console.log("[selftest:ambient] " + line);
+    let node = document.getElementById("selftest-verdict");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "selftest-verdict";
+      node.style.cssText =
+        "position:fixed;left:-99999px;top:0;white-space:pre;pointer-events:none;";
+      document.body.appendChild(node);
+    }
+    node.textContent = line;
+    node.setAttribute("data-pass", String(!!v.pass));
+  };
+
+  let renderer = null;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(1);
+    renderer.setSize(64, 64);
+    const gl = renderer.getContext();
+    const supported = RealtimeRaytracer.isSupported(renderer);
+
+    // A white box seen from outside, plus a floor. No PointLight, no
+    // DirectionalLight, no emissive: the ONLY light is the one each leg adds.
+    const build = (light) => {
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x000000);
+      const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
+      const up = new THREE.Mesh(new THREE.BoxGeometry(4, 0.2, 4), mat);
+      up.position.set(0, 0, 0);
+      const down = new THREE.Mesh(new THREE.BoxGeometry(4, 0.2, 4), mat);
+      down.position.set(0, 2.2, 0); // its UNDERSIDE is what the low camera sees
+      scene.add(up, down, light);
+      return scene;
+    };
+    // Two cameras: one looking down at the up-facing slab, one looking up at
+    // the underside of the raised one. The hemisphere blend must separate them.
+    const camUp = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    camUp.position.set(0, 4.0, 0.001);
+    camUp.lookAt(0, 0, 0);
+    const camDown = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+    camDown.position.set(0, 1.1, 0.001);
+    camDown.lookAt(0, 2.2, 0);
+
+    const buf = new Uint8Array(64 * 64 * 4);
+    const meanLum = () => {
+      gl.readPixels(0, 0, 64, 64, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      let sum = 0;
+      for (let i = 0; i < 64 * 64; i++) {
+        const p = i * 4;
+        sum += 0.2126 * buf[p] + 0.7152 * buf[p + 1] + 0.0722 * buf[p + 2];
+      }
+      return sum / (64 * 64);
+    };
+    // One leg: build, compile, render N frames, read back. adaptiveQuality and
+    // the governor are off so nothing moves under the measurement.
+    const leg = (light, camera, opts = {}) => {
+      const scene = build(light);
+      const rt = new RealtimeRaytracer(renderer, {
+        adaptiveQuality: false,
+        overloadProtection: false,
+        renderScale: 1,
+        taa: false,
+        envColor: new THREE.Color(0, 0, 0),
+        envIntensity: 0,
+        sky: { enabled: false },
+        ...opts,
+      });
+      rt.compileScene(scene);
+      for (let i = 0; i < 12; i++) rt.render(scene, camera);
+      const lum = Math.round(meanLum() * 100) / 100;
+      rt.dispose();
+      return lum;
+    };
+
+    const ambLum = leg(new THREE.AmbientLight(0xffffff, 1.2), camUp);
+    const ambOffLum = leg(new THREE.AmbientLight(0xffffff, 1.2), camUp, { ambient: false });
+    const hemi = () => new THREE.HemisphereLight(0x88bbff, 0x332211, 1.4);
+    const hemiUpLum = leg(hemi(), camUp);
+    const hemiDownLum = leg(hemi(), camDown);
+
+    // 6/255 is examples/selftest.js's BLACK_FLOOR — the same "is this a black
+    // screen" line the main render verdict draws.
+    const BLACK = 6;
+    const ambientLit = ambLum > BLACK;
+    const ambientOffDark = ambOffLum <= BLACK;
+    const hemiLit = hemiUpLum > BLACK;
+    const hemiSplit = Math.abs(hemiUpLum - hemiDownLum) > 2;
+
+    const s = (v) => (supported ? v : true);
+    const pass = s(ambientLit) && s(ambientOffDark) && s(hemiLit) && s(hemiSplit);
+    emit({
+      pass, threw: false, supported,
+      ambientLit, ambientOffDark, hemiLit, hemiSplit,
+      ambLum, ambOffLum, hemiUpLum, hemiDownLum,
+    });
+  } catch (err) {
+    emit({ pass: false, threw: true, error: (err && err.message) || String(err) });
+  } finally {
+    try { if (renderer) renderer.dispose(); } catch { /* ignore */ }
+  }
+}
+
+/**
  * Usage-diagnostics regression check (?selftest=warnings).
  *
  * The library's silent-mistake diagnostics (rt.status.warnings + one console
@@ -1177,9 +1312,13 @@ async function runPresetsSelftest() {
     node.setAttribute("data-pass", String(!!v.pass));
   };
 
-  // Reference snapshot of the 0.11.1 constructor defaults. `read()` below reads
-  // exactly these fields off a live instance; string-equality against this
-  // object IS the "option values identical to 0.11.1" assertion.
+  // Reference snapshot of the CURRENT constructor defaults. `read()` below reads
+  // exactly these fields off a live instance; equality against this object IS
+  // the "the documented defaults are the actual defaults" assertion, and it is
+  // the gate that has to be edited deliberately whenever a default moves — which
+  // is the point. Eight entries moved in 0.15.0 (gi, stochasticLights, the four
+  // ReSTIR correctness options, motionVectors, and the new ambient), and the
+  // options the Hangar work brought are listed too, so a silent drift fails here.
   const DEFAULTS = {
     renderScale: 0.5,
     overscan: 0,
@@ -1188,7 +1327,8 @@ async function runPresetsSelftest() {
     taa: true,
     taaBlend: 0.1,
     taaJitterScale: 1,
-    gi: true,
+    gi: false,
+    ambient: true,
     giHalfRate: false,
     emissiveNEE: true,
     emissiveImportance: true,
@@ -1247,6 +1387,7 @@ async function runPresetsSelftest() {
     taaBlend: rt.taaBlend,
     taaJitterScale: rt.taaJitterScale,
     gi: rt.gi,
+    ambient: rt.ambient,
     giHalfRate: rt.giHalfRate,
     emissiveNEE: rt.emissiveNEE,
     emissiveImportance: rt.emissiveImportance,

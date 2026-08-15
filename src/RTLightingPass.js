@@ -115,6 +115,19 @@ uniform bool uDirBypass;
 // <<< RT_RESTIR_DIR_BYPASS
 uniform bool uGIHalfRate;      // GI ray on alternating checkerboard, doubled
 
+// >>> RT_AMBIENT
+// Unoccluded ambient: three's AmbientLight and HemisphereLight, summed CPU-side
+// by SceneCompiler.syncLights. Four uniforms and no sampler, because this pass
+// is at the WebGL2 16-sampler minimum; no loop and no ray, because neither light
+// has a position to trace toward. All zero when the scene has no such light, and
+// all zero when the ambient option is false — which is what makes that OFF state
+// byte-identical in RESULT to the build before it (the uniform block itself is
+// four declarations of source, see the release report).
+uniform vec3 uAmbientFlat;   // sum of AmbientLight colour x intensity
+uniform vec3 uHemiSky;       // sum of HemisphereLight sky halves
+uniform vec3 uHemiGround;    // ... and their ground halves
+uniform vec3 uHemiUp;        // world axis the hemisphere blend runs along
+// <<< RT_AMBIENT
 uniform vec3 uEnvColor;
 uniform float uEnvIntensity;
 uniform float uFrame;
@@ -1454,6 +1467,20 @@ void main() {
   }
   // <<< RT_RESTIR_DIR_BYPASS
   // <<< RT_RESTIR_COLD_FALLBACK
+// >>> RT_AMBIENT
+  // Unoccluded ambient, added to the DIRECT term because that is the buffer the
+  // composite multiplies by albedo — so this lands as albedo x ambient, which
+  // is what three's own AmbientLight/HemisphereLight do on a Lambert surface.
+  // No ray, no shadow, no loop, no new call site: three uniforms and a dot.
+  //
+  // It is what keeps gi:false (the 0.15.0 default) from rendering every surface
+  // no light faces PURE BLACK. It is NOT global illumination and the docs do not
+  // pretend otherwise: nothing occludes it, nothing carries colour between
+  // surfaces, and a GI bounce does not pick it up (traceRadiance shades its hit
+  // with direct light only, which keeps the three-call-site budget untouched).
+  // Zero uniforms = zero contribution, exactly.
+  direct += uAmbientFlat + mix(uHemiGround, uHemiSky, 0.5 * dot(N, uHemiUp) + 0.5);
+// <<< RT_AMBIENT
 
   // --- 1-bounce indirect (cosine-weighted; pdf cancels the NdotL/PI).
   // traceRadiance shades the hit with direct + NEE light, or returns the
@@ -1917,6 +1944,12 @@ export class RTLightingPass {
         uDispersion: { value: 0 },
         uLightStochastic: { value: false },
         uGIHalfRate: { value: false },
+        // >>> RT_AMBIENT
+        uAmbientFlat: { value: new THREE.Color(0, 0, 0) },
+        uHemiSky: { value: new THREE.Color(0, 0, 0) },
+        uHemiGround: { value: new THREE.Color(0, 0, 0) },
+        uHemiUp: { value: new THREE.Vector3(0, 1, 0) },
+        // <<< RT_AMBIENT
         uEnvColor: { value: new THREE.Color(0.03, 0.04, 0.06) },
         uEnvIntensity: { value: 1.0 },
         uFrame: { value: 0 },

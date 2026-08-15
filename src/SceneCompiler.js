@@ -117,6 +117,17 @@ export class CompiledScene {
     this.lightColorRadius = [];
     this.lightDirCone = []; // spot direction.xyz + cos(outer angle)
     this.lightCount = 0;
+    // >>> RT_AMBIENT
+    // Unoccluded ambient, summed out of the scene's AmbientLights and
+    // HemisphereLights by syncLights. These are NOT table rows: neither light
+    // has a position to trace a shadow ray at, so they are uniforms the lighting
+    // pass adds to the direct irradiance with no ray. All zero = the scene has
+    // none, which is also exactly what `ambient: false` uploads.
+    this.ambientColor = new THREE.Color(0, 0, 0);   // sum of colour x intensity
+    this.hemiSky = new THREE.Color(0, 0, 0);        // hemisphere, upper half
+    this.hemiGround = new THREE.Color(0, 0, 0);     // hemisphere, lower half
+    this.hemiUp = new THREE.Vector3(0, 1, 0);       // world axis of that blend
+    // <<< RT_AMBIENT
     this.emissiveTriCount = 0;
     // >>> RT_RESTIR_CAND_CDF
     // Total power of the emissive NEE set, in the power CDF's own units (area x
@@ -1722,13 +1733,46 @@ export function syncLights(scene, compiled) {
   const tmpP = new THREE.Vector3();
   const tmpT = new THREE.Vector3();
 
+  // UNOCCLUDED AMBIENT (see the `ambient` option). AmbientLight and
+  // HemisphereLight are not traceable sources: there is no position to aim a
+  // shadow ray at, so they can never be table rows. They are summed here into a
+  // few numbers the lighting pass adds to the direct irradiance with NO ray and
+  // no shadow. Accumulated in the SAME traversal as the analytic lights, and
+  // outside the slot machinery, because they take no slot — a scene with all 32
+  // slots full still has an ambient term. Reset first: this function is the only
+  // writer and it is called on every updateLights.
+  compiled.ambientColor.setRGB(0, 0, 0);
+  compiled.hemiSky.setRGB(0, 0, 0);
+  compiled.hemiGround.setRGB(0, 0, 0);
+  const hemiUp = compiled.hemiUp.set(0, 0, 0);
+
   // 1. Gather the active lights in traversal order, computing each one's table
   //    row up front. (The previous code pushed straight into the arrays; doing
   //    the scan first is what lets us seat survivors in their old slots.)
   const active = [];
   scene.traverse((obj) => {
     if (!obj.isLight || !obj.visible || obj.intensity <= 0) return;
-    if (obj.isSpotLight) {
+    if (obj.isAmbientLight) {
+      compiled.ambientColor.r += obj.color.r * obj.intensity;
+      compiled.ambientColor.g += obj.color.g * obj.intensity;
+      compiled.ambientColor.b += obj.color.b * obj.intensity;
+    } else if (obj.isHemisphereLight) {
+      compiled.hemiSky.r += obj.color.r * obj.intensity;
+      compiled.hemiSky.g += obj.color.g * obj.intensity;
+      compiled.hemiSky.b += obj.color.b * obj.intensity;
+      const g = obj.groundColor || obj.color;
+      compiled.hemiGround.r += g.r * obj.intensity;
+      compiled.hemiGround.g += g.g * obj.intensity;
+      compiled.hemiGround.b += g.b * obj.intensity;
+      // A HemisphereLight has no target: three points it along its own world
+      // POSITION (which is why the default (0,1,0) reads as a plain sky/ground
+      // blend). Several of them combine as an intensity-weighted mean direction,
+      // normalised at the end, so two opposed hemis do not sum their colours
+      // onto a meaningless axis; a light left at the origin votes for +Y.
+      obj.getWorldPosition(tmpP);
+      if (tmpP.lengthSq() > 1e-12) hemiUp.addScaledVector(tmpP.normalize(), obj.intensity);
+      else hemiUp.y += obj.intensity;
+    } else if (obj.isSpotLight) {
       // posType.w encodes type AND the inner-cone cosine: w = 2 + cosInner
       // (any w >= 1.5 is a spot). Direction + outer cosine live in dirCone.
       obj.getWorldPosition(tmpP);
@@ -1830,6 +1874,10 @@ export function syncLights(scene, compiled) {
   }
 
   compiled.lightCount = count;
+  // Normalise the hemisphere axis once, after every vote is in. Zero length =
+  // no hemisphere lights at all, and +Y keeps the shader's dot() well-defined.
+  if (hemiUp.lengthSq() > 1e-12) hemiUp.normalize();
+  else hemiUp.set(0, 1, 0);
 }
 
 export { MAX_LIGHTS };

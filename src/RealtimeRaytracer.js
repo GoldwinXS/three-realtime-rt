@@ -835,6 +835,30 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * (the demo's "cost scale" slider drives it).
      */
     this.costScale = options.costScale ?? 1 / 96;
+    /**
+     * Honour three's AmbientLight and HemisphereLight as an UNOCCLUDED ambient
+     * term (default true, new in 0.15.0). Both were ignored before: neither has
+     * a position to trace a shadow ray at, so neither can be a row in the light
+     * table, and the renderer had no non-traced light path at all. That was
+     * survivable while `gi` defaulted ON, because a GI ray that escapes the
+     * scene returns `envColor` and every surface got SOMETHING; with `gi: false`
+     * as the 0.15.0 default it is not, and a surface no light faces would render
+     * pure black.
+     *
+     * SceneCompiler sums the visible AmbientLights into one colour and the
+     * visible HemisphereLights into (sky, ground, up), and the lighting pass
+     * adds `flat + mix(ground, sky, 0.5*dot(N, up) + 0.5)` to the DIRECT
+     * irradiance — demodulated, so the composite multiplies it by albedo like
+     * everything else. Three uniforms and a dot product: no ray, no shadow, no
+     * loop, no sampler.
+     *
+     * It is NOT global illumination and is not sold as one. Nothing occludes it
+     * (a closed box lit only by an AmbientLight renders flat), nothing carries
+     * colour from one surface to another, and GI bounces do not pick it up.
+     * `gi: true` remains the real thing. `false` here uploads zeros, which the
+     * shader adds unconditionally, so OFF is bit-for-bit the pre-0.15 result.
+     */
+    this.ambient = options.ambient ?? true;
     /** Environment (sky) color used for GI rays that miss + composite background. */
     this.envColor = options.envColor ?? new THREE.Color(0.03, 0.04, 0.06);
     this.envIntensity = options.envIntensity ?? 1.0;
@@ -978,8 +1002,23 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.denoiseWideDamp = options.denoiseWideDamp ?? 0;
     /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
     this.fireflyClamp = options.fireflyClamp ?? 4.0;
-    /** 1-bounce global illumination (traced indirect). Toggle for a direct-only look. */
-    this.gi = options.gi ?? true;
+    /**
+     * 1-bounce global illumination (traced indirect). DEFAULT OFF since 0.15.0.
+     *
+     * It is the most expensive thing in the renderer — one extra traced ray per
+     * pixel per frame, which shades its hit with the full direct + NEE stack —
+     * and it is the one feature whose absence a scene can be authored around.
+     * The defaults must run well on hardware nobody sent us, so the heavy path
+     * is the opt-in and the correctness fixes are the default. Turn it on for
+     * colour bleed; it is a one-line change and the demo panel's most visible
+     * switch.
+     *
+     * `ambient` (below) is what keeps `gi: false` from rendering every
+     * light-facing-away surface pure black: an AmbientLight / HemisphereLight in
+     * the scene now contributes an unoccluded flat term. That is not GI and the
+     * docs say so.
+     */
+    this.gi = options.gi ?? false;
     /**
      * Half-rate GI: trace the bounce on alternating checkerboard parity each
      * frame (doubled — unbiased, temporal accumulation converges to the same
@@ -3131,6 +3170,21 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
 
     // 2. ray traced lighting with temporal reprojection
     const rtU = this.rtPass.material.uniforms;
+    // Unoccluded ambient. `ambient: false` uploads zeros, which is not a
+    // shortcut but the definition: the shader adds these four uniforms
+    // unconditionally, so all-zero IS "no ambient", bit for bit. A scene with
+    // no AmbientLight/HemisphereLight already reads zero here, so the option
+    // costs nothing to leave on.
+    if (this.ambient && this.compiled) {
+      rtU.uAmbientFlat.value.copy(this.compiled.ambientColor);
+      rtU.uHemiSky.value.copy(this.compiled.hemiSky);
+      rtU.uHemiGround.value.copy(this.compiled.hemiGround);
+      rtU.uHemiUp.value.copy(this.compiled.hemiUp);
+    } else {
+      rtU.uAmbientFlat.value.setRGB(0, 0, 0);
+      rtU.uHemiSky.value.setRGB(0, 0, 0);
+      rtU.uHemiGround.value.setRGB(0, 0, 0);
+    }
     rtU.uEnvColor.value.copy(this.envColor);
     rtU.uEnvIntensity.value = this.envIntensity;
     rtU.uEps.value = this.eps;

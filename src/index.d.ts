@@ -295,8 +295,27 @@ export interface RealtimeRaytracerOptions {
    * applies the buffer resize itself; null disables this level.
    */
   canvasScaleHook?: ((scale: number) => void) | null;
-  /** 1-bounce global illumination (traced indirect). Toggle for a direct-only look. */
+  /**
+   * 1-bounce global illumination (traced indirect). DEFAULT `false` since
+   * 0.15.0: it is the most expensive thing in the renderer (one extra traced
+   * ray per pixel per frame, shaded with the full direct + NEE stack) and the
+   * defaults have to run on hardware nobody sent us. Turn it on for colour
+   * bleed. `ambient` is what keeps the off state from being black.
+   */
   gi?: boolean;
+  /**
+   * Honour three's `AmbientLight` and `HemisphereLight` as an UNOCCLUDED
+   * ambient term (default `true`, new in 0.15.0). Both were ignored before,
+   * because neither has a position to trace a shadow ray at. The compiler sums
+   * the visible ones and the lighting pass adds
+   * `flat + mix(ground, sky, 0.5*dot(N, up) + 0.5)` to the direct irradiance
+   * with no ray: three uniforms and a dot product, no sampler, no loop.
+   *
+   * NOT global illumination. Nothing occludes it, nothing carries colour
+   * between surfaces, and GI bounces do not pick it up; `gi: true` remains the
+   * real thing. `false` uploads zeros, so the result is bit-for-bit pre-0.15.
+   */
+  ambient?: boolean;
   /**
    * Half-rate GI: trace the bounce on alternating checkerboard parity each
    * frame (doubled — unbiased, temporal accumulation converges to the same
@@ -1030,8 +1049,10 @@ export class RealtimeRaytracer {
   glassClampScale: number;
   /** Clamp on indirect luminance to suppress fireflies. 0 disables. */
   fireflyClamp: number;
-  /** 1-bounce global illumination. */
+  /** 1-bounce global illumination. Default false since 0.15.0. */
   gi: boolean;
+  /** Honour AmbientLight / HemisphereLight as unoccluded ambient (default true). Live-assignable. */
+  ambient: boolean;
   /** Half-rate GI: alternating checkerboard temporal amortisation. Pass this option explicitly at construction to pin it against the adaptive governor. */
   giHalfRate: boolean;
   /** Sample static emissive meshes as area lights (NEE). */

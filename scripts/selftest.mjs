@@ -391,6 +391,18 @@ function describeGovernor(v) {
 // ?selftest=warnings / ?selftest=presets). Both pages are single-page loads
 // that build their own renderer and write ONE JSON verdict into
 // #selftest-verdict; `describe` turns a failing verdict into a human sentence.
+function describeAmbient(v) {
+  if (v.threw) return `ambient scene threw: ${v.error}`;
+  const gates = [
+    ["ambientLit", v.ambientLit],
+    ["ambientOffDark", v.ambientOffDark],
+    ["hemiLit", v.hemiLit],
+    ["hemiSplit", v.hemiSplit],
+  ];
+  const bad = gates.filter(([, ok]) => !ok).map(([n]) => n);
+  return `gate(s): ${bad.join(", ") || "unknown"} (lum amb ${v.ambLum} / off ${v.ambOffLum} / hemi up ${v.hemiUpLum} down ${v.hemiDownLum})`;
+}
+
 function describePresets(v) {
   if (v.threw) return `presets scene threw: ${v.error}`;
   const gates = [
@@ -509,6 +521,7 @@ async function main() {
   let warnings = null;
   let presets = null;
   let governor = null;
+  let ambient = null;
   try {
     results.push(["chromium", await runChromiumLeg("chromium", base)]);
     for (const [name, launcher] of [["firefox", firefox], ["webkit", webkit]]) {
@@ -552,6 +565,17 @@ async function main() {
         (presets.verdict ? `\n     ${JSON.stringify(presets.verdict)}` : "")
     );
 
+    // Ambient-light check (chromium, default three). Guards the 0.15.0 `ambient`
+    // option and, with it, the `gi: false` default: with neither, a scene whose
+    // only light is an AmbientLight renders pure black.
+    console.log(`\n=== ambient lights (chromium, ?selftest=ambient) ===`);
+    ambient = await driveCheck(base, "ambient", describeAmbient);
+    console.log(
+      `  -> ${ambient.status.toUpperCase()} (${ambient.ms}ms)` +
+        (ambient.reason ? `\n     reason: ${ambient.reason}` : "") +
+        (ambient.verdict ? `\n     ${JSON.stringify(ambient.verdict)}` : "")
+    );
+
     // Governor-pinning check (chromium, default three).
     console.log(`\n=== governor pinning (chromium, ?selftest=governor) ===`);
     governor = await driveCheck(base, "governor", describeGovernor);
@@ -583,6 +607,7 @@ async function main() {
   console.log(pad("empty-scene", 18) + pad(empty ? empty.status : "-", 8) + "(compileScene no-op + render fallback)");
   console.log(pad("warnings", 18) + pad(warnings ? warnings.status : "-", 8) + "(usage diagnostics fire once, status.warnings)");
   console.log(pad("presets", 18) + pad(presets ? presets.status : "-", 8) + "(preset API: defaults byte-identity + balanced no-op)");
+  console.log(pad("ambient", 18) + pad(ambient ? ambient.status : "-", 8) + "(AmbientLight/HemisphereLight lit; off = black)");
   console.log(pad("governor", 18) + pad(governor ? governor.status : "-", 8) + "(option pinning: _takeFreeWins + _releaseFreeWins invariants)");
   for (const [name, r] of results) {
     if (r.status !== "pass" && r.reason) console.log(`  ${name}: ${r.reason}`);
@@ -590,6 +615,7 @@ async function main() {
   if (empty && empty.status !== "pass" && empty.reason) console.log(`  empty-scene: ${empty.reason}`);
   if (warnings && warnings.status !== "pass" && warnings.reason) console.log(`  warnings: ${warnings.reason}`);
   if (presets && presets.status !== "pass" && presets.reason) console.log(`  presets: ${presets.reason}`);
+  if (ambient && ambient.status !== "pass" && ambient.reason) console.log(`  ambient: ${ambient.reason}`);
   if (governor && governor.status !== "pass" && governor.reason) console.log(`  governor: ${governor.reason}`);
   console.log("========================================================");
 
@@ -604,6 +630,7 @@ async function main() {
   if (!empty || empty.status !== "pass") problems.push(`empty-scene (${empty ? empty.status : "missing"})`);
   if (!warnings || warnings.status !== "pass") problems.push(`warnings (${warnings ? warnings.status : "missing"})`);
   if (!presets || presets.status !== "pass") problems.push(`presets (${presets ? presets.status : "missing"})`);
+  if (!ambient || ambient.status !== "pass") problems.push(`ambient (${ambient ? ambient.status : "missing"})`);
   if (!governor || governor.status !== "pass") problems.push(`governor (${governor ? governor.status : "missing"})`);
   const failed = results.filter(([, r]) => r.status === "fail").map(([n]) => n);
   for (const n of failed) if (!problems.some((p) => p.startsWith(n))) problems.push(`${n} (fail)`);
