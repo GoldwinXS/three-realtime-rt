@@ -123,33 +123,46 @@ let triCount = 0;
 // RealtimeRaytracer on every scene switch, so `settings` outlives any one `rt`
 // and is re-applied after each switchScene() creates one. Controls write here
 // then call applySettings().
-const settings = {
-  gi: true,
-  emissiveNEE: true,
-  reflections: true,
-  refraction: true,
-  restir: true,
-  denoise: true,
-  taa: true,
-  volumetric: false,
-  renderScale: 0.5,
+//
+// The STARTING values are the library's own, read from RealtimeRaytracer.DEFAULTS
+// rather than restated here: the gallery is a place to see what the library does
+// out of the box, so a hand-written copy of these opinions would be the one thing
+// it must not have. `volumetric` is flattened because the strip's checkbox is a
+// boolean; everything else is a straight key match, which is what makes
+// defaultSettings() below a one-liner.
+const defaultSettings = () => ({
+  gi: RealtimeRaytracer.DEFAULTS.gi,
+  ambient: RealtimeRaytracer.DEFAULTS.ambient,
+  emissiveNEE: RealtimeRaytracer.DEFAULTS.emissiveNEE,
+  reflections: RealtimeRaytracer.DEFAULTS.reflections,
+  refraction: RealtimeRaytracer.DEFAULTS.refraction,
+  restir: RealtimeRaytracer.DEFAULTS.restir,
+  restirDirectionalBypass: RealtimeRaytracer.DEFAULTS.restirDirectionalBypass,
+  restirReprojectionRescue: RealtimeRaytracer.DEFAULTS.restirReprojectionRescue,
+  restirCandidateImportance: RealtimeRaytracer.DEFAULTS.restirCandidateImportance,
+  motionVectors: RealtimeRaytracer.DEFAULTS.motionVectors,
+  denoise: RealtimeRaytracer.DEFAULTS.denoise,
+  taa: RealtimeRaytracer.DEFAULTS.taa,
+  volumetric: RealtimeRaytracer.DEFAULTS.volumetric.enabled,
+  renderScale: RealtimeRaytracer.DEFAULTS.renderScale,
   // Auto quality ON out of the box — the governor steers renderScale, denoise,
   // and (via canvasScaleHook) canvas scale to hold the frame-rate target on
   // whatever hardware loads the gallery.
-  adaptiveQuality: true,
-};
+  adaptiveQuality: RealtimeRaytracer.DEFAULTS.adaptiveQuality,
+});
+const settings = defaultSettings();
 
 function applySettings() {
   if (!rt) return;
-  rt.gi = settings.gi;
-  rt.emissiveNEE = settings.emissiveNEE;
-  rt.reflections = settings.reflections;
-  rt.refraction = settings.refraction;
-  rt.restir = settings.restir;
-  rt.denoise = settings.denoise;
-  rt.taa = settings.taa;
+  for (const k of [
+    "gi", "ambient", "emissiveNEE", "reflections", "refraction", "restir",
+    "restirDirectionalBypass", "restirReprojectionRescue",
+    "restirCandidateImportance", "motionVectors", "denoise", "taa",
+    "adaptiveQuality",
+  ]) {
+    rt[k] = settings[k];
+  }
   rt.volumetric.enabled = settings.volumetric;
-  rt.adaptiveQuality = settings.adaptiveQuality;
   // renderScale reallocates targets, so only touch it when it actually changed.
   if (rt.renderScale !== settings.renderScale) rt.renderScale = settings.renderScale;
   rt.resetAccumulation();
@@ -265,6 +278,25 @@ if (canvasSelect) {
     setCanvasScale(parseFloat(canvasSelect.value));
     settings.adaptiveQuality = false; // manual res selection overrides auto
     if (autoBox) autoBox.checked = false;
+    applySettings();
+  });
+}
+
+// Reset to defaults: put every control in the strip back to the library's own
+// constructor defaults, re-read the DOM from them, and start the image again.
+// The canvas scale is the app's rather than the renderer's, so full size is its
+// default. Nothing is persisted by this page, so there is no storage to clear —
+// if that ever changes, it clears here.
+const resetBtn = document.getElementById("opt-reset");
+if (resetBtn) {
+  resetBtn.addEventListener("click", () => {
+    Object.assign(settings, defaultSettings());
+    document.querySelectorAll("#options input[data-flag]").forEach((box) => {
+      box.checked = settings[box.dataset.flag];
+    });
+    if (resSelect) resSelect.value = String(settings.renderScale);
+    setCanvasScale(1);
+    if (canvasSelect) canvasSelect.value = "1";
     applySettings();
   });
 }

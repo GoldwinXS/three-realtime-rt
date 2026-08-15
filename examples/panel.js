@@ -16,6 +16,10 @@
 // Vite resolves JSON named imports in dev and build alike, so the fps badge
 // always shows the version being served rather than a hand-copied string.
 import { version } from "../package.json";
+// The Reset button re-applies the LIBRARY's own defaults, read from the
+// library rather than restated here — a second copy of these opinions in the
+// demo is exactly how a "reset" ends up resetting to the wrong thing.
+import { RealtimeRaytracer } from "../src/index.js";
 
 const CSS = `
 :root { --panel-bg: rgba(14,18,24,0.95); --panel-br: #26323c; --ink: #d7e0e6;
@@ -94,6 +98,12 @@ const CSS = `
 #panel input[type=color] { width: 26px; height: 20px; padding: 0; border: 1px solid #37474f;
   border-radius: 4px; background: none; cursor: pointer; flex: none; }
 #panel .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 4px; }
+/* the reset bar sits OUTSIDE the collapsible groups, just above the pinned
+   footer, because a control that undoes every other control should not be
+   hidden inside one of the things it undoes */
+#panel .reset-bar { border-top: 1px solid var(--panel-br); padding: 9px 14px; }
+#panel .reset-bar button { width: 100%; }
+#panel .reset-bar .note { margin: 7px 0 0 0; }
 #panel button { font: inherit; color: var(--ink); background: #17222b; border: 1px solid #2f414d;
   border-radius: 6px; padding: 7px 6px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 5px; transition: all .12s; }
 #panel button:hover { background: #1e2d38; border-color: var(--accent); color: #fff; }
@@ -433,10 +443,12 @@ export function buildPanel({
     "the canvas; it also sets denoise passes and fast lights. Changing any of " +
     "those by hand switches this off.";
   rSec.append(autoNote);
-  rSec.append(toggle("denoise", rt.denoise, (v) => (rt.denoise = v),
-    "the à-trous denoiser — smooths the noisy pre-convergence frames").row);
-  rSec.append(toggle("TAA (anti-alias)", rt.taa, (v) => { rt.taa = v; rt.resetAccumulation(); },
-    "temporal anti-aliasing — accumulates across frames to settle edges").row);
+  const denoiseT = toggle("denoise", rt.denoise, (v) => (rt.denoise = v),
+    "the à-trous denoiser — smooths the noisy pre-convergence frames");
+  rSec.append(denoiseT.row);
+  const taaT = toggle("TAA (anti-alias)", rt.taa, (v) => { rt.taa = v; rt.resetAccumulation(); },
+    "temporal anti-aliasing — accumulates across frames to settle edges");
+  rSec.append(taaT.row);
   // Include the mobile preset's scales — otherwise touching this dropdown on
   // a phone locks you out of the value the page started with. Manual choice
   // takes the wheel from the adaptive governor.
@@ -460,29 +472,26 @@ export function buildPanel({
   const canvasBadge = govBadge(canvasSel.row, "driven by auto quality — the governor's deepest lever, taken only after lighting res bottoms out at 20%");
   const lightBadge = govBadge(lightSel.row, "driven by auto quality — the first resolution the governor spends, in 5% steps down to 20%");
   rSec.append(canvasSel.row, lightSel.row);
-  rSec.append(
-    // Overscan: render past the canvas edges and crop back, so the leading-edge
-    // disocclusion noise during camera motion is born off-screen. Costs pixels
-    // (0.1 → 1.44×), so it lives next to the resolution controls.
-    selectRow("overscan", [["off", 0], ["5%", 0.05], ["10%", 0.1]], rt.overscan, (v) => {
-      rt.overscan = parseFloat(v);
-    }, "render past the canvas edge and crop back, so camera-motion noise is born off-screen").row
-  );
-  rSec.append(
-    selectRow("view", [
-      ["composite", 0], ["albedo", 1], ["normals", 2],
-      ["irradiance", 3], ["world pos", 4], ["emissive", 5], ["specular", 6],
-      ["bvh cost", 7],
-    ], rt.outputMode, (v) => (rt.outputMode = parseInt(v, 10)),
-      "debug views of the G-buffer and the lighting passes").row
-  );
+  // Overscan: render past the canvas edges and crop back, so the leading-edge
+  // disocclusion noise during camera motion is born off-screen. Costs pixels
+  // (0.1 → 1.44×), so it lives next to the resolution controls.
+  const overscanSel = selectRow("overscan", [["off", 0], ["5%", 0.05], ["10%", 0.1]], rt.overscan, (v) => {
+    rt.overscan = parseFloat(v);
+  }, "render past the canvas edge and crop back, so camera-motion noise is born off-screen");
+  rSec.append(overscanSel.row);
+  const viewSel = selectRow("view", [
+    ["composite", 0], ["albedo", 1], ["normals", 2],
+    ["irradiance", 3], ["world pos", 4], ["emissive", 5], ["specular", 6],
+    ["bvh cost", 7],
+  ], rt.outputMode, (v) => (rt.outputMode = parseInt(v, 10)),
+    "debug views of the G-buffer and the lighting passes");
+  rSec.append(viewSel.row);
   // BVH-cost heatmap scale: the slider is "visits to saturate" (hot/white end),
   // 32..512; rt.costScale is its reciprocal. Only affects the mode-7 view.
-  rSec.append(
-    slider("cost scale", 32, 512, 16, Math.round(1 / rt.costScale),
-      (x) => `${Number(x).toFixed(0)} hits`, (v) => (rt.costScale = 1 / v),
-      "BVH traversal cost heatmap saturation, for the “bvh cost” view")
-  );
+  const costS = sliderRow("cost scale", 32, 512, 16, Math.round(1 / rt.costScale),
+    (x) => `${Number(x).toFixed(0)} hits`, (v) => (rt.costScale = 1 / v),
+    "BVH traversal cost heatmap saturation, for the “bvh cost” view");
+  rSec.append(costS.row);
   panel.append(rSec);
 
   // Rows in one section sometimes have to drive rows in another (a feature
@@ -555,11 +564,66 @@ export function buildPanel({
     applyRestir(v);
   });
   laSec.append(restirT.row);
+
+  // --- the reservoir's own knobs, as sub-rows of the toggle they modify ------
+  // All five arrived with the 0.15.0 Hangar port and four of them are ON by
+  // default now, so the panel has to be able to turn each one OFF: that A/B is
+  // the only way to see what it bought. Same "this modifies the row above"
+  // grammar the GI modifiers use, dimmed while ReSTIR is off because every one
+  // of them is inert without a reservoir.
+  const restirSubs = [];
+  const restirSub = (row) => {
+    row.classList.add("sub");
+    restirSubs.push(row);
+    laSec.append(row);
+    return row;
+  };
+  const dirBypassT = featureToggle("restirDirectionalBypass", "sun bypass", rt.restirDirectionalBypass,
+    (v) => { rt.restirDirectionalBypass = v; rt.resetAccumulation(); },
+    "keep DIRECTIONAL lights out of the reservoir and shade them exactly. The reservoir scores candidates UNSHADOWED, so it elects the sun everywhere and spends its one visibility ray on the wall between: interiors go black with bright specks. Costs one shadow ray per pixel.");
+  restirSub(dirBypassT.row);
+  const rescueT = featureToggle("restirReprojectionRescue", "reprojection rescue", rt.restirReprojectionRescue,
+    (v) => { rt.restirReprojectionRescue = v; rt.resetAccumulation(); },
+    "sub-texel correction plus a four-neighbour rescue when the reservoir's history fails its plane test. Without it, TAA jitter walks the sample across thin geometry and balusters/handrails/frames never accumulate any history at all.");
+  restirSub(rescueT.row);
+  const candT = featureToggle("restirCandidateImportance", "candidate importance", rt.restirCandidateImportance,
+    (v) => { rt.restirCandidateImportance = v; rt.resetAccumulation(); },
+    "draw reservoir candidates by POWER (pool split, then that pool's CDF) instead of uniformly over lights + emissive triangles. Uniform spends ~91% of its candidates on the emissive pool, which carries ~4% of the light. Measured free.");
+  restirSub(candT.row);
+  const clampRelS = sliderRow("relative cap", 0, 4, 0.5, rt.restirClampRel, (x) => (Number(x) === 0 ? "off" : Number(x).toFixed(1)),
+    (v) => { rt.restirClampRel = v; rt.resetAccumulation(); },
+    "firefly cap on the ReSTIR direct term as a MULTIPLE of the pixel's own reservoir estimate of the light total (0 = the old absolute cap alone). One sample carries the whole sum, so an absolute cap clips the peaks and nothing lifts the zeros: bright surfaces converge dark.");
+  restirSub(clampRelS.row);
+  const warmS = sliderRow("warm age", 0, 64, 4, rt.restirWarmAge, (x) => (Number(x) === 0 ? "off" : Number(x).toFixed(0)),
+    (v) => { rt.restirWarmAge = v; rt.resetAccumulation(); },
+    "shade any pixel with fewer than N frames of validated reservoir history by the EXACT per-light loop instead. Removes reveal speckle outright and costs 5-6x a ReSTIR frame on those pixels; measured 2.2x whole-frame in motion, which is why it ships off.");
+  restirSub(warmS.row);
+  const samplesS = sliderRow("multi-sample", 1, 4, 1, rt.restirSamples, (x) => `${Number(x).toFixed(0)}x`,
+    (v) => { rt.restirSamples = v; rt.resetAccumulation(); },
+    "shade N reservoir winners per pixel (the pixel's own plus N-1 neighbours'), each with its own visibility ray, averaged. Sub-1/sqrt(N) because neighbouring reservoirs are correlated, and the shipped denoiser already removes most of what it buys.");
+  restirSub(samplesS.row);
+  const warmNote = el("div", "note");
+  warmNote.textContent =
+    "these five are the reservoir being RIGHT rather than fast: four are on by " +
+    "default and cost either nothing or one ray. “warm age” is the exception, " +
+    "off because it is 2.2x the frame in motion.";
+  laSec.append(warmNote);
+
   // Grab the fast-lights toggle first so the ReSTIR handler can uncheck it.
   const fastLights = featureToggle("stochasticLights", "fast lights (1 ray)", rt.stochasticLights, (v) => { rt.stochasticLights = v; setAdaptive(false); rt.resetAccumulation(); });
   laSec.append(fastLights.row);
-  laSec.append(toggle("volumetric light", rt.volumetric.enabled, (v) => { rt.volumetric.enabled = v; rt.resetAccumulation(); }).row);
-  laSec.append(toggle("fog / haze", rt.fog.enabled, (v) => { rt.fog.enabled = v; rt.resetAccumulation(); }).row);
+  // Ambient / hemisphere lights as an unoccluded flat term (0.15.0). It belongs
+  // with the LIGHTS, not with ReSTIR: it is a light source the compiler used to
+  // ignore outright, and it is what stops the default gi:false from rendering
+  // every surface no light faces pure black.
+  const ambientT = featureToggle("ambient", "ambient / hemisphere", rt.ambient,
+    (v) => { rt.ambient = v; rt.resetAccumulation(); },
+    "honour three's AmbientLight and HemisphereLight as an UNOCCLUDED flat term (no ray, no shadow). Not GI: nothing occludes it and nothing carries colour between surfaces.");
+  laSec.append(ambientT.row);
+  const volT = toggle("volumetric light", rt.volumetric.enabled, (v) => { rt.volumetric.enabled = v; rt.resetAccumulation(); });
+  laSec.append(volT.row);
+  const fogT = toggle("fog / haze", rt.fog.enabled, (v) => { rt.fog.enabled = v; rt.resetAccumulation(); });
+  laSec.append(fogT.row);
   laSec.append(slider("density", 0.01, 0.12, 0.005, rt.fog.density, (x) => x.toFixed(2), (v) => (rt.fog.density = v)));
   panel.append(laSec);
 
@@ -667,8 +731,9 @@ export function buildPanel({
   // grain on the sphere at the demo's reduced render scale before it fully
   // converges. Drag it up to see the effect; it shimmers slightly while
   // converging, so reset the accumulator on each change.
-  efSec.append(slider("dispersion", 0, 0.3, 0.01, rt.dispersion, (x) => Number(x).toFixed(2), (v) => { rt.dispersion = v; rt.resetAccumulation(); },
-    "chromatic dispersion on the refracted term — the amount white light splits into colour"));
+  const dispS = sliderRow("dispersion", 0, 0.3, 0.01, rt.dispersion, (x) => Number(x).toFixed(2), (v) => { rt.dispersion = v; rt.resetAccumulation(); },
+    "chromatic dispersion on the refracted term — the amount white light splits into colour");
+  efSec.append(dispS.row);
   // Kubelka-Munk scattering: reveals the room's scattering piece (in the museum
   // "Alabaster" (the reading lamp plus the two spheres that differ ONLY in
   // whether they scatter), in the Cornell box the stepped stone wedge). Absorption
@@ -699,10 +764,12 @@ export function buildPanel({
 
   // --- Quality & Performance: the converger's dials. -------------------------
   const qpSec = colSection(ICON.chip, "Quality & Performance", true);
-  qpSec.append(slider("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v),
-    "clamp the bright speckle outliers that sparse sampling leaves behind"));
-  qpSec.append(slider("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v),
-    "how many frames of temporal history the converger keeps"));
+  const fireflyS = sliderRow("firefly clamp", 1, 8, 0.5, rt.fireflyClamp, (x) => Number(x).toFixed(1), (v) => (rt.fireflyClamp = v),
+    "clamp the bright speckle outliers that sparse sampling leaves behind");
+  qpSec.append(fireflyS.row);
+  const historyS = sliderRow("history length", 8, 128, 8, rt.maxHistory, (x) => Number(x).toFixed(0), (v) => (rt.maxHistory = v),
+    "how many frames of temporal history the converger keeps");
+  qpSec.append(historyS.row);
   // Keeps its full 0..5 range: the campaign's finding is about what the
   // GOVERNOR should choose, not about what you may look at. 4 and 5 are where
   // the à-trous lattice is measurable, so they stay reachable by hand.
@@ -711,11 +778,130 @@ export function buildPanel({
     setAdaptive(false); // the governor writes this row too; dragging it takes the wheel
   }, "how many à-trous filter passes the denoiser runs");
   qpSec.append(denoisePasses.row);
+  // Motion vectors (0.15.0, on by default). NOT a ReSTIR knob — the G-buffer's
+  // fifth attachment feeds three temporal stages (the irradiance EMA and the
+  // reservoir consume it; TAA measured worse on it and deliberately does not),
+  // so it sits with the other temporal dials. Inert on a device without 5 draw
+  // buffers, and the row says so rather than lying about what is running.
+  const motionT = toggle("motion vectors", rt.motionVectors, (v) => { rt.motionVectors = v; rt.resetAccumulation(); },
+    "reproject temporal history through each fragment's PREVIOUS screen position instead of through the camera alone. Camera-only reprojection is simply wrong for a moving mesh; a static scene renders identically either way.");
+  if (!rt.motionVectorsSupported) {
+    motionT.input.disabled = true;
+    motionT.row.classList.add("dim");
+    motionT.row.title = "this GPU exposes fewer than 5 draw buffers, so the motion-vector attachment cannot be allocated; every stage stays on camera-only reprojection";
+  }
+  qpSec.append(motionT.row);
   panel.append(qpSec);
 
   // --- per-room exhibit controls go here, below the shared panel -------------
   const exhibits = el("div", "exhibits");
   panel.append(exhibits);
+
+  // --- Reset to defaults ----------------------------------------------------
+  // The owner's rule: "we need a button to reset settings to the default, which
+  // should default to most things off."
+  //
+  // The defaults come from RealtimeRaytracer.DEFAULTS, not from a list written
+  // out here: a demo that restates the library's opinions is a demo whose reset
+  // button drifts. Every row this panel owns is driven back through the SAME
+  // handler a click would use (reg[name].apply for the scene-revealing features,
+  // so the room actually reveals/hides its pieces and recompiles), then the
+  // controls are re-read from the renderer, so nothing can be left showing a
+  // value the renderer is not using.
+  //
+  // It also clears the tour's sessionStorage snapshot. Without that, "reset"
+  // would last exactly until you walked to the next stop and the carried
+  // settings came back — which is the sort of thing that makes a reset button
+  // untrustworthy.
+  const resetBar = el("div", "reset-bar");
+  const resetBtn = el("button", null, `${ICON.reset}<span>Reset to defaults</span>`);
+  const resetToDefaults = () => {
+    const D = RealtimeRaytracer.DEFAULTS;
+
+    // 1. The scene-revealing features go through their own handlers, because a
+    //    room owns what they reveal and whether they recompile.
+    for (const [name, want] of [
+      ["gi", D.gi],
+      ["emissive", D.emissiveNEE],
+      ["reflections", D.reflections],
+      ["refraction", D.refraction],
+      ["absorption", false],
+      ["scattering", false],
+    ]) {
+      const f = reg[name];
+      if (!f) continue;
+      if (f.input.checked !== want) {
+        f.input.checked = want;
+        f.apply(want);
+      }
+      touched.delete(name);
+    }
+    // Tinted shadows is a sub-row of absorption and is disabled without it, so
+    // it is put back by hand (its handler also hands the ReSTIR lease back).
+    if (tintedShadows.input.checked) {
+      tintedShadows.input.checked = false;
+      applyTintedShadows(false);
+    }
+
+    // 2. Plain live properties. The ReSTIR lease is voided first: a borrower
+    //    holding a saved state would otherwise restore it over the reset on its
+    //    way out.
+    restirSavedState = null;
+    restirBorrowers.clear();
+    applyRestir(D.restir);
+    for (const k of [
+      "renderScale", "overscan", "denoise", "denoiseIterations", "taa",
+      "ambient", "giHalfRate", "restirGI", "specular", "dispersion",
+      "stochasticLights", "restirWarmAge", "restirDirectionalBypass",
+      "restirReprojectionRescue", "restirCandidateImportance", "restirClampRel",
+      "restirSamples", "motionVectors", "maxHistory", "fireflyClamp",
+      "outputMode", "costScale", "targetFps",
+    ]) {
+      if (rt[k] !== D[k]) rt[k] = D[k];
+    }
+    rt.volumetric.enabled = D.volumetric.enabled;
+    // Fog is scene dressing rather than a library default (the constructor's is
+    // simply "off"), and the demo's own start is off, so reset means off.
+    rt.fog.enabled = false;
+    // adaptiveQuality LAST: several rows above call setAdaptive(false) as a
+    // side effect of being written, so setting it first would be undone.
+    setAdaptive(D.adaptiveQuality);
+    // The canvas is the app's, not the renderer's; full size is its default.
+    canvasScaleNow = 1;
+    setCanvasScale(1);
+
+    // 3. Any persisted state. Today only the tour writes one.
+    try { sessionStorage.removeItem("rtTourSettings"); } catch { /* storage off */ }
+
+    // 4. Re-read every control from the renderer, including the rows the
+    //    governor owns, and start the image again.
+    for (const [t, v] of [
+      [ambientT, rt.ambient], [dirBypassT, rt.restirDirectionalBypass],
+      [rescueT, rt.restirReprojectionRescue], [candT, rt.restirCandidateImportance],
+      [motionT, rt.motionVectors], [restirGiT, rt.restirGI], [halfRateT, rt.giHalfRate],
+      [denoiseT, rt.denoise], [taaT, rt.taa], [volT, rt.volumetric.enabled],
+      [fogT, rt.fog.enabled],
+    ]) t.input.checked = v;
+    clampRelS.set(rt.restirClampRel);
+    warmS.set(rt.restirWarmAge);
+    samplesS.set(rt.restirSamples);
+    dispS.set(rt.dispersion);
+    fireflyS.set(rt.fireflyClamp);
+    historyS.set(rt.maxHistory);
+    costS.set(Math.round(1 / rt.costScale));
+    overscanSel.select.value = String(rt.overscan);
+    viewSel.select.value = String(rt.outputMode);
+    syncGovernorRows(true);
+    rt.resetAccumulation();
+  };
+  resetBtn.addEventListener("click", resetToDefaults);
+  resetBar.append(resetBtn);
+  const resetNote = el("div", "note");
+  resetNote.textContent =
+    "the library's own constructor defaults: the correctness fixes on, the " +
+    "expensive paths (GI, volumetric, warm age) off, full canvas, auto quality on.";
+  resetBar.append(resetNote);
+  panel.append(resetBar);
 
   // Pinned footer: the fps readout and the links live in one sticky bar at the
   // panel's bottom edge, so they stay in view however many groups are open.
@@ -861,6 +1047,8 @@ export function buildPanel({
     gateHooks,
     borrowRestir,
     setFeatureState,
+    /** Re-apply RealtimeRaytracer.DEFAULTS to every row this panel owns. */
+    resetToDefaults,
     /** Current checked state of a registered feature row. */
     isOn: (name) => !!(reg[name] && reg[name].input.checked),
     touched,

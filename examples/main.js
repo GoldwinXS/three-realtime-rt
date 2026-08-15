@@ -228,43 +228,47 @@ async function main() {
     window.addEventListener("unhandledrejection", (e) => add("promise", [e.reason]));
   }
 
-  // The demo starts at the user's tested MINIMAL config on every tier: a lean
-  // stochastic-light core with the heavy paths (GI, emissive NEE, reflections,
-  // refraction) off. Each is an opt-in add-on in the panel so its frame cost is
-  // visible on whatever hardware this actually is. Explicit — no tier presets —
-  // so the starting point is identical everywhere. targetFps stays set so the
-  // "auto quality" toggle has a target to walk quality toward.
+  // THE DEMO NOW BOOTS ON THE LIBRARY'S OWN DEFAULTS on a desktop tier.
+  //
+  // This block used to be the "tested MINIMAL" start: renderScale 0.375, five
+  // denoise passes, stochastic lights, the governor OFF, and GI on with emissive
+  // NEE / reflections / refraction pinned off. Every one of those was a reaction
+  // to defaults that were heavy in the wrong places, and 0.15.0 moved the
+  // defaults instead: the expensive path (gi) is off, the correctness fixes are
+  // on, and ReSTIR carries the light count. Pinning the old values now would
+  // mean the reference integration demonstrates settings the library does not
+  // ship — and, worse, every explicitly-passed option is PINNED against the
+  // adaptive governor (the 0.14.1 contract), so the old block also forbade the
+  // governor from ever using the levers it exists to use.
+  //
+  // What is still passed, and why each one is not a default:
+  //   the mid tier's lean start  — phones and tablets; measurement, not taste
+  //   targetFps                  — the governor needs a target
+  //   canvasScaleHook            — the app owns the canvas, so it owns the lever
+  //   envColor / sky / fog       — scene description, not quality
+  //   absorptionShadows: false   — a SCENE-REVEAL choice, not a cost one: the
+  //     museum's "tinted glass" toggle has to be a real before/after, and with
+  //     nothing absorbing the megakernel compiles byte-identically either way.
+  //
+  // The panel's per-feature rows keep their A/B meaning either way: what changed
+  // is which side of each A/B you land on first. GI is now the one you turn ON
+  // to see colour bleed, rather than the one you turn off to get frames back.
+  const lean = RealtimeRaytracer.detectTier(renderer) === "mid";
   const rt = new RealtimeRaytracer(renderer, {
-    renderScale: 0.375,
-    denoiseIterations: 5,
-    stochasticLights: true,
-    adaptiveQuality: false,
-    // GI is ON at boot now, deliberately: this room's pitch is "every feature,
-    // one lit room", and the owner's glow-up ask (a natural feel) plus the
-    // procedural-sky experiment both need the one-bounce path — the sky only
-    // lights the room through GI-miss rays, and the critic's "objects float,
-    // no contact shadows" read is the flat no-bounce look. Everything else
-    // stays at the tested minimal boot so the per-feature cost rows in the
-    // panel keep their A/B meaning. The added frame cost is fenced in the
-    // report.
-    gi: true,
-    emissiveNEE: false,
-    reflections: false,
-    refraction: false,
-    // Coloured shadows default ON in the library (they cost nothing until a
-    // material actually absorbs), but the demo starts them OFF so the museum's
-    // reveal is a real before/after: "tinted glass" brings the Lumiere screen in
-    // casting one flat dark rectangle — what a rasterizer draws — and "tinted
-    // shadows" turns that rectangle into the coloured light quilt. Boot is
-    // unaffected either way: with nothing absorbing, the megakernel uses the
-    // byte-identical no-absorption source regardless of this flag.
-    absorptionShadows: false,
+    // Phones and tablets still start lean. Not carried over on faith: these are
+    // the two knobs recommendedOptions("mid") itself picks, and the governor is
+    // free to walk both back up now that it can measure headroom (the two-way
+    // governor is in this release).
+    ...(lean ? { renderScale: 0.375, denoiseIterations: 3 } : {}),
     targetFps: 55,
     // Deepest governor lever: canvas scale is app-owned (we own the canvas + CSS
     // stretch), so hand the governor our setter. setCanvasScale is declared
     // below; the closure only fires at render time, after it exists.
     canvasScaleHook: (s) => setCanvasScale(s),
-    maxHistory: 48,     // shorter history so moving shadows keep up
+    // The museum's "tinted glass" reveal is a before/after, so coloured shadows
+    // start off here even though the library defaults them on (they cost nothing
+    // until a material actually absorbs).
+    absorptionShadows: false,
     envColor: new THREE.Color(0x0a0f18), // low ambient for GI rays that escape the room
     sky,                // (disabled indoors) procedural sky as GI ambient + background
     fog: { enabled: false, color: new THREE.Color(0.5, 0.55, 0.62), density: 0.04 },
@@ -1447,10 +1451,26 @@ async function runPresetsSelftest() {
     // gate guards; it is the machine the selftest actually runs on).
     const s = (v) => (supported ? v : true);
 
-    // 1. Byte-identity: a fresh instance (no preset) matches the 0.11.1 defaults.
+    // 1. Byte-identity: a fresh instance (no preset) matches the snapshot above.
     const a = new RealtimeRaytracer(renderer);
     const before = JSON.stringify(read(a));
     const defaultsMatch = s(before === JSON.stringify(DEFAULTS));
+
+    // 1b. RealtimeRaytracer.DEFAULTS is what it claims to be. Apps (and both of
+    // this repo's demos) build their "reset to defaults" button out of that
+    // static, so if it drifts from the constructor the button quietly resets to
+    // the WRONG settings and nothing complains. Every key is compared against
+    // the same-named property on the fresh instance above; `volumetric` is the
+    // one nested entry and carries only `enabled`.
+    const staticMismatches = [];
+    if (supported) {
+      for (const [k, want] of Object.entries(RealtimeRaytracer.DEFAULTS)) {
+        const got = k === "volumetric" ? a.volumetric.enabled : a[k];
+        const wantV = k === "volumetric" ? want.enabled : want;
+        if (got !== wantV) staticMismatches.push(`${k}: DEFAULTS ${wantV} vs instance ${got}`);
+      }
+    }
+    const staticDefaultsMatch = s(staticMismatches.length === 0);
 
     // 2. applyPreset("balanced") on that fresh instance changes nothing.
     a.applyPreset("balanced");
@@ -1518,7 +1538,8 @@ async function runPresetsSelftest() {
     );
 
     const pass =
-      defaultsMatch && balancedNoop && ctorBalanced && explicitWins && presetStillApplied &&
+      defaultsMatch && staticDefaultsMatch &&
+      balancedNoop && ctorBalanced && explicitWins && presetStillApplied &&
       qualityApplied && perfApplied && motionApplied && unknownThrows &&
       getterCtor && getterApply && getterCustom && presetsShape && allFlat;
 
@@ -1528,6 +1549,8 @@ async function runPresetsSelftest() {
       threw: false,
       supported,
       defaultsMatch,
+      staticDefaultsMatch,
+      staticMismatches: staticMismatches.length ? staticMismatches : undefined,
       balancedNoop,
       ctorBalanced,
       explicitWins,

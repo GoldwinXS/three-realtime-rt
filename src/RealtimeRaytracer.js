@@ -628,6 +628,73 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
    * The exact numbers below are the MEASURED winners from the v0.12.0 quality
    * presets round (see REPORT_PRESETS.md), not guesses.
    */
+  /**
+   * The constructor's defaults for every LIVE-ASSIGNABLE option, as one flat
+   * object, so an app can put a "reset to defaults" button in its own UI
+   * without hard-coding a second copy of this library's opinions (both demos
+   * here do exactly that). Frozen: read it, spread it, do not mutate it.
+   *
+   * `volumetric` is the one nested entry and it carries only `enabled`, for the
+   * same reason the presets do: density / maxDist / zones are the app's scene
+   * description, not a quality setting to reset.
+   *
+   * NOT the full option list. Options that need a `compileScene()`
+   * (`absorptionShadows`, `kmScattering`, `textureTiles`), options that are
+   * scene data (`envColor`, `sky`, `fog`, `ior`) and constructor-only wiring
+   * (`canvasScaleHook`, `preset`) are deliberately absent — a reset button
+   * should not silently recompile your scene or repaint your sky.
+   *
+   * DRIFT IS GATED, not promised: `?selftest=presets` asserts that every key
+   * here equals the same-named property on a freshly constructed instance
+   * (`staticDefaultsMatch`), so this object cannot quietly fall behind the
+   * constructor it documents.
+   */
+  static DEFAULTS = Object.freeze({
+    // resolution and the governor
+    renderScale: 0.5,
+    overscan: 0,
+    adaptiveQuality: true,
+    targetFps: 55,
+    denoise: true,
+    denoiseIterations: 2,
+    taa: true,
+    // what is traced
+    gi: false,
+    giHalfRate: false,
+    ambient: true,
+    emissiveNEE: true,
+    emissiveImportance: true,
+    specular: true,
+    reflections: true,
+    refraction: true,
+    transparency: true,
+    dispersion: 0,
+    volumetric: Object.freeze({ enabled: false }),
+    // direct-light estimator
+    restir: true,
+    restirGI: false,
+    stochasticLights: false,
+    restirMCap: 16,
+    restirWarmAge: 0,
+    restirDirectionalBypass: true,
+    restirReprojectionRescue: true,
+    restirCandidateImportance: true,
+    restirClampRel: 2,
+    restirSamples: 1,
+    restirSampleRadius: 10,
+    restirDynamicAccept: false,
+    restirDynamicFreeze: false,
+    // temporal
+    motionVectors: true,
+    temporalReprojection: true,
+    motionAdaptive: false,
+    maxHistory: 48,
+    fireflyClamp: 4.0,
+    // debug views
+    outputMode: 0,
+    costScale: 1 / 96,
+  });
+
   static PRESETS = {
     quality: {
       renderScale: 0.75,

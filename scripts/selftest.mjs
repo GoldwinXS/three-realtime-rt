@@ -385,7 +385,8 @@ function describeGovernor(v) {
     ["restirMCapUnpinnedStillLowers", v.restirMCapUnpinnedStillLowers],
   ];
   const bad = gates.filter(([, ok]) => !ok).map(([n]) => n);
-  return `gate(s): ${bad.join(", ") || "unknown"}`;
+  const drift = v.staticMismatches ? ` [RealtimeRaytracer.DEFAULTS drift: ${v.staticMismatches.join("; ")}]` : "";
+  return `gate(s): ${bad.join(", ") || "unknown"}${drift}`;
 }
 
 // ?selftest=warnings / ?selftest=presets). Both pages are single-page loads
@@ -407,6 +408,7 @@ function describePresets(v) {
   if (v.threw) return `presets scene threw: ${v.error}`;
   const gates = [
     ["defaultsMatch", v.defaultsMatch],
+    ["staticDefaultsMatch", v.staticDefaultsMatch],
     ["balancedNoop", v.balancedNoop],
     ["ctorBalanced", v.ctorBalanced],
     ["explicitWins", v.explicitWins],

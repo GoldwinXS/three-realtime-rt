@@ -930,6 +930,21 @@ export class RealtimeRaytracer {
    */
   static PRESETS: Record<PresetName, RealtimeRaytracerPreset>;
 
+  /**
+   * The constructor's defaults for every LIVE-ASSIGNABLE option, as one flat
+   * frozen object, so an app can offer "reset to defaults" without hard-coding
+   * a second copy of this library's opinions. Read it, spread it, do not mutate
+   * it. `volumetric` carries only `enabled`.
+   *
+   * Deliberately NOT the full option list: options that need a `compileScene()`
+   * (`absorptionShadows`, `kmScattering`, `textureTiles`), scene description
+   * (`envColor`, `sky`, `fog`, `ior`) and constructor-only wiring
+   * (`canvasScaleHook`, `preset`) are absent, because a reset button should not
+   * recompile your scene or repaint your sky. `?selftest=presets` asserts every
+   * key here equals the same-named property on a fresh instance.
+   */
+  static DEFAULTS: Readonly<RealtimeRaytracerOptions>;
+
   /** Can this renderer run the ray tracing pipeline at all (WebGL2 + float RTs on hardware GPU)? */
   static isSupported(renderer: WebGLRenderer): boolean;
   /** Rough capability tier for choosing defaults (synchronous WebGL heuristic). */
