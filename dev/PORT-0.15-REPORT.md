@@ -440,11 +440,23 @@ tier keeps `renderScale 0.375` / 3 denoise passes, which is what
 hook, `envColor`/`sky`/`fog`, and `absorptionShadows: false` (a scene-reveal
 choice, not a cost one — it compiles byte-identically either way).
 
-**Consequence the owner should see before merging:** the museum now opens
-without GI and with emissive area lights, reflections and refraction ON, which
-is a different first frame from 0.14.1's. That is the "most things off" rule
-applied to the expensive path rather than to the correct one, but it is a look
-change and it is the owner's call.
+**Two consequences the owner should see before merging**, both of them look
+changes rather than faults, and both the owner's call:
+
+1. **The museum now opens without GI** and with emissive area lights,
+   reflections and refraction ON, which is a different first frame from
+   0.14.1's. That is the "most things off" rule applied to the expensive path
+   rather than to the correct one.
+2. **The gallery's Cornell box now opens without GI too**, and its caption in
+   `SCENE_LIST` promises "colour bleed". It is still lit (the ceiling lamp is an
+   emissive NEE area light, and it renders at `lightCount: 0` because it has no
+   analytic light at all), but the red and green bleed onto the boxes — the
+   thing that scene exists to show — is one click away in the options strip
+   rather than on screen at boot. I did NOT special-case it: a scene overriding
+   the library's defaults for itself is a design change beyond the spec, and the
+   honest reading of "GI is opt-in" is that the GI demo asks for GI. If the
+   owner would rather that one scene shipped with `gi: true`, it is a one-line
+   addition to `SCENES.cornell`'s returned object once `gallery.js` reads it.
 
 ## Part 4: the waterfall scene (`169433f`)
 
