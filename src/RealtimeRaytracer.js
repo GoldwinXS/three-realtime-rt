@@ -83,9 +83,11 @@ export class RealtimeRaytracer {
         adaptiveQuality: true,
       };
     }
-    // High: full per-light direct shadows (stochasticLights pinned false).
-    // Pinned explicitly because the constructor default is now `true` (the
-    // conservative-default change) — high must keep its original behaviour.
+    // High: the constructor defaults at desktop lighting resolution. Since
+    // 0.15.0 `stochasticLights` defaults to false, so this no longer has to
+    // undo it — it is still passed EXPLICITLY, because an explicit option is
+    // pinned against the adaptive governor and this tier is saying "do not
+    // trade my light rays away", not merely restating a default.
     return { renderScale: 0.5, denoiseIterations: 3, stochasticLights: false, adaptiveQuality: true };
   }
 
@@ -645,7 +647,12 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       giHalfRate: false,
       specular: true,
       volumetric: { enabled: false },
-      stochasticLights: true,
+      // Tracks the constructor default, which flipped to false in 0.15.0.
+      // `balanced` is DEFINED as "the constructor defaults, written out", and
+      // the render self-test asserts it is a no-op on a fresh instance
+      // (?selftest=presets, gate `balancedNoop`) — so this value is not a
+      // choice, it is a mirror.
+      stochasticLights: false,
       fireflyClamp: 4.0,
     },
     performance: {
@@ -1060,11 +1067,21 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * One stochastic direct shadow ray per pixel per frame (source picked at
      * random) instead of one per light — the biggest ray-count lever for
      * many-light scenes and mobile GPUs. Slightly noisier moving shadows;
-     * temporal accumulation + the denoiser absorb it. Defaults ON so the
-     * zero-config renderer stays cheap on weak GPUs; the governor turns it off
-     * again once it has scaled resolution up on a strong machine.
+     * temporal accumulation + the denoiser absorb it.
+     *
+     * DEFAULT OFF since 0.15.0, and this is a correctness flip rather than a
+     * cost one. It only ever applies when ReSTIR is OFF (the shader reads
+     * `uRestirEnabled ? reservoir : uLightStochastic ? oneRandomLight : exact`),
+     * and ReSTIR is on by default and is the cheap many-light path now. What
+     * the old default actually did was silently redefine what `restir: false`
+     * MEANS: not the exact per-light loop but one random light per pixel per
+     * frame, which is the noisiest estimator in the renderer. Every "ReSTIR off"
+     * reference taken in this project by flipping one flag was that estimator
+     * (found the hard way — see the Hangar cold-fallback report). Off, `restir:
+     * false` is the exact path, which is what a reference is for. The governor
+     * still turns it ON when it needs the rays back.
      */
-    this.stochasticLights = options.stochasticLights ?? true;
+    this.stochasticLights = options.stochasticLights ?? false;
     /**
      * Adaptive quality governor: watches the app's real frame time and walks
      * QUALITY_LADDER — degrading when frames run long, cautiously probing a
@@ -1261,8 +1278,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      */
     this.restirWarmAge = options.restirWarmAge ?? 0;
     /**
-     * DIRECTIONAL LIGHTS BYPASS THE RESERVOIR (default false = shipped
-     * behaviour). With it on, a directional light is never a ReSTIR candidate
+     * DIRECTIONAL LIGHTS BYPASS THE RESERVOIR (DEFAULT ON since 0.15.0; false
+     * restores the pre-0.15 behaviour). With it on, a directional light is
+     * never a ReSTIR candidate
      * and never survives as an inherited winner; the lighting pass shades every
      * directional light exactly instead, once, in the same single call site the
      * exact path uses.
@@ -1284,11 +1302,11 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * excludes those lights, so a candidate slot spent on one is wasted rather
      * than wrong (one sun among 16-29 lights = 3-6% of candidates).
      */
-    this.restirDirectionalBypass = options.restirDirectionalBypass ?? false;
+    this.restirDirectionalBypass = options.restirDirectionalBypass ?? true;
     /**
-     * RESERVOIR REPROJECTION THAT SURVIVES JITTER AND THIN GEOMETRY (default
-     * false = shipped behaviour). Two halves of one fix in the ReSTIR temporal
-     * stage, both gated by this switch:
+     * RESERVOIR REPROJECTION THAT SURVIVES JITTER AND THIN GEOMETRY (DEFAULT ON
+     * since 0.15.0; false restores the pre-0.15 behaviour). Two halves of one
+     * fix in the ReSTIR temporal stage, both gated by this switch:
      *   1. the SUB-TEXEL correction AccumulatePass has always applied
      *      (`prevUv -= currUv - vUv`), because the G-buffer sample under a
      *      reservoir texel is TAA-jittered and so P does not project to the
@@ -1308,10 +1326,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * COST is bounded and ALU-only: at most four extra uPrevGWorldPos fetches
      * and still exactly one uPrevReservoir fetch, on the pixels that failed.
      */
-    this.restirReprojectionRescue = options.restirReprojectionRescue ?? false;
+    this.restirReprojectionRescue = options.restirReprojectionRescue ?? true;
     /**
-     * RESERVOIR CANDIDATES ARE DRAWN THE WAY NEE DRAWS THEM (default false =
-     * shipped behaviour, byte for byte).
+     * RESERVOIR CANDIDATES ARE DRAWN THE WAY NEE DRAWS THEM (DEFAULT ON since
+     * 0.15.0; false restores the pre-0.15 behaviour, byte for byte).
      *
      * WHY. The temporal stage streams 8 candidates UNIFORMLY out of S = analytic
      * lights + emissive NEE triangles. In a room with 26 lights and 256 emissive
@@ -1333,10 +1351,11 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * rand() per candidate (pool choice), all ALU: no extra rays, no extra
      * texture rows. Measured in this game: see dev/candidates-REPORT.md.
      */
-    this.restirCandidateImportance = options.restirCandidateImportance ?? false;
+    this.restirCandidateImportance = options.restirCandidateImportance ?? true;
     /**
      * FIREFLY CAP ON THE RESTIR DIRECT TERM, RELATIVE TO THE PIXEL'S OWN
-     * RESERVOIR TOTAL (default 0 = off = the absolute cap alone = shipped).
+     * RESERVOIR TOTAL (DEFAULT 2 since 0.15.0; 0 = off = the absolute cap alone
+     * = the pre-0.15 behaviour).
      *
      * WHY. The direct term out of a reservoir is capped at 2 x fireflyClamp,
      * while the exact per-light loop caps analytic lights nowhere. Because ReSTIR
@@ -1351,7 +1370,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * everything this pixel could receive", which still catches a genuine 1/d^2
      * spike (those are 100x) and lets a fully lit surface reach its own total.
      */
-    this.restirClampRel = options.restirClampRel ?? 0;
+    this.restirClampRel = options.restirClampRel ?? 2;
     this.restirPass = new RestirPass(this._scaledW, this._scaledH);
     /**
      * Dynamic-mesh reservoir treatments, both DEFAULT OFF (nothing changes until
@@ -1372,7 +1391,8 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.restirDynamicFreeze = options.restirDynamicFreeze ?? false;
 
     /**
-     * MOTION VECTORS for temporal reprojection (DEFAULT OFF). The G-buffer
+     * MOTION VECTORS for temporal reprojection (DEFAULT ON since 0.15.0; false
+     * restores the pre-0.15 camera-only reprojection). The G-buffer
      * writes, into a fifth RG32F attachment, each fragment's PREVIOUS screen
      * position (its last-frame clip position from the dynamic mesh's PREVIOUS
      * model matrix and uPrevViewProj), and the three temporal stages — the
@@ -1397,7 +1417,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * device without it the option is ignored with a one-time warning and every
      * stage keeps camera-only reprojection.
      */
-    this.motionVectors = options.motionVectors ?? false;
+    this.motionVectors = options.motionVectors ?? true;
     this.motionVectorsSupported = RealtimeRaytracer._motionMrtSupported(renderer);
     this._motionVectorsActive = false;
     this._motionWarned = false;
