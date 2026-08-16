@@ -907,7 +907,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       );
     }
 
-    this.gbuffer = new GBufferPass(this._width, this._height, { mixedPrecision });
+    this.gbuffer = new GBufferPass(this._width, this._height, {
+      mixedPrecision,
+      materialPooling: options.gbufferMaterialPooling ?? true,
+    });
     this.rtPass = new RTLightingPass(this._scaledW, this._scaledH, {
       specMRT: this.specMRTSupported,
       maxLights: this._maxLights,
