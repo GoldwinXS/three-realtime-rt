@@ -404,6 +404,30 @@ function describeAmbient(v) {
   return `gate(s): ${bad.join(", ") || "unknown"} (lum amb ${v.ambLum} / off ${v.ambOffLum} / hemi up ${v.hemiUpLum} down ${v.hemiDownLum})`;
 }
 
+function describeLights(v) {
+  if (v.threw) return `lights scene threw: ${v.error}`;
+  const gates = [
+    ["allLit", v.allLit],
+    ["cappedLit", v.cappedLit],
+    ["capReported", v.capReported],
+  ];
+  const bad = gates.filter(([, ok]) => !ok).map(([n]) => n);
+  return `gate(s): ${bad.join(", ") || "unknown"} (counted ${v.countDefault}/${v.lights} at maxLights ` +
+    `${v.capDefault}, ${v.count32}/32 at 32; table ${v.tableDefault} / ${v.table32})`;
+}
+
+function describeLightGrid(v) {
+  if (v.threw) return `lightgrid scene threw: ${v.error}`;
+  const gates = [
+    ["gridLocal", v.gridLocal],
+    ["globalMixed", v.globalMixed],
+    ["better", v.better],
+  ];
+  const bad = gates.filter(([, ok]) => !ok).map(([n]) => n);
+  return `gate(s): ${bad.join(", ") || "unknown"} (own-room winners: grid on ${v.onFrac}, off ${v.offFrac}, ` +
+    `${v.onSamples}/${v.offSamples} samples, ${v.cells} cells)`;
+}
+
 function describePresets(v) {
   if (v.threw) return `presets scene threw: ${v.error}`;
   const gates = [
@@ -524,6 +548,8 @@ async function main() {
   let presets = null;
   let governor = null;
   let ambient = null;
+  let lights = null;
+  let lightgrid = null;
   try {
     results.push(["chromium", await runChromiumLeg("chromium", base)]);
     for (const [name, launcher] of [["firefox", firefox], ["webkit", webkit]]) {
@@ -578,6 +604,28 @@ async function main() {
         (ambient.verdict ? `\n     ${JSON.stringify(ambient.verdict)}` : "")
     );
 
+    // Many-light check (chromium, default three). Guards 0.16.0's `maxLights`:
+    // 48 lights over a strip must show 48 pools, and the same scene capped at
+    // the old 32 must show 32.
+    console.log(`\n=== many lights (chromium, ?selftest=lights) ===`);
+    lights = await driveCheck(base, "lights", describeLights);
+    console.log(
+      `  -> ${lights.status.toUpperCase()} (${lights.ms}ms)` +
+        (lights.reason ? `\n     reason: ${lights.reason}` : "") +
+        (lights.verdict ? `\n     ${JSON.stringify(lights.verdict)}` : "")
+    );
+
+    // Light-grid check (chromium, default three). Guards 0.16.0's local
+    // candidate sampling: with the grid on, a cold pixel's reservoir winner is
+    // the light in its own room rather than a coin flip between the two.
+    console.log(`\n=== light grid (chromium, ?selftest=lightgrid) ===`);
+    lightgrid = await driveCheck(base, "lightgrid", describeLightGrid);
+    console.log(
+      `  -> ${lightgrid.status.toUpperCase()} (${lightgrid.ms}ms)` +
+        (lightgrid.reason ? `\n     reason: ${lightgrid.reason}` : "") +
+        (lightgrid.verdict ? `\n     ${JSON.stringify(lightgrid.verdict)}` : "")
+    );
+
     // Governor-pinning check (chromium, default three).
     console.log(`\n=== governor pinning (chromium, ?selftest=governor) ===`);
     governor = await driveCheck(base, "governor", describeGovernor);
@@ -610,6 +658,8 @@ async function main() {
   console.log(pad("warnings", 18) + pad(warnings ? warnings.status : "-", 8) + "(usage diagnostics fire once, status.warnings)");
   console.log(pad("presets", 18) + pad(presets ? presets.status : "-", 8) + "(preset API: defaults byte-identity + balanced no-op)");
   console.log(pad("ambient", 18) + pad(ambient ? ambient.status : "-", 8) + "(AmbientLight/HemisphereLight lit; off = black)");
+  console.log(pad("lights", 18) + pad(lights ? lights.status : "-", 8) + "(48 lights over a strip = 48 pools; capped at 32 = 32)");
+  console.log(pad("lightgrid", 18) + pad(lightgrid ? lightgrid.status : "-", 8) + "(local candidates: own-room winners on a cold frame)");
   console.log(pad("governor", 18) + pad(governor ? governor.status : "-", 8) + "(option pinning: _takeFreeWins + _releaseFreeWins invariants)");
   for (const [name, r] of results) {
     if (r.status !== "pass" && r.reason) console.log(`  ${name}: ${r.reason}`);
@@ -618,6 +668,8 @@ async function main() {
   if (warnings && warnings.status !== "pass" && warnings.reason) console.log(`  warnings: ${warnings.reason}`);
   if (presets && presets.status !== "pass" && presets.reason) console.log(`  presets: ${presets.reason}`);
   if (ambient && ambient.status !== "pass" && ambient.reason) console.log(`  ambient: ${ambient.reason}`);
+  if (lights && lights.status !== "pass" && lights.reason) console.log(`  lights: ${lights.reason}`);
+  if (lightgrid && lightgrid.status !== "pass" && lightgrid.reason) console.log(`  lightgrid: ${lightgrid.reason}`);
   if (governor && governor.status !== "pass" && governor.reason) console.log(`  governor: ${governor.reason}`);
   console.log("========================================================");
 
@@ -633,6 +685,8 @@ async function main() {
   if (!warnings || warnings.status !== "pass") problems.push(`warnings (${warnings ? warnings.status : "missing"})`);
   if (!presets || presets.status !== "pass") problems.push(`presets (${presets ? presets.status : "missing"})`);
   if (!ambient || ambient.status !== "pass") problems.push(`ambient (${ambient ? ambient.status : "missing"})`);
+  if (!lights || lights.status !== "pass") problems.push(`lights (${lights ? lights.status : "missing"})`);
+  if (!lightgrid || lightgrid.status !== "pass") problems.push(`lightgrid (${lightgrid ? lightgrid.status : "missing"})`);
   if (!governor || governor.status !== "pass") problems.push(`governor (${governor ? governor.status : "missing"})`);
   const failed = results.filter(([, r]) => r.status === "fail").map(([n]) => n);
   for (const n of failed) if (!problems.some((p) => p.startsWith(n))) problems.push(`${n} (fail)`);

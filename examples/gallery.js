@@ -145,6 +145,7 @@ const defaultSettings = () => ({
   restirDirectionalBypass: RealtimeRaytracer.DEFAULTS.restirDirectionalBypass,
   restirReprojectionRescue: RealtimeRaytracer.DEFAULTS.restirReprojectionRescue,
   restirCandidateImportance: RealtimeRaytracer.DEFAULTS.restirCandidateImportance,
+  restirLightGrid: RealtimeRaytracer.DEFAULTS.restirLightGrid,
   motionVectors: RealtimeRaytracer.DEFAULTS.motionVectors,
   denoise: RealtimeRaytracer.DEFAULTS.denoise,
   taa: RealtimeRaytracer.DEFAULTS.taa,
@@ -162,7 +163,7 @@ function applySettings() {
   for (const k of [
     "gi", "ambient", "emissiveNEE", "reflections", "refraction", "restir",
     "restirDirectionalBypass", "restirReprojectionRescue",
-    "restirCandidateImportance", "motionVectors", "denoise", "taa",
+    "restirCandidateImportance", "restirLightGrid", "motionVectors", "denoise", "taa",
     "adaptiveQuality",
   ]) {
     rt[k] = settings[k];
@@ -216,6 +217,7 @@ async function switchScene(key) {
     canvasScaleHook: (s) => setCanvasScale(s),
   });
   applySettings();
+  syncLightsRow();
   // Re-apply the current canvas scale so the new rt's buffers match (its ctor
   // read the renderer size, but be explicit in case scale changed mid-session).
   rt.setSize(...bufferSize());
@@ -301,6 +303,30 @@ if (canvasSelect) {
   });
 }
 
+// SCENE LIGHTS — only the hotel has a light count worth steering (96 fixtures,
+// thinned evenly across its rooms), so the row hides itself on every other
+// scene rather than pretending to do something. Changing it re-reads the table
+// and restarts the image, which is also the cheapest way to SEE what a reveal
+// costs: the reservoirs all re-learn at once.
+const lightsSelect = document.getElementById("opt-lights");
+const lightsRow = document.getElementById("opt-lights-row");
+const lightCountEl = document.getElementById("opt-lightcount");
+function syncLightsRow() {
+  const has = !!(sceneDef && sceneDef.debug && sceneDef.debug.setLights);
+  if (lightsRow) lightsRow.style.display = has ? "" : "none";
+  if (lightCountEl && rt) {
+    lightCountEl.textContent = `light table: ${rt.lightCount} / ${rt.maxLights} seats`;
+  }
+}
+if (lightsSelect) {
+  lightsSelect.addEventListener("change", () => {
+    if (!sceneDef || !sceneDef.debug || !sceneDef.debug.setLights) return;
+    sceneDef.debug.setLights(parseInt(lightsSelect.value, 10));
+    if (rt) { rt.updateLights(scene); rt.resetAccumulation(); }
+    syncLightsRow();
+  });
+}
+
 // Reset to defaults: put every control in the strip back to the library's own
 // constructor defaults, re-read the DOM from them, and start the image again.
 // The canvas scale is the app's rather than the renderer's, so full size is its
@@ -345,7 +371,10 @@ function animate() {
   // 0.15.0's stable light slots are what keep each one's table index (and so
   // every reservoir pointing at it) valid while it moves.
   if (sceneDef && sceneDef.update) {
-    sceneDef.update();
+    // The camera goes IN because a scene may drive it (the hotel's dolly): it
+    // moves camera.position and controls.target together, which keeps
+    // OrbitControls' own spherical intact and the mouse still usable.
+    sceneDef.update({ camera, controls, renderer });
     rt.updateDynamic();
     rt.updateLights(scene);
   }
@@ -358,8 +387,9 @@ function animate() {
     fps = Math.round((frames * 1000) / (now - lastFps));
     frames = 0; lastFps = now;
     statsEl.textContent =
-      `${fps} fps · ${triCount.toLocaleString()} tris\n` +
+      `${fps} fps · ${triCount.toLocaleString()} tris · ${rt.lightCount}/${rt.maxLights} lights\n` +
       `${rtEnabled ? `RT @ ${Math.round(rt.renderScale * 100)}% lighting res` : "plain raster"}`;
+    syncLightsRow();
   }
 }
 

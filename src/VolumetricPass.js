@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
-import { MAX_LIGHTS } from "./SceneCompiler.js";
+import { MAX_LIGHTS, clampMaxLights } from "./SceneCompiler.js";
 import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
 
 // Must match MAX_FOG_ZONES in the fragment shader.
@@ -29,7 +29,7 @@ ${shaderStructs}
 ${shaderIntersectFunction}
 ${BVH_ANY_HIT_GLSL}
 
-#define MAX_LIGHTS ${MAX_LIGHTS}
+#define MAX_LIGHTS RT_MAX_LIGHTS_VALUE
 #define PI 3.14159265358979
 
 layout(location = 0) out vec4 outScatter;
@@ -48,9 +48,13 @@ uniform sampler2D uPrevAccum;
 uniform mat4 uPrevViewProj;
 uniform float uMaxHistory;
 
-uniform vec4 uLightPosType[MAX_LIGHTS];
-uniform vec4 uLightColorRadius[MAX_LIGHTS];
-uniform vec4 uLightDirCone[MAX_LIGHTS]; // spot: direction.xyz + cos(outer)
+// THE LIGHT TABLE lives in one row of uMaterialsTex (row = uLightRow), 4 texels
+// per seat: see SceneCompiler's layout comment. Until 0.16.0 these were three
+// vec4[MAX_LIGHTS] uniform arrays, which is what capped a scene at 32 lights.
+uniform int uLightRow;
+vec4 lightPosType(int i)     { return texelFetch(uMaterialsTex, ivec2(i * 4,     uLightRow), 0); }
+vec4 lightColorRadius(int i) { return texelFetch(uMaterialsTex, ivec2(i * 4 + 1, uLightRow), 0); }
+vec4 lightDirCone(int i)     { return texelFetch(uMaterialsTex, ivec2(i * 4 + 2, uLightRow), 0); } // spot: direction.xyz + cos(outer)
 uniform int uLightCount;
 uniform int uEmissiveCount;
 
@@ -130,8 +134,8 @@ bool occluded(vec3 ro, vec3 rd, float maxDist) {
 // Like the surface version but with no cosine term (isotropic phase, folded
 // into uDensity along with 1/4π).
 vec3 lightAt(int i, vec3 S) {
-  vec4 posType = uLightPosType[i];
-  vec4 colRad = uLightColorRadius[i];
+  vec4 posType = lightPosType(i);
+  vec4 colRad = lightColorRadius(i);
   if (posType.w < 0.5 || posType.w >= 1.5) {
     vec3 lp = posType.xyz + randUnitVector() * colRad.w;
     vec3 d = lp - S;
@@ -140,7 +144,7 @@ vec3 lightAt(int i, vec3 S) {
     float cone = 1.0;
     if (posType.w >= 1.5) {
       // spot: this is what draws visible light CONES in fog
-      vec4 dc = uLightDirCone[i];
+      vec4 dc = lightDirCone(i);
       cone = smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, -d / dist));
       if (cone <= 0.0) return vec3(0.0);
     }
@@ -272,7 +276,8 @@ void main() {
  * pixel per frame.
  */
 export class VolumetricPass {
-  constructor(width, height) {
+  constructor(width, height, { maxLights = MAX_LIGHTS } = {}) {
+    this.maxLights = clampMaxLights(maxLights);
     this.targetA = this._makeTarget(width, height);
     this.targetB = this._makeTarget(width, height);
 
@@ -282,7 +287,7 @@ export class VolumetricPass {
       name: "rt:volumetric",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
-      fragmentShader: volumetricFrag,
+      fragmentShader: volumetricFrag.replace(/RT_MAX_LIGHTS_VALUE/g, String(this.maxLights)),
       uniforms: {
         bvhStatic: { value: null },
         bvhDynamic: { value: null },
@@ -292,9 +297,7 @@ export class VolumetricPass {
         uPrevAccum: { value: null },
         uPrevViewProj: { value: new THREE.Matrix4() },
         uMaxHistory: { value: 48 },
-        uLightPosType: { value: [] },
-        uLightColorRadius: { value: [] },
-        uLightDirCone: { value: [] },
+        uLightRow: { value: 0 },
         uLightCount: { value: 0 },
         uEmissiveCount: { value: 0 },
         uCameraPos: { value: new THREE.Vector3() },
@@ -339,9 +342,7 @@ export class VolumetricPass {
     u.bvhDynamic.value = compiled.dynamicBvhUniform;
     u.uHasDynamic.value = compiled.hasDynamic;
     u.uMaterialsTex.value = compiled.materialsTex;
-    u.uLightPosType.value = compiled.lightPosType;
-    u.uLightColorRadius.value = compiled.lightColorRadius;
-    u.uLightDirCone.value = compiled.lightDirCone;
+    u.uLightRow.value = compiled.lightRow;
     u.uLightCount.value = compiled.lightCount;
     u.uEmissiveCount.value = compiled.emissiveTriCount;
   }

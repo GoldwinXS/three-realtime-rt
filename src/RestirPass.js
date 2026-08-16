@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { MAX_LIGHTS } from "./SceneCompiler.js";
+import { MAX_LIGHTS, clampMaxLights } from "./SceneCompiler.js";
 import { makeMRT } from "./mrtCompat.js";
 
 const fullscreenVert = /* glsl */ `
@@ -14,17 +14,23 @@ void main() {
 // first, PCG after) and the candidate contribution — which MUST stay in
 // agreement with RTLightingPass.shadeReservoir (minus visibility).
 const RESTIR_COMMON = /* glsl */ `
-#define MAX_LIGHTS ${MAX_LIGHTS}
+#define MAX_LIGHTS RT_MAX_LIGHTS_VALUE
 #define PI 3.14159265358979
 
 uniform sampler2D uGWorldPos;
 uniform sampler2D uGNormalMetal;
 uniform sampler2D uMaterialsTex;  // row 1: emissive tris, rows 2..65: blue noise,
                                   // row 66: the emissive POWER CDF (.x cumulative,
-                                  // .y the triangle's pick probability)
-uniform vec4 uLightPosType[MAX_LIGHTS];
-uniform vec4 uLightColorRadius[MAX_LIGHTS];
-uniform vec4 uLightDirCone[MAX_LIGHTS]; // spot: direction.xyz + cos(outer)
+                                  // .y the triangle's pick probability),
+                                  // row uLightRow: the analytic light table
+// THE LIGHT TABLE, 4 texels per seat in one row of uMaterialsTex (see
+// SceneCompiler). Three vec4[MAX_LIGHTS] uniform arrays until 0.16.0; the
+// values are the same float32s, so candidateContribution's arithmetic is
+// unchanged to the bit.
+uniform int uLightRow;
+vec4 lightPosType(int i)     { return texelFetch(uMaterialsTex, ivec2(i * 4,     uLightRow), 0); }
+vec4 lightColorRadius(int i) { return texelFetch(uMaterialsTex, ivec2(i * 4 + 1, uLightRow), 0); }
+vec4 lightDirCone(int i)     { return texelFetch(uMaterialsTex, ivec2(i * 4 + 2, uLightRow), 0); } // spot: direction.xyz + cos(outer)
 uniform int uLightCount;
 uniform int uEmissiveCount;
 uniform float uFrame;
@@ -98,8 +104,8 @@ float restirSpecBoost(vec3 N, vec3 wi, vec3 P) {
 vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
   if (id < float(MAX_LIGHTS)) {
     int i = int(id);
-    vec4 posType = uLightPosType[i];
-    vec4 colRad = uLightColorRadius[i];
+    vec4 posType = lightPosType(i);
+    vec4 colRad = lightColorRadius(i);
     if (posType.w < 0.5 || posType.w >= 1.5) {
       vec3 d = posType.xyz - P; // light CENTER: soft-radius jitter re-drawn at shading
       float dl = length(d);
@@ -109,7 +115,7 @@ vec3 candidateContribution(float id, vec2 uv, vec3 P, vec3 N) {
       float cone = 1.0;
       if (posType.w >= 1.5) {
         // spot cone — MUST match RTLightingPass.spotFalloff for a consistent estimator
-        vec4 dc = uLightDirCone[i];
+        vec4 dc = lightDirCone(i);
         cone = smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, -d / dl));
         if (cone <= 0.0) return vec3(0.0);
       }
@@ -176,6 +182,9 @@ precision highp float;
 ${RESTIR_COMMON}
 
 #define CANDIDATES 8
+// Lower-bound search steps over a light CDF row: ceil(log2(maxLights)), baked in
+// at construction (7 at the default 128 seats, 5 at 32).
+#define LIGHT_CDF_STEPS RT_CDF_STEPS_VALUE
 
 layout(location = 0) out vec4 outReservoir;
 layout(location = 1) out vec4 outHistory;
@@ -228,10 +237,43 @@ uniform vec2 uTexelSizeT;     // 1 / reservoir resolution
 uniform float uCandidateCDF;
 // P(draw from the analytic-light pool) = PL / (PL + PE), clamped to [0.1, 0.9]
 // when both pools carry power, 1 or 0 when only one does. Computed CPU-side.
+// GLOBAL on purpose: the grid below localises WHICH light is drawn, not how
+// often the light pool is drawn from at all.
 uniform float uPoolSplit;
-// Per-light power CDF: .x cumulative (the last active light is forced to 1.0),
-// .y that light's pick probability. Same layout as row 66, deliberately.
-uniform vec2 uLightCdf[MAX_LIGHTS];
+// >>> RT_LIGHT_GRID
+// THE LIGHT GRID (0.16.0). Per-light pick probabilities, one texture ROW per
+// cell of a uniform grid over the static world, plus row 0 = the GLOBAL
+// distribution (power only, no geometry). Texel i of a row is
+// (cdf_i, p_i, w_i, 0) — the same (.x cumulative, .y probability) layout as
+// row 66 and as the vec2[MAX_LIGHTS] uniform array this replaces, so the search
+// below is the same search.
+//
+// WHY: candidates used to be drawn from the global power CDF, which is fine at
+// eight lights and useless at eighty — in a hotel corridor a pixel's own room
+// holds 3 of 96 lights, so ~1 candidate in 32 could possibly light it and the
+// reservoir spends its stream on lights behind walls. The grid weights each
+// light by what it could deliver to THIS cell (see LightGridPass for the
+// weight), so a pixel's candidates come from its own room. RIS stays unbiased:
+// every light with a non-zero p̂ keeps a non-zero probability (the build floors
+// every active light at 1e-4 of the cell's maximum), and the estimator divides
+// by whatever pdf produced the sample.
+uniform sampler2D uLightGrid;
+uniform vec3 uGridOrigin;    // world position of cell (0,0,0)'s corner
+uniform vec3 uGridInvCell;   // 1 / cell size, per axis
+uniform ivec3 uGridDims;     // cells per axis
+uniform float uUseLightGrid; // 0 = always row 0 (the 0.15.0 global CDF)
+
+// Row of uLightGrid this surface point draws its candidates from. 0 = global:
+// the grid is off, the scene has none, or the point is outside the static AABB
+// (a dynamic mesh that flew out of the building still gets a valid pdf).
+int lightGridRow(vec3 P) {
+  if (uUseLightGrid < 0.5) return 0;
+  vec3 f = (P - uGridOrigin) * uGridInvCell;
+  ivec3 c = ivec3(floor(f));
+  if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, uGridDims))) return 0;
+  return 1 + c.x + uGridDims.x * (c.y + uGridDims.y * c.z);
+}
+// <<< RT_LIGHT_GRID
 // Mirrors RTLightingPass.uEmissiveCDF: when the game switches emissive
 // importance sampling off, the reservoir's emissive picks go uniform too, so the
 // two estimators keep agreeing about what a triangle's pick probability is.
@@ -279,19 +321,32 @@ void main() {
       // out one candidate sooner and PCG takes over; that is fine, the first
       // candidate is the one worth decorrelating.
       if (rand() < uPoolSplit) {
-        // ANALYTIC LIGHT, by the power CDF. Linear scan with a running compare:
-        // MAX_LIGHTS is 32 and this is a uniform array, so a binary search would
-        // index it dynamically too and buy nothing. The last active entry is
-        // 1.0 and rand() < 1.0, so this always terminates on a real light.
+        // ANALYTIC LIGHT, by the CDF of this pixel's grid cell (row 0 = the
+        // global power CDF = the 0.15.0 behaviour). The linear scan this
+        // replaced was justified by "MAX_LIGHTS is 32 and it is a uniform
+        // array"; at 128 seats in a texture the same lower-bound search costs
+        // LIGHT_CDF_STEPS = ceil(log2(maxLights)) fetches instead of up to 128,
+        // and lands on the SAME index (both return the first seat whose
+        // cumulative is >= u, ties included).
         float u = rand();
-        int li = 0;
-        for (int j = 0; j < MAX_LIGHTS; j++) {
-          if (j >= uLightCount) break;
-          li = j;
-          if (u <= uLightCdf[j].x) break;
+        int row = lightGridRow(P);
+        int lo = 0;
+        int hi = uLightCount - 1;
+        for (int s = 0; s < LIGHT_CDF_STEPS; s++) {
+          if (lo >= hi) break;
+          int mid = (lo + hi) >> 1;
+          if (u > texelFetch(uLightGrid, ivec2(mid, row), 0).x) lo = mid + 1;
+          else hi = mid;
         }
-        id = float(li);
-        invPdf = 1.0 / max(uPoolSplit * uLightCdf[li].y, 1e-12);
+        id = float(lo);
+        // p == 0 can only mean a light with no power at all or a directional one
+        // under the bypass, and BOTH score p̂ = 0, so this candidate's weight is
+        // zero either way — the guard just refuses to turn 0 x 1e12 into a
+        // number. (It is also the only thing standing between a light-grid
+        // program that failed to link, i.e. an all-zero table, and a white
+        // screen; see RealtimeRaytracer._passClass.)
+        float pI = texelFetch(uLightGrid, ivec2(lo, row), 0).y;
+        invPdf = pI > 0.0 ? 1.0 / (uPoolSplit * pI) : 0.0;
       } else {
         // EMISSIVE TRIANGLE, by the SAME 8-step binary search over row 66 that
         // RTLightingPass.sampleEmissiveTri runs, and honouring uEmissiveCDF the
@@ -546,7 +601,12 @@ void main() {
  * with a single visibility ray.
  */
 export class RestirPass {
-  constructor(width, height) {
+  constructor(width, height, { maxLights = MAX_LIGHTS } = {}) {
+    this.maxLights = clampMaxLights(maxLights);
+    // Steps of the lower-bound search over a light CDF row. ceil(log2(n)) is
+    // exactly enough for n seats; one extra would be harmless but this is a
+    // loop in the hottest shader in the pipeline.
+    this._cdfSteps = Math.max(1, Math.ceil(Math.log2(Math.max(2, this.maxLights))));
     // Temporal targets are two-attachment MRTs: [0] = live reservoir (consumed
     // by the spatial stage THIS frame), [1] = history (fed back next frame).
     // Keeping them separate is what lets change 2 freeze the history under a
@@ -563,14 +623,14 @@ export class RestirPass {
         name,
         glslVersion: THREE.GLSL3,
         vertexShader: fullscreenVert,
-        fragmentShader: frag,
+        fragmentShader: frag
+          .replace(/RT_MAX_LIGHTS_VALUE/g, String(this.maxLights))
+          .replace(/RT_CDF_STEPS_VALUE/g, String(this._cdfSteps)),
         uniforms: {
           uGWorldPos: { value: null },
           uGNormalMetal: { value: null },
           uMaterialsTex: { value: null },
-          uLightPosType: { value: [] },
-          uLightColorRadius: { value: [] },
-          uLightDirCone: { value: [] },
+          uLightRow: { value: 0 },
           uLightCount: { value: 0 },
           uEmissiveCount: { value: 0 },
           uFrame: { value: 0 },
@@ -585,9 +645,15 @@ export class RestirPass {
                 // candidates, it only merges reservoirs that already exist.
                 uCandidateCDF: { value: 0.0 },
                 uPoolSplit: { value: 1.0 },
-                uLightCdf: { value: new Float32Array(MAX_LIGHTS * 2) },
                 uEmissiveCDF: { value: true },
                 // <<< RT_RESTIR_CAND_CDF
+                // >>> RT_LIGHT_GRID
+                uLightGrid: { value: null },
+                uGridOrigin: { value: new THREE.Vector3() },
+                uGridInvCell: { value: new THREE.Vector3(1, 1, 1) },
+                uGridDims: { value: new Int32Array([1, 1, 1]) },
+                uUseLightGrid: { value: 0.0 },
+                // <<< RT_LIGHT_GRID
                 uPrevReservoir: { value: null },
                 uPrevGWorldPos: { value: null },
                 uPrevViewProj: { value: new THREE.Matrix4() },
@@ -652,12 +718,26 @@ export class RestirPass {
     for (const m of [this.material, this.spatialMaterial]) {
       const u = m.uniforms;
       u.uMaterialsTex.value = compiled.materialsTex;
-      u.uLightPosType.value = compiled.lightPosType;
-      u.uLightColorRadius.value = compiled.lightColorRadius;
-      u.uLightDirCone.value = compiled.lightDirCone;
+      u.uLightRow.value = compiled.lightRow;
       u.uLightCount.value = compiled.lightCount;
       u.uEmissiveCount.value = compiled.emissiveTriCount;
     }
+    // >>> RT_LIGHT_GRID
+    // Grid GEOMETRY comes from the compiled scene (it is the static world's
+    // AABB); the grid TEXTURE comes from LightGridPass via setLightGrid, because
+    // building it needs a renderer and this method has none.
+    const tu = this.material.uniforms;
+    const g = compiled.lightGrid;
+    if (g) {
+      tu.uGridOrigin.value.set(g.origin[0], g.origin[1], g.origin[2]);
+      tu.uGridInvCell.value.set(1 / g.cell[0], 1 / g.cell[1], 1 / g.cell[2]);
+      tu.uGridDims.value[0] = g.dims[0];
+      tu.uGridDims.value[1] = g.dims[1];
+      tu.uGridDims.value[2] = g.dims[2];
+    } else {
+      tu.uGridDims.value[0] = tu.uGridDims.value[1] = tu.uGridDims.value[2] = 0;
+    }
+    // <<< RT_LIGHT_GRID
     // >>> RT_RESTIR_CAND_CDF
     this._compiled = compiled;
     this._rebuildPools();
@@ -685,22 +765,42 @@ export class RestirPass {
     this.material.uniforms.uEmissiveCDF.value = !!enabled;
   }
 
+  // >>> RT_LIGHT_GRID
   /**
-   * Rebuild the analytic-light power CDF and the pool split from the CURRENT
-   * light table, emissive count and directional-bypass flag.
+   * Point the candidate sampler at the light-grid texture LightGridPass built,
+   * and say whether the per-cell rows may be used. `enabled: false` still needs
+   * the texture: row 0 IS the global power CDF the 0.15.0 path drew from, so
+   * this is where that table lives now either way.
+   */
+  setLightGrid(texture, enabled) {
+    const u = this.material.uniforms;
+    u.uLightGrid.value = texture || null;
+    u.uUseLightGrid.value = texture && enabled ? 1.0 : 0.0;
+  }
+  // <<< RT_LIGHT_GRID
+
+  /**
+   * Rebuild the pool split from the CURRENT light table, emissive count and
+   * directional-bypass flag.
    *
    * Called once per render() rather than from each setter, because all three of
    * its inputs are live knobs: the light table's CONTENTS change under
    * updateLights() with no call into this pass at all, the emissive count
    * follows the emissiveNEE toggle every frame, and the bypass is an A/B switch.
-   * It is a 32-iteration loop over an array that is already in cache; measured
-   * against a 25-80 ms frame it is not visible.
+   * It is a loop over lightCount floats already in cache; measured against a
+   * 25-80 ms frame it is not visible.
+   *
+   * 0.16.0: the per-light CDF this also used to build now lives in the light
+   * GRID texture (row 0 is the same global power distribution, rows 1+ localise
+   * it), built on the GPU by LightGridPass. What stays here is the SPLIT, which
+   * is one scalar and needs the emissive set's power, a CPU-side quantity.
    *
    * TWO THINGS THIS MUST NOT GET WRONG.
    *  1. A light's weight is zero EXACTLY when candidateContribution scores it
    *     zero, that is, a directional light while uDirBypass is on. Support then
    *     still covers the target (pdf 0 only where p̂ is 0), which is what keeps
-   *     RIS unbiased. Any other reason to zero a weight would be a bug.
+   *     RIS unbiased. Any other reason to zero a weight would be a bug. (The
+   *     grid build applies the same rule to the same flag.)
    *  2. Luminance here uses the same Rec.601 weights as the shader's rtLum, so a
    *     light with a non-zero p̂ can never have a zero pick probability. (The
    *     emissive side's total comes from the CDF's own Rec.709 weights; the two
@@ -711,32 +811,18 @@ export class RestirPass {
    */
   _rebuildPools() {
     const u = this.material.uniforms;
-    const cdf = u.uLightCdf.value;
     const c = this._compiled;
-    const n = c ? Math.min(c.lightCount | 0, MAX_LIGHTS) : 0;
+    const n = c ? Math.min(c.lightCount | 0, this.maxLights) : 0;
     const skipDir = u.uDirBypass.value > 0.5;
-    const w = this._lightW || (this._lightW = new Float32Array(MAX_LIGHTS));
     let PL = 0;
     for (let i = 0; i < n; i++) {
       const type = c.lightPosType[i * 4 + 3];
       const isDir = type >= 0.5 && type < 1.5;
-      w[i] = skipDir && isDir
-        ? 0
-        : 0.299 * c.lightColorRadius[i * 4] +
-          0.587 * c.lightColorRadius[i * 4 + 1] +
-          0.114 * c.lightColorRadius[i * 4 + 2];
-      PL += w[i];
-    }
-    let cum = 0;
-    for (let i = 0; i < n; i++) {
-      // PL === 0 means every light is weightless (an empty scene, black lights,
-      // or a sun-only scene with the bypass on). Fall back to the uniform table
-      // so the array is never left holding stale cumulatives; those lights all
-      // have p̂ = 0, so nothing is selected out of it either way.
-      const p = PL > 0 ? w[i] / PL : 1 / n;
-      cum += p;
-      cdf[i * 2] = i === n - 1 ? 1.0 : cum;
-      cdf[i * 2 + 1] = p;
+      if (skipDir && isDir) continue;
+      PL +=
+        0.299 * c.lightColorRadius[i * 4] +
+        0.587 * c.lightColorRadius[i * 4 + 1] +
+        0.114 * c.lightColorRadius[i * 4 + 2];
     }
     const PE = u.uEmissiveCount.value > 0 && c ? c.emissivePower || 0 : 0;
     // "Non-empty" means "carries power". A pool with members but no power

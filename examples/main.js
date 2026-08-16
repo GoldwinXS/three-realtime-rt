@@ -96,6 +96,18 @@ async function main() {
     await runAmbientSelftest();
     return;
   }
+  // ?selftest=lights: the 0.16.0 light-table cap (see runLightsSelftest).
+  // Self-contained: 48 lights over a strip, counted from the frame.
+  if (PARAMS.get("selftest") === "lights") {
+    await runLightsSelftest();
+    return;
+  }
+  // ?selftest=lightgrid: local candidate sampling (see runLightGridSelftest).
+  // Self-contained: two rooms, one light each, read out of the reservoir.
+  if (PARAMS.get("selftest") === "lightgrid") {
+    await runLightGridSelftest();
+    return;
+  }
 
   // 1. An ordinary three.js scene (coloured room, lights, hero props).
   const { scene, camera, bounds, lights, sky, ready, showcase, water, windows, fox } = buildScene();
@@ -864,6 +876,376 @@ async function runAmbientSelftest() {
       pass, threw: false, supported,
       ambientLit, ambientOffDark, hemiLit, hemiSplit,
       ambLum, ambOffLum, hemiUpLum, hemiDownLum,
+    });
+  } catch (err) {
+    emit({ pass: false, threw: true, error: (err && err.message) || String(err) });
+  } finally {
+    try { if (renderer) renderer.dispose(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * MANY-LIGHT CHECK (?selftest=lights) — the gate for 0.16.0's `maxLights`.
+ *
+ * 48 point lights in a row a few centimetres above a long strip of floor, seen
+ * from directly overhead: 48 separate pools of light, and the whole test is
+ * "count the pools". Through 0.15.0 the table held 32 rows, so this scene could
+ * only ever have shown 32 of them; the second leg re-runs the identical scene at
+ * `maxLights: 32` and must count 32, which is what proves the first leg's 48 is
+ * the cap moving rather than the counter being generous.
+ *
+ * The count is a peak count over a 1-D profile (max luma per image column, then
+ * rising edges through the half-maximum), not a blob detector: the lights are
+ * spaced far enough apart relative to their height that the valley between two
+ * pools is about 4% of a peak, so the threshold has an enormous margin either
+ * side of it.
+ */
+async function runLightsSelftest() {
+  const emit = (v) => {
+    const line = JSON.stringify({ lightsScene: true, ...v });
+    console.log("[selftest:lights] " + line);
+    let node = document.getElementById("selftest-verdict");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "selftest-verdict";
+      node.style.cssText =
+        "position:fixed;left:-99999px;top:0;white-space:pre;pointer-events:none;";
+      document.body.appendChild(node);
+    }
+    node.textContent = line;
+    node.setAttribute("data-pass", String(!!v.pass));
+  };
+
+  const N = 48;
+  const W = 1024, H = 96;
+  let renderer = null;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(1);
+    renderer.setSize(W, H);
+    const gl = renderer.getContext();
+    const supported = RealtimeRaytracer.isSupported(renderer);
+
+    const SPAN = 61.0;         // strip length in world units
+    const STEP = SPAN / N;     // 1.27 units between lights
+    const LY = 0.18;           // light height: pools must not merge (see below)
+    const build = () => {
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x000000);
+      const floor = new THREE.Mesh(
+        new THREE.BoxGeometry(SPAN + 3, 0.2, 5),
+        new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 })
+      );
+      floor.position.y = -0.1;
+      scene.add(floor);
+      for (let i = 0; i < N; i++) {
+        // Low and dim on purpose. A pool's peak goes as 1/h^2 and the valley
+        // between two pools as 1/(h^2 + (step/2)^2), so the peak-to-valley ratio
+        // IS (1 + (step/2h)^2)^1.5: at h = 0.18 and step = 1.27 that is 25x,
+        // which survives the tonemap; at h = 0.3 it is 6x, which does not, and
+        // the whole strip reads as one blob. The intensity keeps the peak off
+        // the top of the range for the same reason.
+        const l = new THREE.PointLight(0xffffff, 0.03, 0, 2);
+        l.position.set(-SPAN / 2 + (i + 0.5) * STEP, LY, 0);
+        l.userData.rtRadius = 0.02;
+        scene.add(l);
+      }
+      return scene;
+    };
+    // Straight down, and NARROW: three's fov is vertical, so on a 1024x96
+    // canvas a 40-degree fov spans 356 world units across and the 61-unit strip
+    // lands in 17% of the image, three pixels per pool. At 8 degrees the strip
+    // fills the width and a pool is ~19 pixels. `up` has to leave +Y or lookAt
+    // is degenerate.
+    const camera = new THREE.PerspectiveCamera(8, W / H, 0.1, 200);
+    camera.up.set(0, 0, -1);
+    camera.position.set(0, 46, 0);
+    camera.lookAt(0, 0, 0);
+    camera.updateMatrixWorld();
+
+    const buf = new Uint8Array(W * H * 4);
+    /**
+     * Count pools as LOCAL MAXIMA WITH PROMINENCE, not as crossings of a
+     * half-maximum: the composite tonemaps, so a 25x radiance ratio between a
+     * pool's centre and the gap beside it lands as maybe 2x in bytes and a
+     * global threshold either finds one blob or finds noise. A peak here is a
+     * column that is the largest in its own neighbourhood and stands at least
+     * `prom` above the lowest point between it and the previous one.
+     */
+    const countPools = () => {
+      gl.readPixels(0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      const prof = new Float32Array(W);
+      for (let x = 0; x < W; x++) {
+        let m = 0;
+        for (let y = 0; y < H; y++) {
+          const p = (y * W + x) * 4;
+          m = Math.max(m, 0.2126 * buf[p] + 0.7152 * buf[p + 1] + 0.0722 * buf[p + 2]);
+        }
+        prof[x] = m;
+      }
+      const peak = Math.max(...prof);
+      const lo = Math.min(...prof);
+      const prom = Math.max(4, (peak - lo) * 0.15);
+      // Half the expected pool spacing in pixels, from the geometry rather than
+      // from taste: two peaks closer than this are one pool.
+      const win = Math.max(2, Math.floor((W / N) * 0.4));
+      let count = 0;
+      let lastPeak = -1;
+      let valley = Infinity;
+      for (let x = 1; x < W - 1; x++) {
+        valley = Math.min(valley, prof[x]);
+        let isMax = prof[x] >= prof[x - 1] && prof[x] >= prof[x + 1];
+        if (isMax) {
+          for (let d = -win; d <= win && isMax; d++) {
+            const j = x + d;
+            if (j >= 0 && j < W && prof[j] > prof[x]) isMax = false;
+          }
+        }
+        if (!isMax) continue;
+        // A peak has to be a POOL, not the flattest point of an unlit stretch:
+        // without this the dark tail of the capped leg (lights 33-48 dropped)
+        // contributes its own local maximum and every count comes out +1.
+        if (prof[x] < lo + prom) continue;
+        if (lastPeak >= 0 && (x - lastPeak < win || prof[x] - valley < prom)) continue;
+        count++;
+        lastPeak = x;
+        valley = prof[x];
+      }
+      return { count, peak: Math.round(peak * 100) / 100, prom: Math.round(prom * 100) / 100 };
+    };
+
+    const leg = (maxLights) => {
+      const scene = build();
+      const rt = new RealtimeRaytracer(renderer, {
+        adaptiveQuality: false,
+        overloadProtection: false,
+        renderScale: 1,
+        taa: false,
+        denoise: false,
+        envColor: new THREE.Color(0, 0, 0),
+        envIntensity: 0,
+        sky: { enabled: false },
+        ...(maxLights ? { maxLights } : {}),
+      });
+      rt.compileScene(scene);
+      for (let i = 0; i < 24; i++) rt.render(scene, camera);
+      const r = countPools();
+      r.tableLights = rt.lightCount;
+      r.cap = rt.maxLights;
+      rt.dispose();
+      return r;
+    };
+
+    const all = leg(null);          // constructor default (128)
+    const capped = leg(32);         // the 0.15.0 cap, re-created on purpose
+
+    const s = (v) => (supported ? v : true);
+    const allLit = all.count === N;
+    const cappedLit = capped.count === 32;
+    const capReported = capped.tableLights === 32 && all.tableLights === N;
+    const pass = s(allLit) && s(cappedLit) && s(capReported);
+    if (!cappedLit || !allLit) {
+      console.log(
+        `[selftest:lights] counted ${all.count} pools at maxLights ${all.cap} and ` +
+          `${capped.count} at 32 (expected ${N} and 32)`
+      );
+    }
+    emit({
+      pass, threw: false, supported,
+      allLit, cappedLit, capReported,
+      lights: N,
+      countDefault: all.count, capDefault: all.cap, tableDefault: all.tableLights,
+      count32: capped.count, table32: capped.tableLights,
+      peakDefault: all.peak, peak32: capped.peak,
+    });
+  } catch (err) {
+    emit({ pass: false, threw: true, error: (err && err.message) || String(err) });
+  } finally {
+    try { if (renderer) renderer.dispose(); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * LIGHT-GRID CHECK (?selftest=lightgrid) — the gate for 0.16.0's local candidates.
+ *
+ * Two rooms with a solid wall between them and ONE bright light in each. The
+ * question the option answers is where a pixel's CANDIDATES come from, so that
+ * is what is measured: the candidate distribution is literally the table the
+ * light grid builds, so the check reads that table back off the GPU and asks
+ * what share of a cell's probability belongs to the light in that cell's own
+ * room. Row 0 of the same table is the global power CDF the 0.15.0 path draws
+ * from, so both arms come out of one readback.
+ *
+ * WHY NOT COUNT RESERVOIR WINNERS, which was the first cut: RIS re-weights by
+ * the target, and with two lights the far one is 6x further away, so its p̂ is
+ * ~40x smaller and it loses whether or not it was ever proposed. Measured, that
+ * test read 0.888 with the grid on and 0.891 with it off — it cannot see the
+ * thing it was written to see. The winner fraction is still reported below as
+ * an observation; the gate is on the distribution.
+ */
+async function runLightGridSelftest() {
+  const emit = (v) => {
+    const line = JSON.stringify({ lightGridScene: true, ...v });
+    console.log("[selftest:lightgrid] " + line);
+    let node = document.getElementById("selftest-verdict");
+    if (!node) {
+      node = document.createElement("div");
+      node.id = "selftest-verdict";
+      node.style.cssText =
+        "position:fixed;left:-99999px;top:0;white-space:pre;pointer-events:none;";
+      document.body.appendChild(node);
+    }
+    node.textContent = line;
+    node.setAttribute("data-pass", String(!!v.pass));
+  };
+
+  const W = 256, H = 128;
+  let renderer = null;
+  try {
+    renderer = new THREE.WebGLRenderer({ antialias: false, preserveDrawingBuffer: true });
+    renderer.setPixelRatio(1);
+    renderer.setSize(W, H);
+    const supported = RealtimeRaytracer.isSupported(renderer);
+
+    // Two 6-wide rooms sharing a solid wall at x = 0, open toward the camera.
+    const build = () => {
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x000000);
+      const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 });
+      const box = (w, h, d, x, y, z) => {
+        const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+        m.position.set(x, y, z);
+        scene.add(m);
+        return m;
+      };
+      // Two 11-wide rooms, not two 6-wide ones. The share of a cell's
+      // probability that belongs to its own room is set by the RATIO of the two
+      // distances (the weight is an inverse square), so it is the room WIDTH
+      // that decides the number: at 6 wide the far light is 2.4x further and
+      // the share tops out at 0.85, at 11 wide it is 3.8x and the share is 0.94.
+      box(23, 0.2, 6, 0, -0.1, 0);      // floor
+      box(23, 0.2, 6, 0, 4.1, 0);       // ceiling
+      box(23, 4, 0.2, 0, 2, -3.1);      // back
+      box(0.4, 4, 6, 0, 2, 0);          // the wall between the rooms
+      box(0.2, 4, 6, -11.6, 2, 0);      // outer walls
+      box(0.2, 4, 6, 11.6, 2, 0);
+      for (const x of [-5.5, 5.5]) {
+        const l = new THREE.PointLight(0xffffff, 6.0, 0, 2);
+        l.position.set(x, 3.2, -0.6);
+        l.userData.rtRadius = 0.06;
+        scene.add(l);
+      }
+      return scene;
+    };
+    const camera = new THREE.PerspectiveCamera(60, W / H, 0.1, 100);
+    camera.position.set(0, 2.0, 14.0);
+    camera.lookAt(0, 1.8, 0);
+    camera.updateMatrixWorld();
+
+    /**
+     * Fraction of shaded pixels whose reservoir winner is the light on THEIR
+     * side of the wall — reported, not gated (see the header). Screen x maps
+     * monotonically to world x here, so the left half of the reservoir is the
+     * left room; the middle eighth is skipped because the wall lives there.
+     */
+    const ownRoomFraction = (rt) => {
+      const t = rt.restirPass.spatialTarget;
+      const w = t.width, h = t.height;
+      const px = new Float32Array(w * h * 4);
+      renderer.readRenderTargetPixels(t, 0, 0, w, h, px);
+      // Seat -> side, from the compiled table (seats are assigned by traversal
+      // order, so this must be read, not assumed).
+      const side = [];
+      for (let i = 0; i < rt.lightCount; i++) side.push(Math.sign(rt.compiled.lightPosType[i * 4]));
+      let own = 0, other = 0;
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const o = (y * w + x) * 4;
+          if (px[o + 3] <= 0) continue;              // no reservoir here
+          const u = x / (w - 1);
+          if (u > 0.44 && u < 0.56) continue;        // the wall
+          const id = Math.round(px[o]);
+          if (id >= rt.lightCount) continue;         // emissive candidate (none here)
+          const want = u < 0.5 ? -1 : 1;
+          if (side[id] === want) own++; else other++;
+        }
+      }
+      return { own, other, frac: own + other > 0 ? own / (own + other) : 0 };
+    };
+
+    /**
+     * Probability the candidate sampler assigns to each light, read straight off
+     * the light-grid table: `row` 0 is the global CDF, `row` 1 + c is cell c.
+     * Texel i is (cdf_i, p_i, w_i, 0).
+     */
+    const rowProbs = (rt, row) => {
+      const t = rt.lightGridPass.target;
+      const px = new Float32Array(t.width * 4);
+      renderer.readRenderTargetPixels(t, 0, row, t.width, 1, px);
+      const out = [];
+      for (let i = 0; i < rt.lightCount; i++) out.push(px[i * 4 + 1]);
+      return out;
+    };
+    /** Row of the grid that contains a world point (mirrors the shader). */
+    const rowOf = (rt, p) => {
+      const g = rt.compiled.lightGrid;
+      const c = [0, 1, 2].map((a) =>
+        Math.floor((p[a] - g.origin[a]) / g.cell[a])
+      );
+      for (let a = 0; a < 3; a++) if (c[a] < 0 || c[a] >= g.dims[a]) return 0;
+      return 1 + c[0] + g.dims[0] * (c[1] + g.dims[1] * c[2]);
+    };
+
+    const scene = build();
+    const rt = new RealtimeRaytracer(renderer, {
+      adaptiveQuality: false,
+      overloadProtection: false,
+      renderScale: 1,
+      taa: false,
+      denoise: false,
+      envColor: new THREE.Color(0, 0, 0),
+      envIntensity: 0,
+      sky: { enabled: false },
+      restirLightGrid: true,
+    });
+    rt.compileScene(scene);
+    // ONE frame with a cold reservoir, which is also what builds the grid.
+    rt.render(scene, camera);
+    const winners = ownRoomFraction(rt);
+    // Seat -> side of the wall, read from the compiled table.
+    const side = [];
+    for (let i = 0; i < rt.lightCount; i++) side.push(Math.sign(rt.compiled.lightPosType[i * 4]));
+    // A point on the floor in the middle of each room.
+    const probeL = rowProbs(rt, rowOf(rt, [-5.5, 0.3, 0]));
+    const probeR = rowProbs(rt, rowOf(rt, [5.5, 0.3, 0]));
+    const global = rowProbs(rt, 0);
+    const shareFor = (probs, want) => {
+      let own = 0, all = 0;
+      for (let i = 0; i < probs.length; i++) { all += probs[i]; if (side[i] === want) own += probs[i]; }
+      return all > 0 ? own / all : 0;
+    };
+    const leftShare = shareFor(probeL, -1);
+    const rightShare = shareFor(probeR, 1);
+    const globalShare = shareFor(global, -1);
+    const cells = rt.lightGridPass.cells;
+    const lights = rt.lightCount;
+    rt.dispose();
+
+    const s = (v) => (supported ? v : true);
+    const gridLocal = leftShare > 0.9 && rightShare > 0.9;
+    const globalMixed = globalShare > 0.35 && globalShare < 0.65;
+    const better = Math.min(leftShare, rightShare) > globalShare + 0.2;
+    const pass = s(gridLocal) && s(globalMixed) && s(better) && s(lights === 2);
+    emit({
+      pass, threw: false, supported,
+      gridLocal, globalMixed, better,
+      onFrac: Math.round(Math.min(leftShare, rightShare) * 1000) / 1000,
+      offFrac: Math.round(globalShare * 1000) / 1000,
+      leftShare: Math.round(leftShare * 1000) / 1000,
+      rightShare: Math.round(rightShare * 1000) / 1000,
+      winnerFrac: Math.round(winners.frac * 1000) / 1000,
+      onSamples: winners.own + winners.other, offSamples: winners.own + winners.other,
+      cells, lights,
     });
   } catch (err) {
     emit({ pass: false, threw: true, error: (err && err.message) || String(err) });

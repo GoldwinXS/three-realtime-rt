@@ -1,5 +1,78 @@
 # Changelog
 
+## 0.16.0
+
+**Lights without a cap.** The renderer's light table has been 32 rows since the
+first release, and the comment next to it said what it was waiting for: *"stage-1
+cap; a data-texture light list is future work"*. This is that work. The cap was
+never a cost decision (under ReSTIR a light costs nothing per frame), it was a
+UNIFORM BUDGET: three `vec4[32]` arrays in four shaders already spend 96 of the
+224 uniform vectors WebGL2 guarantees, and 128 seats would have needed 384. Moved
+into the texture the passes already bind, a seat costs four texels.
+
+Every number below was measured on this machine against its own floor
+(`dev/LIGHTS-0.16-REPORT.md` has the tables and the protocol).
+
+### The light table lives in the scene-data texture
+
+- **New constructor option `maxLights`, default 128, hard max 256.** It is
+  compile-time, like `textureTiles`: the value is a `#define` in four programs
+  and the scene-data texture's width, so the setter throws with a clear message
+  instead of accepting a number it cannot honour.
+- The table moved to the LAST row of the scene-data texture, 4 texels per seat
+  (`posType`, `colorRadius`, `dirCone`, `extra`; `extra.x` is a per-seat
+  generation counter, bumped when a different light takes the seat). Every pass
+  reads it through three accessors (`lightPosType(i)`, `lightColorRadius(i)`,
+  `lightDirCone(i)`), so not one line of shading maths changed.
+- **`RTLightingPass` still binds exactly 16 samplers, and its textual
+  `traceRadiance(` count is unchanged at 5** (one declaration and four calls;
+  0.15.0's report said 4, and counting master's own file finds five). Both were
+  release walls before this change and are asserted, with counts, in the report.
+- **Verified bit-identical.** With the new features off (`restirLightGrid:
+  false`, `maxLights: 32`) and candidate importance off, master and this branch
+  produce the SAME 2,764,800 bytes on museum / cornell / waterfall / a many-light
+  room, at k=1 and k=90, on a protocol whose own floor is exactly zero. With
+  candidate importance ON, 6 bytes in 2,764,800 differ by 1, which is the
+  candidate CDF now being summed on the GPU in float32 rather than on the CPU in
+  float64, and it is the only difference in the release.
+- `updateLights` uploads the light ROW only (`texSubImage2D`), not the whole
+  texture: `needsUpdate` re-sends the tile block with it, which is tens of
+  megabytes on a textured scene. It also compares the table against what is
+  already in the texture and does nothing at all when nothing moved.
+
+### The light grid: candidates from lights that matter to this pixel
+
+- **New option `restirLightGrid`, default `true`.** The reservoir's
+  analytic-light candidates are drawn from a per-cell distribution over a uniform
+  grid on the scene's static bounds (RTXDI's "light grid"), instead of one
+  scene-wide power CDF. In a corridor with three lights per room and ninety-six
+  in the building, the global CDF put about one candidate in thirty-two in the
+  room the pixel is standing in.
+- Weight of light i in cell c is `lum / max(d², (cellDiagonal/2)²)`, the same
+  inverse square the shading uses, with d measured to the nearest point of the
+  cell's box, times a spot-cone factor. Every active light keeps at least 1/1000
+  of the cell's largest weight, so RIS support is complete and the estimator
+  stays unbiased.
+- Built on the GPU in two small draws whenever the light set, the directional
+  bypass or the grid toggle changes; a still scene builds it once. **Row 0 of the
+  same table is the global power CDF**, which is what `restirLightGrid: false`
+  reads, so turning the grid off is the 0.15.0 candidate stream rather than a
+  third code path.
+- The per-light CDF uniform array (`vec2[MAX_LIGHTS]`) is gone with it.
+
+### Demo, docs, tests
+
+- **New gallery scene `hotel`**: a 53 m corridor, twelve rooms down each side,
+  four fixtures in each, so 96 analytic lights at once, with every door open and
+  a slow dolly past them. `?lights=32|64|96` thins the fixtures evenly across the
+  rooms. The gallery strip gains a **light grid** toggle and a
+  `lights / maxLights` readout.
+- **New self-tests.** `?selftest=lights`: 48 lights over a strip must render 48
+  distinct pools, and the same scene at `maxLights: 32` must render 32.
+  `?selftest=lightgrid`: two rooms with one light each and a wall between, and
+  the share of the CANDIDATE distribution that belongs to the pixel's own room,
+  read off the light-grid table itself: 0.944 per-cell against 0.500 global.
+
 ## 0.15.0
 
 **The defaults philosophy of this release, in the owner's words:** *"I would

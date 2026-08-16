@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
-import { MAX_LIGHTS } from "./SceneCompiler.js";
+import { MAX_LIGHTS, clampMaxLights } from "./SceneCompiler.js";
 import { SKY_GLSL } from "./sky.glsl.js";
 import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
 import { makeMRT } from "./mrtCompat.js";
@@ -37,7 +37,7 @@ ${shaderIntersectFunction}
 ${BVH_ANY_HIT_GLSL}
 ${SKY_GLSL}
 
-#define MAX_LIGHTS ${MAX_LIGHTS}
+#define MAX_LIGHTS RT_MAX_LIGHTS_VALUE
 #define PI 3.14159265358979
 
 // MRT: [0] reservoir hit position + packed(M, oct-normal) (fp32),
@@ -68,9 +68,13 @@ uniform sampler2D uPrevResPos;     // history attachment 0: hitPos.xyz + M
 uniform sampler2D uPrevResRad;     // history attachment 1: radiance.rgb + W
 uniform mat4 uPrevViewProj;
 
-uniform vec4 uLightPosType[MAX_LIGHTS];
-uniform vec4 uLightColorRadius[MAX_LIGHTS];
-uniform vec4 uLightDirCone[MAX_LIGHTS];
+// THE LIGHT TABLE lives in one row of uMaterialsTex (row = uLightRow), 4 texels
+// per seat: see SceneCompiler's layout comment. Until 0.16.0 these were three
+// vec4[MAX_LIGHTS] uniform arrays, which is what capped a scene at 32 lights.
+uniform int uLightRow;
+vec4 lightPosType(int i)     { return texelFetch(uMaterialsTex, ivec2(i * 4,     uLightRow), 0); }
+vec4 lightColorRadius(int i) { return texelFetch(uMaterialsTex, ivec2(i * 4 + 1, uLightRow), 0); }
+vec4 lightDirCone(int i)     { return texelFetch(uMaterialsTex, ivec2(i * 4 + 2, uLightRow), 0); } // spot: direction.xyz + cos(outer)
 uniform int uLightCount;
 uniform int uEmissiveCount;
 uniform bool uEmissiveCDF;
@@ -289,15 +293,15 @@ vec4 tileSample(float tileIdx, vec2 st) {
 
 // ---------- one-light NEE at a GI-bounce hit (specular dropped) ----------
 float spotFalloff(int i, vec3 lightToP) {
-  vec4 posType = uLightPosType[i];
+  vec4 posType = lightPosType(i);
   if (posType.w < 1.5) return 1.0;
-  vec4 dc = uLightDirCone[i];
+  vec4 dc = lightDirCone(i);
   return smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, lightToP));
 }
 
 vec3 lightContribution(int i, vec3 P, vec3 N) {
-  vec4 posType = uLightPosType[i];
-  vec4 colRad = uLightColorRadius[i];
+  vec4 posType = lightPosType(i);
+  vec4 colRad = lightColorRadius(i);
   vec3 L;
   float dist2 = 1.0;
   float maxDist = 1e7;
@@ -961,13 +965,15 @@ void main() {
  * reservoir instead of fading slowly. 0 is byte-identical to the pre-feature path.
  */
 export class GIReservoirPass {
-  constructor(width, height) {
+  constructor(width, height, { maxLights = MAX_LIGHTS } = {}) {
+    this.maxLights = clampMaxLights(maxLights);
     this.targetA = this._makeTarget(width, height);
     this.targetB = this._makeTarget(width, height);
 
     // Texture-tile variant: the giFrag source with RT_TEXTURE_TILES stripped.
     // Cached here so the strip runs once, not on every toggle.
-    this._fragTiles = giFrag;
+    const giFragSized = giFrag.replace(/RT_MAX_LIGHTS_VALUE/g, String(this.maxLights));
+    this._fragTiles = giFragSized;
     this._fragNoTiles = (function stripTag(src, tag) {
       const lines = src.split("\n");
       const out = [];
@@ -978,7 +984,7 @@ export class GIReservoirPass {
         if (!drop) out.push(line);
       }
       return out.join("\n");
-    })(giFrag, "RT_TEXTURE_TILES");
+    })(giFragSized, "RT_TEXTURE_TILES");
     this._tilesData = false;
     this._tilesOn = false;
 
@@ -988,7 +994,7 @@ export class GIReservoirPass {
       name: "rt:gi-reservoir",
       glslVersion: THREE.GLSL3,
       vertexShader: fullscreenVert,
-      fragmentShader: giFrag,
+      fragmentShader: giFragSized,
       uniforms: {
         bvhStatic: { value: null },
         bvhDynamic: { value: null },
@@ -1002,9 +1008,7 @@ export class GIReservoirPass {
         uPrevResPos: { value: null },
         uPrevResRad: { value: null },
         uPrevViewProj: { value: new THREE.Matrix4() },
-        uLightPosType: { value: [] },
-        uLightColorRadius: { value: [] },
-        uLightDirCone: { value: [] },
+        uLightRow: { value: 0 },
         uLightCount: { value: 0 },
         uEmissiveCount: { value: 0 },
         uEmissiveCDF: { value: true },
@@ -1065,9 +1069,7 @@ export class GIReservoirPass {
     u.uAttrStatic.value = compiled.staticAttrTex;
     u.uAttrDynamic.value = compiled.dynamicAttrTex;
     u.uMaterialsTex.value = compiled.materialsTex;
-    u.uLightPosType.value = compiled.lightPosType;
-    u.uLightColorRadius.value = compiled.lightColorRadius;
-    u.uLightDirCone.value = compiled.lightDirCone;
+    u.uLightRow.value = compiled.lightRow;
     u.uLightCount.value = compiled.lightCount;
     u.uEmissiveCount.value = compiled.emissiveTriCount;
     this._tilesData = !!compiled.hasTextureTiles;
