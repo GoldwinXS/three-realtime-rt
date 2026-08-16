@@ -85,6 +85,42 @@ float fogDensityAt(vec3 p) {
   return d;
 }
 
+// Slab test of the camera ray segment [0, segLen] against every zone AABB.
+// True iff some t in [0, segLen] lies inside at least one zone. Used by the
+// cull below: when only zones scatter (uDensity <= 0), a ray that touches none
+// of them contributes exactly zero to the march, so the whole loop is skipped.
+// Each box is fattened by uEps so a ray that grazes a zone face is never culled:
+// a false NEGATIVE would change the image, while a false positive only wastes a
+// march whose in-scatter product is zero anyway (the image stays bit-identical).
+bool rayHitsAnyZone(vec3 ro, vec3 rd, float segLen) {
+  for (int i = 0; i < MAX_FOG_ZONES; i++) {
+    if (i >= uFogZoneCount) break;
+    vec3 mn = uFogZones[i * 2].xyz - uEps;
+    vec3 mx = uFogZones[i * 2 + 1].xyz + uEps;
+    float t0 = 0.0, t1 = segLen;
+    if (rd.x != 0.0) {
+      float ta = (mn.x - ro.x) / rd.x;
+      float tb = (mx.x - ro.x) / rd.x;
+      t0 = max(t0, min(ta, tb));
+      t1 = min(t1, max(ta, tb));
+    } else if (ro.x < mn.x || ro.x > mx.x) { continue; }
+    if (rd.y != 0.0) {
+      float ta = (mn.y - ro.y) / rd.y;
+      float tb = (mx.y - ro.y) / rd.y;
+      t0 = max(t0, min(ta, tb));
+      t1 = min(t1, max(ta, tb));
+    } else if (ro.y < mn.y || ro.y > mx.y) { continue; }
+    if (rd.z != 0.0) {
+      float ta = (mn.z - ro.z) / rd.z;
+      float tb = (mx.z - ro.z) / rd.z;
+      t0 = max(t0, min(ta, tb));
+      t1 = min(t1, max(ta, tb));
+    } else if (ro.z < mn.z || ro.z > mx.z) { continue; }
+    if (t0 <= t1) return true;
+  }
+  return false;
+}
+
 // ---------- RNG ----------
 // First four dims from the shared blue-noise tile (rows 2..65 of the
 // scene-data texture) with an R2 temporal shift; the rest is PCG. Same
@@ -123,6 +159,15 @@ vec3 randUnitVector() {
   return vec3(r * cos(a), r * sin(a), z);
 }
 
+// Local scatter coefficient at the current march step (0 outside every zone
+// when uDensity <= 0). lightAt/emissiveAt skip their BVH shadow ray when it is
+// zero - the in-scatter product is zero there anyway - while STILL drawing the
+// same RNG values, so the per-pixel random stream never shifts and the image
+// stays byte-identical to the un-culled pass. The skip is a nested if (not an
+// AND) so the traversal is provably not evaluated when gScatter is zero on
+// every GLSL backend, not just ones that guarantee short-circuit evaluation.
+float gScatter;
+
 // Any-hit: first blocker wins, no closest-hit sorting (see bvhAnyHit.glsl.js).
 bool occluded(vec3 ro, vec3 rd, float maxDist) {
   if (bvhIntersectAnyHit(bvhStatic, ro, rd, maxDist - 2.0 * uEps)) return true;
@@ -148,11 +193,15 @@ vec3 lightAt(int i, vec3 S) {
       cone = smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, -d / dist));
       if (cone <= 0.0) return vec3(0.0);
     }
-    if (occluded(S, d / dist, dist)) return vec3(0.0);
+    if (gScatter > 0.0) {
+      if (occluded(S, d / dist, dist)) return vec3(0.0);
+    }
     return colRad.rgb * (cone / (dist * dist));
   }
   vec3 L = normalize(-posType.xyz + randUnitVector() * colRad.w);
-  if (occluded(S, L, 1e7)) return vec3(0.0);
+  if (gScatter > 0.0) {
+    if (occluded(S, L, 1e7)) return vec3(0.0);
+  }
   return colRad.rgb;
 }
 
@@ -175,7 +224,9 @@ vec3 emissiveAt(vec3 S) {
   vec3 wi = d / dist;
   float cosL = abs(dot(t3.xyz, wi));
   if (cosL < 1e-4) return vec3(0.0);
-  if (occluded(S, wi, dist)) return vec3(0.0);
+  if (gScatter > 0.0) {
+    if (occluded(S, wi, dist)) return vec3(0.0);
+  }
   vec3 e = vec3(t1.w, t2.w, t3.w) * (cosL * float(uEmissiveCount) * t0.w / max(d2, 1e-4));
   // same close-range variance clamp idea as the surface pass
   float l = dot(e, vec3(0.299, 0.587, 0.114));
@@ -217,35 +268,47 @@ void main() {
     bool hasL = uLightCount > 0;
     bool hasE = uEmissiveCount > 0;
     float segStep = segLen / float(VOL_STEPS);
-    // Piecewise integration: density can vary along the ray (zones), so the
-    // transmittance is built up step by step from the LOCAL density at each
-    // sample rather than a single closed-form exp(-uDensity * t).
-    float opticalDepth = 0.0;
-    for (int k = 0; k < VOL_STEPS; k++) {
-      float t = (float(k) + rand()) * segStep; // ascending strata
-      vec3 S = uCameraPos + rd * t;
-      float local = fogDensityAt(S);
-      opticalDepth += local * segStep;
-      vec3 Lin = vec3(0.0);
-      // Stochastically pick analytic lights or the emissive set, weighted 1/p.
-      if (hasL && hasE) {
-        if (rand() < 0.5) {
+    // Zone cull (0.16.2 prep; measured on an RTX 3060 in the Hangar gallery,
+    // dev/gpu-floor wave 3G): with density 0 + one localized shaft zone this
+    // pass was 20.7 ms at canvas 1.0, flat in renderScale, because every
+    // quarter-canvas pixel paid VOL_STEPS BVH shadow rays for a product that
+    // was exactly zero outside the zone. So when only zones scatter, slab-test
+    // the ray segment against every zone AABB first: a ray that touches none
+    // of them contributes zero to sample_, and the whole march is skipped.
+    // The temporal blend below still runs, so history decays identically.
+    bool march = uDensity > 0.0 || rayHitsAnyZone(uCameraPos, rd, segLen);
+    if (march) {
+      // Piecewise integration: density can vary along the ray (zones), so the
+      // transmittance is built up step by step from the LOCAL density at each
+      // sample rather than a single closed-form exp(-uDensity * t).
+      float opticalDepth = 0.0;
+      for (int k = 0; k < VOL_STEPS; k++) {
+        float t = (float(k) + rand()) * segStep; // ascending strata
+        vec3 S = uCameraPos + rd * t;
+        float local = fogDensityAt(S);
+        gScatter = local;   // gates the shadow rays below; 0 outside fog/zones
+        opticalDepth += local * segStep;
+        vec3 Lin = vec3(0.0);
+        // Stochastically pick analytic lights or the emissive set, weighted 1/p.
+        if (hasL && hasE) {
+          if (rand() < 0.5) {
+            int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
+            Lin = lightAt(i, S) * float(uLightCount) * 2.0;
+          } else {
+            Lin = emissiveAt(S) * 2.0;
+          }
+        } else if (hasL) {
           int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
-          Lin = lightAt(i, S) * float(uLightCount) * 2.0;
-        } else {
-          Lin = emissiveAt(S) * 2.0;
+          Lin = lightAt(i, S) * float(uLightCount);
+        } else if (hasE) {
+          Lin = emissiveAt(S);
         }
-      } else if (hasL) {
-        int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
-        Lin = lightAt(i, S) * float(uLightCount);
-      } else if (hasE) {
-        Lin = emissiveAt(S);
+        vec3 c = Lin * local * segStep * exp(-opticalDepth);
+        // per-step spike clamp — outliers decay only as 1/count in the EMA
+        float sl = dot(c, vec3(0.299, 0.587, 0.114));
+        if (sl > 2.0) c *= 2.0 / sl;
+        sample_ += c;
       }
-      vec3 c = Lin * local * segStep * exp(-opticalDepth);
-      // per-step spike clamp — outliers decay only as 1/count in the EMA
-      float sl = dot(c, vec3(0.299, 0.587, 0.114));
-      if (sl > 2.0) c *= 2.0 / sl;
-      sample_ += c;
     }
   }
 
