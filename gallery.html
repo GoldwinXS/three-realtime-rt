@@ -109,6 +109,14 @@
     #options label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
     #options input[type="checkbox"] { accent-color: #38d0e0; cursor: pointer; }
     #options .opt-res-row { margin-top: 8px; gap: 8px; }
+    /* the reset button undoes every control above it, so it sits at the end of
+       the strip on its own line rather than inside the checkbox grid */
+    #options #opt-reset {
+      display: block; width: 100%; margin-top: 9px; font: inherit; color: #cfe0ea;
+      background: #17222b; border: 1px solid #2f414d; border-radius: 6px;
+      padding: 6px 8px; cursor: pointer;
+    }
+    #options #opt-reset:hover { border-color: #38d0e0; color: #fff; background: #1e2d38; }
     #options select {
       font: inherit; color: inherit; background: #16202b;
       border: 1px solid #2c3a46; border-radius: 6px; padding: 3px 6px; cursor: pointer;
@@ -158,14 +166,15 @@
       #hud.busy { opacity: 0.12; }
     }
   </style>
-  <script type="module" crossorigin src="./assets/gallery-E4pisSwD.js"></script>
+  <script type="module" crossorigin src="./assets/gallery-C37jI0bQ.js"></script>
   <link rel="modulepreload" crossorigin href="./assets/modulepreload-polyfill-B5Qt9EMX.js">
-  <link rel="modulepreload" crossorigin href="./assets/RealtimeRaytracer-Bb3iMtd4.js">
-  <link rel="modulepreload" crossorigin href="./assets/OrbitControls-BlBZCci6.js">
-  <link rel="modulepreload" crossorigin href="./assets/Duck-Dacmoewm.js">
-  <link rel="modulepreload" crossorigin href="./assets/DRACOLoader-N4ug4sxl.js">
+  <link rel="modulepreload" crossorigin href="./assets/RealtimeRaytracer-DP4_Ai5X.js">
+  <link rel="modulepreload" crossorigin href="./assets/OrbitControls-DZ0EIapT.js">
+  <link rel="modulepreload" crossorigin href="./assets/Duck-BGzCl1_7.js">
+  <link rel="modulepreload" crossorigin href="./assets/DRACOLoader-DnwnU1AA.js">
+  <link rel="modulepreload" crossorigin href="./assets/physics-Bb-HOJl4.js">
   <link rel="modulepreload" crossorigin href="./assets/DamagedHelmet-Ra207Cae.js">
-  <link rel="modulepreload" crossorigin href="./assets/gallery-scenes-CrEssIiW.js">
+  <link rel="modulepreload" crossorigin href="./assets/gallery-scenes-C5w713Ez.js">
 </head>
 <body>
   <div id="app"></div>
@@ -177,6 +186,7 @@
     <div class="pick-wrap">
       <select id="scene-pick">
         <option value="cornell">Cornell box (the classic)</option>
+        <option value="waterfall">Waterfall (moving, many lights)</option>
         <option value="tokyo">Littlest Tokyo (DRACO glTF)</option>
         <option value="lantern">Lantern (Khronos sample)</option>
         <option value="helmet">Damaged Helmet + props</option>
@@ -202,10 +212,15 @@
       <summary>options</summary>
       <div class="opt-grid">
         <label><input type="checkbox" data-flag="gi" /> GI</label>
+        <label><input type="checkbox" data-flag="ambient" /> ambient</label>
         <label><input type="checkbox" data-flag="emissiveNEE" /> emissive NEE</label>
         <label><input type="checkbox" data-flag="reflections" /> reflections</label>
         <label><input type="checkbox" data-flag="refraction" /> refraction</label>
         <label><input type="checkbox" data-flag="restir" /> ReSTIR</label>
+        <label><input type="checkbox" data-flag="restirDirectionalBypass" /> sun bypass</label>
+        <label><input type="checkbox" data-flag="restirReprojectionRescue" /> reproj rescue</label>
+        <label><input type="checkbox" data-flag="restirCandidateImportance" /> cand importance</label>
+        <label><input type="checkbox" data-flag="motionVectors" /> motion vectors</label>
         <label><input type="checkbox" data-flag="denoise" /> denoise</label>
         <label><input type="checkbox" data-flag="taa" /> TAA</label>
         <label><input type="checkbox" data-flag="volumetric" /> volumetric</label>
@@ -229,6 +244,7 @@
           <option value="0.5">50%</option>
         </select>
       </label>
+      <button id="opt-reset" type="button">Reset to defaults</button>
     </details>
   </div>
   <div id="gallery-cue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 9l-3 3 3 3M9 5l3-3 3 3M15 19l-3 3-3-3M19 9l3 3-3 3"/></svg><span>drag to orbit</span></div>
