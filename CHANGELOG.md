@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.16.1
+
+**`updateDynamic()` does work proportional to what moved.** The dynamic path
+re-baked every rigid segment through its matrixWorld, refit the whole dynamic
+BVH, and rebuilt every node's bounds/contents texture, every frame, whether or
+not anything moved. A Hangar scene with 396 dynamic segments measured 11.8 ms
+per frame on that path while 380 of the segments were parked at `y = -1000`
+(the engine cannot add a dynamic mesh after `compileScene`, so pools are
+compiled in and parked). The parked pool now costs nothing:
+
+- **Per-segment dirty test.** Each rigid segment keeps a `Float64Array` copy of
+  the 16 `matrixWorld` elements it was last baked with; a segment is dirty if
+  any element differs (exact compare), or it is deforming/skinned, or on the
+  first call. Only dirty segments are baked. Each segment also keeps its world
+  AABB from its last bake, and the frame's dynamic bounding volume is the union
+  of those cached AABBs, so a parked segment costs a box union, not a vertex
+  loop.
+- **Partial refit.** At compile (and after a rebuild) the dynamic BVH is walked
+  once to build, per segment, the sorted `Uint32Array` of node32 indices on the
+  paths to every leaf whose triangles overlap the segment. Per frame the dirty
+  segments' maps are unioned and `MeshBVH.refit(set)` refits only those nodes;
+  when nothing is dirty the refit is skipped entirely. (Leaf offset/count index
+  the geometry's index buffer, which MeshBVH's build reorders, so the maps are
+  built by routing each leaf triangle's first vertex through that index to its
+  segment, not by assuming triangle == vertex/3.)
+- **Partial repack.** The bounds Float32Array `bvhToTextures` produced at build
+  is kept; per frame only the refit-set node bounds are rewritten and
+  `boundsTexture.needsUpdate` is set. Contents and index textures never change
+  on a refit and are not touched. Only the dirty segments' position texels are
+  rewritten into the BVH position texture.
+- **Rebuild path unchanged.** When the dynamic volume grows or shrinks 3x the
+  tree is rebuilt, the per-segment maps rebuilt, and every leaf is normalized
+  with one full refit so the partial and full paths stay bit-identical after a
+  rebuild. The dynamic-emissive refresh runs only when a dirty segment is an
+  emitter.
+- **New read-only stat** `compiled.lastDynamicUpdate = { dirtySegments,
+  refitNodes, bakedTriangles, ms }` for harnesses; documented on
+  `CompiledScene`. `updateDynamic()` takes no arguments, as before.
+
 ## 0.16.0
 
 **Lights without a cap.** The renderer's light table has been 32 rows since the

@@ -944,6 +944,16 @@ export class CompiledScene {
   /** CPU cost (ms) of the most recent dynamic-emissive refresh (0 if none). */
   lastEmissiveRefreshMs: number;
   /**
+   * What the most recent {@link updateDynamic} actually did, and its CPU cost
+   * (ms). **Since 0.16.1.** `dirtySegments` is how many dynamic segments were
+   * re-baked (0 when every rigid segment's `matrixWorld` was unchanged);
+   * `refitNodes` is how many BVH nodes were refit that frame (0 when nothing
+   * moved, or on a full rebuild); `bakedTriangles` is the triangle count those
+   * dirty segments cover. A parked pool costs nothing, so a frame where only
+   * one mover moved reports `dirtySegments: 1` and a small `refitNodes`.
+   */
+  lastDynamicUpdate: { dirtySegments: number; refitNodes: number; bakedTriangles: number; ms: number };
+  /**
    * Usage diagnostics raised while compiling this scene (**since 0.7.0**). The
    * standalone {@link compileScene} reports these to the console; going through
    * {@link RealtimeRaytracer.compileScene} additionally mirrors them onto

@@ -202,6 +202,25 @@ export class CompiledScene {
     this._normalFrame = 0;
     this._dynBuildVolume = null; // world-volume of the dynamic set at build time
     this._skinVec = new THREE.Vector3(); // reused per-vertex temp for CPU skinning
+    this._dirtySinceNormalUpload = false; // normals changed since the last upload
+
+    // >>> RT_DYNAMIC_PARTIAL (0.16.1)
+    // Internal flag forcing the OLD full re-bake/refit/repack path every frame.
+    // Used ONLY by the identity gates to prove the partial path is bit-exact;
+    // it is not part of the public API and can be removed later.
+    this.forceFullDynamicUpdate = false;
+    // Per-frame stat for harnesses: what the most recent updateDynamic() did and
+    // how long it took on the CPU (mirrors lastEmissiveRefreshMs's precedent of
+    // living on the compiled scene, not on the renderer).
+    this.lastDynamicUpdate = { dirtySegments: 0, refitNodes: 0, bakedTriangles: 0, ms: 0 };
+    // Cached repack array (the bvhToTextures bounds layout) from the last build,
+    // so a per-frame refit can rewrite ONLY the changed node bounds in place.
+    // The contents array never changes on a refit, so it is not kept here.
+    this._dynBoundsArray = null;
+    this._dynNodeCount = 0;
+    // Reusable per-frame refit set (cleared and refilled each updateDynamic).
+    this._dynRefitSet = new Set();
+    // <<< RT_DYNAMIC_PARTIAL
   }
 
   /**
@@ -209,9 +228,17 @@ export class CompiledScene {
    * geometry, refit the dynamic BVH, and re-upload ONLY the (small) dynamic
    * textures. The static BVH is never touched. Call once per frame after moving
    * the meshes.
+   *
+   * Work is proportional to what MOVED since the last call: a segment whose
+   * 16 matrixWorld elements are unchanged (and that is not deforming/skinned)
+   * costs nothing but a box union and a 16-element compare, so a parked pool
+   * (the engine has no way to add a dynamic mesh after compileScene, so pools
+   * are compiled in and parked) is free.
    */
   updateDynamic() {
     if (!this.hasDynamic || this.dynamic.length === 0) return;
+    const now = typeof performance !== "undefined" ? performance : Date;
+    const t0 = now.now();
     const posAttr = this.dynamicMerged.getAttribute("position");
     const pos = posAttr.array;
     // Packed attribute stride in FLOATS per vertex: 8 when the scene compiled
@@ -220,155 +247,41 @@ export class CompiledScene {
     // every re-bake writes normals at wrong offsets (the drag-corruption bug).
     const S = this.hasTextureTiles ? 8 : 4;
     const packed = this.dynamicPacked;
-    let minX = Infinity, minY = Infinity, minZ = Infinity;
-    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    const full = this.forceFullDynamicUpdate;
 
+    // 1. Per-segment dirty test + bake. Only dirty segments are baked; parked
+    //    ones keep their cached AABB and their cached last-matrix snapshot.
+    const dirtySegs = [];
+    let bakedTriangles = 0;
+    let anyDirtyEmitter = false;
     for (const seg of this.dynamic) {
       seg.mesh.updateWorldMatrix(true, false);
-      const m = seg.mesh.matrixWorld.elements;
-      const nm = this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements;
-      let o = seg.start * 3;
-      let p = seg.start * S;
-
-      if (seg.skinned) {
-        // Animated SkinnedMesh: CPU-skin the SOURCE vertices with three's own
-        // applyBoneTransform (bindMatrix + bone weights/matrices), then expand
-        // through the de-index mapping into the merged triangle soup. In r160
-        // applyBoneTransform/getVertexPosition return the vertex in the mesh's
-        // LOCAL (bind-relative) space — NOT world — so matrixWorld is still
-        // applied here, exactly like the rigid/deforming paths.
-        const mesh = seg.mesh;
-        // Keep the skeleton's bone texture coherent for the raster (G-buffer)
-        // path; applyBoneTransform itself reads bone.matrixWorld, which the app
-        // must have posed (mixer.update + a world-matrix update) before this call.
-        if (mesh.skeleton) mesh.skeleton.update();
-        const local = seg.skinnedLocal;   // Float32Array(srcVertexCount * 3)
-        const tmp = this._skinVec;
-        const srcN = seg.srcVertexCount;
-        // 1. Skin each UNIQUE source vertex ONCE (O(verts x 4 bones)); shared
-        //    triangle-soup slots then reuse the cached result.
-        for (let sv = 0; sv < srcN; sv++) {
-          mesh.getVertexPosition(sv, tmp); // bind pos -> skinned LOCAL space
-          local[sv * 3] = tmp.x;
-          local[sv * 3 + 1] = tmp.y;
-          local[sv * 3 + 2] = tmp.z;
-        }
-        const map = seg.indexMap; // null = identity (non-indexed source)
-        // 2. Expand to the merged layout and transform to world.
-        for (let i = 0; i < seg.count; i++) {
-          const sv = map ? map[i] : i;
-          const x = local[sv * 3], y = local[sv * 3 + 1], z = local[sv * 3 + 2];
-          const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
-          const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
-          const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
-          pos[o] = wx;
-          pos[o + 1] = wy;
-          pos[o + 2] = wz;
-          if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
-          if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
-          if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
-          o += 3;
-        }
-        // 3. PER-FACE normals from the skinned world triangles — the merged
-        //    layout is already a de-indexed triangle soup, so each face's 3
-        //    slots get the same geometric normal (flat-shaded). Secondary rays
-        //    (shadows/GI) only need the geometry to be right; primary visibility
-        //    still gets smooth normals from the raster path. This skips
-        //    CPU-skinning the normal attribute entirely.
-        let fp = seg.start * S;
-        for (let i = 0; i < seg.count; i += 3) {
-          const b = (seg.start + i) * 3;
-          const ax = pos[b], ay = pos[b + 1], az = pos[b + 2];
-          const e1x = pos[b + 3] - ax, e1y = pos[b + 4] - ay, e1z = pos[b + 5] - az;
-          const e2x = pos[b + 6] - ax, e2y = pos[b + 7] - ay, e2z = pos[b + 8] - az;
-          let nx = e1y * e2z - e1z * e2y;
-          let ny = e1z * e2x - e1x * e2z;
-          let nz = e1x * e2y - e1y * e2x;
-          const il = 1.0 / (Math.hypot(nx, ny, nz) || 1);
-          nx *= il; ny *= il; nz *= il;
-          packed[fp + 0] = nx; packed[fp + 1] = ny; packed[fp + 2] = nz;                   // v0
-          packed[fp + S] = nx; packed[fp + S + 1] = ny; packed[fp + S + 2] = nz;           // v1
-          packed[fp + 2 * S] = nx; packed[fp + 2 * S + 1] = ny; packed[fp + 2 * S + 2] = nz; // v2
-          // matIndex (offset 3) and, at stride 8, the uv texel never change
-          fp += 3 * S;
-        }
-      } else if (seg.deforming) {
-        // CPU-deformed mesh (water/cloth): read the LIVE geometry every frame
-        // and expand it back to the merged de-indexed layout through the mapping
-        // snapshotted at compile time. `indexMap` (the source geometry's index
-        // buffer, or null for an already-non-indexed source) maps each merged
-        // triangle-soup vertex slot to its source-vertex index; the source
-        // attributes carry the shared, deformed values.
-        const livePosAttr = seg.liveGeometry.getAttribute("position");
-        if (livePosAttr.count !== seg.srcVertexCount) {
-          throw new Error(
-            "three-realtime-rt: deforming mesh vertex count changed since " +
-            `compile (${seg.srcVertexCount} -> ${livePosAttr.count}); the merged ` +
-            "BVH layout is fixed at compile time — call compileScene() again."
-          );
-        }
-        const sp = livePosAttr.array;
-        const snAttr = seg.liveGeometry.getAttribute("normal");
-        const sn = snAttr ? snAttr.array : null;
-        const map = seg.indexMap; // null = identity (non-indexed source)
-        const ln = seg.localNorm; // fallback if the app never recomputed normals
-        for (let i = 0; i < seg.count; i++) {
-          const sv = map ? map[i] : i;
-          const x = sp[sv * 3], y = sp[sv * 3 + 1], z = sp[sv * 3 + 2];
-          const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
-          const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
-          const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
-          pos[o] = wx;
-          pos[o + 1] = wy;
-          pos[o + 2] = wz;
-          if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
-          if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
-          if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
-          let nx, ny, nz;
-          if (sn) { nx = sn[sv * 3]; ny = sn[sv * 3 + 1]; nz = sn[sv * 3 + 2]; }
-          else { nx = ln[i * 3]; ny = ln[i * 3 + 1]; nz = ln[i * 3 + 2]; }
-          const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
-          const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
-          const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
-          const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
-          packed[p] = tx * il;
-          packed[p + 1] = ty * il;
-          packed[p + 2] = tz * il;
-          // matIndex (offset 3) and, at stride 8, the uv texel never change
-          o += 3;
-          p += S;
-        }
-      } else {
-        // Rigid mover: transform the frozen local snapshot by the world matrix.
-        const lp = seg.localPos;
-        const ln = seg.localNorm;
-        for (let i = 0; i < seg.count; i++) {
-          const x = lp[i * 3], y = lp[i * 3 + 1], z = lp[i * 3 + 2];
-          const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
-          const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
-          const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
-          pos[o] = wx;
-          pos[o + 1] = wy;
-          pos[o + 2] = wz;
-          if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
-          if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
-          if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
-          const nx = ln[i * 3], ny = ln[i * 3 + 1], nz = ln[i * 3 + 2];
-          const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
-          const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
-          const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
-          const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
-          packed[p] = tx * il;
-          packed[p + 1] = ty * il;
-          packed[p + 2] = tz * il;
-          // matIndex (offset 3) and, at stride 8, the uv texel never change
-          o += 3;
-          p += S;
-        }
+      const dirty = full || this._segmentDirty(seg);
+      if (dirty) {
+        dirtySegs.push(seg);
+        bakedTriangles += seg.count / 3;
+        this._bakeSegment(seg, pos, packed, S);
+        if (seg.emissive) anyDirtyEmitter = true;
       }
     }
-    posAttr.needsUpdate = true;
+    if (dirtySegs.length > 0) {
+      posAttr.needsUpdate = true;
+      this._dirtySinceNormalUpload = true;
+    }
 
+    // 2. Frame bounding volume = union of the cached segment AABBs (parked
+    //    segments contribute a cached box, not a vertex loop).
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const seg of this.dynamic) {
+      const b = seg.aabb;
+      if (b[0] < minX) minX = b[0];
+      if (b[1] < minY) minY = b[1];
+      if (b[2] < minZ) minZ = b[2];
+      if (b[3] > maxX) maxX = b[3];
+      if (b[4] > maxY) maxY = b[4];
+      if (b[5] > maxZ) maxZ = b[5];
+    }
     // refit() keeps the tree TOPOLOGY from build time. While the props sit in
     // a pile that's fine — but once they scatter (an explosion), triangles
     // that are tree-neighbors end up across the room, refitted nodes balloon
@@ -381,25 +294,334 @@ export class CompiledScene {
       Math.max(maxY - minY, 1e-6) *
       Math.max(maxZ - minZ, 1e-6);
     if (this._dynBuildVolume == null) this._dynBuildVolume = vol;
+
+    let refitNodes = 0;
     if (vol > this._dynBuildVolume * 3 || vol < this._dynBuildVolume / 3) {
+      // Full rebuild: new tree, rebuilt per-segment node maps, full repack.
       this.dynamicBvh = new MeshBVH(this.dynamicMerged, { strategy: CENTER });
-      this._dynBuildVolume = vol;
-    } else {
+      // Normalize every leaf to refit's exact min/max: the build computes leaf
+      // bounds up to 1 ULP looser/tighter than refit, and the partial path only
+      // ever re-derives the DIRTY leaves, so a parked leaf left at its build
+      // value would drift 1 ULP from the full path (which refits every leaf).
+      // One full refit at rebuild time makes the two paths bit-identical again.
       this.dynamicBvh.refit();
+      this._rebuildDynamicNodeMaps();
+      this._dynBuildVolume = vol;
+    } else if (full) {
+      // OLD full path (forceFullDynamicUpdate): full refit + full repack, kept
+      // only so the identity gates can prove the partial path is bit-exact.
+      this.dynamicBvh.refit();
+      this.dynamicBvhUniform.updateFrom(this.dynamicBvh);
+    } else if (dirtySegs.length > 0) {
+      // Partial path: refit only the nodes on the paths to the dirty leaves,
+      // repack only those node bounds, and rewrite only the dirty vertices'
+      // position texels. Contents and index textures never change on a refit.
+      if (dirtySegs.length === this.dynamic.length) {
+        // Every segment dirty: the union of the per-segment maps is the whole
+        // tree, so skip the Set (and its .has() overhead inside refit) and refit
+        // everything, then repack every node's bounds.
+        this.dynamicBvh.refit();
+        this._repackAllDynamicBounds();
+        this._updateDynamicPositions(dirtySegs, pos);
+        refitNodes = this._dynNodeCount;
+      } else {
+        const set = this._dynRefitSet;
+        set.clear();
+        for (const seg of dirtySegs) {
+          const nodes = seg.refitNodes;
+          for (let i = 0; i < nodes.length; i++) set.add(nodes[i]);
+        }
+        if (set.size > 0) {
+          this.dynamicBvh.refit(set);
+          this._repackDynamicBounds(set);
+          this._updateDynamicPositions(dirtySegs, pos);
+          refitNodes = set.size;
+        }
+      }
     }
-    this.dynamicBvhUniform.updateFrom(this.dynamicBvh);
+    // (When nothing is dirty and no rebuild happened, refit and repack are
+    // skipped entirely: a parked frame costs only the dirty tests + the box
+    // union above.)
+
     // Normals only feed GI-bounce shading off movers — amortize their upload for
     // rigid movers. Deforming and skinned meshes change shape (not just
     // orientation) every frame, so their normals must go up every frame or the
     // shading lags the silhouette; one such segment forces the whole (shared)
-    // upload.
-    if (this.hasDeforming || this.hasSkinned || this._normalFrame++ % 8 === 0) {
+    // upload. The `_dirtySinceNormalUpload` gate skips an upload when the packed
+    // array is byte-identical to what is already on the GPU (an upload would be a
+    // no-op), which is what keeps a nothing-moving frame near zero.
+    const normalFrame = this._normalFrame++;
+    const uploadNormals =
+      this.hasDeforming || this.hasSkinned || (this._dirtySinceNormalUpload && normalFrame % 8 === 0);
+    if (uploadNormals) {
       this.dynamicAttrTex.updateFrom(this.dynamicPackedAttr);
+      this._dirtySinceNormalUpload = false;
     }
 
     // Refresh dynamic emissive area lights from the freshly baked world-space
-    // merged positions (rows in the scene-data texture + the power CDF).
-    if (this.hasDynamicEmissive) this._refreshDynamicEmissive();
+    // merged positions (rows in the scene-data texture + the power CDF). Only
+    // needed when a DIRTY segment is an emitter: a parked emitter's rows are
+    // unchanged, so re-deriving them is a no-op and is skipped.
+    if (this.hasDynamicEmissive && anyDirtyEmitter) this._refreshDynamicEmissive();
+
+    this.lastDynamicUpdate = {
+      dirtySegments: dirtySegs.length,
+      refitNodes,
+      bakedTriangles,
+      ms: now.now() - t0,
+    };
+  }
+
+  /**
+   * A segment is dirty when it has never been baked (first call), when it is
+   * deforming/skinned (its shape can change without its matrix changing), or
+   * when any of its 16 matrixWorld elements differs from the snapshot taken at
+   * the last bake (exact double compare, matching how three stores them).
+   */
+  _segmentDirty(seg) {
+    if (seg.deforming || seg.skinned) return true;
+    const m = seg.mesh.matrixWorld.elements;
+    const last = seg.lastMatrix;
+    if (last === null) {
+      seg.lastMatrix = new Float64Array(m);
+      return true;
+    }
+    for (let i = 0; i < 16; i++) {
+      if (last[i] !== m[i]) {
+        last.set(m);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Re-bake ONE dynamic segment's current world transform into the merged
+   * position array and the packed normal array, and store the segment's world
+   * AABB in seg.aabb (Float32Array(6)). `seg.mesh.matrixWorld` must already be
+   * current (updateWorldMatrix was called by the caller).
+   */
+  _bakeSegment(seg, pos, packed, S) {
+    const m = seg.mesh.matrixWorld.elements;
+    const nm = this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements;
+    const aabb = seg.aabb || (seg.aabb = new Float32Array(6));
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    let o = seg.start * 3;
+    let p = seg.start * S;
+
+    if (seg.skinned) {
+      // Animated SkinnedMesh: CPU-skin the SOURCE vertices with three's own
+      // applyBoneTransform (bindMatrix + bone weights/matrices), then expand
+      // through the de-index mapping into the merged triangle soup. In r160
+      // applyBoneTransform/getVertexPosition return the vertex in the mesh's
+      // LOCAL (bind-relative) space, NOT world, so matrixWorld is still
+      // applied here, exactly like the rigid/deforming paths.
+      const mesh = seg.mesh;
+      // Keep the skeleton's bone texture coherent for the raster (G-buffer)
+      // path; applyBoneTransform itself reads bone.matrixWorld, which the app
+      // must have posed (mixer.update + a world-matrix update) before this call.
+      if (mesh.skeleton) mesh.skeleton.update();
+      const local = seg.skinnedLocal;   // Float32Array(srcVertexCount * 3)
+      const tmp = this._skinVec;
+      const srcN = seg.srcVertexCount;
+      // 1. Skin each UNIQUE source vertex ONCE (O(verts x 4 bones)); shared
+      //    triangle-soup slots then reuse the cached result.
+      for (let sv = 0; sv < srcN; sv++) {
+        mesh.getVertexPosition(sv, tmp); // bind pos -> skinned LOCAL space
+        local[sv * 3] = tmp.x;
+        local[sv * 3 + 1] = tmp.y;
+        local[sv * 3 + 2] = tmp.z;
+      }
+      const map = seg.indexMap; // null = identity (non-indexed source)
+      // 2. Expand to the merged layout and transform to world.
+      for (let i = 0; i < seg.count; i++) {
+        const sv = map ? map[i] : i;
+        const x = local[sv * 3], y = local[sv * 3 + 1], z = local[sv * 3 + 2];
+        const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+        const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+        const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+        pos[o] = wx;
+        pos[o + 1] = wy;
+        pos[o + 2] = wz;
+        if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+        if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+        if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+        o += 3;
+      }
+      // 3. PER-FACE normals from the skinned world triangles; the merged
+      //    layout is already a de-indexed triangle soup, so each face's 3
+      //    slots get the same geometric normal (flat-shaded). Secondary rays
+      //    (shadows/GI) only need the geometry to be right; primary visibility
+      //    still gets smooth normals from the raster path. This skips
+      //    CPU-skinning the normal attribute entirely.
+      let fp = seg.start * S;
+      for (let i = 0; i < seg.count; i += 3) {
+        const b = (seg.start + i) * 3;
+        const ax = pos[b], ay = pos[b + 1], az = pos[b + 2];
+        const e1x = pos[b + 3] - ax, e1y = pos[b + 4] - ay, e1z = pos[b + 5] - az;
+        const e2x = pos[b + 6] - ax, e2y = pos[b + 7] - ay, e2z = pos[b + 8] - az;
+        let nx = e1y * e2z - e1z * e2y;
+        let ny = e1z * e2x - e1x * e2z;
+        let nz = e1x * e2y - e1y * e2x;
+        const il = 1.0 / (Math.hypot(nx, ny, nz) || 1);
+        nx *= il; ny *= il; nz *= il;
+        packed[fp + 0] = nx; packed[fp + 1] = ny; packed[fp + 2] = nz;                   // v0
+        packed[fp + S] = nx; packed[fp + S + 1] = ny; packed[fp + S + 2] = nz;           // v1
+        packed[fp + 2 * S] = nx; packed[fp + 2 * S + 1] = ny; packed[fp + 2 * S + 2] = nz; // v2
+        // matIndex (offset 3) and, at stride 8, the uv texel never change
+        fp += 3 * S;
+      }
+    } else if (seg.deforming) {
+      // CPU-deformed mesh (water/cloth): read the LIVE geometry every frame
+      // and expand it back to the merged de-indexed layout through the mapping
+      // snapshotted at compile time. `indexMap` (the source geometry's index
+      // buffer, or null for an already-non-indexed source) maps each merged
+      // triangle-soup vertex slot to its source-vertex index; the source
+      // attributes carry the shared, deformed values.
+      const livePosAttr = seg.liveGeometry.getAttribute("position");
+      if (livePosAttr.count !== seg.srcVertexCount) {
+        throw new Error(
+          "three-realtime-rt: deforming mesh vertex count changed since " +
+          `compile (${seg.srcVertexCount} -> ${livePosAttr.count}); the merged ` +
+          "BVH layout is fixed at compile time; call compileScene() again."
+        );
+      }
+      const sp = livePosAttr.array;
+      const snAttr = seg.liveGeometry.getAttribute("normal");
+      const sn = snAttr ? snAttr.array : null;
+      const map = seg.indexMap; // null = identity (non-indexed source)
+      const ln = seg.localNorm; // fallback if the app never recomputed normals
+      for (let i = 0; i < seg.count; i++) {
+        const sv = map ? map[i] : i;
+        const x = sp[sv * 3], y = sp[sv * 3 + 1], z = sp[sv * 3 + 2];
+        const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+        const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+        const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+        pos[o] = wx;
+        pos[o + 1] = wy;
+        pos[o + 2] = wz;
+        if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+        if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+        if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+        let nx, ny, nz;
+        if (sn) { nx = sn[sv * 3]; ny = sn[sv * 3 + 1]; nz = sn[sv * 3 + 2]; }
+        else { nx = ln[i * 3]; ny = ln[i * 3 + 1]; nz = ln[i * 3 + 2]; }
+        const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
+        const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
+        const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
+        const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
+        packed[p] = tx * il;
+        packed[p + 1] = ty * il;
+        packed[p + 2] = tz * il;
+        // matIndex (offset 3) and, at stride 8, the uv texel never change
+        o += 3;
+        p += S;
+      }
+    } else {
+      // Rigid mover: transform the frozen local snapshot by the world matrix.
+      const lp = seg.localPos;
+      const ln = seg.localNorm;
+      for (let i = 0; i < seg.count; i++) {
+        const x = lp[i * 3], y = lp[i * 3 + 1], z = lp[i * 3 + 2];
+        const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+        const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+        const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+        pos[o] = wx;
+        pos[o + 1] = wy;
+        pos[o + 2] = wz;
+        if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+        if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+        if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+        const nx = ln[i * 3], ny = ln[i * 3 + 1], nz = ln[i * 3 + 2];
+        const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
+        const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
+        const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
+        const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
+        packed[p] = tx * il;
+        packed[p + 1] = ty * il;
+        packed[p + 2] = tz * il;
+        // matIndex (offset 3) and, at stride 8, the uv texel never change
+        o += 3;
+        p += S;
+      }
+    }
+    aabb[0] = minX; aabb[1] = minY; aabb[2] = minZ;
+    aabb[3] = maxX; aabb[4] = maxY; aabb[5] = maxZ;
+  }
+
+  /**
+   * Rewrite ONLY the bounds texels of the nodes in the refit set into the
+   * cached bvhBounds array (the bvhToTextures layout), then flag the bounds
+   * texture for re-upload. Contents never change on a refit, so the contents
+   * texture is left alone. `refitSet` holds node32 indices (byte offset / 4).
+   */
+  _repackDynamicBounds(refitSet) {
+    const bounds = this._dynBoundsArray;
+    const float32Array = new Float32Array(this.dynamicBvh._roots[0]);
+    for (const n of refitSet) {
+      // bounds texel layout: node i -> boundsArray[8i + 0..2] = min,
+      // [8i + 4..6] = max, and 8i is the node's node32 index n.
+      bounds[n + 0] = float32Array[n + 0];
+      bounds[n + 1] = float32Array[n + 1];
+      bounds[n + 2] = float32Array[n + 2];
+      bounds[n + 4] = float32Array[n + 3];
+      bounds[n + 5] = float32Array[n + 4];
+      bounds[n + 6] = float32Array[n + 5];
+    }
+    this.dynamicBvhUniform.bvhBounds.needsUpdate = true;
+  }
+
+  /**
+   * Rewrite every node's bounds into the cached bvhBounds array (the whole-tree
+   * equivalent of _repackDynamicBounds, used when every segment is dirty).
+   */
+  _repackAllDynamicBounds() {
+    const bounds = this._dynBoundsArray;
+    const float32Array = new Float32Array(this.dynamicBvh._roots[0]);
+    const nodeCount = this._dynNodeCount;
+    for (let n = 0; n < nodeCount; n++) {
+      const i = n * 8;
+      bounds[i + 0] = float32Array[i + 0];
+      bounds[i + 1] = float32Array[i + 1];
+      bounds[i + 2] = float32Array[i + 2];
+      bounds[i + 4] = float32Array[i + 3];
+      bounds[i + 5] = float32Array[i + 4];
+      bounds[i + 6] = float32Array[i + 5];
+    }
+    this.dynamicBvhUniform.bvhBounds.needsUpdate = true;
+  }
+
+  /**
+   * Rewrite only the dirty segments' position texels into the cached BVH
+   * position texture (FloatVertexAttributeTexture, finalStride 4: xyz + 1.0).
+   * O(dirty vertices), so a parked pool costs nothing here either.
+   */
+  _updateDynamicPositions(dirtySegs, pos) {
+    const data = this.dynamicBvhUniform.position.image.data;
+    for (const seg of dirtySegs) {
+      const v0 = seg.start, v1 = seg.start + seg.count;
+      let o = v0 * 3;
+      let d = v0 * 4;
+      for (let v = v0; v < v1; v++, o += 3, d += 4) {
+        data[d] = pos[o];
+        data[d + 1] = pos[o + 1];
+        data[d + 2] = pos[o + 2];
+      }
+    }
+    this.dynamicBvhUniform.position.needsUpdate = true;
+  }
+
+  /**
+   * After a full rebuild (new MeshBVH): full repack (bounds + contents +
+   * position + index) and rebuild the per-segment node maps, then re-grab the
+   * cached repack arrays the partial path mutates in place.
+   */
+  _rebuildDynamicNodeMaps() {
+    this.dynamicBvhUniform.updateFrom(this.dynamicBvh);
+    this._dynBoundsArray = this.dynamicBvhUniform.bvhBounds.image.data;
+    this._dynNodeCount = this.dynamicBvh._roots[0].byteLength / 32;
+    buildDynamicNodeMaps(this);
   }
 
   /**
@@ -1472,6 +1694,103 @@ function buildLevel(geometries, { dynamic, stride2 = false }) {
   return { merged, bvh, ...packAttributes(merged, stride2) };
 }
 
+// >>> RT_DYNAMIC_PARTIAL (0.16.1)
+// First index k in a sorted array such that arr[k] >= x.
+function lowerBound(arr, x) {
+  let lo = 0, hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid] < x) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * Walk the dynamic BVH once and build, per segment, the sorted Uint32Array of
+ * node32 indices on every path from the root to a leaf whose triangles overlap
+ * the segment. three-mesh-bvh's refit(set) descends only into children whose
+ * node32 index is in the set, so the set MUST contain every node on the path to
+ * each changed leaf (an internal node with NEITHER child in the set forces its
+ * whole subtree instead). Storing full root-to-leaf paths per segment means the
+ * per-frame refit set is simply the union of the dirty segments' maps.
+ *
+ * Segment `start`/`count` are VERTEX offsets into the merged geometry's position
+ * array (that array is never reordered). The leaf offset/count, however, index
+ * into the geometry's INDEX buffer, and MeshBVH's build REORDERS that buffer (the
+ * partition step), so a leaf's triangles are `index[3*(offset+j) + k]`, NOT
+ * `3*(offset+j)`. Each triangle's vertices all belong to one segment, so mapping
+ * the triangle's FIRST vertex through the index buffer to its segment is enough.
+ */
+function buildDynamicNodeMaps(compiled) {
+  const bvh = compiled.dynamicBvh;
+  const roots = bvh._roots;
+  // The GPU struct only supports a single root; assert it once, at compile time.
+  if (!roots || roots.length !== 1) {
+    throw new Error(
+      "three-realtime-rt: multi-root dynamic BVHs are not supported by the GPU struct."
+    );
+  }
+  const root = roots[0];
+  const uint16Array = new Uint16Array(root);
+  const uint32Array = new Uint32Array(root);
+
+  const segs = compiled.dynamic;
+  const n = segs.length;
+  const segStart = new Array(n);
+  for (let i = 0; i < n; i++) segStart[i] = segs[i].start;
+  const indexArr = compiled.dynamicMerged.index
+    ? compiled.dynamicMerged.index.array
+    : null;
+
+  // First segment whose start > v, minus one = the segment containing vertex v
+  // (segments are contiguous and sorted by `start`).
+  const segOf = (v) => lowerBound(segStart, v + 1) - 1;
+
+  // Temporary per-segment Sets (dedupe); converted to sorted Uint32Arrays below.
+  const sets = new Array(n);
+  for (let i = 0; i < n; i++) sets[i] = new Set();
+
+  // Iterative DFS with an explicit path stack (node32 indices root..current).
+  const path = [];
+  const stack = [[0, false]]; // [node32, exiting?]
+  while (stack.length) {
+    const entry = stack.pop();
+    const node32 = entry[0];
+    if (entry[1]) {
+      path.pop();
+      continue;
+    }
+    path.push(node32);
+    const isLeaf = uint16Array[node32 * 2 + 15] === 0xffff;
+    if (isLeaf) {
+      const offset = uint32Array[node32 + 6];
+      const count = uint16Array[node32 * 2 + 14];
+      // Which segments does this leaf touch? One first-vertex lookup per triangle.
+      const touched = new Set();
+      for (let t = offset; t < offset + count; t++) {
+        const v = indexArr ? indexArr[3 * t] : 3 * t;
+        touched.add(segOf(v));
+      }
+      for (const si of touched) {
+        const s = sets[si];
+        for (let d = 0; d < path.length; d++) s.add(path[d]);
+      }
+      path.pop();
+    } else {
+      stack.push([node32, true]); // exit marker
+      stack.push([node32 + 8, false]); // left child
+      stack.push([uint32Array[node32 + 6], false]); // right child
+    }
+  }
+
+  for (let i = 0; i < n; i++) {
+    const arr = Array.from(sets[i]).sort((a, b) => a - b);
+    segs[i].refitNodes = Uint32Array.from(arr);
+  }
+}
+// <<< RT_DYNAMIC_PARTIAL
+
 export function compileScene(scene, options = {}) {
   scene.updateMatrixWorld(true);
   const dynamicSet = options.dynamicMeshes ? new Set(options.dynamicMeshes) : null;
@@ -1614,6 +1933,17 @@ export function compileScene(scene, options = {}) {
         // Cache of per-source-vertex skinned LOCAL positions (skinned segs only),
         // filled each frame so shared triangle-soup slots reuse one skin solve.
         skinnedLocal: skinned ? new Float32Array(extracted.srcVertexCount * 3) : null,
+        // >>> RT_DYNAMIC_PARTIAL (0.16.1)
+        // Per-segment caches for the partial update path: a Float64Array snapshot
+        // of the 16 matrixWorld elements at the last bake (exact double compare),
+        // the segment's world AABB from that bake, and (filled once by
+        // buildDynamicNodeMaps) the sorted node32 indices on every BVH path that
+        // reaches a leaf overlapping this segment's triangle range.
+        lastMatrix: null,
+        aabb: null,
+        refitNodes: null,
+        emissive: false,
+        // <<< RT_DYNAMIC_PARTIAL
       });
       dynVertexOffset += extracted.count;
     } else {
@@ -1713,6 +2043,13 @@ export function compileScene(scene, options = {}) {
   compiled.dynamicPacked = d.packed;
   compiled.dynamicPackedAttr = d.attr;
   compiled.dynamicAttrTex.updateFrom(d.attr);
+  // >>> RT_DYNAMIC_PARTIAL (0.16.1)
+  // Keep the repack arrays bvhToTextures just produced (the partial path rewrites
+  // them in place) and walk the tree once to build each segment's refit node set.
+  compiled._dynBoundsArray = compiled.dynamicBvhUniform.bvhBounds.image.data;
+  compiled._dynNodeCount = compiled.dynamicBvh._roots[0].byteLength / 32;
+  if (compiled.hasDynamic) buildDynamicNodeMaps(compiled);
+  // <<< RT_DYNAMIC_PARTIAL
 
   compiled.triangleCount =
     (s.merged.getAttribute("position").count +
@@ -1761,6 +2098,22 @@ export function compileScene(scene, options = {}) {
     if (t.dyn) compiled._dynamicEmissive.push({ row: r, off: t.dynOff, emit: t.emit });
   }
   compiled.hasDynamicEmissive = compiled._dynamicEmissive.length > 0;
+  // >>> RT_DYNAMIC_PARTIAL (0.16.1)
+  // Mark which dynamic segments carry (post-cap) emissive triangles so the
+  // per-frame emissive refresh is skipped unless a DIRTY segment is an emitter.
+  for (const de of compiled._dynamicEmissive) {
+    const v = de.off / 3; // merged vertex index of the emitter triangle's v0
+    // Segments are contiguous and sorted by `start`, so binary-search the one
+    // whose [start, start+count) contains v.
+    let lo = 0, hi = compiled.dynamic.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (compiled.dynamic[mid].start <= v) lo = mid + 1;
+      else hi = mid;
+    }
+    compiled.dynamic[lo - 1].emissive = true;
+  }
+  // <<< RT_DYNAMIC_PARTIAL
   // Per-material Beer-Lambert absorption opt-in (attenuationColor +
   // attenuationDistance, or userData.rtAttenuation). Resolved BEFORE the scene
   // data texture is built because a non-null table appends row 67 to it.
