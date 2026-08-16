@@ -487,14 +487,26 @@ export class CompiledScene {
           "BVH layout is fixed at compile time; call compileScene() again."
         );
       }
-      const sp = livePosAttr.array;
+      // Same accessor semantics as extractMeshGeometry: an interleaved or
+      // normalized attribute's .array is not contiguous floats, so read the
+      // live values through getX/Y/Z unless it is already a direct triple.
+      const directPos =
+        !livePosAttr.isInterleavedBufferAttribute &&
+        !livePosAttr.normalized && livePosAttr.itemSize === 3;
+      const sp = directPos ? livePosAttr.array : null;
       const snAttr = seg.liveGeometry.getAttribute("normal");
-      const sn = snAttr ? snAttr.array : null;
+      const directNormal = !!(
+        snAttr && !snAttr.isInterleavedBufferAttribute &&
+        !snAttr.normalized && snAttr.itemSize === 3
+      );
+      const sn = directNormal ? snAttr.array : null;
       const map = seg.indexMap; // null = identity (non-indexed source)
       const ln = seg.localNorm; // fallback if the app never recomputed normals
       for (let i = 0; i < seg.count; i++) {
         const sv = map ? map[i] : i;
-        const x = sp[sv * 3], y = sp[sv * 3 + 1], z = sp[sv * 3 + 2];
+        const x = directPos ? sp[sv * 3] : livePosAttr.getX(sv);
+        const y = directPos ? sp[sv * 3 + 1] : livePosAttr.getY(sv);
+        const z = directPos ? sp[sv * 3 + 2] : livePosAttr.getZ(sv);
         const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
         const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
         const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
@@ -505,7 +517,11 @@ export class CompiledScene {
         if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
         if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
         let nx, ny, nz;
-        if (sn) { nx = sn[sv * 3]; ny = sn[sv * 3 + 1]; nz = sn[sv * 3 + 2]; }
+        if (snAttr) {
+          nx = directNormal ? sn[sv * 3] : snAttr.getX(sv);
+          ny = directNormal ? sn[sv * 3 + 1] : snAttr.getY(sv);
+          nz = directNormal ? sn[sv * 3 + 2] : snAttr.getZ(sv);
+        }
         else { nx = ln[i * 3]; ny = ln[i * 3 + 1]; nz = ln[i * 3 + 2]; }
         const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
         const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
@@ -696,7 +712,35 @@ export class CompiledScene {
   }
 }
 
+function copyVec3Attribute(attribute, count = attribute.count) {
+  const out = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const o = i * 3;
+    out[o] = attribute.getX(i);
+    out[o + 1] = attribute.getY(i);
+    out[o + 2] = attribute.getZ(i);
+  }
+  return out;
+}
+
+function copyVec2Attribute(attribute, count = attribute.count) {
+  const out = new Float32Array(count * 2);
+  for (let i = 0; i < count; i++) {
+    const o = i * 2;
+    out[o] = attribute.getX(i);
+    out[o + 1] = attribute.getY(i);
+  }
+  return out;
+}
+
 function extractMeshGeometry(mesh) {
+  // Compute missing normals on the indexed source BEFORE expanding it. Doing
+  // this after toNonIndexed() produces flat face normals in the de-indexed trace mesh,
+  // while the ordinary per-mesh G-buffer sees smooth shared-vertex normals on
+  // the original geometry.
+  if (!mesh.geometry.getAttribute("normal")) {
+    mesh.geometry.computeVertexNormals();
+  }
   const indexed = mesh.geometry.index;
   const src = indexed ? mesh.geometry.toNonIndexed() : mesh.geometry.clone();
 
@@ -707,24 +751,29 @@ function extractMeshGeometry(mesh) {
     // as normalize(vec3(0)) → NaN and the entire silhouette goes black.
     // computeVertexNormals on the original is a benign mutation: it only
     // fills in an attribute the geometry already should have carried.
-    if (!mesh.geometry.getAttribute("normal")) {
-      mesh.geometry.computeVertexNormals();
-    }
   }
-  const localPos = src.getAttribute("position").array.slice();
-  const localNorm = src.getAttribute("normal").array.slice();
+  // BufferAttribute.array is not necessarily tightly packed (interleaved
+  // attributes retain their parent stride), and normalized integer attributes
+  // need getX/Y/Z's de-normalisation. Pack explicitly so every downstream path
+  // sees the same contiguous float triples.
+  // A GL_TRIANGLES draw ignores one or two trailing vertices. Trim each source
+  // independently before any merge so tails can never combine across meshes in
+  // the trace BVH.
+  const rawCount = src.getAttribute("position").count;
+  const count = rawCount - (rawCount % 3);
+  const localPos = copyVec3Attribute(src.getAttribute("position"), count);
+  const localNorm = copyVec3Attribute(src.getAttribute("normal"), count);
 
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", src.getAttribute("position").clone());
-  geo.setAttribute("normal", src.getAttribute("normal").clone());
+  geo.setAttribute("position", new THREE.BufferAttribute(localPos.slice(), 3));
+  geo.setAttribute("normal", new THREE.BufferAttribute(localNorm.slice(), 3));
 
-  const count = src.getAttribute("position").count;
   // Preserve UVs for secondary-ray texture sampling (stride-2 attribute layout).
   // If the source geometry has no UV attribute, fill with zeros so mergeGeometries
   // does not drop a mismatched attribute across geometries.
   const hasUv = src.getAttribute("uv") !== undefined;
   if (hasUv) {
-    geo.setAttribute("uv", src.getAttribute("uv").clone());
+    geo.setAttribute("uv", new THREE.BufferAttribute(copyVec2Attribute(src.getAttribute("uv"), count), 2));
   } else {
     const zeroUv = new Float32Array(count * 2);
     geo.setAttribute("uv", new THREE.BufferAttribute(zeroUv, 2));
@@ -741,7 +790,7 @@ function extractMeshGeometry(mesh) {
   // buffer), or null when the source was already non-indexed (identity map).
   // `srcVertexCount` is the live position count at compile time — used to catch
   // a topology change that would invalidate this mapping.
-  const indexMap = indexed ? mesh.geometry.index.array.slice() : null;
+  const indexMap = indexed ? mesh.geometry.index.array.slice(0, count) : null;
   const srcVertexCount = mesh.geometry.getAttribute("position").count;
   return { geo, localPos, localNorm, count, indexMap, srcVertexCount };
 }

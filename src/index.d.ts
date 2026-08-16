@@ -699,6 +699,13 @@ export interface RealtimeRaytracerOptions {
    */
   motionVectors?: boolean;
   /**
+   * Pool the internal G-buffer draw materials by vertex-color presence and
+   * culling side (default `true`). This is an internal draw-state optimization;
+   * meshes with custom Object3D render callbacks automatically use the legacy
+   * per-mesh proxy path. Set `false` for diagnostics or unusual integrations.
+   */
+  gbufferMaterialPooling?: boolean;
+  /**
    * Temporal anti-aliasing: sub-pixel projection jitter + a full-res history
    * resolve with neighbourhood clamp.
    */

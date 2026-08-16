@@ -1,0 +1,1165 @@
+diff --git a/scripts/gbuffer-material-pooling-selftest.mjs b/scripts/gbuffer-material-pooling-selftest.mjs
+new file mode 100644
+index 0000000..9a80304
+--- /dev/null
++++ b/scripts/gbuffer-material-pooling-selftest.mjs
+@@ -0,0 +1,143 @@
++import * as THREE from "three";
++import { GBufferPass } from "../src/GBufferPass.js";
++
++function assert(condition, message) {
++  if (!condition) throw new Error(message);
++}
++
++function makeGeometry(withColors = false) {
++  const geometry = new THREE.BufferGeometry();
++  geometry.setAttribute("position", new THREE.Float32BufferAttribute([
++    0, 0, 0, 1, 0, 0, 0, 1, 0,
++  ], 3));
++  geometry.setAttribute("normal", new THREE.Float32BufferAttribute([
++    0, 0, 1, 0, 0, 1, 0, 0, 1,
++  ], 3));
++  if (withColors) geometry.setAttribute("color", new THREE.Float32BufferAttribute([
++    1, 0, 0, 0, 1, 0, 0, 0, 1,
++  ], 3));
++  return geometry;
++}
++
++function makeRenderer({ throwOnRender = false, seen = [] } = {}) {
++  return {
++    setRenderTarget() {},
++    setClearColor() {},
++    clear() {},
++    render(scene, camera) {
++      if (throwOnRender) throw new Error("intentional renderer failure");
++      scene.traverse((object) => {
++        if (!object.isMesh || !object.material) return;
++        const materials = Array.isArray(object.material) ? object.material : [object.material];
++        for (let i = 0; i < materials.length; i++) {
++          const material = materials[i];
++          if (!material || material.visible === false) continue;
++          const group = { materialIndex: i };
++          object.onBeforeRender(this, scene, camera, object.geometry, material, group);
++          material.onBeforeRender?.(this, scene, camera, object.geometry, object, group);
++          seen.push({ object, material });
++          object.onAfterRender(this, scene, camera, object.geometry, material, group);
++        }
++      });
++    },
++  };
++}
++
++const pass = new GBufferPass(2, 2, { materialPooling: true });
++const geometry = makeGeometry(false);
++geometry.addGroup(0, 3, 0);
++geometry.addGroup(0, 3, 1);
++geometry.addGroup(0, 3, 2);
++const red = new THREE.MeshStandardMaterial({ color: 0xff0000, side: THREE.BackSide });
++const hidden = new THREE.MeshStandardMaterial({ color: 0x00ff00, visible: false });
++const mesh = new THREE.Mesh(geometry, [red, null, hidden]);
++const originals = mesh.material;
++
++const slots = pass._sharedMaterialFor(mesh);
++assert(Array.isArray(slots), "multi-material replacement must remain an array");
++assert(slots[1] === null, "null material holes must remain null");
++assert(slots[2].visible === false, "invisible source slots must use an invisible proxy");
++assert(slots[0].vertexColors === false, "no-color geometry must use the no-color pool");
++assert(slots[0].side === THREE.BackSide, "pool must preserve source side");
++
++mesh.updateMatrixWorld(true);
++slots[0].onBeforeRender({}, new THREE.Scene(), new THREE.PerspectiveCamera(), geometry, mesh, { materialIndex: 0 });
++assert(slots[0].uniforms.uColor.value.equals(red.color), "source color must sync");
++const normalBefore = slots[0].uniforms.uNormalMatrixWorld.value.clone();
++red.color.set(0x112233);
++mesh.scale.set(2, 1, 1);
++mesh.updateMatrixWorld(true);
++slots[0].onBeforeRender({}, new THREE.Scene(), new THREE.PerspectiveCamera(), geometry, mesh, { materialIndex: 0 });
++assert(slots[0].uniforms.uColor.value.equals(red.color), "live source color must sync");
++assert(!slots[0].uniforms.uNormalMatrixWorld.value.equals(normalBefore), "live matrix change must sync");
++
++// The source may change side during Object3D.onBeforeRender. The selected pool
++// entry keeps its culling side immutable for the render-list item.
++const fixedSideMaterial = slots[0];
++red.side = THREE.DoubleSide;
++fixedSideMaterial.onBeforeRender({}, new THREE.Scene(), new THREE.PerspectiveCamera(), geometry, mesh, { materialIndex: 0 });
++assert(fixedSideMaterial.side === THREE.BackSide, "pool side must remain immutable during callbacks");
++const changedSlots = pass._sharedMaterialFor(mesh);
++assert(changedSlots[0] !== fixedSideMaterial, "side changes must select a new pool entry");
++assert(changedSlots[0].side === THREE.DoubleSide, "new pool entry must use the changed side");
++
++const colored = new THREE.Mesh(makeGeometry(true), new THREE.MeshStandardMaterial());
++const coloredProxy = pass._sharedMaterialFor(colored);
++assert(coloredProxy.vertexColors === true, "color geometry must use the color pool");
++
++let callbackCount = 0;
++const custom = new THREE.Mesh(makeGeometry(), new THREE.MeshStandardMaterial({ color: 0xabcdef }));
++custom.onBeforeRender = () => { callbackCount++; };
++const scene = new THREE.Scene();
++scene.background = new THREE.Color(0x123456);
++scene.add(mesh, custom, colored);
++const sprite = new THREE.Sprite();
++scene.add(sprite);
++const originalBackground = scene.background;
++const seen = [];
++pass.render(makeRenderer({ seen }), scene, new THREE.PerspectiveCamera());
++assert(callbackCount > 0, "custom Object3D callback must still run");
++assert(mesh.material === originals, "render must restore the original material array");
++const customDraw = seen.find((entry) => entry.object === custom);
++assert(customDraw, "custom callback mesh must reach the renderer");
++assert(
++  customDraw.material === pass._materialCache.get(custom) &&
++    ![...pass._sharedMaterialPool.values()].includes(customDraw.material),
++  "custom callback mesh must use its legacy per-mesh proxy"
++);
++assert(sprite.visible === true, "non-mesh visibility must be restored");
++assert(scene.background === originalBackground, "scene background must be restored");
++assert(seen.some((entry) => entry.object === mesh), "pooled mesh must render");
++
++// Exception restoration must cover materials, visibility, layers and background.
++const clearGlass = new THREE.Mesh(makeGeometry(), new THREE.MeshStandardMaterial());
++clearGlass.material.userData.rtClearGlass = true;
++scene.add(clearGlass);
++const clearLayers = clearGlass.layers.mask;
++let threw = false;
++try {
++  pass.render(makeRenderer({ throwOnRender: true }), scene, new THREE.PerspectiveCamera());
++} catch (error) {
++  threw = error.message === "intentional renderer failure";
++}
++assert(threw, "renderer exception must propagate");
++assert(mesh.material === originals, "exception must restore pooled material arrays");
++assert(clearGlass.layers.mask === clearLayers, "exception must restore clear-glass layers");
++assert(sprite.visible === true, "exception must restore hidden object visibility");
++assert(scene.background === originalBackground, "exception must restore background");
++
++const noPool = new GBufferPass(2, 2, { materialPooling: false });
++assert(noPool._materialPooling === false, "materialPooling=false must disable the pool");
++const noPoolScene = new THREE.Scene();
++const noPoolMesh = new THREE.Mesh(makeGeometry(), new THREE.MeshStandardMaterial());
++noPoolScene.add(noPoolMesh);
++noPool.render(makeRenderer(), noPoolScene, new THREE.PerspectiveCamera());
++assert(noPool._sharedMaterialPool.size === 0, "disabled pooling must not allocate shared materials");
++noPool.dispose();
++noPoolMesh.geometry.dispose();
++noPoolMesh.material.dispose();
++
++pass.dispose();
++for (const material of [red, hidden, colored.material, custom.material, clearGlass.material]) material.dispose();
++for (const object of [mesh, colored, custom, clearGlass]) object.geometry.dispose();
++console.log("gbuffer material pooling self-test: passed");
+diff --git a/scripts/geometry-selftest.mjs b/scripts/geometry-selftest.mjs
+new file mode 100644
+index 0000000..11d8893
+--- /dev/null
++++ b/scripts/geometry-selftest.mjs
+@@ -0,0 +1,118 @@
++import assert from "node:assert/strict";
++import * as THREE from "three";
++import { compileScene } from "../src/SceneCompiler.js";
++
++const near = (actual, expected, eps = 1e-5) => {
++  assert.ok(
++    Math.abs(actual - expected) <= eps,
++    `expected ${actual} to be within ${eps} of ${expected}`
++  );
++};
++
++function normalizedInterleavedTriangle() {
++  const geometry = new THREE.BufferGeometry();
++  const positions = new THREE.InterleavedBuffer(new Int16Array([
++    0, 0, 0, 1234,
++    32767, 0, 0, 1234,
++    0, 32767, 0, 1234,
++  ]), 4);
++  const normals = new THREE.InterleavedBuffer(new Int8Array([
++    0, 0, 127, 12,
++    0, 0, 127, 12,
++    0, 0, 127, 12,
++  ]), 4);
++  geometry.setAttribute(
++    "position",
++    new THREE.InterleavedBufferAttribute(positions, 3, 0, true)
++  );
++  geometry.setAttribute(
++    "normal",
++    new THREE.InterleavedBufferAttribute(normals, 3, 0, true)
++  );
++  return { geometry, positions, normals };
++}
++
++// Static extraction must respect interleaved stride and integer normalization.
++{
++  const { geometry } = normalizedInterleavedTriangle();
++  const scene = new THREE.Scene();
++  scene.add(new THREE.Mesh(geometry, new THREE.MeshStandardMaterial()));
++  const compiled = compileScene(scene);
++  const out = compiled.staticBvh.geometry.getAttribute("position").array;
++  assert.deepEqual(Array.from(out), [0, 0, 0, 1, 0, 0, 0, 1, 0]);
++  compiled.dispose();
++}
++
++// The live CPU-deformation path must use the same accessor semantics in motion.
++{
++  const { geometry, positions, normals } = normalizedInterleavedTriangle();
++  const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial());
++  mesh.userData.rtDeforming = true;
++  const scene = new THREE.Scene();
++  scene.add(mesh);
++  const compiled = compileScene(scene, { dynamicMeshes: [mesh] });
++
++  positions.array[4] = 16384;
++  positions.array[9] = 16384;
++  positions.needsUpdate = true;
++  for (let i = 0; i < 3; i++) {
++    const o = i * 4;
++    normals.array[o] = 0;
++    normals.array[o + 1] = 127;
++    normals.array[o + 2] = 0;
++  }
++  normals.needsUpdate = true;
++  compiled.updateDynamic();
++
++  const out = compiled.dynamicMerged.getAttribute("position").array;
++  near(out[3], 16384 / 32767);
++  near(out[7], 16384 / 32767);
++  for (let i = 0; i < 3; i++) {
++    const o = i * 4;
++    near(compiled.dynamicPacked[o], 0);
++    near(compiled.dynamicPacked[o + 1], 1);
++    near(compiled.dynamicPacked[o + 2], 0);
++  }
++  compiled.dispose();
++}
++
++// Missing normals are computed while vertices are still indexed, preserving
++// the smooth shared-vertex normal seen by Three.js's raster path.
++{
++  const geometry = new THREE.BufferGeometry();
++  geometry.setAttribute("position", new THREE.Float32BufferAttribute([
++    0, 0, 0,
++    1, 0, 0,
++    0, 1, 0,
++    0, 0, 1,
++  ], 3));
++  geometry.setIndex([0, 1, 2, 0, 3, 1]);
++  const scene = new THREE.Scene();
++  scene.add(new THREE.Mesh(geometry, new THREE.MeshStandardMaterial()));
++  const compiled = compileScene(scene);
++  const normal = compiled.staticBvh.geometry.getAttribute("normal");
++  near(normal.getX(0), 0);
++  near(normal.getY(0), Math.SQRT1_2);
++  near(normal.getZ(0), Math.SQRT1_2);
++  compiled.dispose();
++}
++
++// Each source's incomplete GL_TRIANGLES tail is discarded independently; two
++// adjacent tails must never combine into a phantom cross-mesh triangle.
++{
++  const makeMesh = (vertices, x) => {
++    const geometry = new THREE.BufferGeometry();
++    const values = [];
++    for (let i = 0; i < vertices; i++) values.push(x + (i === 1 ? 1 : 0), i === 2 ? 1 : 0, 0);
++    geometry.setAttribute("position", new THREE.Float32BufferAttribute(values, 3));
++    return new THREE.Mesh(geometry, new THREE.MeshStandardMaterial());
++  };
++  const scene = new THREE.Scene();
++  scene.add(makeMesh(4, 0), makeMesh(3, 3));
++  const compiled = compileScene(scene);
++  assert.equal(compiled.triangleCount, 2);
++  assert.equal(compiled.staticBvh.geometry.getAttribute("position").count, 6);
++  compiled.dispose();
++}
++
++console.log("OK — scene-geometry compiler checks passed");
+diff --git a/src/GBufferPass.js b/src/GBufferPass.js
+index 5d88b46..db42ab7 100644
+--- a/src/GBufferPass.js
++++ b/src/GBufferPass.js
+@@ -238,16 +238,44 @@ void main() {
+ }
+ `;
+ 
++// A mesh explicitly marked as rtClearGlass is collision/gameplay geometry with
++// no optical surface. SceneCompiler omits it from both BVHs; the raster
++// G-buffer must omit the same mesh so the actual surface behind it owns depth,
++// motion, fog, and temporal guides.
++function isClearGlassMesh(mesh) {
++  const materials = mesh.material;
++  if (!Array.isArray(materials)) {
++    return !!(
++      materials && materials.userData && materials.userData.rtClearGlass === true
++    );
++  }
++  if (materials.length === 0) return false;
++  for (let i = 0; i < materials.length; i++) {
++    const material = materials[i];
++    if (!(material && material.userData && material.userData.rtClearGlass === true)) {
++      return false;
++    }
++  }
++  return true;
++}
++
++function hasCustomObjectCallbacks(object) {
++  return object.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender ||
++    object.onAfterRender !== THREE.Object3D.prototype.onAfterRender;
++}
++
+ /**
+  * Rasterizes the scene into a 4-target G-buffer (all RGBA32F):
+  *   [0] albedo.rgb + roughness   [1] worldNormal.xyz + metalness
+  *   [2] worldPos.xyz + validFlag [3] emissive.rgb
+  *
+- * Uses a per-mesh material swap (cached) so each mesh's Standard/Basic/Lambert/Phong
+- * material properties flow into the buffer without touching user materials.
++ * Uses a pooled material swap by default so each mesh's Standard/Basic/Lambert/Phong
++ * material properties flow into the buffer without touching user materials. Meshes
++ * with custom Object3D render callbacks use the legacy per-mesh proxy path so their
++ * callback-visible material behavior remains unchanged.
+  */
+ export class GBufferPass {
+-  constructor(width, height, { mixedPrecision = true } = {}) {
++  constructor(width, height, { mixedPrecision = true, materialPooling = true } = {}) {
+     // Mixed fp16/fp32 attachments are legal WebGL2 but some implementations
+     // (notably Apple's Metal backend) may reject the framebuffer — the caller
+     // probes support and passes the verdict here.
+@@ -256,6 +284,7 @@ export class GBufferPass {
+     // normals are needed to validate reprojected history (stage 2).
+     this._width = width;
+     this._height = height;
++    this._materialPooling = materialPooling !== false;
+     this._targets = [
+       this._makeTarget(width, height),
+       this._makeTarget(width, height),
+@@ -263,9 +292,17 @@ export class GBufferPass {
+     this._current = 0;
+ 
+     this._materialCache = new WeakMap(); // mesh -> gbuffer ShaderMaterial
+-    this._swapped = []; // [mesh, originalMaterial] pairs during render
++    this._sharedMaterialPool = new Map(); // `${vertexColors}:${side}` -> ShaderMaterial
++    this._sharedHiddenMaterial = null;
++    this._sharedSources = new WeakMap(); // mesh -> original material(s)
++    this._sharedMaterialArrays = new WeakMap();
++    // Flat alternating arrays avoid allocating a short pair array for every
++    // visible mesh on every G-buffer traversal.  Entries are [object, value]
++    // at indices [i, i + 1], restored in the finally block below.
++    this._swapped = [];
++    this._maskedLayers = [];
+     this._hidden = []; // objects temporarily hidden for the G-buffer draw
+-    this._normalMat3 = new THREE.Matrix3();
++    this._normalMat3 = new THREE.Matrix3(); // synchronous per-mesh scratch
+     // World-space 3D-texture albedo: off unless a scene registers a material with
+     // userData.rtVolumeAlbedo (see setVolume). When off, the gbuffer program is
+     // compiled WITHOUT the RT_VOLUME_ALBEDO define — no sampler3D, byte-identical.
+@@ -306,6 +343,12 @@ export class GBufferPass {
+     return this._dummyVolumeTex;
+   }
+ 
++  _resetSharedMaterialPool() {
++    for (const material of this._sharedMaterialPool.values()) material.dispose();
++    this._sharedMaterialPool.clear();
++    this._sharedMaterialArrays = new WeakMap();
++  }
++
+   /**
+    * Enable/disable the world-space 3D-texture albedo path for the primary
+    * (G-buffer) visibility. Compiles the RT_VOLUME_ALBEDO define into the per-mesh
+@@ -318,6 +361,7 @@ export class GBufferPass {
+     if (on === this._volumeEnabled) return;
+     this._volumeEnabled = on;
+     this._materialCache = new WeakMap(); // force recompile with the new define
++    this._resetSharedMaterialPool();
+   }
+ 
+   /**
+@@ -339,6 +383,7 @@ export class GBufferPass {
+     ];
+     this._current = 0;
+     this._materialCache = new WeakMap(); // force recompile with the new define
++    this._resetSharedMaterialPool();
+   }
+ 
+   /**
+@@ -482,15 +527,21 @@ export class GBufferPass {
+     // color attribute. This drives three's USE_COLOR define (see gbufferVert), so
+     // a mesh without one writes byte-identical albedo. The material cache is
+     // per-mesh, so this per-mesh define variant is safe.
+-    material.vertexColors = !!(mesh.geometry && mesh.geometry.getAttribute("color"));
++    material.vertexColors = !!(mesh && mesh.geometry && mesh.geometry.getAttribute("color"));
+     return material;
+   }
+ 
+   // Sync properties from one user material into one gbuffer material (cheap; run
+-  // every frame). `mesh` supplies the shared world normal matrix + side.
+-  _syncGbufferMaterial(material, src, mesh) {
++  // every frame). The final three arguments are computed once per mesh lookup;
++  // passing them directly keeps the hot traversal allocation-free.
++  _syncGbufferMaterial(material, src, isDynamic, previousModel, normalMatrix, fixedSide = null) {
+     const u = material.uniforms;
++    // Preserve Three's per-material visibility, including invisible entries in
++    // a multi-material mesh. The proxy replaces the source before render-list
++    // construction, so failing to mirror this flag would make hidden groups draw.
++    material.visible = src.visible !== false;
+     if (src.color) u.uColor.value.copy(src.color);
++    else u.uColor.value.set(1, 1, 1);
+     u.uRoughness.value = src.roughness ?? 1.0;
+     u.uMetalness.value = src.metalness ?? 0.0;
+     u.uTransmission.value = src.transmission ?? 0.0; // MeshPhysicalMaterial
+@@ -502,7 +553,7 @@ export class GBufferPass {
+       u.uEmissive.value
+         .copy(src.emissive)
+         .multiplyScalar(src.emissiveIntensity ?? 1);
+-    }
++    } else u.uEmissive.value.set(0, 0, 0);
+     u.uMap.value = src.map ?? null;
+     u.uHasMap.value = !!src.map;
+     u.uEmissiveMap.value = src.emissiveMap ?? null;
+@@ -520,14 +571,13 @@ export class GBufferPass {
+     // lighting pass. opacity 1 renders opaque, matching the old force-opaque path.
+     u.uBlend.value = !!src.transparent;
+     u.uOpacity.value = src.opacity ?? 1.0;
+-    u.uIsDynamic.value = this._dynamicMeshes && this._dynamicMeshes.has(mesh) ? 1.0 : 0.0;
++    u.uIsDynamic.value = isDynamic ? 1.0 : 0.0;
+     // Motion-vector inputs. Static meshes use their (constant) matrixWorld as
+     // the previous model — identical to modelMatrix, so the motion vector
+     // collapses to camera-only reprojection exactly. Dynamic meshes use the
+     // previous frame's captured matrix (see setPrevModelMatrices).
+     if (this._motionEnabled) {
+-      const prev = this._prevModelMatrices ? this._prevModelMatrices.get(mesh) : null;
+-      u.uPrevModelMatrix.value.copy(prev || mesh.matrixWorld);
++      u.uPrevModelMatrix.value.copy(previousModel);
+       u.uPrevViewProj.value.copy(this._motionPrevViewProj);
+     }
+     // World-space 3D-texture albedo. Only meshes whose material opted in via
+@@ -547,8 +597,11 @@ export class GBufferPass {
+         u.uVolumeTex.value = this._dummyVolume();
+       }
+     }
+-    u.uNormalMatrixWorld.value.getNormalMatrix(mesh.matrixWorld);
+-    material.side = src.side ?? THREE.FrontSide;
++    u.uNormalMatrixWorld.value.copy(normalMatrix);
++    // Pooled materials are keyed by side. Keep that render state immutable for
++    // the whole render-list item even if user code mutates the source material
++    // during Object3D.onBeforeRender; legacy proxies retain the old live sync.
++    material.side = fixedSide === null ? (src.side ?? THREE.FrontSide) : fixedSide;
+   }
+ 
+   // Returns the gbuffer material(s) for a mesh: a single ShaderMaterial, or — for
+@@ -556,6 +609,17 @@ export class GBufferPass {
+   // of them, one per source material, index-aligned so three renders each group
+   // with its own gbuffer material natively.
+   _gbufferMaterialFor(mesh) {
++    const isDynamic = !!(this._dynamicMeshes && this._dynamicMeshes.has(mesh));
++    const previousModel = this._motionEnabled && this._prevModelMatrices
++      ? this._prevModelMatrices.get(mesh) || mesh.matrixWorld
++      : mesh.matrixWorld;
++    // Compute the inverse-transpose exactly once for this mesh invocation. The
++    // scratch is copied into every per-material uniform below, so no uniform
++    // Matrix3 instance is shared between multi-material groups.
++    const normalMatrix = this._normalMat3.getNormalMatrix(mesh.matrixWorld);
++    const vertexColors = !!(
++      mesh.geometry && mesh.geometry.getAttribute("color")
++    );
+     if (Array.isArray(mesh.material)) {
+       let cached = this._materialCache.get(mesh);
+       if (!Array.isArray(cached) || cached.length !== mesh.material.length) {
+@@ -563,7 +627,21 @@ export class GBufferPass {
+         this._materialCache.set(mesh, cached);
+       }
+       for (let i = 0; i < mesh.material.length; i++) {
+-        this._syncGbufferMaterial(cached[i], mesh.material[i], mesh);
++        const src = mesh.material[i];
++        // Three skips a group whose material slot is empty. Preserve the hole
++        // instead of trying to sync it as a ShaderMaterial.
++        if (!src) {
++          cached[i] = src;
++          continue;
++        }
++        if (!cached[i]) cached[i] = this._makeGbufferMaterial(mesh);
++        if (cached[i].vertexColors !== vertexColors) {
++          cached[i].vertexColors = vertexColors;
++          cached[i].needsUpdate = true;
++        }
++        this._syncGbufferMaterial(
++          cached[i], src, isDynamic, previousModel, normalMatrix
++        );
+       }
+       return cached;
+     }
+@@ -572,10 +650,86 @@ export class GBufferPass {
+       material = this._makeGbufferMaterial(mesh);
+       this._materialCache.set(mesh, material);
+     }
+-    this._syncGbufferMaterial(material, mesh.material, mesh);
++    if (material.vertexColors !== vertexColors) {
++      material.vertexColors = vertexColors;
++      material.needsUpdate = true;
++    }
++    this._syncGbufferMaterial(
++      material, mesh.material, isDynamic, previousModel, normalMatrix
++    );
++    return material;
++  }
++
++  _makeSharedMaterial(vertexColors, side) {
++    const material = this._makeGbufferMaterial(null);
++    material.vertexColors = vertexColors;
++    material.side = side;
++    material.onBeforeRender = (_renderer, _scene, _camera, geometry, object, group) => {
++      const original = this._sharedSources.get(object);
++      const index = group && group.materialIndex !== undefined ? group.materialIndex : 0;
++      const src = Array.isArray(original) ? original[index] : original;
++      if (!src) return;
++      const isDynamic = !!(this._dynamicMeshes && this._dynamicMeshes.has(object));
++      const previousModel = this._motionEnabled && this._prevModelMatrices
++        ? this._prevModelMatrices.get(object) || object.matrixWorld
++        : object.matrixWorld;
++      const normalMatrix = this._normalMat3.getNormalMatrix(object.matrixWorld);
++      this._syncGbufferMaterial(
++        material,
++        src,
++        isDynamic,
++        previousModel,
++        normalMatrix,
++        side
++      );
++      // Keep the pool key's culling state immutable after source callbacks have
++      // run, and force three to upload this draw's source-material uniforms.
++      material.side = side;
++      material.uniformsNeedUpdate = true;
++    };
+     return material;
+   }
+ 
++  _sharedMaterialForSource(source, vertexColors) {
++    if (!source || source.visible === false) return this._sharedHiddenMaterial;
++    const side = source.side ?? THREE.FrontSide;
++    // Side and color presence are the only compile/render-list variants needed
++    // by this pass. Stringifying the numeric side also tolerates uncommon side
++    // values without assuming only FrontSide/BackSide/DoubleSide.
++    const key = `${vertexColors ? 1 : 0}:${String(side)}`;
++    let material = this._sharedMaterialPool.get(key);
++    if (!material) {
++      material = this._makeSharedMaterial(vertexColors, side);
++      this._sharedMaterialPool.set(key, material);
++    }
++    return material;
++  }
++
++  _sharedMaterialFor(mesh) {
++    if (!this._sharedHiddenMaterial) {
++      this._sharedHiddenMaterial = new THREE.MeshBasicMaterial({ visible: false });
++    }
++    const source = mesh.material;
++    const vertexColors = !!(
++      mesh.geometry && mesh.geometry.getAttribute("color")
++    );
++    if (!Array.isArray(source)) {
++      this._sharedSources.set(mesh, source);
++      return this._sharedMaterialForSource(source, vertexColors);
++    }
++    let cached = this._sharedMaterialArrays.get(mesh);
++    if (!Array.isArray(cached) || cached.length !== source.length) {
++      cached = new Array(source.length);
++      this._sharedMaterialArrays.set(mesh, cached);
++    }
++    this._sharedSources.set(mesh, source);
++    for (let i = 0; i < source.length; i++) {
++      const src = source[i];
++      cached[i] = src ? this._sharedMaterialForSource(src, vertexColors) : src;
++    }
++    return cached;
++  }
++
+   render(renderer, scene, camera) {
+     // Ping-pong: what was "current" becomes "previous".
+     this._current = 1 - this._current;
+@@ -596,12 +750,19 @@ export class GBufferPass {
+     // draw them yourself in an overlay pass on top of rt.render() if you need
+     // them on screen. compileScene() warns once naming them.
+     this._swapped.length = 0;
++    this._maskedLayers.length = 0;
+     this._hidden.length = 0;
+     scene.traverse((obj) => {
+       if (!obj.visible) return;
+       if (obj.isMesh && obj.geometry) {
+-        this._swapped.push([obj, obj.material]);
+-        obj.material = this._gbufferMaterialFor(obj);
++        if (isClearGlassMesh(obj)) {
++          this._maskedLayers.push(obj, obj.layers.mask);
++          obj.layers.mask = 0;
++          return;
++        }
++        this._swapped.push(obj, obj.material);
++        const usePool = this._materialPooling && !hasCustomObjectCallbacks(obj);
++        obj.material = usePool ? this._sharedMaterialFor(obj) : this._gbufferMaterialFor(obj);
+         return;
+       }
+       if (obj.isSprite || obj.isLine || obj.isPoints) {
+@@ -611,25 +772,36 @@ export class GBufferPass {
+     });
+ 
+     const prevBackground = scene.background;
+-    scene.background = null; // background writes nothing; worldPos.w stays 0
+-
+-    renderer.setRenderTarget(this.target);
+-    renderer.setClearColor(0x000000, 0);
+-    renderer.clear(true, true, false);
+-    renderer.render(scene, camera);
+-    renderer.setRenderTarget(null);
+-
+-    scene.background = prevBackground;
+-    for (const [mesh, mat] of this._swapped) mesh.material = mat;
+-    this._swapped.length = 0;
+-    // Restore visibility exactly once per object (each was pushed once, and only
+-    // if it was visible when we hid it).
+-    for (const obj of this._hidden) obj.visible = true;
+-    this._hidden.length = 0;
++    let targetBound = false;
++    try {
++      scene.background = null; // background writes nothing; worldPos.w stays 0
++      renderer.setRenderTarget(this.target);
++      targetBound = true;
++      renderer.setClearColor(0x000000, 0);
++      renderer.clear(true, true, false);
++      renderer.render(scene, camera);
++    } finally {
++      if (targetBound) renderer.setRenderTarget(null);
++      scene.background = prevBackground;
++      for (let i = 0; i < this._swapped.length; i += 2) {
++        this._swapped[i].material = this._swapped[i + 1];
++      }
++      this._swapped.length = 0;
++      for (let i = 0; i < this._maskedLayers.length; i += 2) {
++        this._maskedLayers[i].layers.mask = this._maskedLayers[i + 1];
++      }
++      this._maskedLayers.length = 0;
++      // Restore visibility exactly once per object (each was pushed once, and only
++      // if it was visible when we hid it).
++      for (const obj of this._hidden) obj.visible = true;
++      this._hidden.length = 0;
++    }
+   }
+ 
+   dispose() {
+     for (const t of this._targets) t.dispose();
+     if (this._dummyVolumeTex) this._dummyVolumeTex.dispose();
++    this._resetSharedMaterialPool();
++    if (this._sharedHiddenMaterial) this._sharedHiddenMaterial.dispose();
+   }
+ }
+diff --git a/src/RealtimeRaytracer.js b/src/RealtimeRaytracer.js
+index 0156999..eebb730 100644
+--- a/src/RealtimeRaytracer.js
++++ b/src/RealtimeRaytracer.js
+@@ -872,7 +872,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
+     );
+     this._volumeUnitWarned = false;
+ 
+-    this.gbuffer = new GBufferPass(this._width, this._height, { mixedPrecision });
++    this.gbuffer = new GBufferPass(this._width, this._height, {
++      mixedPrecision,
++      materialPooling: options.gbufferMaterialPooling ?? true,
++    });
+     this.rtPass = new RTLightingPass(this._scaledW, this._scaledH, {
+       specMRT: this.specMRTSupported,
+     });
+@@ -3097,20 +3100,40 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
+   // _motionTaa` (measurement isolation) and the live `motionVectors` toggle both
+   // take effect.
+   _syncMotionVectors() {
+-    const want = !!(this.motionVectors && this.motionVectorsSupported);
++    // Motion vectors only improve reprojection for geometry whose model/vertex
++    // position changed. On an entirely static compiled scene they reduce exactly
++    // to the existing camera-only path, while still making the G-buffer write a
++    // fifth full-resolution RG32F attachment and run the previous-position math
++    // for every vertex/fragment. Keep that bandwidth for scenes that can use it.
++    // A later compile that introduces/removes dynamic geometry flips this state
++    // on the next render through the existing transition/reset path below.
++    const want = !!(
++      this.motionVectors &&
++      this.motionVectorsSupported &&
++      this.compiled?.hasDynamic
++    );
+     if (want !== this._motionVectorsActive) {
+       this._motionVectorsActive = want;
+       this.gbuffer.setMotionVectors(want);
+       if (!want) this._prevModelMatrices.clear();
+       this.resetAccumulation();
+-      if (this.motionVectors && !this.motionVectorsSupported && !this._motionWarned) {
+-        this._motionWarned = true;
+-        console.warn(
+-          "three-realtime-rt: motionVectors requested but this GPU lacks the " +
+-            "5-attachment motion MRT (needs MAX_DRAW_BUFFERS >= 5) — falling back " +
+-            "to camera-only reprojection."
+-        );
+-      }
++    }
++    // `_motionVectorsActive` starts false, so an unsupported GPU also computes
++    // `want === false` on its first frame. Keep the warning outside the state-
++    // transition branch or that common case can never report the fallback.
++    // Static scenes do not need the extra attachment, so stay quiet for them.
++    if (
++      this.motionVectors &&
++      this.compiled?.hasDynamic &&
++      !this.motionVectorsSupported &&
++      !this._motionWarned
++    ) {
++      this._motionWarned = true;
++      console.warn(
++        "three-realtime-rt: motionVectors requested but this GPU lacks the " +
++          "5-attachment motion MRT (needs MAX_DRAW_BUFFERS >= 5) — falling back " +
++          "to camera-only reprojection."
++      );
+     }
+     if (this._motionVectorsActive) {
+       this.gbuffer.setPrevModelMatrices(this._prevModelMatrices);
+diff --git a/src/SceneCompiler.js b/src/SceneCompiler.js
+index 2191186..2531d51 100644
+--- a/src/SceneCompiler.js
++++ b/src/SceneCompiler.js
+@@ -65,6 +65,9 @@ export class CompiledScene {
+     this.staticBvh = null;
+     this.staticBvhUniform = new MeshBVHUniformStruct();
+     this.staticAttrTex = new FloatVertexAttributeTexture();
++    // Meshes explicitly declared optically absent via rtClearGlass. They remain
++    // in the user's scene for collision/game logic but are not retained here.
++    this.clearGlassMeshCount = 0;
+ 
+     // Dynamic level (re-baked/refit each frame).
+     this.dynamicBvh = null;
+@@ -93,6 +96,10 @@ export class CompiledScene {
+ 
+     this.materialsTex = null;
+     this.materials = [];
++    // True when at least one compiled material is traced as transmissive. This
++    // lets RTLightingPass omit the glass/refraction megakernel from opaque-only
++    // scenes without changing the runtime toggle for glass scenes.
++    this.hasTransmission = false;
+     // World-space 3D-texture albedo (see collectVolumeAlbedo). null when no
+     // material opted in via userData.rtVolumeAlbedo. v1 is single-volume: the
+     // FIRST opted-in material wins for the traced-bounce path (the lighting
+@@ -170,13 +177,25 @@ export class CompiledScene {
+     // every re-bake writes normals at wrong offsets (the drag-corruption bug).
+     const S = this.hasTextureTiles ? 8 : 4;
+     const packed = this.dynamicPacked;
++    // Rigid-mover normals are uploaded only every eighth update, so computing
++    // and packing them on the seven intervening frames cannot affect GPU-visible
++    // output. Deforming/skinned geometry still refreshes the shared attribute
++    // texture every frame and therefore keeps every segment's normals current.
++    const uploadNormals =
++      this.hasDeforming || this.hasSkinned || this._normalFrame++ % 8 === 0;
+     let minX = Infinity, minY = Infinity, minZ = Infinity;
+     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+ 
+     for (const seg of this.dynamic) {
+       seg.mesh.updateWorldMatrix(true, false);
+       const m = seg.mesh.matrixWorld.elements;
+-      const nm = this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements;
++      // Skinned segments derive flat world-space normals from their freshly
++      // baked triangles below. Deforming segments always need the matrix;
++      // rigid segments need it only on an attribute-upload frame.
++      const nm =
++        seg.deforming || (!seg.skinned && uploadNormals)
++          ? this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements
++          : null;
+       let o = seg.start * 3;
+       let p = seg.start * S;
+ 
+@@ -257,14 +276,23 @@ export class CompiledScene {
+             "BVH layout is fixed at compile time — call compileScene() again."
+           );
+         }
+-        const sp = livePosAttr.array;
++        const directPos =
++          !livePosAttr.isInterleavedBufferAttribute &&
++          !livePosAttr.normalized && livePosAttr.itemSize === 3;
++        const sp = directPos ? livePosAttr.array : null;
+         const snAttr = seg.liveGeometry.getAttribute("normal");
+-        const sn = snAttr ? snAttr.array : null;
++        const directNormal = !!(
++          snAttr && !snAttr.isInterleavedBufferAttribute &&
++          !snAttr.normalized && snAttr.itemSize === 3
++        );
++        const sn = directNormal ? snAttr.array : null;
+         const map = seg.indexMap; // null = identity (non-indexed source)
+         const ln = seg.localNorm; // fallback if the app never recomputed normals
+         for (let i = 0; i < seg.count; i++) {
+           const sv = map ? map[i] : i;
+-          const x = sp[sv * 3], y = sp[sv * 3 + 1], z = sp[sv * 3 + 2];
++          const x = directPos ? sp[sv * 3] : livePosAttr.getX(sv);
++          const y = directPos ? sp[sv * 3 + 1] : livePosAttr.getY(sv);
++          const z = directPos ? sp[sv * 3 + 2] : livePosAttr.getZ(sv);
+           const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+           const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+           const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+@@ -275,7 +303,11 @@ export class CompiledScene {
+           if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+           if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+           let nx, ny, nz;
+-          if (sn) { nx = sn[sv * 3]; ny = sn[sv * 3 + 1]; nz = sn[sv * 3 + 2]; }
++          if (snAttr) {
++            nx = directNormal ? sn[sv * 3] : snAttr.getX(sv);
++            ny = directNormal ? sn[sv * 3 + 1] : snAttr.getY(sv);
++            nz = directNormal ? sn[sv * 3 + 2] : snAttr.getZ(sv);
++          }
+           else { nx = ln[i * 3]; ny = ln[i * 3 + 1]; nz = ln[i * 3 + 2]; }
+           const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
+           const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
+@@ -303,14 +335,16 @@ export class CompiledScene {
+           if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
+           if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+           if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
+-          const nx = ln[i * 3], ny = ln[i * 3 + 1], nz = ln[i * 3 + 2];
+-          const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
+-          const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
+-          const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
+-          const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
+-          packed[p] = tx * il;
+-          packed[p + 1] = ty * il;
+-          packed[p + 2] = tz * il;
++          if (uploadNormals) {
++            const nx = ln[i * 3], ny = ln[i * 3 + 1], nz = ln[i * 3 + 2];
++            const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
++            const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
++            const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
++            const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
++            packed[p] = tx * il;
++            packed[p + 1] = ty * il;
++            packed[p + 2] = tz * il;
++          }
+           // matIndex (offset 3) and, at stride 8, the uv texel never change
+           o += 3;
+           p += S;
+@@ -343,7 +377,7 @@ export class CompiledScene {
+     // orientation) every frame, so their normals must go up every frame or the
+     // shading lags the silhouette; one such segment forces the whole (shared)
+     // upload.
+-    if (this.hasDeforming || this.hasSkinned || this._normalFrame++ % 8 === 0) {
++    if (uploadNormals) {
+       this.dynamicAttrTex.updateFrom(this.dynamicPackedAttr);
+     }
+ 
+@@ -421,10 +455,39 @@ export class CompiledScene {
+     if (this.dynamicMerged) this.dynamicMerged.dispose();
+     // Drop the staleness fingerprints (WeakRefs + a 16-float matrix each).
+     this.staticSources = [];
++    this.clearGlassMeshCount = 0;
+   }
+ }
+ 
++function copyVec3Attribute(attribute, count = attribute.count) {
++  const out = new Float32Array(count * 3);
++  for (let i = 0; i < count; i++) {
++    const o = i * 3;
++    out[o] = attribute.getX(i);
++    out[o + 1] = attribute.getY(i);
++    out[o + 2] = attribute.getZ(i);
++  }
++  return out;
++}
++
++function copyVec2Attribute(attribute, count = attribute.count) {
++  const out = new Float32Array(count * 2);
++  for (let i = 0; i < count; i++) {
++    const o = i * 2;
++    out[o] = attribute.getX(i);
++    out[o + 1] = attribute.getY(i);
++  }
++  return out;
++}
++
+ function extractMeshGeometry(mesh) {
++  // Compute missing normals on the indexed source BEFORE expanding it. Doing
++  // this after toNonIndexed() produces flat face normals in the de-indexed trace mesh,
++  // while the ordinary per-mesh G-buffer sees smooth shared-vertex normals on
++  // the original geometry.
++  if (!mesh.geometry.getAttribute("normal")) {
++    mesh.geometry.computeVertexNormals();
++  }
+   const indexed = mesh.geometry.index;
+   const src = indexed ? mesh.geometry.toNonIndexed() : mesh.geometry.clone();
+ 
+@@ -435,24 +498,29 @@ function extractMeshGeometry(mesh) {
+     // as normalize(vec3(0)) → NaN and the entire silhouette goes black.
+     // computeVertexNormals on the original is a benign mutation: it only
+     // fills in an attribute the geometry already should have carried.
+-    if (!mesh.geometry.getAttribute("normal")) {
+-      mesh.geometry.computeVertexNormals();
+-    }
+   }
+-  const localPos = src.getAttribute("position").array.slice();
+-  const localNorm = src.getAttribute("normal").array.slice();
++  // BufferAttribute.array is not necessarily tightly packed (interleaved
++  // attributes retain their parent stride), and normalized integer attributes
++  // need getX/Y/Z's de-normalisation. Pack explicitly so every downstream path
++  // sees the same contiguous float triples.
++  // A GL_TRIANGLES draw ignores one or two trailing vertices. Trim each source
++  // independently before any merge so tails can never combine across meshes in
++  // the trace BVH.
++  const rawCount = src.getAttribute("position").count;
++  const count = rawCount - (rawCount % 3);
++  const localPos = copyVec3Attribute(src.getAttribute("position"), count);
++  const localNorm = copyVec3Attribute(src.getAttribute("normal"), count);
+ 
+   const geo = new THREE.BufferGeometry();
+-  geo.setAttribute("position", src.getAttribute("position").clone());
+-  geo.setAttribute("normal", src.getAttribute("normal").clone());
++  geo.setAttribute("position", new THREE.BufferAttribute(localPos.slice(), 3));
++  geo.setAttribute("normal", new THREE.BufferAttribute(localNorm.slice(), 3));
+ 
+-  const count = src.getAttribute("position").count;
+   // Preserve UVs for secondary-ray texture sampling (stride-2 attribute layout).
+   // If the source geometry has no UV attribute, fill with zeros so mergeGeometries
+   // does not drop a mismatched attribute across geometries.
+   const hasUv = src.getAttribute("uv") !== undefined;
+   if (hasUv) {
+-    geo.setAttribute("uv", src.getAttribute("uv").clone());
++    geo.setAttribute("uv", new THREE.BufferAttribute(copyVec2Attribute(src.getAttribute("uv"), count), 2));
+   } else {
+     const zeroUv = new Float32Array(count * 2);
+     geo.setAttribute("uv", new THREE.BufferAttribute(zeroUv, 2));
+@@ -469,7 +537,7 @@ function extractMeshGeometry(mesh) {
+   // buffer), or null when the source was already non-indexed (identity map).
+   // `srcVertexCount` is the live position count at compile time — used to catch
+   // a topology change that would invalidate this mapping.
+-  const indexMap = indexed ? mesh.geometry.index.array.slice() : null;
++  const indexMap = indexed ? mesh.geometry.index.array.slice(0, count) : null;
+   const srcVertexCount = mesh.geometry.getAttribute("position").count;
+   return { geo, localPos, localNorm, count, indexMap, srcVertexCount };
+ }
+@@ -513,6 +581,33 @@ function resolveMeshMaterials(mesh, count, registerMaterial) {
+   return { matIdx, ranges };
+ }
+ 
++function validateClearGlassMaterial(mat) {
++  if (!(mat && mat.userData && mat.userData.rtClearGlass === true)) return;
++  const transmission = mat.transmission ?? 0;
++  const ior = mat.ior ?? 1.5;
++  const attenuation = mat.userData.rtAttenuation;
++  const scattering = mat.userData.rtScattering;
++  const ac = mat.attenuationColor;
++  const physicalAbsorption = Number.isFinite(mat.attenuationDistance) &&
++    mat.attenuationDistance > 0 && ac &&
++    (ac.r < 0.999999 || ac.g < 0.999999 || ac.b < 0.999999);
++  if (
++    mat.transparent || !Number.isFinite(transmission) || transmission < 0.99 ||
++    !Number.isFinite(ior) || Math.abs(ior - 1.0) >= 1e-4 ||
++    attenuation || scattering || physicalAbsorption
++  ) {
++    throw new Error(
++      "three-realtime-rt: userData.rtClearGlass is only for an optically absent " +
++      "single-surface pane: transparent must be false, transmission >= 0.99, " +
++      "ior = 1, and absorption/scattering must be unset."
++    );
++  }
++}
++
++function isClearGlassMaterial(mat) {
++  return !!(mat && mat.userData && mat.userData.rtClearGlass === true);
++}
++
+ // Average-colour cache for emissive maps: texture -> [r,g,b] linear, or null when
+ // the image is unreadable (CORS-tainted / not yet decoded). Keyed by the THREE
+ // texture so the two collect sites (material row + NEE tris) share one solve.
+@@ -840,6 +935,9 @@ function collectVolumeAlbedo(materials) {
+ // treated as non-absorbing — exactly today's behaviour, as is setting nothing.
+ function absorptionSigmaFor(mat, derivedScale = 0) {
+   if (!mat) return null;
++  // Defensive even though clear sheets are omitted before material registration:
++  // collision-only geometry can never opt back into Beer absorption via colour.
++  if (mat.userData && mat.userData.rtClearGlass === true) return null;
+   // Only glass surfaces ever have an in-medium path length to attenuate over
+   // (the refracted entry-to-exit chord in RTLightingPass.glassRadiance), and the
+   // shader identifies the medium by the material of the interface a refracted
+@@ -988,6 +1086,7 @@ function collectAbsorption(materials, force = false, derivedScale = 0) {
+ // error.
+ function scatteringSigmaFor(mat) {
+   if (!mat) return null;
++  if (mat.userData && mat.userData.rtClearGlass === true) return null;
+   const ud = mat.userData && mat.userData.rtScattering;
+   if (!ud) return null;
+   // Same gate as absorption, for the same reason: the view and shadow marches
+@@ -1429,10 +1528,16 @@ export function compileScene(scene, options = {}) {
+   // can still be collected — the compiled scene must never keep it alive.
+   const staticSources = [];
+   const canTrack = typeof WeakRef === "function";
++  let clearGlassMeshCount = 0;
++  let hasTransmission = false;
+ 
+   const registerMaterial = (m) => {
+     let i = materials.indexOf(m);
+-    if (i < 0) { i = materials.length; materials.push(m); }
++    if (i < 0) {
++      validateClearGlassMaterial(m);
++      i = materials.length;
++      materials.push(m);
++    }
+     return i;
+   };
+ 
+@@ -1445,13 +1550,62 @@ export function compileScene(scene, options = {}) {
+       diag["untraceable-object"].push(obj);
+       return;
+     }
+-    if (!obj.isMesh || !obj.geometry || !obj.visible || obj.userData.rtExclude) return;
++    if (!obj.isMesh || !obj.geometry || !obj.visible) return;
++    const isArray = Array.isArray(obj.material);
++    const rep = isArray ? obj.material[0] : obj.material;
++    const meshMaterials = isArray ? obj.material : [rep];
++    const clearCount = meshMaterials.reduce(
++      (count, material) => count + (isClearGlassMaterial(material) ? 1 : 0),
++      0
++    );
++    if (clearCount > 0) {
++      // rtClearGlass is stronger than ordinary transmission: it declares this
++      // mesh to be collision/gameplay geometry with no optical surface at all.
++      // Keeping it out of BOTH BVHs makes direct shadows and secondary rays pass
++      // straight through; GBufferPass omits the same all-clear mesh so primary
++      // visibility, fog depth, motion history, and ray cost also match an absent
++      // pane. A mixed material array cannot satisfy that mesh-wide contract.
++      for (const material of meshMaterials) validateClearGlassMaterial(material);
++      if (clearCount !== meshMaterials.length) {
++        throw new Error(
++          "three-realtime-rt: a mesh cannot mix userData.rtClearGlass with " +
++          "ordinary materials. Split the optically absent pane into its own mesh."
++        );
++      }
++      if (dynamicSet && dynamicSet.has(obj)) {
++        throw new Error(
++          "three-realtime-rt: an rtClearGlass mesh is optically absent and must " +
++          "not be listed in dynamicMeshes. Keep updating it in your collision/game " +
++          "system, but remove it from the ray-tracing dynamic set."
++        );
++      }
++      if (
++        obj.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender ||
++        obj.onAfterRender !== THREE.Object3D.prototype.onAfterRender
++      ) {
++        throw new Error(
++          "three-realtime-rt: an rtClearGlass mesh is never submitted for rendering, " +
++          "so it cannot use onBeforeRender/onAfterRender callbacks. Move that logic " +
++          "to the game loop or use ordinary transmissive glass."
++        );
++      }
++      clearGlassMeshCount++;
++      return;
++    }
++    // rtExclude omits a mesh from the trace BVH, not from primary visibility.
++    // Its G-buffer material can still be glass, so it must keep the refraction
++    // shader variant alive even though it never enters the material table.
++    if (meshMaterials.some(
++      (material) => material && !material.transparent &&
++        (material.transmission ?? 0) > 0.001
++    )) {
++      hasTransmission = true;
++    }
++    if (obj.userData.rtExclude) return;
+     // An InstancedMesh is traversed as ONE mesh: its per-instance matrices are a
+     // GPU attribute the compiler never reads, so every instance past the first
+     // silently vanishes from the traced world (and from the G-buffer).
+     if (obj.isInstancedMesh) diag["instanced-mesh"].push(obj);
+-    const isArray = Array.isArray(obj.material);
+-    const rep = isArray ? obj.material[0] : obj.material;
+     // Transparent surfaces must not act as opaque occluders — e.g.
+     // LittlestTokyo's glass display case (texture-alpha, opacity 1) would put
+     // the whole model in shadow. Alpha-textured glass can't be cheaply tested,
+@@ -1600,7 +1754,8 @@ export function compileScene(scene, options = {}) {
+   compiled.warnings = warnings;
+   compiled.staticSources = staticSources;
+ 
+-  if (staticGeoms.length === 0 && dynamicGeoms.length === 0) {
++  compiled.clearGlassMeshCount = clearGlassMeshCount;
++  if (staticGeoms.length === 0 && dynamicGeoms.length === 0 && clearGlassMeshCount === 0) {
+     throw new Error("three-realtime-rt: no meshes found in scene");
+   }
+ 
+@@ -1622,7 +1777,6 @@ export function compileScene(scene, options = {}) {
+   compiled.staticBvh = s.bvh;
+   compiled.staticBvhUniform.updateFrom(s.bvh);
+   compiled.staticAttrTex.updateFrom(s.attr);
+-
+   // Dynamic level.
+   compiled.hasDynamic = dynamicGeoms.length > 0;
+   const d = buildLevel(dynamicGeoms, { dynamic: true, stride2 });
+@@ -1634,7 +1788,7 @@ export function compileScene(scene, options = {}) {
+   compiled.dynamicAttrTex.updateFrom(d.attr);
+ 
+   compiled.triangleCount =
+-    (s.merged.getAttribute("position").count +
++    ((staticGeoms.length > 0 ? s.merged.getAttribute("position").count : 0) +
+       (compiled.hasDynamic ? d.merged.getAttribute("position").count : 0)) / 3;
+ 
+   // World-space extent of the static level. Used to auto-scale the ray offset
+@@ -1643,7 +1797,9 @@ export function compileScene(scene, options = {}) {
+   // micro-geometry and the scene renders black.
+   s.merged.computeBoundingBox();
+   const bb = s.merged.boundingBox;
+-  compiled.sceneDiagonal = bb.isEmpty() ? 1 : bb.min.distanceTo(bb.max);
++  compiled.sceneDiagonal = staticGeoms.length === 0 || bb.isEmpty()
++    ? 1
++    : bb.min.distanceTo(bb.max);
+ 
+   if (emissiveTris.length > MAX_EMISSIVE_TRIS) {
+     console.warn(
+@@ -1683,6 +1839,7 @@ export function compileScene(scene, options = {}) {
+   // nothing absorbs — the two-flux code reads K from row 67 and the glass flag
+   // from its .w, and row 68 is addressed relative to it.
+   compiled.scattering = collectScattering(materials);
++  compiled.hasTransmission = hasTransmission;
+   compiled.absorption = collectAbsorption(
+     materials,
+     !!(compiled.scattering || hasTiles),
+diff --git a/src/index.d.ts b/src/index.d.ts
+index 6772b17..d8058a0 100644
+--- a/src/index.d.ts
++++ b/src/index.d.ts
+@@ -650,19 +650,28 @@ export interface RealtimeRaytracerOptions {
+    * Motion vectors for temporal reprojection (DEFAULT `true` since 0.15.0;
+    * `false` restores the pre-0.15 camera-only reprojection). The G-buffer
+    * writes each fragment's previous screen position into a fifth RG32F
+-   * attachment, and the irradiance EMA, the ReSTIR reservoir, and the TAA
+-   * resolve look up history at that position instead of reprojecting the
+-   * CURRENT world position through the previous view-projection. That
++   * attachment, and the irradiance EMA and ReSTIR reservoir look up history at
++   * that position instead of reprojecting the CURRENT world position through
++   * the previous view-projection. TAA deliberately stays on camera-only
++   * reprojection because consuming object vectors measured as a regression. That
+    * camera-only reprojection is wrong for MOVING meshes (a point on them
+    * occupied different world space last frame, so its history is rejected every
+-   * frame) and correct for static geometry — for a static mesh the motion vector
+-   * collapses exactly to camera-only reprojection, so a static scene renders
+-   * byte-identically on or off. Rigid transforms only; deforming/skinned meshes
++   * frame) and correct for static geometry. The fifth attachment is therefore
++   * enabled only when the compiled scene has traceable `dynamicMeshes`; a fully
++   * static scene automatically uses the equivalent camera-only path. Rigid
++   * transforms only; deforming/skinned meshes
+    * still use a rigid previous matrix (they need per-vertex history, which is
+    * out of scope). Requires a GPU with >= 5 draw buffers (WebGL2 guarantees only
+    * 4); on a device without one the option is ignored with a one-time warning.
+    */
+   motionVectors?: boolean;
++  /**
++   * Pool the internal G-buffer draw materials by vertex-color presence and
++   * culling side (default `true`). This is an internal draw-state optimization;
++   * meshes with custom Object3D render callbacks automatically use the legacy
++   * per-mesh proxy path. Set `false` for diagnostics or unusual integrations.
++   */
++  gbufferMaterialPooling?: boolean;
+   /**
+    * Temporal anti-aliasing: sub-pixel projection jitter + a full-res history
+    * resolve with neighbourhood clamp.
+@@ -834,6 +843,13 @@ export interface CompileSceneOptions {
+ export class CompiledScene {
+   /** Total triangle count across the static and dynamic levels. */
+   triangleCount: number;
++  /** Optically absent rtClearGlass meshes omitted from both BVHs and the G-buffer. */
++  clearGlassMeshCount: number;
++  /**
++   * True when any primary-visible material needs the traced refraction shader,
++   * including materials on `rtExclude` meshes that are absent from the BVH.
++   */
++  hasTransmission: boolean;
+   /** Number of lights scanned into the compiled light tables. */
+   lightCount: number;
+   /**
