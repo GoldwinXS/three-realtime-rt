@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.16.2
+
+**The volumetric pass marches only where there is something to scatter.** With
+`density: 0` and localized `zones`, every quarter-canvas pixel used to run the
+full stratified march (4 steps, each with a BVH any-hit shadow ray to a random
+light) and multiply the result by a local density that was 0.0 for every step
+outside the zone: measured 16.8 ms per frame at canvas 1.0 on an RTX 3060, flat
+in `renderScale`, for one sun-shaft zone that was not even on screen. Now the
+ray segment is slab-tested against every zone AABB first (fattened by `eps` so
+a grazing ray is never culled) and the march is skipped when it crosses none;
+inside the march the shadow ray is skipped when the local density is zero. The
+`rand()` calls are kept in the same order and count, so the output is
+byte-identical (0 diff, same boot, both at a pose that does not see the zone
+and one that looks straight into it). Cost after: 0.04 ms at the gallery pose,
+3.2 ms of in-zone march when looking into the shaft. Global fog (`density > 0`)
+is unchanged.
+
+**G-buffer material pooling** (`gbufferMaterialPooling`, default `true`; ported
+from a community PR against 0.15.0). Instead of one G-buffer `ShaderMaterial`
+per mesh, the pass keeps one shared material per `(vertexColors, side)` key and
+syncs the source material's uniforms per draw in `onBeforeRender` (with
+`uniformsNeedUpdate`), so three.js switches programs far less often; meshes with
+custom `onBeforeRender`/`onAfterRender` callbacks and multi-material meshes keep
+the legacy per-mesh proxies. The pooled path honours `material.visible`
+(an invisible source material no longer rasterizes into the G-buffer). Raster
+output byte-identical; traced within floor. `false` restores the per-mesh path.
+
+**Compiler hardening.** `extractMeshGeometry` reads interleaved and normalized
+attributes through `getX/Y/Z` (they pack to contiguous floats now), computes
+missing normals on the indexed source before de-indexing (smooth, not flat),
+and drops dangling triangle tails per source mesh (`count % 3`), never across
+meshes. `updateDynamic()` untouched (bit-exact gate: 0 diff).
+
 ## 0.16.1
 
 **`updateDynamic()` does work proportional to what moved.** The dynamic path
