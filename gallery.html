@@ -178,6 +178,7 @@
       <select id="scene-pick">
         <option value="cornell">Cornell box (the classic)</option>
         <option value="waterfall">Waterfall (moving, many lights)</option>
+        <option value="hotel">Hotel corridor (96 lights)</option>
         <option value="tokyo">Littlest Tokyo (DRACO glTF)</option>
         <option value="lantern">Lantern (Khronos sample)</option>
         <option value="helmet">Damaged Helmet + props</option>
@@ -211,6 +212,7 @@
         <label><input type="checkbox" data-flag="restirDirectionalBypass" /> sun bypass</label>
         <label><input type="checkbox" data-flag="restirReprojectionRescue" /> reproj rescue</label>
         <label><input type="checkbox" data-flag="restirCandidateImportance" /> cand importance</label>
+        <label><input type="checkbox" data-flag="restirLightGrid" /> light grid</label>
         <label><input type="checkbox" data-flag="motionVectors" /> motion vectors</label>
         <label><input type="checkbox" data-flag="denoise" /> denoise</label>
         <label><input type="checkbox" data-flag="taa" /> TAA</label>
@@ -235,6 +237,14 @@
           <option value="0.5">50%</option>
         </select>
       </label>
+      <label class="opt-res-row" id="opt-lights-row">scene lights
+        <select id="opt-lights">
+          <option value="32">32</option>
+          <option value="64">64</option>
+          <option value="96" selected>96</option>
+        </select>
+      </label>
+      <div id="opt-lightcount" class="hud-caption"></div>
       <button id="opt-reset" type="button">Reset to defaults</button>
     </details>
   </div>

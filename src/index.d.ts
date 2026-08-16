@@ -375,6 +375,22 @@ export interface RealtimeRaytracerOptions {
    */
   textureTiles?: { size?: number; max?: number } | false;
   /**
+   * LIGHT-TABLE CAPACITY: how many analytic lights (point / spot / directional)
+   * this instance can shade at once. Default 128, hard max 256, new in 0.16.0 —
+   * it was a fixed 32 before, which was a UNIFORM budget rather than a cost one
+   * (three `vec4[32]` arrays in four shaders). The table now lives in a row of
+   * the scene-data texture, so a seat costs 4 texels.
+   *
+   * CONSTRUCTOR ONLY, like `textureTiles`: it is compiled into four shaders'
+   * `#define MAX_LIGHTS` and into the scene-data texture's width, so assigning
+   * to `rt.maxLights` afterwards THROWS rather than silently doing nothing.
+   *
+   * A light costs nothing per frame under ReSTIR (one visibility ray per pixel
+   * however many lights exist). It costs one shadow ray per pixel on the exact
+   * path (`restir: false`, or a pixel younger than `restirWarmAge`).
+   */
+  maxLights?: number;
+  /**
    * Alpha-blended transparency: `transparent: true` meshes are primary-visible
    * and composited against the geometry behind them (weighted by `opacity`).
    * Default true. Off = blend surfaces render fully opaque.
@@ -454,6 +470,25 @@ export interface RealtimeRaytracerOptions {
    * candidates, the same 8-step binary search the exact path runs.
    */
   restirCandidateImportance?: boolean;
+  /**
+   * LOCAL CANDIDATES: draw the reservoir's analytic-light candidates from a
+   * per-cell distribution over a uniform grid on the scene's static bounds,
+   * instead of one scene-wide power CDF. DEFAULT `true`, new in 0.16.0;
+   * `false` is the 0.15.0 global CDF, which lives in row 0 of the same table.
+   *
+   * With many lights the global CDF is the problem the light cap was hiding: in
+   * a building with eighty lights, roughly one candidate in thirty-two can reach
+   * the pixel at all, and the rest of the reservoir's stream is spent on lights
+   * behind walls. The grid weights light i in cell c by
+   * `lum / max(d^2, (cellDiagonal/2)^2)` times a spot-cone factor, d being the
+   * distance to the nearest point of the cell — the same inverse square the
+   * shading uses. Unbiased: every active light keeps at least 1/1000 of the
+   * cell's largest weight, so the source pdf still covers the target's support.
+   *
+   * Built on the GPU in two small draws whenever the light set (or the
+   * directional bypass) changes; a still scene builds it once.
+   */
+  restirLightGrid?: boolean;
   /**
    * Cap the ReSTIR direct term at `restirClampRel` x the pixel's own reservoir
    * estimate of the unshadowed light total, or at the absolute
@@ -825,6 +860,12 @@ export interface CompileSceneOptions {
   dynamicMeshes?: Object3D[];
   /** Texture-tile config for secondary-ray map sampling (see {@link RealtimeRaytracer.textureTiles}). */
   textureTiles?: { size?: number; max?: number } | false;
+  /**
+   * Light-table capacity for this compile (default 128, max 256). A
+   * {@link RealtimeRaytracer} always injects its own `maxLights` here, so pass
+   * this only when calling {@link compileScene} directly.
+   */
+  maxLights?: number;
 }
 
 /**
@@ -836,6 +877,12 @@ export class CompiledScene {
   triangleCount: number;
   /** Number of lights scanned into the compiled light tables. */
   lightCount: number;
+  /** Light-table capacity this scene was compiled for (the `maxLights` option). */
+  maxLights: number;
+  /** Row of the scene-data texture holding the light table (4 texels per seat). */
+  lightRow: number;
+  /** True when the most recent `syncLights` changed any value in the table. */
+  lightsChanged: boolean;
   /**
    * Number of emissive triangles registered as NEE area lights (static +
    * dynamic). A material can stay out of this list with
@@ -1193,6 +1240,12 @@ export class RealtimeRaytracer {
   restirReprojectionRescue: boolean;
   /** ReSTIR candidates drawn by power (pool split + per-pool CDF) instead of uniformly over S (default true since 0.15.0). */
   restirCandidateImportance: boolean;
+  /** ReSTIR candidates drawn from the light grid's per-cell distribution instead of the global power CDF (default true since 0.16.0). */
+  restirLightGrid: boolean;
+  /** Light-table capacity (default 128). READ-ONLY after construction: the setter throws, because it is compiled into four shaders and the scene-data texture. */
+  readonly maxLights: number;
+  /** Lights currently seated in the compiled table (0 with no compiled scene). */
+  readonly lightCount: number;
   /** ReSTIR direct-term firefly cap relative to the pixel's own reservoir total; 0 = the absolute cap alone (default 2 since 0.15.0). */
   restirClampRel: number;
   /** Reservoir winners shaded per pixel, each with its own visibility ray (default 1 = shipped). */
@@ -1252,7 +1305,11 @@ export class RealtimeRaytracer {
   dispose(): void;
 }
 
-/** Stage-1 cap (32) on the number of lights scanned into the compiled light tables. */
+/**
+ * DEFAULT light-table capacity (128 since 0.16.0, when `maxLights` became an
+ * option; it was a fixed 32 before). Read `compiled.maxLights` or
+ * `rt.maxLights` for the value an instance actually uses.
+ */
 export const MAX_LIGHTS: number;
 
 /** Build a {@link CompiledScene} (BVH + material/light tables) from a scene. */

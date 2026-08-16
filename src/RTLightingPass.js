@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
-import { MAX_LIGHTS } from "./SceneCompiler.js";
+import { MAX_LIGHTS, clampMaxLights } from "./SceneCompiler.js";
 import { SKY_GLSL } from "./sky.glsl.js";
 import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
 import { makeMRT } from "./mrtCompat.js";
@@ -23,7 +23,7 @@ ${shaderIntersectFunction}
 ${BVH_ANY_HIT_GLSL}
 ${SKY_GLSL}
 
-#define MAX_LIGHTS ${MAX_LIGHTS}
+#define MAX_LIGHTS RT_MAX_LIGHTS_VALUE
 #define PI 3.14159265358979
 
 layout(location = 0) out vec4 outIrradiance;
@@ -59,9 +59,22 @@ uniform float uFireflyClamp;
 uniform float uGlassClampScale; // glass firefly cap, in uFireflyClamp units (0 = off)
 uniform bool uRawOutput; // when true: skip EMA, write raw sampleIrr for AccumulatePass
 
-uniform vec4 uLightPosType[MAX_LIGHTS];     // xyz pos|dir, w: 0 point, 1 directional, >=2 spot (w-2 = cosInner)
-uniform vec4 uLightColorRadius[MAX_LIGHTS]; // rgb color*intensity, w radius
-uniform vec4 uLightDirCone[MAX_LIGHTS];     // spot: direction.xyz + cos(outer angle)
+// THE LIGHT TABLE lives in one row of uMaterialsTex (row index = uLightRow),
+// 4 texels per seat. It was three vec4[MAX_LIGHTS] uniform arrays until 0.16.0,
+// which is what capped the scene at 32 lights: 128 seats would be 384 uniform
+// vectors against a 224 guaranteed minimum, while as texels they cost nothing
+// but width in a texture this pass already binds. The three accessors below are
+// the ONLY readers — every shading expression downstream is unchanged, so the
+// maths is bit-identical to the uniform-array build (a texelFetch of an RGBA32F
+// NearestFilter texel returns the stored float32 exactly).
+uniform int uLightRow;
+// Directional lights currently seated. The bypass sweep below is a loop over the
+// WHOLE table testing each seat's type, and a seat is now a texel fetch: with no
+// sun in the scene that is uLightCount wasted fetches per pixel per frame.
+uniform int uDirCount;
+vec4 lightPosType(int i)     { return texelFetch(uMaterialsTex, ivec2(i * 4,     uLightRow), 0); } // xyz pos|dir, w: 0 point, 1 directional, >=2 spot (w-2 = cosInner)
+vec4 lightColorRadius(int i) { return texelFetch(uMaterialsTex, ivec2(i * 4 + 1, uLightRow), 0); } // rgb color*intensity, w radius
+vec4 lightDirCone(int i)     { return texelFetch(uMaterialsTex, ivec2(i * 4 + 2, uLightRow), 0); } // spot: direction.xyz + cos(outer angle)
 uniform int uLightCount;
 uniform int uEmissiveCount; // NEE area-light triangles in row 1 of uMaterialsTex
 uniform bool uEmissiveCDF;  // importance-sample tris by the power CDF (row 66)
@@ -674,15 +687,15 @@ void addSpec(vec3 N, vec3 L, vec3 li, float NoL) {
 // Spot cone falloff: smooth between the outer and inner cone cosines
 // (posType.w = 2 + cosInner; dirCone.w = cosOuter).
 float spotFalloff(int i, vec3 lightToP) {
-  vec4 posType = uLightPosType[i];
+  vec4 posType = lightPosType(i);
   if (posType.w < 1.5) return 1.0;
-  vec4 dc = uLightDirCone[i];
+  vec4 dc = lightDirCone(i);
   return smoothstep(dc.w, posType.w - 2.0, dot(dc.xyz, lightToP));
 }
 
 vec3 lightContribution(int i, vec3 P, vec3 N) {
-  vec4 posType = uLightPosType[i];
-  vec4 colRad = uLightColorRadius[i];
+  vec4 posType = lightPosType(i);
+  vec4 colRad = lightColorRadius(i);
 
   vec3 L;
   float dist2 = 1.0;
@@ -739,7 +752,7 @@ vec3 lightContribution(int i, vec3 P, vec3 N) {
 vec3 sampleOneLight(vec3 P, vec3 N, bool skipDir) {
   if (uLightCount == 0) return vec3(0.0);
   int i = min(int(rand() * float(uLightCount)), uLightCount - 1);
-  float lw = uLightPosType[i].w;
+  float lw = lightPosType(i).w;
   if (skipDir && lw >= 0.5 && lw < 1.5) return vec3(0.0);
   return lightContribution(i, P, N) * float(uLightCount);
 }
@@ -865,8 +878,8 @@ vec3 shadeReservoirSample(vec4 res, vec3 P, vec3 N, float wgt) {
   float maxDist;
   if (id < float(MAX_LIGHTS)) {
     int i = int(id);
-    vec4 posType = uLightPosType[i];
-    vec4 colRad = uLightColorRadius[i];
+    vec4 posType = lightPosType(i);
+    vec4 colRad = lightColorRadius(i);
     if (posType.w < 0.5 || posType.w >= 1.5) {
       vec3 d = posType.xyz - P;
       float dl = length(d);
@@ -1019,11 +1032,14 @@ vec3 shadeReservoir(vec3 P, vec3 N) {
 // hoisted in front), which is what makes the cold-fallback arm comparable.
 vec3 shadeLightSet(vec3 P, vec3 N, int mode) {
   if (mode == 2) return vec3(0.0);
+  // Nothing directional to sweep for: skip the loop rather than fetch every
+  // seat's type to discover that. (Mode 0 must still run — it is every light.)
+  if (mode == 1 && uDirCount == 0) return vec3(0.0);
   vec3 d = vec3(0.0);
   for (int i = 0; i < MAX_LIGHTS; i++) {
     if (i >= uLightCount) break;
     if (mode == 1) {
-      float lw = uLightPosType[i].w;
+      float lw = lightPosType(i).w;
       if (lw < 0.5 || lw >= 1.5) continue;   // not directional
     }
     d += lightContribution(i, P, N);
@@ -1136,8 +1152,8 @@ vec3 analyticGlint(vec3 P, vec3 refl) {
   vec3 sum = vec3(0.0);
   for (int i = 0; i < MAX_LIGHTS; i++) {
     if (i >= uLightCount) break;
-    vec4 posType = uLightPosType[i];
-    vec4 colRad = uLightColorRadius[i];
+    vec4 posType = lightPosType(i);
+    vec4 colRad = lightColorRadius(i);
     if (posType.w < 0.5 || posType.w >= 1.5) {
       // point / spot
       vec3 d = posType.xyz - P;
@@ -1828,8 +1844,12 @@ export class RTLightingPass {
   // target exactly like 0.3.x, the shader's second output collapses to a dead
   // local variable, and render() returns { specular: null } (the caller then
   // runs with specular off; blend surfaces degrade to opaque as documented).
-  constructor(width, height, { specMRT = true } = {}) {
+  constructor(width, height, { specMRT = true, maxLights = MAX_LIGHTS } = {}) {
     this.specMRT = specMRT;
+    // Light-table capacity, baked into the megakernel's MAX_LIGHTS define (it is
+    // only a LOOP BOUND now — the table itself is texels, see uLightRow — so a
+    // bigger value costs nothing per frame while uLightCount is small).
+    this.maxLights = clampMaxLights(maxLights);
     this.targetA = this._makeTarget(width, height);
     this.targetB = this._makeTarget(width, height);
     // Accumulated specular history (ping-pong), fed by the fresh specular in
@@ -1859,9 +1879,13 @@ export class RTLightingPass {
     // inside any absorption block except the shadow-ray site inside
     // RT_ABSORB_SHADOWS). Rather than doubling the cached-variant matrix, it is
     // stripped dynamically at splice time — a scene-compile cost, never per frame.
+    const fragSized = rtLightingFrag.replace(
+      /RT_MAX_LIGHTS_VALUE/g,
+      String(this.maxLights)
+    );
     const fragFull = specMRT
-      ? rtLightingFrag
-      : rtLightingFrag.replace(
+      ? fragSized
+      : fragSized.replace(
           "layout(location = 1) out vec4 outSpecular;",
           "vec4 outSpecular; // single-target fallback: dead store"
         );
@@ -1931,10 +1955,9 @@ export class RTLightingPass {
         uRawOutput: { value: false },
         uFireflyClamp: { value: 4.0 },
         uGlassClampScale: { value: 4.0 },
-        uLightPosType: { value: [] },
-        uLightColorRadius: { value: [] },
-        uLightDirCone: { value: [] },
+        uLightRow: { value: 0 },
         uLightCount: { value: 0 },
+        uDirCount: { value: 0 },
         uEmissiveCount: { value: 0 },
         uEmissiveCDF: { value: true },
         uReflEnabled: { value: true },
@@ -2148,11 +2171,17 @@ export class RTLightingPass {
     u.uAttrStatic.value = compiled.staticAttrTex;
     u.uAttrDynamic.value = compiled.dynamicAttrTex;
     u.uMaterialsTex.value = compiled.materialsTex;
-    u.uLightPosType.value = compiled.lightPosType;
-    u.uLightColorRadius.value = compiled.lightColorRadius;
-    u.uLightDirCone.value = compiled.lightDirCone;
+    u.uLightRow.value = compiled.lightRow;
     u.uLightCount.value = compiled.lightCount;
+    u.uDirCount.value = compiled.directionalCount || 0;
     u.uEmissiveCount.value = compiled.emissiveTriCount;
+    if (compiled.maxLights > this.maxLights) {
+      console.warn(
+        `three-realtime-rt: the compiled scene allows ${compiled.maxLights} lights but this ` +
+          `renderer was constructed with maxLights: ${this.maxLights}; seats past ${this.maxLights} ` +
+          "will not be shaded. Pass the same maxLights to the constructor and compileScene()."
+      );
+    }
     // Beer-Lambert absorption rides row 67 of the scene-data texture bound just
     // above, so the shader variant follows the compiled scene directly — no
     // uniform, no sampler, nothing for the caller to remember.

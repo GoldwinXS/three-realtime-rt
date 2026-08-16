@@ -24,6 +24,9 @@ const rt = new RealtimeRaytracer(renderer, {
   restirDynamicAccept: false,
   restirDynamicFreeze: false,
   gpuTiming: "auto",
+  // 0.16.0
+  maxLights: 96,
+  restirLightGrid: true,
 });
 
 // Live-assignable properties.
@@ -33,6 +36,10 @@ rt.motionVectors = false;
 rt.restirClampRel = 0;
 rt.restirSamples = 3;
 rt.restirDynamicFreeze = true;
+// 0.16.0 live + read-only surface.
+rt.restirLightGrid = false;
+const cap: number = rt.maxLights;
+const lit: number = rt.lightCount;
 const supported: boolean = rt.motionVectorsSupported;
 const cost: number | null = rt.gpuCostMs;
 
@@ -41,10 +48,13 @@ const D = RealtimeRaytracer.DEFAULTS;
 const g: boolean | undefined = D.gi;
 const a: boolean | undefined = D.ambient;
 const clamp: number | undefined = D.restirClampRel;
+const gridDefault: boolean | undefined = D.restirLightGrid;
 
 // The compiled scene's new field.
 rt.compileScene(scene);
 const power: number = rt.compiled!.emissivePower;
+const row: number = rt.compiled!.lightRow;
+const compiledCap: number = rt.compiled!.maxLights;
 
 rt.render(scene, camera);
-export { supported, cost, g, a, clamp, power };
+export { supported, cost, g, a, clamp, power, cap, lit, gridDefault, row, compiledCap };

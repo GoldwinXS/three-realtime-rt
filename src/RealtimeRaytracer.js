@@ -1,5 +1,12 @@
 import * as THREE from "three";
-import { compileScene, syncLights } from "./SceneCompiler.js";
+import {
+  compileScene,
+  syncLights,
+  uploadLightRows,
+  clampMaxLights,
+  DEFAULT_MAX_LIGHTS,
+  MAX_LIGHTS_LIMIT,
+} from "./SceneCompiler.js";
 import { GBufferPass } from "./GBufferPass.js";
 import { RTLightingPass } from "./RTLightingPass.js";
 import { DenoisePass } from "./DenoisePass.js";
@@ -9,6 +16,7 @@ import { TAAPass } from "./TAAPass.js";
 import { VolumetricPass } from "./VolumetricPass.js";
 import { RestirPass } from "./RestirPass.js";
 import { GIReservoirPass } from "./GIReservoirPass.js";
+import { LightGridPass } from "./LightGridPass.js";
 import { CopyPass } from "./CopyPass.js";
 import { GpuTimer } from "./GpuTimer.js";
 import { makeMRT } from "./mrtCompat.js";
@@ -679,6 +687,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     restirDirectionalBypass: true,
     restirReprojectionRescue: true,
     restirCandidateImportance: true,
+    restirLightGrid: true,
     restirClampRel: 2,
     restirSamples: 1,
     restirSampleRadius: 10,
@@ -871,10 +880,37 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       renderer.getContext().MAX_TEXTURE_IMAGE_UNITS
     );
     this._volumeUnitWarned = false;
+    // Largest texture this GPU can allocate. The light GRID is one texture ROW
+    // per cell, so this is the only limit its cell count depends on (WebGL2
+    // guarantees 2048; desktop reports 16384).
+    this._maxTextureSize = renderer.getContext().getParameter(
+      renderer.getContext().MAX_TEXTURE_SIZE
+    );
+    /**
+     * LIGHT-TABLE CAPACITY (default 128, hard max 256). COMPILE-TIME, like
+     * `textureTiles`: every pass bakes it into a `#define` and the scene-data
+     * texture into its width, so the setter throws rather than lying.
+     *
+     * Through 0.15.0 this was a fixed 32 and it was a UNIFORM budget, not a
+     * taste: three vec4[32] arrays in four shaders. 0.16.0 moved the table into
+     * rows of the scene-data texture, so a seat now costs 4 texels and the cap
+     * became a number you can choose. A light costs NOTHING per frame under
+     * ReSTIR (the reservoir shades one winner however many lights exist); it
+     * costs a shadow ray per light per pixel on the exact path (`restir: false`,
+     * or a cold pixel under `restirWarmAge`).
+     */
+    this._maxLights = clampMaxLights(options.maxLights);
+    if (options.maxLights !== undefined && this._maxLights !== Math.floor(Number(options.maxLights))) {
+      console.warn(
+        `three-realtime-rt: maxLights ${options.maxLights} is out of range; using ${this._maxLights} ` +
+          `(1..${MAX_LIGHTS_LIMIT}).`
+      );
+    }
 
     this.gbuffer = new GBufferPass(this._width, this._height, { mixedPrecision });
     this.rtPass = new RTLightingPass(this._scaledW, this._scaledH, {
       specMRT: this.specMRTSupported,
+      maxLights: this._maxLights,
     });
     this.denoisePass = new DenoisePass(this._scaledW, this._scaledH);
     // Separate à-trous instance for the specular buffer (its own ping-pong
@@ -1328,7 +1364,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // Quarter CANVAS resolution, independent of renderScale: fog is
     // low-frequency, so resolution buys nothing — the budget goes into
     // multiple march steps per ray instead (see VolumetricPass).
-    this.volumetricPass = new VolumetricPass(this._volW, this._volH);
+    this.volumetricPass = new VolumetricPass(this._volW, this._volH, {
+      maxLights: this._maxLights,
+    });
 
     /**
      * ReSTIR direct lighting: per-pixel reservoirs converge onto the light
@@ -1477,7 +1515,31 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * spike (those are 100x) and lets a fully lit surface reach its own total.
      */
     this.restirClampRel = options.restirClampRel ?? 2;
-    this.restirPass = new RestirPass(this._scaledW, this._scaledH);
+    this.restirPass = new RestirPass(this._scaledW, this._scaledH, {
+      maxLights: this._maxLights,
+    });
+    /**
+     * LOCAL CANDIDATES (DEFAULT ON, new in 0.16.0). Draw the reservoir's
+     * analytic-light candidates from a per-cell distribution (see LightGridPass)
+     * instead of one scene-wide power CDF.
+     *
+     * WHY IT IS ON BY DEFAULT. The global CDF is fine while a scene has a
+     * handful of lights and useless when it has eighty: in a corridor with three
+     * lights per room, one candidate in thirty-two can reach the pixel at all,
+     * and the reservoir spends its stream on lights behind walls — the same
+     * "reveal noise" the 0.15.0 fixes removed, arriving by a different door. The
+     * grid weights each light by what it could deliver to the pixel's own cell,
+     * which is what makes a 96-light scene converge like an 8-light one.
+     *
+     * `false` = the 0.15.0 global CDF, from row 0 of the same texture, so the
+     * candidate stream is the one 0.15.0 drew.
+     */
+    this.restirLightGrid = options.restirLightGrid ?? true;
+    this.lightGridPass = new LightGridPass({ maxLights: this._maxLights });
+    // Rebuild flags: the table is a function of the light set, the grid geometry
+    // and the directional bypass, so exactly those three set it dirty.
+    this._lightGridDirty = true;
+    this._lightGridState = null;
     /**
      * Dynamic-mesh reservoir treatments, both DEFAULT OFF (nothing changes until
      * switched on). A moving mesh's pixels reject their reprojected history every
@@ -1629,7 +1691,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * the old path.
      */
     this.restirGIVisFallback = options.restirGIVisFallback ?? true;
-    this.giReservoirPass = new GIReservoirPass(this._scaledW, this._scaledH);
+    this.giReservoirPass = new GIReservoirPass(this._scaledW, this._scaledH, {
+      maxLights: this._maxLights,
+    });
     this._giMissWarned = false;
 
     /** Distance fog (composited in linear space before tonemap). */
@@ -1818,6 +1882,21 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
         return { feature: "restir", disable: () => { this.restir = false; } };
       case "rt:gi-reservoir":
         return { feature: "restirGI", disable: () => { this.restirGI = false; } };
+      case "rt:lightgrid-weights":
+      case "rt:lightgrid-cdf":
+        // The grid only chooses which lights are PROPOSED, so losing it costs
+        // candidate quality and nothing else. It takes importance sampling down
+        // with it on purpose: the CDF now lives in this table, so a table that
+        // was never built means the uniform-pick path (which reads none of it)
+        // is the only correct fallback. Both are live toggles; the image stays
+        // lit, noisier in a many-light scene.
+        return {
+          feature: "restirLightGrid",
+          disable: () => {
+            this.restirLightGrid = false;
+            this.restirCandidateImportance = false;
+          },
+        };
       case "rt:denoise":
         return { feature: "denoise", disable: () => { this.denoise = false; } };
       case "rt:volumetric":
@@ -2078,9 +2157,18 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // Merge instance-level textureTiles into compileScene options so the CPU-side
     // tile build and stride-2 layout follow the constructor setting. An explicit
     // option passed to compileScene wins over the instance default.
+    // maxLights rides along the same way: the compiled table's width and the
+    // shaders' #define MUST agree, so the instance value always wins over a
+    // stray option (a caller who passes a different one gets told).
     const compileOpts = options?.textureTiles !== undefined
-      ? options
-      : { ...options, textureTiles: this._textureTiles };
+      ? { ...options, maxLights: this._maxLights }
+      : { ...options, textureTiles: this._textureTiles, maxLights: this._maxLights };
+    if (options?.maxLights !== undefined && clampMaxLights(options.maxLights) !== this._maxLights) {
+      console.warn(
+        `three-realtime-rt: compileScene({ maxLights: ${options.maxLights} }) ignored — the ` +
+          `shaders were built for maxLights: ${this._maxLights}. Pass it to the constructor instead.`
+      );
+    }
     let compiled;
     try {
       compiled = compileScene(scene, compileOpts);
@@ -2136,6 +2224,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
     this.giReservoirPass.setCompiledScene(this.compiled);
+    this._syncLightGrid(true);
     // Tell the G-buffer which meshes are dynamic so it can flag their pixels
     // (gEmissive.a) for the reservoir passes.
     this.gbuffer.setDynamicMeshes(
@@ -2200,6 +2289,50 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.volumetricPass.setCompiledScene(this.compiled);
     this.restirPass.setCompiledScene(this.compiled);
     this.giReservoirPass.setCompiledScene(this.compiled);
+    // The table lives in the scene-data texture now, so this is where it reaches
+    // the GPU. Only the light ROW is uploaded (see uploadLightRows) —
+    // `needsUpdate` would re-send the whole texture, tile block included.
+    // syncLights already decided whether anything actually changed, so an app
+    // that calls updateLights every frame out of habit pays one compare loop.
+    if (this.compiled.lightsChanged) {
+      this._lightUpload = uploadLightRows(this.compiled, this.renderer);
+      this._lightGridDirty = true;
+    }
+  }
+
+  /**
+   * Keep the light-grid table in step with the compiled scene and with the two
+   * knobs its contents depend on, and rebuild it when something moved. Called
+   * from compileScene (reallocate) and once per render (rebuild if dirty), so a
+   * still scene pays nothing per frame.
+   */
+  _syncLightGrid(realloc) {
+    if (!this.compiled || !this.lightGridPass) return;
+    if (realloc) {
+      this.lightGridPass.setCompiledScene(this.compiled, this._maxTextureSize);
+      this._lightGridDirty = true;
+      this._lightGridState = null;
+    }
+    // Contents depend on the light SET (updateLights sets the dirty flag), the
+    // directional bypass (a bypassed sun is weighted zero) and whether the cell
+    // rows are wanted at all — those last two are live toggles, so they are
+    // compared rather than trusted.
+    const state =
+      (this.restirLightGrid ? 1 : 0) +
+      "|" + (this.restirDirectionalBypass ? 1 : 0) +
+      "|" + this.compiled.lightCount;
+    if (state !== this._lightGridState) {
+      this._lightGridState = state;
+      this._lightGridDirty = true;
+    }
+    if (!this._lightGridDirty) return;
+    this.lightGridPass.setCompiledScene(this.compiled, this._maxTextureSize);
+    this.lightGridPass.build(this.renderer, {
+      dirBypass: !!this.restirDirectionalBypass,
+      cellRows: !!this.restirLightGrid,
+    });
+    this._lightGridDirty = false;
+    this.restirPass.setLightGrid(this.lightGridPass.texture, !!this.restirLightGrid);
   }
 
   resetAccumulation() {
@@ -2365,6 +2498,33 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     if (!this.supported) return;
     this.rtPass.setKmScattering(on);
     this.resetAccumulation();
+  }
+
+  /**
+   * Light-table capacity: how many analytic lights this instance can shade at
+   * once (default 128, hard max 256). READ-ONLY after construction, and the
+   * setter says so rather than accepting a value it cannot honour: the number is
+   * baked into four shaders' `#define MAX_LIGHTS` and into the compiled scene's
+   * texture width, so changing it means new programs and a recompile.
+   *
+   * Lights beyond the cap are dropped in traversal order, with survivors keeping
+   * their seats (see SceneCompiler.syncLights).
+   */
+  get maxLights() {
+    return this._maxLights;
+  }
+  set maxLights(v) {
+    if (clampMaxLights(v) === this._maxLights) return;
+    throw new Error(
+      `three-realtime-rt: maxLights is a constructor option (currently ${this._maxLights}) and ` +
+        "cannot be changed on a live renderer — it is compiled into every lighting shader and " +
+        `into the scene-data texture. Construct with new RealtimeRaytracer(renderer, { maxLights: ${v} }).`
+    );
+  }
+
+  /** Lights currently in the compiled table (0 with no compiled scene). */
+  get lightCount() {
+    return this.compiled ? this.compiled.lightCount : 0;
   }
 
   /**
@@ -3344,6 +3504,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       // by one pdf and the estimator converges to the other one's answer.
       this.restirPass.setCandidateImportance(this.restirCandidateImportance);
       this.restirPass.setEmissiveImportance(this.emissiveImportance);
+      // The candidate distribution itself: row 0 is the global power CDF the
+      // draw used to read from a uniform array, rows 1+ localise it per grid
+      // cell. Rebuilt only when the light set or one of its two knobs moved.
+      this._syncLightGrid(false);
       reservoirTex = this.restirPass.render(
         this.renderer,
         this.gbuffer,
@@ -3624,6 +3788,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.volumetricPass.dispose();
     this.restirPass.dispose();
     this.giReservoirPass.dispose();
+    this.lightGridPass.dispose();
     this._sceneColor.dispose();
     this._copyPass.dispose();
     if (this._gpuTimer) this._gpuTimer.dispose();

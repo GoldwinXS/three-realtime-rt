@@ -417,6 +417,191 @@ export const SCENES = {
       debug: { physics, emitters, riders, lamp, fill, hemi },
     };
   },
+
+  /**
+   * HOTEL — the many-light scene, and the reason 0.16.0 exists.
+   *
+   * A 53 m corridor with twelve rooms down each side, every door open, every
+   * room lit by up to four small fixtures: 96 analytic lights on at once, all of
+   * them inside the light table (0.15.0 capped it at 32, so this scene could not
+   * have been lit at all without turning rooms off as you walked). The camera
+   * dollies slowly down the corridor, which is the case the release is about:
+   * each doorway REVEALS three or four lights that no pixel on screen had a
+   * reservoir for a frame ago.
+   *
+   * `?lights=32|64|96` thins the fixtures EVENLY across the rooms (not "the
+   * first N rooms"), so the corridor stays lit end to end at every setting and
+   * the only variable is how many lights the estimator has to choose between.
+   *
+   * No emissive geometry on purpose: the NEE pool would then carry half the
+   * light and the analytic-light candidate distribution — the thing under test —
+   * would only get half the draws.
+   */
+  async hotel() {
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x05070a);
+
+    const ROOMS = 12;          // per side
+    const PITCH = 4.4;         // room centre spacing along the corridor
+    const CW = 3.2, CH = 3.0;  // corridor width and height
+    const RW = 5.0, RD = 3.6;  // room width (across) and depth (along)
+    const DOORW = 1.2, DOORH = 2.2;
+    const T = 0.2;             // wall thickness
+    const Z0 = -((ROOMS - 1) * PITCH) / 2;
+    const LEN = ROOMS * PITCH + 6;
+
+    const carpet = new THREE.MeshStandardMaterial({ color: 0x6a4a3c, roughness: 0.95 });
+    const wallMat = new THREE.MeshStandardMaterial({ color: 0xcfc6b4, roughness: 0.9 });
+    const ceilMat = new THREE.MeshStandardMaterial({ color: 0xe6e2d8, roughness: 0.95 });
+    const roomMat = new THREE.MeshStandardMaterial({ color: 0xb0a693, roughness: 0.9 });
+    const trimMat = new THREE.MeshStandardMaterial({ color: 0x3b3a38, roughness: 0.45, metalness: 0.35 });
+    const bedMat = new THREE.MeshStandardMaterial({ color: 0x8ea3b8, roughness: 0.8 });
+
+    const box = (w, h, d, x, y, z, mat) => {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+      m.position.set(x, y, z);
+      scene.add(m);
+      return m;
+    };
+
+    // --- the corridor ---------------------------------------------------------
+    box(CW, T, LEN, 0, -T / 2, 0, carpet);
+    box(CW, T, LEN, 0, CH + T / 2, 0, ceilMat);
+    box(CW + 2 * (RW + T), T, T, 0, CH / 2, -LEN / 2, wallMat); // end caps
+    box(CW + 2 * (RW + T), CH, T, 0, CH / 2, LEN / 2, wallMat);
+
+    // --- rooms, and the corridor wall around each doorway ---------------------
+    // The wall between corridor and room is built as PIERS plus a lintel rather
+    // than a wall with a hole: two boxes and a header per door, and the BVH gets
+    // clean axis-aligned geometry instead of a punched face.
+    const lights = [];
+    const rooms = [];
+    for (let side = -1; side <= 1; side += 2) {
+      const wallX = side * (CW / 2 + T / 2);
+      const roomX = side * (CW / 2 + T + RW / 2);
+      for (let i = 0; i < ROOMS; i++) {
+        const z = Z0 + i * PITCH;
+        // corridor wall: pier, pier, lintel
+        const pier = (PITCH - DOORW) / 2;
+        box(T, CH, pier, wallX, CH / 2, z - (DOORW + pier) / 2, wallMat);
+        box(T, CH, pier, wallX, CH / 2, z + (DOORW + pier) / 2, wallMat);
+        box(T, CH - DOORH, DOORW, wallX, DOORH + (CH - DOORH) / 2, z, wallMat);
+        box(T * 1.6, DOORH, 0.1, wallX, DOORH / 2, z - DOORW / 2 - 0.05, trimMat);
+        box(T * 1.6, DOORH, 0.1, wallX, DOORH / 2, z + DOORW / 2 + 0.05, trimMat);
+        // the room itself
+        box(RW, T, RD, roomX, -T / 2, z, roomMat);
+        box(RW, T, RD, roomX, CH + T / 2, z, ceilMat);
+        box(RW, CH, T, roomX, CH / 2, z - RD / 2 - T / 2, wallMat);
+        box(RW, CH, T, roomX, CH / 2, z + RD / 2 + T / 2, wallMat);
+        box(T, CH, RD + 2 * T, roomX + side * (RW / 2 + T / 2), CH / 2, z, wallMat);
+        // one bed and one bedside table, so the fixtures have something to
+        // shadow and the reveal has structure rather than a flat wash
+        box(1.9, 0.5, 1.2, roomX + side * 0.6, 0.25, z, bedMat);
+        box(0.5, 0.55, 0.5, roomX - side * 1.3, 0.28, z + 0.9, trimMat);
+        rooms.push({ x: roomX, z, side });
+      }
+    }
+
+    // --- 4 fixtures per room, 96 in all --------------------------------------
+    // Each room gets a slightly different warmth so a reveal reads as "a new
+    // room lit up" rather than "the same wash got brighter".
+    rooms.forEach((r, idx) => {
+      const warm = new THREE.Color().setHSL(0.09 + ((idx * 7) % 12) * 0.004, 0.55, 0.55);
+      const cool = new THREE.Color().setHSL(0.58 - ((idx * 5) % 9) * 0.006, 0.45, 0.55);
+      const roomLights = [];
+      // 1: ceiling fixture
+      const ceil = new THREE.PointLight(warm, 3.0, 0, 2);
+      ceil.position.set(r.x, CH - 0.35, r.z);
+      ceil.userData.rtRadius = 0.12;
+      roomLights.push(ceil);
+      // 2: bedside lamp
+      const bedside = new THREE.PointLight(warm, 1.6, 0, 2);
+      bedside.position.set(r.x - r.side * 1.3, 0.75, r.z + 0.9);
+      bedside.userData.rtRadius = 0.08;
+      roomLights.push(bedside);
+      // 3: a SPOT over the doorway, aimed into the corridor. The one light in
+      // the room whose cone the light grid has to reason about, and the one the
+      // corridor actually sees when the door goes by.
+      const spot = new THREE.SpotLight(warm, 6.0, 0, Math.PI / 5, 0.5, 2);
+      spot.position.set(r.x - r.side * (RW / 2 - 0.15), CH - 0.4, r.z);
+      spot.target.position.set(r.x - r.side * (RW / 2 + 2.2), 0, r.z);
+      spot.userData.rtRadius = 0.06;
+      scene.add(spot.target);
+      roomLights.push(spot);
+      // 4: a cool accent at the back wall
+      const accent = new THREE.PointLight(cool, 1.2, 0, 2);
+      accent.position.set(r.x + r.side * (RW / 2 - 0.3), 1.5, r.z - RD / 2 + 0.4);
+      accent.userData.rtRadius = 0.1;
+      roomLights.push(accent);
+      for (const l of roomLights) scene.add(l);
+      lights.push(roomLights);
+    });
+
+    /**
+     * Keep `n` fixtures lit, spread EVENLY over the rooms: room r keeps
+     * floor(n/24) lights, and the first n % 24 rooms keep one more. The corridor
+     * therefore stays lit end to end at 32 as well as at 96, so a cost or noise
+     * A/B across n is not also an A/B on "how much of the scene is dark".
+     */
+    const setLights = (n) => {
+      const total = rooms.length * 4;
+      const want = Math.max(0, Math.min(total, n | 0));
+      const per = Math.floor(want / rooms.length);
+      const extra = want % rooms.length;
+      lights.forEach((roomLights, r) => {
+        const keep = per + (r < extra ? 1 : 0);
+        roomLights.forEach((l, k) => { l.visible = k < keep; });
+      });
+      return want;
+    };
+    const wanted = parseInt(new URLSearchParams(location.search).get("lights") || "96", 10);
+    setLights(Number.isFinite(wanted) ? wanted : 96);
+
+    // Unoccluded ambient, so the rooms the fixtures do not reach are dim rather
+    // than pure black with gi off (the 0.15.0 option, doing its job).
+    const hemi = new THREE.HemisphereLight(0x5a6c8a, 0x2a2118, 0.18);
+    hemi.position.set(0, 1, 0);
+    scene.add(hemi);
+
+    // --- the dolly ------------------------------------------------------------
+    // Pose is a function of accumulated sim time, and the gallery loop hands the
+    // camera in. Moving the TARGET by the same delta keeps OrbitControls happy
+    // (it re-derives its spherical from position - target every update), so the
+    // user can still grab the mouse and look around while the dolly runs.
+    let last = performance.now();
+    let travel = 0;
+    let dolly = true;
+    return {
+      scene,
+      sky: { enabled: false },
+      cam: [0, 1.7, Z0 - 3.4],
+      target: [0, 1.55, Z0 + 2],
+      env: { color: new THREE.Color(0.02, 0.025, 0.035), intensity: 1.0 },
+      update({ camera, controls } = {}) {
+        const now = performance.now();
+        const dt = Math.min(0.1, (now - last) / 1000);
+        last = now;
+        if (!dolly || !camera || dt <= 0) return false;
+        const span = (ROOMS - 1) * PITCH + 4;
+        travel += dt * 0.9;
+        if (travel > span) travel = 0; // back to the near end, a full reveal
+        const z = Z0 - 3.4 + travel;
+        const dz = z - camera.position.z;
+        camera.position.z = z;
+        if (controls) controls.target.z += dz;
+        return false; // nothing in the SCENE moved; only the camera did
+      },
+      debug: {
+        setLights,
+        lightGroups: lights,
+        rooms,
+        hemi,
+        get dolly() { return dolly; },
+        set dolly(v) { dolly = !!v; },
+      },
+    };
+  },
+
   async tokyo() {
     // Dusk: the scene is a night street, so the sky is a deep twilight (not the
     // flat bright grey the generic daylight palette gave it). The model's
@@ -573,6 +758,8 @@ export const SCENE_LIST = [
     "The classic GI test room: one ceiling light, colour bleed, real shadows."],
   ["waterfall", "Waterfall (moving, many lights)", { galleryOnly: true },
     "Forty bodies falling through a peg board forever. Six of them glow and four carry lights, so the light moves with the geometry."],
+  ["hotel", "Hotel corridor (96 lights)", { galleryOnly: true },
+    "Twelve rooms down each side, four fixtures in every one: 96 analytic lights at once, and a slow dolly past every open door."],
   // Curated order: the assets a three.js reader recognises on sight come first,
   // and the one entry that needs no network at all comes last (it is the
   // offline fallback, not a showcase — the helmet is already the museum's hero

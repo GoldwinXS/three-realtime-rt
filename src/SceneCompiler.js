@@ -9,7 +9,31 @@ import {
 } from "three-mesh-bvh";
 import { decodeBlueNoise, BLUE_NOISE_SIZE } from "./blueNoise.js";
 
-const MAX_LIGHTS = 32; // stage-1 cap; a data-texture light list is future work
+// Light-table capacity. Through 0.15.0 this was a hard 32 ("stage-1 cap; a
+// data-texture light list is future work") because every pass carried the table
+// in three vec4[MAX_LIGHTS] UNIFORM arrays, and 32 x 3 vec4 already spends 96 of
+// the 224 uniform vectors WebGL2 guarantees. 0.16.0 IS that data-texture list:
+// the table lives in rows of the scene-data texture (see buildSceneDataTexture),
+// so the cap costs texels rather than uniform vectors and becomes a per-instance
+// option. DEFAULT_MAX_LIGHTS is the constructor default; MAX_LIGHTS_LIMIT is the
+// hard ceiling (a table row is maxLights * 4 texels wide, and the texture's width
+// is max(everything else, that), so 256 lights = 1024 texels — inside the 2048
+// MAX_TEXTURE_SIZE floor every WebGL2 device meets).
+const DEFAULT_MAX_LIGHTS = 128;
+const MAX_LIGHTS_LIMIT = 256;
+// Back-compat export: the value `MAX_LIGHTS` had as a constant is now the
+// default of the `maxLights` option. Code that imported it to size an array
+// still gets a valid (and larger) bound; code that needs the actual instance
+// cap should read `compiled.maxLights`.
+const MAX_LIGHTS = DEFAULT_MAX_LIGHTS;
+
+/** Clamp/validate a `maxLights` option to [1, MAX_LIGHTS_LIMIT] integers. */
+function clampMaxLights(v) {
+  if (v === undefined || v === null) return DEFAULT_MAX_LIGHTS;
+  const n = Math.floor(Number(v));
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_LIGHTS;
+  return Math.min(MAX_LIGHTS_LIMIT, n);
+}
 
 // Emissive-mesh triangles sampled by next-event estimation. Beyond the cap the
 // largest-area triangles win (they carry the most light); the rest are dropped
@@ -117,6 +141,32 @@ export class CompiledScene {
     this.lightColorRadius = [];
     this.lightDirCone = []; // spot direction.xyz + cos(outer angle)
     this.lightCount = 0;
+    // Seats holding a DIRECTIONAL light (see syncLights): the lighting pass's
+    // bypass sweep skips its whole loop when this is zero.
+    this.directionalCount = 0;
+    // Light-table capacity (the `maxLights` option) and the row of the
+    // scene-data texture the table starts at. The CPU-side arrays above stay the
+    // canonical copy (RealtimeRaytracer's light-motion signature reads them);
+    // syncLights mirrors them into the texture row, which is what the shaders
+    // read. lightRow is -1 until the texture exists.
+    this.maxLights = DEFAULT_MAX_LIGHTS;
+    this.lightRow = -1;
+    // Set by syncLights: true when ANY float of the table changed in that call.
+    // The light-grid build and the texture upload both key off it, so a scene
+    // whose app calls updateLights every frame out of habit pays nothing.
+    this.lightsChanged = true;
+    // Per-seat generation counter, written to the table's `extra.x`. Bumped when
+    // a DIFFERENT light object takes a seat (not when the same light moves), so
+    // a future consumer can tell "my light moved" from "my seat was re-let".
+    this._seatGen = null;
+    this._seatObj = null;
+    // Uniform light grid over the static world (see buildLightGrid): { origin,
+    // cell, dims, cells }. Null when the scene has no finite static bounds.
+    this.lightGrid = null;
+    // Static-level world AABB, kept because the light grid needs it and
+    // sceneDiagonal alone cannot rebuild it.
+    this.staticMin = null;
+    this.staticMax = null;
     // >>> RT_AMBIENT
     // Unoccluded ambient, summed out of the scene's AmbientLights and
     // HemisphereLights by syncLights. These are NOT table rows: neither light
@@ -1131,9 +1181,24 @@ function collectScattering(materials) {
 // Row 70+ (OPTIONAL — present only with row 69): tile block. Each unique texture
 //   image is resampled to TILE x TILE RGBA, in linear colour. Tile t lives at
 //   rows 70 + t*TILE, columns 0..TILE-1. Texture width must become max(existing, TILE).
+// LAST ROW (always present, index passed to every pass as `uLightRow` because
+//   the tile block above it has a variable height): the ANALYTIC LIGHT TABLE,
+//   4 texels per light seat:
+//     [i*4+0] posType      xyz world position (or direction), w type
+//     [i*4+1] colorRadius  rgb colour x intensity, w soft-shadow radius
+//     [i*4+2] dirCone      spot direction.xyz + cos(outer angle)
+//     [i*4+3] extra        x = seat generation (bumped when a DIFFERENT light
+//                          takes this seat), yzw reserved 0
+//   Texture width must become max(existing, maxLights * 4). This is what removed
+//   the 32-light cap in 0.16.0: the table used to be three vec4[32] uniform
+//   arrays in four separate shaders. Seats past `lightCount` are zeroed, and
+//   every sampling path is bounded by uLightCount, so a wide table costs texels
+//   and nothing else.
 // All packed into ONE texture because the lighting pass already sits at the
-// WebGL2-guaranteed 16-sampler limit — extra samplers are not available.
-function buildSceneDataTexture(materials, emissiveTris, absorption, scattering, tileData) {
+// WebGL2-guaranteed 16-sampler limit — extra samplers are not available. That
+// constraint is exactly why the light table went HERE rather than into a texture
+// of its own.
+function buildSceneDataTexture(materials, emissiveTris, absorption, scattering, tileData, maxLights) {
   const bn = decodeBlueNoise();
   const hasTiles = tileData && tileData.tiles && tileData.tiles.length > 0;
   // When tiles exist, rows 67 and 68 must be materialised for absolute addressing.
@@ -1142,12 +1207,20 @@ function buildSceneDataTexture(materials, emissiveTris, absorption, scattering, 
   const hasScattering = scattering || forceAbsRows;
   const tileSize = tileData ? tileData.tileSize : DEFAULT_TILE_SIZE;
   const numTiles = hasTiles ? tileData.tiles.length : 0;
-  const width = Math.max(materials.length * 2, emissiveTris.length * 4, BLUE_NOISE_SIZE, hasTiles ? tileSize : 1);
+  const width = Math.max(
+    materials.length * 2,
+    emissiveTris.length * 4,
+    BLUE_NOISE_SIZE,
+    hasTiles ? tileSize : 1,
+    maxLights * 4
+  );
   const height = 2 + BLUE_NOISE_SIZE + 1
     + (hasAbsorption ? 1 : 0)
     + (hasScattering ? 1 : 0)
     + (hasTiles ? 1 : 0)         // row 69: tile indices
-    + (hasTiles ? numTiles * tileSize : 0); // tile block
+    + (hasTiles ? numTiles * tileSize : 0) // tile block
+    + 1;                         // the light table, always last
+  const lightRow = height - 1;
   const data = new Float32Array(width * height * 4);
   materials.forEach((mat, i) => {
     const o = i * 8;
@@ -1242,11 +1315,13 @@ function buildSceneDataTexture(materials, emissiveTris, absorption, scattering, 
       }
     }
   }
+  // The light table's own row is left zeroed here: syncLights() writes it (and
+  // is called at the end of every compileScene), which keeps ONE writer for it.
   const tex = new THREE.DataTexture(data, width, height, THREE.RGBAFormat, THREE.FloatType);
   tex.minFilter = THREE.NearestFilter;
   tex.magFilter = THREE.NearestFilter;
   tex.needsUpdate = true;
-  return tex;
+  return { tex, lightRow };
 }
 
 // Write the emissive power CDF (row 66 of the scene-data texture). Weight =
@@ -1400,6 +1475,11 @@ function buildLevel(geometries, { dynamic, stride2 = false }) {
 export function compileScene(scene, options = {}) {
   scene.updateMatrixWorld(true);
   const dynamicSet = options.dynamicMeshes ? new Set(options.dynamicMeshes) : null;
+  // Light-table capacity for THIS scene. Compile-time like textureTiles: the
+  // shaders bake it into a #define and the scene-data texture into its width, so
+  // it cannot change without a recompile. RealtimeRaytracer always injects its
+  // own instance value here, so the two can never disagree.
+  const maxLights = clampMaxLights(options.maxLights);
   // Texture tiles: when enabled, material maps are resampled to tiles on the
   // scene-data texture so secondary rays can sample per-texel colour at hit points.
   const tt = options.textureTiles;
@@ -1407,6 +1487,7 @@ export function compileScene(scene, options = {}) {
   const maxTiles = (tt && tt.max) || DEFAULT_MAX_TILES;
 
   const compiled = new CompiledScene();
+  compiled.maxLights = maxLights;
   const materials = compiled.materials;
   const staticGeoms = [];
   const dynamicGeoms = [];
@@ -1644,6 +1725,11 @@ export function compileScene(scene, options = {}) {
   s.merged.computeBoundingBox();
   const bb = s.merged.boundingBox;
   compiled.sceneDiagonal = bb.isEmpty() ? 1 : bb.min.distanceTo(bb.max);
+  if (!bb.isEmpty()) {
+    compiled.staticMin = [bb.min.x, bb.min.y, bb.min.z];
+    compiled.staticMax = [bb.max.x, bb.max.y, bb.max.z];
+  }
+  compiled.lightGrid = buildLightGrid(compiled.staticMin, compiled.staticMax, maxLights);
 
   if (emissiveTris.length > MAX_EMISSIVE_TRIS) {
     console.warn(
@@ -1690,13 +1776,16 @@ export function compileScene(scene, options = {}) {
   );
   compiled.hasTextureTiles = hasTiles;
   compiled._tileSize = tileSize; // for shader source injection
-  compiled.materialsTex = buildSceneDataTexture(
+  const sceneTex = buildSceneDataTexture(
     materials,
     emissiveTris,
     compiled.absorption,
     compiled.scattering,
-    hasTiles ? tileData : null
+    hasTiles ? tileData : null,
+    compiled.maxLights
   );
+  compiled.materialsTex = sceneTex.tex;
+  compiled.lightRow = sceneTex.lightRow;
   // World-space 3D-texture albedo opt-in (userData.rtVolumeAlbedo). Resolved from
   // the deduped material table so the recorded matIndex matches what the BVH
   // per-vertex attribute stores and the lighting pass reads.
@@ -1710,6 +1799,74 @@ export function compileScene(scene, options = {}) {
     if (g !== s.merged && g !== d.merged) g.dispose();
   }
   return compiled;
+}
+
+// Cells along the longest axis of the static world. 24 is a taste number with
+// one constraint behind it: a cell should be smaller than a room, because the
+// whole point of the grid is that a pixel's candidates come from ITS room.
+const LIGHT_GRID_TARGET = 24;
+const LIGHT_GRID_MAX_AXIS = 32;
+const LIGHT_GRID_MAX_CELLS = 8192;
+
+/**
+ * Uniform grid over the compiled scene's STATIC world AABB, used by the ReSTIR
+ * candidate sampler to draw from lights that matter to the pixel's own
+ * neighbourhood (see LightGridPass). Dynamic bounds are deliberately ignored:
+ * the grid indexes ANALYTIC lights, dynamic emissive triangles are not in it,
+ * and a grid whose extent moved every frame would invalidate itself every frame.
+ *
+ * Resolution: about `extent_max / 24` per side, at least 1 and at most 32 per
+ * axis, and the product is scaled back to LIGHT_GRID_MAX_CELLS if it overshoots
+ * (the grid texture is one ROW per cell, so cells are texture height).
+ */
+function buildLightGrid(min, max, maxLights = DEFAULT_MAX_LIGHTS) {
+  if (!min || !max) return null;
+  const ext = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+  const longest = Math.max(ext[0], ext[1], ext[2]);
+  if (!(longest > 0) || !Number.isFinite(longest)) return null;
+  const target = longest / LIGHT_GRID_TARGET;
+  let dims = ext.map((e) =>
+    Math.max(1, Math.min(LIGHT_GRID_MAX_AXIS, Math.round(e / target) || 1))
+  );
+  // CELL BUDGET. The build is one fragment per (seat, cell) and each fragment
+  // walks its row, so it costs cells x lights^2 and that is the only thing it
+  // costs. MEASURED on this machine (RTX 3060): 8000 cells x 128 lights rebuilt
+  // in 2.60 ms before the single-loop CDF and 1.28 ms after, i.e. about 1.0e8
+  // cell-light-light per millisecond. A rebuild happens whenever a light moves,
+  // so at 128 seats a flat 8192-cell grid would be a millisecond of every frame
+  // in a scene with a moving lamp. The cap is therefore a WORK budget — about
+  // half a millisecond at the instance's own maxLights — bounded below so a
+  // many-light scene still gets a usable grid, and it only bites on large
+  // cube-shaped scenes (a corridor's own resolution rule gives it 144).
+  const workCap = Math.max(512, Math.floor(5e7 / Math.max(1, maxLights * maxLights)));
+  const cellCap = Math.min(LIGHT_GRID_MAX_CELLS, workCap);
+  // Scale every axis by the same factor until the product fits. Uniform scaling
+  // keeps cells roughly cubic, which is what makes one distance test per cell a
+  // fair proxy for "how much does this light matter here".
+  let cells = dims[0] * dims[1] * dims[2];
+  while (cells > cellCap) {
+    const f = Math.cbrt(cellCap / cells);
+    const next = dims.map((d) => Math.max(1, Math.floor(d * f)));
+    if (next[0] === dims[0] && next[1] === dims[1] && next[2] === dims[2]) {
+      // f rounded to a no-op (already near the floor): step the longest axis.
+      const li = next.indexOf(Math.max(next[0], next[1], next[2]));
+      if (next[li] <= 1) break;
+      next[li] -= 1;
+    }
+    dims = next;
+    cells = dims[0] * dims[1] * dims[2];
+  }
+  // A hair of padding so a light or a surface sitting exactly on the AABB face
+  // still lands in a cell rather than falling out to the global row.
+  const pad = longest * 1e-3;
+  const origin = [min[0] - pad, min[1] - pad, min[2] - pad];
+  const size = [ext[0] + 2 * pad, ext[1] + 2 * pad, ext[2] + 2 * pad];
+  return {
+    origin,
+    cell: [size[0] / dims[0], size[1] / dims[1], size[2] / dims[2]],
+    dims,
+    cells,
+  };
 }
 
 /**
@@ -1738,8 +1895,8 @@ export function syncLights(scene, compiled) {
   // shadow ray at, so they can never be table rows. They are summed here into a
   // few numbers the lighting pass adds to the direct irradiance with NO ray and
   // no shadow. Accumulated in the SAME traversal as the analytic lights, and
-  // outside the slot machinery, because they take no slot — a scene with all 32
-  // slots full still has an ambient term. Reset first: this function is the only
+  // outside the slot machinery, because they take no slot — a scene with every
+  // seat full still has an ambient term. Reset first: this function is the only
   // writer and it is called on every updateLights.
   compiled.ambientColor.setRGB(0, 0, 0);
   compiled.hemiSky.setRGB(0, 0, 0);
@@ -1825,7 +1982,7 @@ export function syncLights(scene, compiled) {
   // 2. Seat the survivors first — every still-active light re-takes the slot it
   //    held last sync — then hand the freed slots to the newly active lights in
   //    traversal order. A survivor only keeps its slot when that slot still lies
-  //    within the COMPACT table (0..N-1, N = min(active, MAX_LIGHTS)): the
+  //    within the COMPACT table (0..N-1, N = min(active, maxLights)): the
   //    sampling paths draw candidate ids from 0..lightCount-1, so the table must
   //    stay hole-free. In the doorway case the active set barely shrinks (portal
   //    symmetry keeps the room you left lit), so nearly every survivor is under N
@@ -1833,8 +1990,9 @@ export function syncLights(scene, compiled) {
   //    re-light — re-seats the tail. With more active lights than slots, survivors
   //    are always kept and the overflow of new lights is dropped, so a surviving
   //    light deep in the traversal order no longer loses its slot to a newcomer.
-  const N = Math.min(active.length, MAX_LIGHTS);
-  const seat = new Array(MAX_LIGHTS).fill(null);
+  const cap = compiled.maxLights || DEFAULT_MAX_LIGHTS;
+  const N = Math.min(active.length, cap);
+  const seat = new Array(cap).fill(null);
   const seated = new Set();
   for (const a of active) {
     const old = slots.get(a.obj);
@@ -1857,27 +2015,139 @@ export function syncLights(scene, compiled) {
   colorRadius.length = 0;
   dirCone.length = 0;
   slots.clear();
+  // Seat bookkeeping for the table's `extra.x` generation counter.
+  if (!compiled._seatGen || compiled._seatGen.length !== cap) {
+    compiled._seatGen = new Float32Array(cap);
+    compiled._seatObj = new Array(cap).fill(null);
+  }
+  const seatGen = compiled._seatGen;
+  const seatObj = compiled._seatObj;
   let count = 0;
-  for (let i = 0; i < MAX_LIGHTS; i++) {
+  for (let i = 0; i < cap; i++) {
     const a = seat[i];
     if (a) {
       posType.push(a.pt[0], a.pt[1], a.pt[2], a.pt[3]);
       colorRadius.push(a.cr[0], a.cr[1], a.cr[2], a.cr[3]);
       dirCone.push(a.dc[0], a.dc[1], a.dc[2], a.dc[3]);
       slots.set(a.obj, i);
+      if (seatObj[i] !== a.obj) { seatObj[i] = a.obj; seatGen[i] += 1; }
       count++;
     } else {
       posType.push(0, 0, 0, 0);
       colorRadius.push(0, 0, 0, 0);
       dirCone.push(0, 0, 0, 0);
+      if (seatObj[i] !== null) { seatObj[i] = null; seatGen[i] += 1; }
     }
   }
 
   compiled.lightCount = count;
+  // How many seats hold a DIRECTIONAL light. The lighting pass's
+  // directional-only sweep (the bypass) is a loop over the whole table, and
+  // since 0.16.0 each iteration is a texel fetch rather than a uniform read —
+  // 96 fetches per pixel per frame in a scene with no sun at all. This lets that
+  // sweep return immediately. Measured on the hotel: it was most of a 5 ms
+  // regression between 32 and 96 lights.
+  let dirCount = 0;
+  for (let i = 0; i < count; i++) {
+    const w = posType[i * 4 + 3];
+    if (w >= 0.5 && w < 1.5) dirCount++;
+  }
+  compiled.directionalCount = dirCount;
+  writeLightRows(compiled);
   // Normalise the hemisphere axis once, after every vote is in. Zero length =
   // no hemisphere lights at all, and +Y keeps the shader's dot() well-defined.
   if (hemiUp.lengthSq() > 1e-12) hemiUp.normalize();
   else hemiUp.set(0, 1, 0);
 }
 
-export { MAX_LIGHTS };
+/**
+ * Mirror the compact light table into its row of the scene-data texture, and
+ * record whether anything actually changed (`compiled.lightsChanged`).
+ *
+ * The comparison is not an optimisation for its own sake: `updateLights` is the
+ * documented "call me whenever" entry point and demos call it every frame, while
+ * the light GRID build downstream is a real GPU cost. Comparing 4 floats per seat
+ * against what is already in the texture is how a still scene pays nothing.
+ */
+export function writeLightRows(compiled) {
+  const tex = compiled.materialsTex;
+  if (!tex || compiled.lightRow < 0) { compiled.lightsChanged = true; return; }
+  const data = tex.image.data;
+  const width = tex.image.width;
+  const cap = compiled.maxLights || DEFAULT_MAX_LIGHTS;
+  const base = compiled.lightRow * width * 4;
+  const pt = compiled.lightPosType;
+  const cr = compiled.lightColorRadius;
+  const dc = compiled.lightDirCone;
+  const gen = compiled._seatGen;
+  let changed = false;
+  // Math.fround, and this is not a nicety: the table arrays hold float64s and
+  // the texture holds float32s, so comparing the two directly reports a change
+  // for every light whose value is not exactly representable — i.e. almost
+  // always. Measured before the fround: a still 96-light scene rebuilt the light
+  // grid on all 100 frames of a capture.
+  const f32 = Math.fround;
+  for (let i = 0; i < cap; i++) {
+    const o = base + i * 16;
+    const s = i * 4;
+    for (let k = 0; k < 4; k++) {
+      const p = f32(pt[s + k]);
+      const c = f32(cr[s + k]);
+      const d = f32(dc[s + k]);
+      if (data[o + k] !== p) { data[o + k] = p; changed = true; }
+      if (data[o + 4 + k] !== c) { data[o + 4 + k] = c; changed = true; }
+      if (data[o + 8 + k] !== d) { data[o + 8 + k] = d; changed = true; }
+    }
+    const g = gen ? gen[i] : 0;
+    if (data[o + 12] !== g) { data[o + 12] = g; changed = true; }
+  }
+  compiled.lightsChanged = changed;
+}
+
+/**
+ * Upload the light table's row. Returns "sub" (partial upload), "full" (the
+ * whole scene-data texture was re-uploaded) or "none".
+ *
+ * WHY NOT JUST `needsUpdate = true`: three re-uploads the ENTIRE texture for
+ * that flag, and the scene-data texture carries the tile block — a 16-tile,
+ * 128px atlas is 2048 rows of RGBA32F, i.e. tens of megabytes per updateLights
+ * on a scene whose lights move every frame. The light row is 4 texels per light.
+ * Measured on this machine, both numbers are in dev/LIGHTS-0.16-REPORT.md.
+ *
+ * The raw call is guarded three ways: the texture must already exist on the GPU
+ * (otherwise the pending full upload includes our row anyway), the renderer must
+ * expose its WebGLState so three's texture-binding cache stays honest, and any
+ * throw falls back to the flag. Nothing here can leave the table stale.
+ */
+export function uploadLightRows(compiled, renderer) {
+  const tex = compiled.materialsTex;
+  if (!tex || compiled.lightRow < 0) return "none";
+  const props = renderer && renderer.properties ? renderer.properties.get(tex) : null;
+  const glTex = props ? props.__webglTexture : null;
+  const state = renderer ? renderer.state : null;
+  if (!glTex || !state || typeof state.bindTexture !== "function") {
+    tex.needsUpdate = true;
+    return "full";
+  }
+  try {
+    const gl = renderer.getContext();
+    const width = tex.image.width;
+    const cap = compiled.maxLights || DEFAULT_MAX_LIGHTS;
+    const texels = Math.min(width, cap * 4);
+    const start = compiled.lightRow * width * 4;
+    const rowData = tex.image.data.subarray(start, start + texels * 4);
+    state.bindTexture(gl.TEXTURE_2D, glTex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, tex.unpackAlignment || 1);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D, 0, 0, compiled.lightRow, texels, 1, gl.RGBA, gl.FLOAT, rowData
+    );
+    return "sub";
+  } catch (e) {
+    tex.needsUpdate = true;
+    return "full";
+  }
+}
+
+export { MAX_LIGHTS, DEFAULT_MAX_LIGHTS, MAX_LIGHTS_LIMIT, clampMaxLights };

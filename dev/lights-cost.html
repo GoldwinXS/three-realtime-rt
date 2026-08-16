@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>0.16.0 cost harness (interleaved master / branch)</title>
+    <style>
+      html, body { margin: 0; background: #0a0f16; color: #cfe0ea; font: 13px/1.6 ui-monospace, Consolas, monospace; }
+      body { padding: 18px; }
+      h1 { font-size: 15px; color: #7fd8c8; margin: 0 0 12px; }
+      #out { white-space: pre; background: #0e131a; border: 1px solid #26323c; border-radius: 8px; padding: 12px; overflow-x: auto; }
+      /* on-screen but out of the way: readPixels needs a real drawing buffer */
+      #app { position: fixed; left: -20000px; top: 0; }
+    </style>
+  </head>
+  <body>
+    <h1>three-realtime-rt 0.16.0 — cost, interleaved</h1>
+    <pre id="out">booting…</pre>
+    <div id="app"></div>
+    <script type="module" src="./lights-cost.js"></script>
+  </body>
+</html>

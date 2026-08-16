@@ -590,6 +590,10 @@ export function buildPanel({
     (v) => { rt.restirCandidateImportance = v; rt.resetAccumulation(); },
     "draw reservoir candidates by POWER (pool split, then that pool's CDF) instead of uniformly over lights + emissive triangles. Uniform spends ~91% of its candidates on the emissive pool, which carries ~4% of the light. Measured free.");
   restirSub(candT.row);
+  const gridT = featureToggle("restirLightGrid", "light grid", rt.restirLightGrid,
+    (v) => { rt.restirLightGrid = v; rt.resetAccumulation(); },
+    "draw the reservoir's LIGHT candidates from a per-cell grid over the scene instead of one global power CDF. With many lights a global CDF proposes lights behind walls: in a 96-light hotel corridor, about one candidate in thirty-two could reach the pixel at all. Two small GPU draws, rebuilt only when a light moves.");
+  restirSub(gridT.row);
   const clampRelS = sliderRow("relative cap", 0, 4, 0.5, rt.restirClampRel, (x) => (Number(x) === 0 ? "off" : Number(x).toFixed(1)),
     (v) => { rt.restirClampRel = v; rt.resetAccumulation(); },
     "firefly cap on the ReSTIR direct term as a MULTIPLE of the pixel's own reservoir estimate of the light total (0 = the old absolute cap alone). One sample carries the whole sum, so an absolute cap clips the peaks and nothing lifts the zeros: bright surfaces converge dark.");
@@ -604,7 +608,7 @@ export function buildPanel({
   restirSub(samplesS.row);
   const warmNote = el("div", "note");
   warmNote.textContent =
-    "these five are the reservoir being RIGHT rather than fast: four are on by " +
+    "these six are the reservoir being RIGHT rather than fast: five are on by " +
     "default and cost either nothing or one ray. “warm age” is the exception, " +
     "off because it is 2.2x the frame in motion.";
   laSec.append(warmNote);
@@ -853,7 +857,8 @@ export function buildPanel({
       "renderScale", "overscan", "denoise", "denoiseIterations", "taa",
       "ambient", "giHalfRate", "restirGI", "specular", "dispersion",
       "stochasticLights", "restirWarmAge", "restirDirectionalBypass",
-      "restirReprojectionRescue", "restirCandidateImportance", "restirClampRel",
+      "restirReprojectionRescue", "restirCandidateImportance", "restirLightGrid",
+      "restirClampRel",
       "restirSamples", "motionVectors", "maxHistory", "fireflyClamp",
       "outputMode", "costScale", "targetFps",
     ]) {
@@ -878,6 +883,7 @@ export function buildPanel({
     for (const [t, v] of [
       [ambientT, rt.ambient], [dirBypassT, rt.restirDirectionalBypass],
       [rescueT, rt.restirReprojectionRescue], [candT, rt.restirCandidateImportance],
+      [gridT, rt.restirLightGrid],
       [motionT, rt.motionVectors], [restirGiT, rt.restirGI], [halfRateT, rt.giHalfRate],
       [denoiseT, rt.denoise], [taaT, rt.taa], [volT, rt.volumetric.enabled],
       [fogT, rt.fog.enabled],
