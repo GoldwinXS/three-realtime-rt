@@ -238,16 +238,44 @@ void main() {
 }
 `;
 
+// A mesh explicitly marked as rtClearGlass is collision/gameplay geometry with
+// no optical surface. SceneCompiler omits it from both BVHs; the raster
+// G-buffer must omit the same mesh so the actual surface behind it owns depth,
+// motion, fog, and temporal guides.
+function isClearGlassMesh(mesh) {
+  const materials = mesh.material;
+  if (!Array.isArray(materials)) {
+    return !!(
+      materials && materials.userData && materials.userData.rtClearGlass === true
+    );
+  }
+  if (materials.length === 0) return false;
+  for (let i = 0; i < materials.length; i++) {
+    const material = materials[i];
+    if (!(material && material.userData && material.userData.rtClearGlass === true)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasCustomObjectCallbacks(object) {
+  return object.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender ||
+    object.onAfterRender !== THREE.Object3D.prototype.onAfterRender;
+}
+
 /**
  * Rasterizes the scene into a 4-target G-buffer (all RGBA32F):
  *   [0] albedo.rgb + roughness   [1] worldNormal.xyz + metalness
  *   [2] worldPos.xyz + validFlag [3] emissive.rgb
  *
- * Uses a per-mesh material swap (cached) so each mesh's Standard/Basic/Lambert/Phong
- * material properties flow into the buffer without touching user materials.
+ * Uses a pooled material swap by default so each mesh's Standard/Basic/Lambert/Phong
+ * material properties flow into the buffer without touching user materials. Meshes
+ * with custom Object3D render callbacks use the legacy per-mesh proxy path so their
+ * callback-visible material behavior remains unchanged.
  */
 export class GBufferPass {
-  constructor(width, height, { mixedPrecision = true } = {}) {
+  constructor(width, height, { mixedPrecision = true, materialPooling = true } = {}) {
     // Mixed fp16/fp32 attachments are legal WebGL2 but some implementations
     // (notably Apple's Metal backend) may reject the framebuffer — the caller
     // probes support and passes the verdict here.
@@ -256,6 +284,7 @@ export class GBufferPass {
     // normals are needed to validate reprojected history (stage 2).
     this._width = width;
     this._height = height;
+    this._materialPooling = materialPooling !== false;
     this._targets = [
       this._makeTarget(width, height),
       this._makeTarget(width, height),
@@ -263,9 +292,17 @@ export class GBufferPass {
     this._current = 0;
 
     this._materialCache = new WeakMap(); // mesh -> gbuffer ShaderMaterial
-    this._swapped = []; // [mesh, originalMaterial] pairs during render
+    this._sharedMaterialPool = new Map(); // `${vertexColors}:${side}` -> ShaderMaterial
+    this._sharedHiddenMaterial = null;
+    this._sharedSources = new WeakMap(); // mesh -> original material(s)
+    this._sharedMaterialArrays = new WeakMap();
+    // Flat alternating arrays avoid allocating a short pair array for every
+    // visible mesh on every G-buffer traversal.  Entries are [object, value]
+    // at indices [i, i + 1], restored in the finally block below.
+    this._swapped = [];
+    this._maskedLayers = [];
     this._hidden = []; // objects temporarily hidden for the G-buffer draw
-    this._normalMat3 = new THREE.Matrix3();
+    this._normalMat3 = new THREE.Matrix3(); // synchronous per-mesh scratch
     // World-space 3D-texture albedo: off unless a scene registers a material with
     // userData.rtVolumeAlbedo (see setVolume). When off, the gbuffer program is
     // compiled WITHOUT the RT_VOLUME_ALBEDO define — no sampler3D, byte-identical.
@@ -306,6 +343,12 @@ export class GBufferPass {
     return this._dummyVolumeTex;
   }
 
+  _resetSharedMaterialPool() {
+    for (const material of this._sharedMaterialPool.values()) material.dispose();
+    this._sharedMaterialPool.clear();
+    this._sharedMaterialArrays = new WeakMap();
+  }
+
   /**
    * Enable/disable the world-space 3D-texture albedo path for the primary
    * (G-buffer) visibility. Compiles the RT_VOLUME_ALBEDO define into the per-mesh
@@ -318,6 +361,7 @@ export class GBufferPass {
     if (on === this._volumeEnabled) return;
     this._volumeEnabled = on;
     this._materialCache = new WeakMap(); // force recompile with the new define
+    this._resetSharedMaterialPool();
   }
 
   /**
@@ -339,6 +383,7 @@ export class GBufferPass {
     ];
     this._current = 0;
     this._materialCache = new WeakMap(); // force recompile with the new define
+    this._resetSharedMaterialPool();
   }
 
   /**
@@ -482,15 +527,21 @@ export class GBufferPass {
     // color attribute. This drives three's USE_COLOR define (see gbufferVert), so
     // a mesh without one writes byte-identical albedo. The material cache is
     // per-mesh, so this per-mesh define variant is safe.
-    material.vertexColors = !!(mesh.geometry && mesh.geometry.getAttribute("color"));
+    material.vertexColors = !!(mesh && mesh.geometry && mesh.geometry.getAttribute("color"));
     return material;
   }
 
   // Sync properties from one user material into one gbuffer material (cheap; run
-  // every frame). `mesh` supplies the shared world normal matrix + side.
-  _syncGbufferMaterial(material, src, mesh) {
+  // every frame). The final three arguments are computed once per mesh lookup;
+  // passing them directly keeps the hot traversal allocation-free.
+  _syncGbufferMaterial(material, src, isDynamic, previousModel, normalMatrix, fixedSide = null) {
     const u = material.uniforms;
+    // Preserve Three's per-material visibility, including invisible entries in
+    // a multi-material mesh. The proxy replaces the source before render-list
+    // construction, so failing to mirror this flag would make hidden groups draw.
+    material.visible = src.visible !== false;
     if (src.color) u.uColor.value.copy(src.color);
+    else u.uColor.value.set(1, 1, 1);
     u.uRoughness.value = src.roughness ?? 1.0;
     u.uMetalness.value = src.metalness ?? 0.0;
     u.uTransmission.value = src.transmission ?? 0.0; // MeshPhysicalMaterial
@@ -502,7 +553,7 @@ export class GBufferPass {
       u.uEmissive.value
         .copy(src.emissive)
         .multiplyScalar(src.emissiveIntensity ?? 1);
-    }
+    } else u.uEmissive.value.set(0, 0, 0);
     u.uMap.value = src.map ?? null;
     u.uHasMap.value = !!src.map;
     u.uEmissiveMap.value = src.emissiveMap ?? null;
@@ -520,14 +571,13 @@ export class GBufferPass {
     // lighting pass. opacity 1 renders opaque, matching the old force-opaque path.
     u.uBlend.value = !!src.transparent;
     u.uOpacity.value = src.opacity ?? 1.0;
-    u.uIsDynamic.value = this._dynamicMeshes && this._dynamicMeshes.has(mesh) ? 1.0 : 0.0;
+    u.uIsDynamic.value = isDynamic ? 1.0 : 0.0;
     // Motion-vector inputs. Static meshes use their (constant) matrixWorld as
     // the previous model — identical to modelMatrix, so the motion vector
     // collapses to camera-only reprojection exactly. Dynamic meshes use the
     // previous frame's captured matrix (see setPrevModelMatrices).
     if (this._motionEnabled) {
-      const prev = this._prevModelMatrices ? this._prevModelMatrices.get(mesh) : null;
-      u.uPrevModelMatrix.value.copy(prev || mesh.matrixWorld);
+      u.uPrevModelMatrix.value.copy(previousModel);
       u.uPrevViewProj.value.copy(this._motionPrevViewProj);
     }
     // World-space 3D-texture albedo. Only meshes whose material opted in via
@@ -547,8 +597,11 @@ export class GBufferPass {
         u.uVolumeTex.value = this._dummyVolume();
       }
     }
-    u.uNormalMatrixWorld.value.getNormalMatrix(mesh.matrixWorld);
-    material.side = src.side ?? THREE.FrontSide;
+    u.uNormalMatrixWorld.value.copy(normalMatrix);
+    // Pooled materials are keyed by side. Keep that render state immutable for
+    // the whole render-list item even if user code mutates the source material
+    // during Object3D.onBeforeRender; legacy proxies retain the old live sync.
+    material.side = fixedSide === null ? (src.side ?? THREE.FrontSide) : fixedSide;
   }
 
   // Returns the gbuffer material(s) for a mesh: a single ShaderMaterial, or — for
@@ -556,6 +609,17 @@ export class GBufferPass {
   // of them, one per source material, index-aligned so three renders each group
   // with its own gbuffer material natively.
   _gbufferMaterialFor(mesh) {
+    const isDynamic = !!(this._dynamicMeshes && this._dynamicMeshes.has(mesh));
+    const previousModel = this._motionEnabled && this._prevModelMatrices
+      ? this._prevModelMatrices.get(mesh) || mesh.matrixWorld
+      : mesh.matrixWorld;
+    // Compute the inverse-transpose exactly once for this mesh invocation. The
+    // scratch is copied into every per-material uniform below, so no uniform
+    // Matrix3 instance is shared between multi-material groups.
+    const normalMatrix = this._normalMat3.getNormalMatrix(mesh.matrixWorld);
+    const vertexColors = !!(
+      mesh.geometry && mesh.geometry.getAttribute("color")
+    );
     if (Array.isArray(mesh.material)) {
       let cached = this._materialCache.get(mesh);
       if (!Array.isArray(cached) || cached.length !== mesh.material.length) {
@@ -563,7 +627,21 @@ export class GBufferPass {
         this._materialCache.set(mesh, cached);
       }
       for (let i = 0; i < mesh.material.length; i++) {
-        this._syncGbufferMaterial(cached[i], mesh.material[i], mesh);
+        const src = mesh.material[i];
+        // Three skips a group whose material slot is empty. Preserve the hole
+        // instead of trying to sync it as a ShaderMaterial.
+        if (!src) {
+          cached[i] = src;
+          continue;
+        }
+        if (!cached[i]) cached[i] = this._makeGbufferMaterial(mesh);
+        if (cached[i].vertexColors !== vertexColors) {
+          cached[i].vertexColors = vertexColors;
+          cached[i].needsUpdate = true;
+        }
+        this._syncGbufferMaterial(
+          cached[i], src, isDynamic, previousModel, normalMatrix
+        );
       }
       return cached;
     }
@@ -572,8 +650,84 @@ export class GBufferPass {
       material = this._makeGbufferMaterial(mesh);
       this._materialCache.set(mesh, material);
     }
-    this._syncGbufferMaterial(material, mesh.material, mesh);
+    if (material.vertexColors !== vertexColors) {
+      material.vertexColors = vertexColors;
+      material.needsUpdate = true;
+    }
+    this._syncGbufferMaterial(
+      material, mesh.material, isDynamic, previousModel, normalMatrix
+    );
     return material;
+  }
+
+  _makeSharedMaterial(vertexColors, side) {
+    const material = this._makeGbufferMaterial(null);
+    material.vertexColors = vertexColors;
+    material.side = side;
+    material.onBeforeRender = (_renderer, _scene, _camera, geometry, object, group) => {
+      const original = this._sharedSources.get(object);
+      const index = group && group.materialIndex !== undefined ? group.materialIndex : 0;
+      const src = Array.isArray(original) ? original[index] : original;
+      if (!src) return;
+      const isDynamic = !!(this._dynamicMeshes && this._dynamicMeshes.has(object));
+      const previousModel = this._motionEnabled && this._prevModelMatrices
+        ? this._prevModelMatrices.get(object) || object.matrixWorld
+        : object.matrixWorld;
+      const normalMatrix = this._normalMat3.getNormalMatrix(object.matrixWorld);
+      this._syncGbufferMaterial(
+        material,
+        src,
+        isDynamic,
+        previousModel,
+        normalMatrix,
+        side
+      );
+      // Keep the pool key's culling state immutable after source callbacks have
+      // run, and force three to upload this draw's source-material uniforms.
+      material.side = side;
+      material.uniformsNeedUpdate = true;
+    };
+    return material;
+  }
+
+  _sharedMaterialForSource(source, vertexColors) {
+    if (!source || source.visible === false) return this._sharedHiddenMaterial;
+    const side = source.side ?? THREE.FrontSide;
+    // Side and color presence are the only compile/render-list variants needed
+    // by this pass. Stringifying the numeric side also tolerates uncommon side
+    // values without assuming only FrontSide/BackSide/DoubleSide.
+    const key = `${vertexColors ? 1 : 0}:${String(side)}`;
+    let material = this._sharedMaterialPool.get(key);
+    if (!material) {
+      material = this._makeSharedMaterial(vertexColors, side);
+      this._sharedMaterialPool.set(key, material);
+    }
+    return material;
+  }
+
+  _sharedMaterialFor(mesh) {
+    if (!this._sharedHiddenMaterial) {
+      this._sharedHiddenMaterial = new THREE.MeshBasicMaterial({ visible: false });
+    }
+    const source = mesh.material;
+    const vertexColors = !!(
+      mesh.geometry && mesh.geometry.getAttribute("color")
+    );
+    if (!Array.isArray(source)) {
+      this._sharedSources.set(mesh, source);
+      return this._sharedMaterialForSource(source, vertexColors);
+    }
+    let cached = this._sharedMaterialArrays.get(mesh);
+    if (!Array.isArray(cached) || cached.length !== source.length) {
+      cached = new Array(source.length);
+      this._sharedMaterialArrays.set(mesh, cached);
+    }
+    this._sharedSources.set(mesh, source);
+    for (let i = 0; i < source.length; i++) {
+      const src = source[i];
+      cached[i] = src ? this._sharedMaterialForSource(src, vertexColors) : src;
+    }
+    return cached;
   }
 
   render(renderer, scene, camera) {
@@ -596,12 +750,19 @@ export class GBufferPass {
     // draw them yourself in an overlay pass on top of rt.render() if you need
     // them on screen. compileScene() warns once naming them.
     this._swapped.length = 0;
+    this._maskedLayers.length = 0;
     this._hidden.length = 0;
     scene.traverse((obj) => {
       if (!obj.visible) return;
       if (obj.isMesh && obj.geometry) {
-        this._swapped.push([obj, obj.material]);
-        obj.material = this._gbufferMaterialFor(obj);
+        if (isClearGlassMesh(obj)) {
+          this._maskedLayers.push(obj, obj.layers.mask);
+          obj.layers.mask = 0;
+          return;
+        }
+        this._swapped.push(obj, obj.material);
+        const usePool = this._materialPooling && !hasCustomObjectCallbacks(obj);
+        obj.material = usePool ? this._sharedMaterialFor(obj) : this._gbufferMaterialFor(obj);
         return;
       }
       if (obj.isSprite || obj.isLine || obj.isPoints) {
@@ -611,25 +772,36 @@ export class GBufferPass {
     });
 
     const prevBackground = scene.background;
-    scene.background = null; // background writes nothing; worldPos.w stays 0
-
-    renderer.setRenderTarget(this.target);
-    renderer.setClearColor(0x000000, 0);
-    renderer.clear(true, true, false);
-    renderer.render(scene, camera);
-    renderer.setRenderTarget(null);
-
-    scene.background = prevBackground;
-    for (const [mesh, mat] of this._swapped) mesh.material = mat;
-    this._swapped.length = 0;
-    // Restore visibility exactly once per object (each was pushed once, and only
-    // if it was visible when we hid it).
-    for (const obj of this._hidden) obj.visible = true;
-    this._hidden.length = 0;
+    let targetBound = false;
+    try {
+      scene.background = null; // background writes nothing; worldPos.w stays 0
+      renderer.setRenderTarget(this.target);
+      targetBound = true;
+      renderer.setClearColor(0x000000, 0);
+      renderer.clear(true, true, false);
+      renderer.render(scene, camera);
+    } finally {
+      if (targetBound) renderer.setRenderTarget(null);
+      scene.background = prevBackground;
+      for (let i = 0; i < this._swapped.length; i += 2) {
+        this._swapped[i].material = this._swapped[i + 1];
+      }
+      this._swapped.length = 0;
+      for (let i = 0; i < this._maskedLayers.length; i += 2) {
+        this._maskedLayers[i].layers.mask = this._maskedLayers[i + 1];
+      }
+      this._maskedLayers.length = 0;
+      // Restore visibility exactly once per object (each was pushed once, and only
+      // if it was visible when we hid it).
+      for (const obj of this._hidden) obj.visible = true;
+      this._hidden.length = 0;
+    }
   }
 
   dispose() {
     for (const t of this._targets) t.dispose();
     if (this._dummyVolumeTex) this._dummyVolumeTex.dispose();
+    this._resetSharedMaterialPool();
+    if (this._sharedHiddenMaterial) this._sharedHiddenMaterial.dispose();
   }
 }

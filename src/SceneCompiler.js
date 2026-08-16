@@ -65,6 +65,9 @@ export class CompiledScene {
     this.staticBvh = null;
     this.staticBvhUniform = new MeshBVHUniformStruct();
     this.staticAttrTex = new FloatVertexAttributeTexture();
+    // Meshes explicitly declared optically absent via rtClearGlass. They remain
+    // in the user's scene for collision/game logic but are not retained here.
+    this.clearGlassMeshCount = 0;
 
     // Dynamic level (re-baked/refit each frame).
     this.dynamicBvh = null;
@@ -93,6 +96,10 @@ export class CompiledScene {
 
     this.materialsTex = null;
     this.materials = [];
+    // True when at least one compiled material is traced as transmissive. This
+    // lets RTLightingPass omit the glass/refraction megakernel from opaque-only
+    // scenes without changing the runtime toggle for glass scenes.
+    this.hasTransmission = false;
     // World-space 3D-texture albedo (see collectVolumeAlbedo). null when no
     // material opted in via userData.rtVolumeAlbedo. v1 is single-volume: the
     // FIRST opted-in material wins for the traced-bounce path (the lighting
@@ -170,13 +177,25 @@ export class CompiledScene {
     // every re-bake writes normals at wrong offsets (the drag-corruption bug).
     const S = this.hasTextureTiles ? 8 : 4;
     const packed = this.dynamicPacked;
+    // Rigid-mover normals are uploaded only every eighth update, so computing
+    // and packing them on the seven intervening frames cannot affect GPU-visible
+    // output. Deforming/skinned geometry still refreshes the shared attribute
+    // texture every frame and therefore keeps every segment's normals current.
+    const uploadNormals =
+      this.hasDeforming || this.hasSkinned || this._normalFrame++ % 8 === 0;
     let minX = Infinity, minY = Infinity, minZ = Infinity;
     let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
 
     for (const seg of this.dynamic) {
       seg.mesh.updateWorldMatrix(true, false);
       const m = seg.mesh.matrixWorld.elements;
-      const nm = this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements;
+      // Skinned segments derive flat world-space normals from their freshly
+      // baked triangles below. Deforming segments always need the matrix;
+      // rigid segments need it only on an attribute-upload frame.
+      const nm =
+        seg.deforming || (!seg.skinned && uploadNormals)
+          ? this._m3.getNormalMatrix(seg.mesh.matrixWorld).elements
+          : null;
       let o = seg.start * 3;
       let p = seg.start * S;
 
@@ -257,14 +276,23 @@ export class CompiledScene {
             "BVH layout is fixed at compile time — call compileScene() again."
           );
         }
-        const sp = livePosAttr.array;
+        const directPos =
+          !livePosAttr.isInterleavedBufferAttribute &&
+          !livePosAttr.normalized && livePosAttr.itemSize === 3;
+        const sp = directPos ? livePosAttr.array : null;
         const snAttr = seg.liveGeometry.getAttribute("normal");
-        const sn = snAttr ? snAttr.array : null;
+        const directNormal = !!(
+          snAttr && !snAttr.isInterleavedBufferAttribute &&
+          !snAttr.normalized && snAttr.itemSize === 3
+        );
+        const sn = directNormal ? snAttr.array : null;
         const map = seg.indexMap; // null = identity (non-indexed source)
         const ln = seg.localNorm; // fallback if the app never recomputed normals
         for (let i = 0; i < seg.count; i++) {
           const sv = map ? map[i] : i;
-          const x = sp[sv * 3], y = sp[sv * 3 + 1], z = sp[sv * 3 + 2];
+          const x = directPos ? sp[sv * 3] : livePosAttr.getX(sv);
+          const y = directPos ? sp[sv * 3 + 1] : livePosAttr.getY(sv);
+          const z = directPos ? sp[sv * 3 + 2] : livePosAttr.getZ(sv);
           const wx = m[0] * x + m[4] * y + m[8] * z + m[12];
           const wy = m[1] * x + m[5] * y + m[9] * z + m[13];
           const wz = m[2] * x + m[6] * y + m[10] * z + m[14];
@@ -275,7 +303,11 @@ export class CompiledScene {
           if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
           if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
           let nx, ny, nz;
-          if (sn) { nx = sn[sv * 3]; ny = sn[sv * 3 + 1]; nz = sn[sv * 3 + 2]; }
+          if (snAttr) {
+            nx = directNormal ? sn[sv * 3] : snAttr.getX(sv);
+            ny = directNormal ? sn[sv * 3 + 1] : snAttr.getY(sv);
+            nz = directNormal ? sn[sv * 3 + 2] : snAttr.getZ(sv);
+          }
           else { nx = ln[i * 3]; ny = ln[i * 3 + 1]; nz = ln[i * 3 + 2]; }
           const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
           const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
@@ -303,14 +335,16 @@ export class CompiledScene {
           if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
           if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
           if (wz < minZ) minZ = wz; if (wz > maxZ) maxZ = wz;
-          const nx = ln[i * 3], ny = ln[i * 3 + 1], nz = ln[i * 3 + 2];
-          const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
-          const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
-          const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
-          const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
-          packed[p] = tx * il;
-          packed[p + 1] = ty * il;
-          packed[p + 2] = tz * il;
+          if (uploadNormals) {
+            const nx = ln[i * 3], ny = ln[i * 3 + 1], nz = ln[i * 3 + 2];
+            const tx = nm[0] * nx + nm[3] * ny + nm[6] * nz;
+            const ty = nm[1] * nx + nm[4] * ny + nm[7] * nz;
+            const tz = nm[2] * nx + nm[5] * ny + nm[8] * nz;
+            const il = 1.0 / (Math.hypot(tx, ty, tz) || 1);
+            packed[p] = tx * il;
+            packed[p + 1] = ty * il;
+            packed[p + 2] = tz * il;
+          }
           // matIndex (offset 3) and, at stride 8, the uv texel never change
           o += 3;
           p += S;
@@ -343,7 +377,7 @@ export class CompiledScene {
     // orientation) every frame, so their normals must go up every frame or the
     // shading lags the silhouette; one such segment forces the whole (shared)
     // upload.
-    if (this.hasDeforming || this.hasSkinned || this._normalFrame++ % 8 === 0) {
+    if (uploadNormals) {
       this.dynamicAttrTex.updateFrom(this.dynamicPackedAttr);
     }
 
@@ -421,10 +455,39 @@ export class CompiledScene {
     if (this.dynamicMerged) this.dynamicMerged.dispose();
     // Drop the staleness fingerprints (WeakRefs + a 16-float matrix each).
     this.staticSources = [];
+    this.clearGlassMeshCount = 0;
   }
 }
 
+function copyVec3Attribute(attribute, count = attribute.count) {
+  const out = new Float32Array(count * 3);
+  for (let i = 0; i < count; i++) {
+    const o = i * 3;
+    out[o] = attribute.getX(i);
+    out[o + 1] = attribute.getY(i);
+    out[o + 2] = attribute.getZ(i);
+  }
+  return out;
+}
+
+function copyVec2Attribute(attribute, count = attribute.count) {
+  const out = new Float32Array(count * 2);
+  for (let i = 0; i < count; i++) {
+    const o = i * 2;
+    out[o] = attribute.getX(i);
+    out[o + 1] = attribute.getY(i);
+  }
+  return out;
+}
+
 function extractMeshGeometry(mesh) {
+  // Compute missing normals on the indexed source BEFORE expanding it. Doing
+  // this after toNonIndexed() produces flat face normals in the de-indexed trace mesh,
+  // while the ordinary per-mesh G-buffer sees smooth shared-vertex normals on
+  // the original geometry.
+  if (!mesh.geometry.getAttribute("normal")) {
+    mesh.geometry.computeVertexNormals();
+  }
   const indexed = mesh.geometry.index;
   const src = indexed ? mesh.geometry.toNonIndexed() : mesh.geometry.clone();
 
@@ -435,24 +498,29 @@ function extractMeshGeometry(mesh) {
     // as normalize(vec3(0)) → NaN and the entire silhouette goes black.
     // computeVertexNormals on the original is a benign mutation: it only
     // fills in an attribute the geometry already should have carried.
-    if (!mesh.geometry.getAttribute("normal")) {
-      mesh.geometry.computeVertexNormals();
-    }
   }
-  const localPos = src.getAttribute("position").array.slice();
-  const localNorm = src.getAttribute("normal").array.slice();
+  // BufferAttribute.array is not necessarily tightly packed (interleaved
+  // attributes retain their parent stride), and normalized integer attributes
+  // need getX/Y/Z's de-normalisation. Pack explicitly so every downstream path
+  // sees the same contiguous float triples.
+  // A GL_TRIANGLES draw ignores one or two trailing vertices. Trim each source
+  // independently before any merge so tails can never combine across meshes in
+  // the trace BVH.
+  const rawCount = src.getAttribute("position").count;
+  const count = rawCount - (rawCount % 3);
+  const localPos = copyVec3Attribute(src.getAttribute("position"), count);
+  const localNorm = copyVec3Attribute(src.getAttribute("normal"), count);
 
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", src.getAttribute("position").clone());
-  geo.setAttribute("normal", src.getAttribute("normal").clone());
+  geo.setAttribute("position", new THREE.BufferAttribute(localPos.slice(), 3));
+  geo.setAttribute("normal", new THREE.BufferAttribute(localNorm.slice(), 3));
 
-  const count = src.getAttribute("position").count;
   // Preserve UVs for secondary-ray texture sampling (stride-2 attribute layout).
   // If the source geometry has no UV attribute, fill with zeros so mergeGeometries
   // does not drop a mismatched attribute across geometries.
   const hasUv = src.getAttribute("uv") !== undefined;
   if (hasUv) {
-    geo.setAttribute("uv", src.getAttribute("uv").clone());
+    geo.setAttribute("uv", new THREE.BufferAttribute(copyVec2Attribute(src.getAttribute("uv"), count), 2));
   } else {
     const zeroUv = new Float32Array(count * 2);
     geo.setAttribute("uv", new THREE.BufferAttribute(zeroUv, 2));
@@ -469,7 +537,7 @@ function extractMeshGeometry(mesh) {
   // buffer), or null when the source was already non-indexed (identity map).
   // `srcVertexCount` is the live position count at compile time — used to catch
   // a topology change that would invalidate this mapping.
-  const indexMap = indexed ? mesh.geometry.index.array.slice() : null;
+  const indexMap = indexed ? mesh.geometry.index.array.slice(0, count) : null;
   const srcVertexCount = mesh.geometry.getAttribute("position").count;
   return { geo, localPos, localNorm, count, indexMap, srcVertexCount };
 }
@@ -511,6 +579,33 @@ function resolveMeshMaterials(mesh, count, registerMaterial) {
     ranges.push({ start: 0, vcount: count, material: mat });
   }
   return { matIdx, ranges };
+}
+
+function validateClearGlassMaterial(mat) {
+  if (!(mat && mat.userData && mat.userData.rtClearGlass === true)) return;
+  const transmission = mat.transmission ?? 0;
+  const ior = mat.ior ?? 1.5;
+  const attenuation = mat.userData.rtAttenuation;
+  const scattering = mat.userData.rtScattering;
+  const ac = mat.attenuationColor;
+  const physicalAbsorption = Number.isFinite(mat.attenuationDistance) &&
+    mat.attenuationDistance > 0 && ac &&
+    (ac.r < 0.999999 || ac.g < 0.999999 || ac.b < 0.999999);
+  if (
+    mat.transparent || !Number.isFinite(transmission) || transmission < 0.99 ||
+    !Number.isFinite(ior) || Math.abs(ior - 1.0) >= 1e-4 ||
+    attenuation || scattering || physicalAbsorption
+  ) {
+    throw new Error(
+      "three-realtime-rt: userData.rtClearGlass is only for an optically absent " +
+      "single-surface pane: transparent must be false, transmission >= 0.99, " +
+      "ior = 1, and absorption/scattering must be unset."
+    );
+  }
+}
+
+function isClearGlassMaterial(mat) {
+  return !!(mat && mat.userData && mat.userData.rtClearGlass === true);
 }
 
 // Average-colour cache for emissive maps: texture -> [r,g,b] linear, or null when
@@ -840,6 +935,9 @@ function collectVolumeAlbedo(materials) {
 // treated as non-absorbing — exactly today's behaviour, as is setting nothing.
 function absorptionSigmaFor(mat, derivedScale = 0) {
   if (!mat) return null;
+  // Defensive even though clear sheets are omitted before material registration:
+  // collision-only geometry can never opt back into Beer absorption via colour.
+  if (mat.userData && mat.userData.rtClearGlass === true) return null;
   // Only glass surfaces ever have an in-medium path length to attenuate over
   // (the refracted entry-to-exit chord in RTLightingPass.glassRadiance), and the
   // shader identifies the medium by the material of the interface a refracted
@@ -988,6 +1086,7 @@ function collectAbsorption(materials, force = false, derivedScale = 0) {
 // error.
 function scatteringSigmaFor(mat) {
   if (!mat) return null;
+  if (mat.userData && mat.userData.rtClearGlass === true) return null;
   const ud = mat.userData && mat.userData.rtScattering;
   if (!ud) return null;
   // Same gate as absorption, for the same reason: the view and shadow marches
@@ -1429,10 +1528,16 @@ export function compileScene(scene, options = {}) {
   // can still be collected — the compiled scene must never keep it alive.
   const staticSources = [];
   const canTrack = typeof WeakRef === "function";
+  let clearGlassMeshCount = 0;
+  let hasTransmission = false;
 
   const registerMaterial = (m) => {
     let i = materials.indexOf(m);
-    if (i < 0) { i = materials.length; materials.push(m); }
+    if (i < 0) {
+      validateClearGlassMaterial(m);
+      i = materials.length;
+      materials.push(m);
+    }
     return i;
   };
 
@@ -1445,13 +1550,62 @@ export function compileScene(scene, options = {}) {
       diag["untraceable-object"].push(obj);
       return;
     }
-    if (!obj.isMesh || !obj.geometry || !obj.visible || obj.userData.rtExclude) return;
+    if (!obj.isMesh || !obj.geometry || !obj.visible) return;
+    const isArray = Array.isArray(obj.material);
+    const rep = isArray ? obj.material[0] : obj.material;
+    const meshMaterials = isArray ? obj.material : [rep];
+    const clearCount = meshMaterials.reduce(
+      (count, material) => count + (isClearGlassMaterial(material) ? 1 : 0),
+      0
+    );
+    if (clearCount > 0) {
+      // rtClearGlass is stronger than ordinary transmission: it declares this
+      // mesh to be collision/gameplay geometry with no optical surface at all.
+      // Keeping it out of BOTH BVHs makes direct shadows and secondary rays pass
+      // straight through; GBufferPass omits the same all-clear mesh so primary
+      // visibility, fog depth, motion history, and ray cost also match an absent
+      // pane. A mixed material array cannot satisfy that mesh-wide contract.
+      for (const material of meshMaterials) validateClearGlassMaterial(material);
+      if (clearCount !== meshMaterials.length) {
+        throw new Error(
+          "three-realtime-rt: a mesh cannot mix userData.rtClearGlass with " +
+          "ordinary materials. Split the optically absent pane into its own mesh."
+        );
+      }
+      if (dynamicSet && dynamicSet.has(obj)) {
+        throw new Error(
+          "three-realtime-rt: an rtClearGlass mesh is optically absent and must " +
+          "not be listed in dynamicMeshes. Keep updating it in your collision/game " +
+          "system, but remove it from the ray-tracing dynamic set."
+        );
+      }
+      if (
+        obj.onBeforeRender !== THREE.Object3D.prototype.onBeforeRender ||
+        obj.onAfterRender !== THREE.Object3D.prototype.onAfterRender
+      ) {
+        throw new Error(
+          "three-realtime-rt: an rtClearGlass mesh is never submitted for rendering, " +
+          "so it cannot use onBeforeRender/onAfterRender callbacks. Move that logic " +
+          "to the game loop or use ordinary transmissive glass."
+        );
+      }
+      clearGlassMeshCount++;
+      return;
+    }
+    // rtExclude omits a mesh from the trace BVH, not from primary visibility.
+    // Its G-buffer material can still be glass, so it must keep the refraction
+    // shader variant alive even though it never enters the material table.
+    if (meshMaterials.some(
+      (material) => material && !material.transparent &&
+        (material.transmission ?? 0) > 0.001
+    )) {
+      hasTransmission = true;
+    }
+    if (obj.userData.rtExclude) return;
     // An InstancedMesh is traversed as ONE mesh: its per-instance matrices are a
     // GPU attribute the compiler never reads, so every instance past the first
     // silently vanishes from the traced world (and from the G-buffer).
     if (obj.isInstancedMesh) diag["instanced-mesh"].push(obj);
-    const isArray = Array.isArray(obj.material);
-    const rep = isArray ? obj.material[0] : obj.material;
     // Transparent surfaces must not act as opaque occluders — e.g.
     // LittlestTokyo's glass display case (texture-alpha, opacity 1) would put
     // the whole model in shadow. Alpha-textured glass can't be cheaply tested,
@@ -1600,7 +1754,8 @@ export function compileScene(scene, options = {}) {
   compiled.warnings = warnings;
   compiled.staticSources = staticSources;
 
-  if (staticGeoms.length === 0 && dynamicGeoms.length === 0) {
+  compiled.clearGlassMeshCount = clearGlassMeshCount;
+  if (staticGeoms.length === 0 && dynamicGeoms.length === 0 && clearGlassMeshCount === 0) {
     throw new Error("three-realtime-rt: no meshes found in scene");
   }
 
@@ -1622,7 +1777,6 @@ export function compileScene(scene, options = {}) {
   compiled.staticBvh = s.bvh;
   compiled.staticBvhUniform.updateFrom(s.bvh);
   compiled.staticAttrTex.updateFrom(s.attr);
-
   // Dynamic level.
   compiled.hasDynamic = dynamicGeoms.length > 0;
   const d = buildLevel(dynamicGeoms, { dynamic: true, stride2 });
@@ -1634,7 +1788,7 @@ export function compileScene(scene, options = {}) {
   compiled.dynamicAttrTex.updateFrom(d.attr);
 
   compiled.triangleCount =
-    (s.merged.getAttribute("position").count +
+    ((staticGeoms.length > 0 ? s.merged.getAttribute("position").count : 0) +
       (compiled.hasDynamic ? d.merged.getAttribute("position").count : 0)) / 3;
 
   // World-space extent of the static level. Used to auto-scale the ray offset
@@ -1643,7 +1797,9 @@ export function compileScene(scene, options = {}) {
   // micro-geometry and the scene renders black.
   s.merged.computeBoundingBox();
   const bb = s.merged.boundingBox;
-  compiled.sceneDiagonal = bb.isEmpty() ? 1 : bb.min.distanceTo(bb.max);
+  compiled.sceneDiagonal = staticGeoms.length === 0 || bb.isEmpty()
+    ? 1
+    : bb.min.distanceTo(bb.max);
 
   if (emissiveTris.length > MAX_EMISSIVE_TRIS) {
     console.warn(
@@ -1683,6 +1839,7 @@ export function compileScene(scene, options = {}) {
   // nothing absorbs — the two-flux code reads K from row 67 and the glass flag
   // from its .w, and row 68 is addressed relative to it.
   compiled.scattering = collectScattering(materials);
+  compiled.hasTransmission = hasTransmission;
   compiled.absorption = collectAbsorption(
     materials,
     !!(compiled.scattering || hasTiles),

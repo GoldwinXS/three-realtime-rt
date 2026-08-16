@@ -14,21 +14,14 @@
  *      monotonicity/boundedness over a wide parameter sweep (the property that
  *      actually catches a broken guard).
  *
- *   2. BYTE IDENTITY. The zero-cost-when-unused contract. RTLightingPass builds
- *      its shader variants by SOURCE SPLICE, so the three pre-existing variants
- *      (plain / absorption / absorption + coloured shadows) must come out of the
- *      feature branch byte-for-byte identical to the ones master produces. This
- *      compares SHA-256 over each variant's source against the same variant built
- *      from `git show master:src/RTLightingPass.js`, which is the strongest form
- *      of the claim: not "the diff looks additive" but "the bytes are the same".
+ *   2. SOURCE-SPLICE INVARIANTS. The zero-cost-when-unused contract. RTLightingPass
+ *      builds its shader variants by stripping marked line spans from the current
+ *      source. The cached ladder must match those strips exactly, including the
+ *      required innermost-to-outermost order for nested markers.
  *
  * Exit code 0 = all gates pass. Any failure prints the offending numbers and
  * exits 1, so this is CI-shaped.
  */
-import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -45,6 +38,10 @@ import {
   kmStackRGB,
   coefficientFromColorDistance,
 } from "../src/kubelkaMunk.js";
+import {
+  BVH_ANY_HIT_GLSL,
+  BVH_ANY_HIT_FAST_GLSL,
+} from "../src/bvhAnyHit.glsl.js";
 
 let failures = 0;
 const results = [];
@@ -307,13 +304,30 @@ console.log("\nKubelka-Munk reference numerics");
 }
 
 // ---------------------------------------------------------------------------
-// 2. BYTE IDENTITY OF THE PRE-EXISTING SHADER VARIANTS
+// 2. SOURCE-SPLICE INVARIANTS OF THE SHADER VARIANTS
 // ---------------------------------------------------------------------------
-console.log("\nShader-source byte identity vs master");
+console.log("\nShader-source marker stripping invariants");
 
-const sha = (s) => createHash("sha256").update(s, "utf8").digest("hex");
+// Keep this in lockstep with RTLightingPass.stripMarked. The helper is private
+// there, so reproducing its deliberately simple line semantics here lets this
+// self-test validate the current source without relying on a historical branch
+// snapshot (which may legitimately differ in unrelated shader code).
+function stripMarked(src, tag) {
+  const lines = src.split("\n");
+  const out = [];
+  let drop = false;
+  for (const line of lines) {
+    if (line.includes(">>> " + tag)) { drop = true; continue; }
+    if (line.includes("<<< " + tag)) { drop = false; continue; }
+    if (!drop) out.push(line);
+  }
+  return out.join("\n");
+}
 
-async function variantHashes(modulePath) {
+const markerTags = ["RT_ABSORPTION", "RT_ABSORB_SHADOWS", "RT_KM", "RT_REFRACTION"];
+const marker = (tag, side) => `// ${side} ${tag}`;
+
+async function variantSources(modulePath) {
   const { RTLightingPass } = await import(pathToFileURL(modulePath).href);
   // Constructing the pass is pure CPU work (render targets and ShaderMaterials
   // are plain objects until a renderer touches them), so this runs headless.
@@ -328,53 +342,101 @@ async function variantHashes(modulePath) {
   return out;
 }
 
-let identityOk = true;
+let spliceOk = true;
 try {
   const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..");
-  const masterSrc = execFileSync("git", ["show", "master:src/RTLightingPass.js"], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    maxBuffer: 32 * 1024 * 1024,
-  });
-  // Master's module has to resolve its own sibling imports, so it is written into
-  // src/ under a scratch name rather than into the OS temp directory.
-  const scratch = path.join(repoRoot, "src", `.master-RTLightingPass.${process.pid}.mjs`);
-  writeFileSync(scratch, masterSrc);
-  let masterVariants;
-  try {
-    masterVariants = await variantHashes(scratch);
-  } finally {
-    rmSync(scratch, { force: true });
-  }
-  const branchVariants = await variantHashes(path.join(repoRoot, "src", "RTLightingPass.js"));
+  const branchVariants = await variantSources(path.join(repoRoot, "src", "RTLightingPass.js"));
 
-  for (const key of ["plain", "absorption", "absorbShadows"]) {
-    const m = masterVariants[key];
-    const b = branchVariants[key];
-    const ok = m === b;
-    if (!ok) identityOk = false;
+  const km = branchVariants.km;
+  const absorbShadows = branchVariants.absorbShadows;
+  const absorption = branchVariants.absorption;
+  const plain = branchVariants.plain;
+  check(
+    "full variant contains all source-splice markers",
+    Boolean(km) && markerTags.every((tag) => km.includes(marker(tag, ">>>")) && km.includes(marker(tag, "<<<")))
+  );
+  const ladder = [
+    ["RT_KM", km, absorbShadows, "absorbShadows"],
+    ["RT_ABSORB_SHADOWS", absorbShadows, absorption, "absorption"],
+    ["RT_ABSORPTION", absorption, plain, "plain"],
+  ];
+  for (const [tag, source, expected, variant] of ladder) {
+    const stripped = stripMarked(source, tag);
+    const ok = stripped === expected && !stripped.includes(marker(tag, ">>>")) && !stripped.includes(marker(tag, "<<<"));
+    if (!ok) spliceOk = false;
     check(
-      `variant "${key}" byte-identical to master`,
+      `variant "${variant}" equals current source stripped of ${tag}`,
       ok,
-      `${b.length} B sha ${sha(b).slice(0, 8)} vs master ${m.length} B sha ${sha(m).slice(0, 8)}`
+      `${source.length} B -> ${stripped.length} B`
     );
   }
-  if (branchVariants.km) {
-    const km = branchVariants.km;
-    check(
-      'variant "km" is a strict superset (present, larger, strips back cleanly)',
-      km.length > branchVariants.absorbShadows.length,
-      `${km.length} B sha ${sha(km).slice(0, 8)}`
-    );
-  }
+  check(
+    "nested marker strips are ordered innermost-to-outermost",
+    Boolean(km) && stripMarked(stripMarked(stripMarked(km, "RT_KM"), "RT_ABSORB_SHADOWS"), "RT_ABSORPTION") === plain,
+    `${km ? km.length : 0} B full -> ${plain.length} B plain`
+  );
+  const noTransmission = stripMarked(plain, "RT_REFRACTION");
+  check(
+    "opaque-only variant strips glass/refraction code",
+    !noTransmission.includes("glassRadiance") &&
+      !noTransmission.includes("uRefrEnabled") &&
+      !noTransmission.includes("uGlassPrimarySkip") &&
+      !noTransmission.includes("RT_REFRACTION")
+  );
+  check(
+    "full variant keeps exact full-transmission primary-lighting gate",
+    km.includes("uniform bool uGlassPrimarySkip;") &&
+      km.includes("skipGlassPrimary = uGlassPrimarySkip && uRefrEnabled && transmission == 1.0") &&
+      km.includes("if (!skipGlassPrimary) {") &&
+      km.includes("if (!skipGlassPrimary && uReflEnabled && metal > 0.001)")
+  );
+  check(
+    "opaque variant keeps a false gate base without refraction references",
+    noTransmission.includes("bool skipGlassPrimary = false;") &&
+      !noTransmission.includes("uGlassPrimarySkip")
+  );
+  const pass = await import(pathToFileURL(path.join(repoRoot, "src", "RTLightingPass.js")).href)
+    .then(({ RTLightingPass }) => new RTLightingPass(2, 2));
+  pass._transmissionData = false;
+  pass._applyAbsorptionSplice();
+  check(
+    "opaque-only runtime splice applies to the material",
+    !pass.material.fragmentShader.includes("glassRadiance") &&
+      !pass.material.fragmentShader.includes("uRefrEnabled")
+  );
+  pass._transmissionData = true;
+  pass._kmData = false;
+  pass._kmOn = false;
+  pass._syncGlassPrimarySkip();
+  check(
+    "transmission scenes enable the exact gate by default",
+    pass.material.uniforms.uGlassPrimarySkip.value === true
+  );
+  pass._kmData = true;
+  pass._kmOn = true;
+  pass._syncGlassPrimarySkip();
+  check(
+    "KM scenes disable the exact gate",
+    pass.material.uniforms.uGlassPrimarySkip.value === false
+  );
 } catch (err) {
-  identityOk = false;
-  check("byte-identity harness ran", false, String(err && err.message ? err.message : err));
+  spliceOk = false;
+  check("source-splice harness ran", false, String(err && err.message ? err.message : err));
 }
 
-// Silence the unused-binding lint for the diagnostic flag while keeping it in the
-// summary below.
-void identityOk;
+// Silence the unused-binding lint while retaining a diagnostic flag for this gate.
+void spliceOk;
+
+console.log("\nTraversal-source instrumentation invariants");
+check(
+  "instrumented any-hit source retains one cost declaration and increment",
+  BVH_ANY_HIT_GLSL.split("int gBvhVisits = 0;").length - 1 === 1 &&
+    BVH_ANY_HIT_GLSL.split("gBvhVisits ++;").length - 1 === 1
+);
+check(
+  "fast any-hit source removes all cost-counter references",
+  !BVH_ANY_HIT_FAST_GLSL.includes("gBvhVisits")
+);
 
 console.log(
   `\n${failures === 0 ? "OK" : "FAILED"} — ${results.length - failures}/${results.length} checks passed`

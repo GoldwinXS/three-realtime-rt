@@ -17,8 +17,14 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "npm run test:km && npm run test:clear-glass && npm run test:geometry && npm run test:motion && npm run test:gbuffer-pooling && npm run test:glass-primary-skip",
     "test:render": "node scripts/selftest.mjs",
     "test:km": "node scripts/km-selftest.mjs",
+    "test:clear-glass": "node scripts/clear-glass-selftest.mjs",
+    "test:geometry": "node scripts/geometry-selftest.mjs",
+    "test:motion": "node scripts/motion-vectors-selftest.mjs",
+    "test:gbuffer-pooling": "node scripts/gbuffer-material-pooling-selftest.mjs",
+    "test:glass-primary-skip": "node scripts/glass-primary-skip-selftest.mjs",
     "deploy": "vite build && gh-pages -d dist -t"
   },
   "keywords": [

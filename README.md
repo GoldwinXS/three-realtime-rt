@@ -155,6 +155,36 @@ A checklist for dropping the tracer into a scene you already have:
 
 That's the whole integration. Everything below is optional.
 
+### Optically absent collision panes
+
+Some games need a window mesh for collision or interaction, but want the pane
+to have no optical interface at all. Mark that material explicitly:
+
+```js
+const paneMaterial = new THREE.MeshPhysicalMaterial({
+  transmission: 1,
+  ior: 1,
+  transparent: false,
+});
+paneMaterial.userData.rtClearGlass = true;
+
+rt.compileScene(scene);
+```
+
+`rtClearGlass` is a strict contract, not a quality hint. The material must have
+`transmission >= 0.99`, `ior: 1`, no alpha transparency, and no absorption or
+scattering. The compiler validates those values. An all-clear mesh is omitted
+from both trace BVHs and the G-buffer, so it casts no shadow, launches no glass
+rays, writes no misleading depth or motion history, and is visually identical
+to geometry that is not there. The original mesh remains in your scene for your
+own collision, picking, or gameplay code.
+
+Do not mix clear and ordinary materials on one mesh, list a clear pane in
+`dynamicMeshes`, or depend on its `onBeforeRender` / `onAfterRender` callbacks;
+those cases throw with a concrete fix. Ordinary transmissive glass—including
+canopies, bottles, and tinted solid glass—keeps the normal reflection/refraction
+path. Recompile after adding, removing, or changing the flag.
+
 ---
 
 ## Why "hybrid deferred" (the "RTX on" model)
@@ -479,7 +509,7 @@ kmReflectance(6, 20, 0.004, 0.85);   // 4 mm of it over an 85%-reflective backin
 
 The honest caveat is that `kmScattering: true` compiles a **superset** of coloured shadows — the two-flux transmittance is evaluated inside that very march — so if you are coming from a scene with `absorptionShadows: false`, turning scattering on hands you the [coloured-shadow cost](#coloured-shadows-absorptionshadows) (+7.6 ms / +19.9 ms here) along with it. That is the number to budget against; the scattering arithmetic itself is free.
 
-**Zero cost when unused, provably.** With `kmScattering: false`, or with no material carrying `userData.rtScattering`, the marked lines are stripped and the lighting megakernel's source is **byte-identical** to the 0.9.0 build — SHA-256 checked against a `master` checkout by `npm run test:km`, which also runs 23 numeric checks on the analytic reference (the `S → 0` degrade to Beer-Lambert, the `t → ∞` approach to `R_inf` from both sides, the `coth` guard at tiny `b·S·t`, channel independence, a 1344-case finiteness sweep, and the equivalence of the closed form with the forward composition).
+**Zero cost when unused, checked.** With `kmScattering: false`, or with no material carrying `userData.rtScattering`, the marked KM lines are stripped from the lighting megakernel. `npm run test:km` verifies that every cached current-source variant exactly matches those ordered marker removals, and also runs 23 numeric checks on the analytic reference (the `S → 0` degrade to Beer-Lambert, the `t → ∞` approach to `R_inf` from both sides, the `coth` guard at tiny `b·S·t`, channel independence, a 1344-case finiteness sweep, and the equivalence of the closed form with the forward composition).
 
 Validation rig: [`scattering.html`](scattering.html) renders pigments of known K and S and divides by a white Lambert patch under the same directional light — which cancels exposure and units exactly — then compares against the CPU reference. A 10/20/40/80/160 mm slab staircase agrees within **1.5%**, and a sphere probed centre-to-rim within **1–8%**, with the thickness taken from the geometry rather than authored anywhere.
 
@@ -561,11 +591,11 @@ const rt = new RealtimeRaytracer(renderer, {
 
 Primary visibility is rasterized into a G-buffer, so **whatever three.js draws,
 you still see** — the ray tracer computes only the *lighting*, reading a
-deliberately small, fixed slice of the material and light model. The one place
-the G-buffer diverges from a plain three.js draw is transparency: it is a
-**single-layer deferred blend** (see the `transparent` row below and the
-Rendering-model notes), not three.js's per-fragment sorted over-blend. This is
-the honest map of what actually feeds the traced lighting.
+deliberately small, fixed slice of the material and light model. The deliberate
+G-buffer exceptions are transparency—a **single-layer deferred blend**, not
+three.js's per-fragment sorted over-blend—and explicit `rtClearGlass`, whose
+whole contract is to be optically absent. See the material rows and rendering
+notes below for the exact behaviour.
 
 ### Materials
 
@@ -582,7 +612,8 @@ material of a group* row).
 | `metalness` | ✅ | Metallic pixels trace a reflection ray whose analytic-light glints are shadowed; `F0 = mix(0.04, albedo, metalness)`. |
 | `emissive` | ✅ | A *static* emissive mesh becomes a real **area light** (NEE) — casts soft light + shadows, including a GGX highlight. |
 | `emissiveMap` | ✅ average-colour approximation | A map-masked emissive **glows on screen** with its full per-pixel pattern (G-buffer, untouched) **and now also casts light**: the CPU averages the map (`avg(map) × emissive × emissiveIntensity`) and feeds that single colour into the NEE area-light table. Needs a non-black `emissive` (white keeps the cast hue equal to the map average) and a readable image (a CORS-tainted / not-yet-decoded map falls back to visible-only, with a one-time `console.info`). A map that averages to **near-black** (e.g. a model's mostly-dark emissiveMap with a few tiny glowing texels) casts nothing — treated as visible-only so it doesn't flood the NEE list with a whole high-poly mesh. Texel-accurate (spatially-varying) emission is future work. |
-| `transmission` (Physical) | ✅ | Glass: Fresnel reflection (with analytic-light glints) + two-interface refraction. |
+| `transmission` (Physical) | ✅ | Glass: Fresnel reflection (with analytic-light glints) + two-interface refraction. For fully transmissive pixels, the renderer automatically skips primary direct/GI work whose composition weight is exactly zero; the glass path is unchanged. The optimization stays off for Kubelka-Munk materials, which reuse that irradiance. |
+| `userData.rtClearGlass` | ✅ explicit omission | Declares an all-clear mesh to be **optically absent collision/gameplay geometry**. Requires `transparent: false`, `transmission >= 0.99`, `ior: 1`, and no absorption/scattering; invalid or mixed-material uses throw. The mesh remains in the Three.js scene but is omitted from both trace BVHs and the G-buffer, independent of the `refraction` toggle. See *[Optically absent collision panes](#optically-absent-collision-panes)*. |
 | `transparent` + `opacity` | ✅ | Alpha blend: the surface is composited over the geometry behind it (a straight-through traced ray), weighted by scalar `opacity` and **tinted by `color`/`map`**. The behind-radiance rides the **specular buffer** and the opacity blend happens at **composite** (where the pane's albedo lives), so **needs `specular: true`** — with the specular buffer off, blend surfaces degrade to opaque. Single layer — nearest transparent surface wins, overlapping panes don't inter-sort. Kept out of the BVH, so it casts no shadow. Toggle with `transparency`. |
 | `opacity` on an opaque material | ❌ | Only read when `transparent: true`; an opaque material always writes at full coverage. |
 | `alphaMap` | ❌ | There is **no per-pixel opacity route**: opacity is a **scalar per material**, packed into the material word the lighting pass reads. An `alphaMap` is ignored — a mesh carrying one blends at its uniform `opacity` (see the `transparent` + `opacity` row, the supported path), so a partly-cut-out texture reads as an evenly translucent surface. For hard cut-outs use `alphaTest` (`transparent: false`), which occludes as full triangles. |
@@ -597,6 +628,11 @@ material of a group* row).
 | `userData.rtScattering` *(unreleased)* | ✅ | **Kubelka-Munk scattering** — translucent SOLIDS (jade, wax, marble, foliage, lampshades) rather than tinted glass. Absorption alone only ever removes light, so a pigmented translucent body lit from the front is black murk; a scattering coefficient sends light back out, and the two-flux closed form turns (K, S, thickness) into both a reflectance and a transmittance. The thickness is **measured per view ray through the real geometry** — no authored thickness map, so a sphere thins correctly toward its silhouette and a deforming body stays right. Opt in on a translucent material (`transmission > 0`, `transparent: false`, white `color`) with `userData.rtScattering = { coefficient }` (S in 1/world-unit) or `{ color, distance }` (the same derivation as absorption); **K is the material's existing attenuation**, so colour is stated once. Needs `rt.kmScattering` (default off) and `refraction: true`. Costs **exactly nothing when unused** (byte-identical program). **Limits:** no lateral bleed — this is 1-D transport along the ray, light leaves where it entered, so it is not subsurface scattering; no in-scattering into shadow rays; `R` is used as a diffuse albedo under `N·L` (the standard approximation); ONE medium along the view path (stacks compose correctly along shadow rays); bodies thinner than ~`2 × rt.eps` cannot resolve an exit face. Showcase: the museum's **"scattering (Kubelka-Munk)"** toggle (the "Alabaster" reading lamp and the absorb-vs-scatter sphere pair); validation rig: [`scattering.html`](scattering.html). See *[Scattering](#scattering--translucent-solids-kmscattering)*. |
 | per-material `ior` | ✅ | `MeshPhysicalMaterial.ior` refracts per material, encoded in the packed material word for fully-transmissive glass. Supported range **[1.0, 1.98]** (values clamp; the tight ceiling keeps the packed word clear of the alpha-blend boundary). `rt.ior` is the global fallback (partial-transmission glass + the default); **`material.ior` wins when present**. |
 | 2nd+ material of a group | ✅ | Each group material of a multi-material mesh (`mesh.material` array + `geometry.groups`) is registered separately in the G-buffer **and** the BVH, with per-vertex material indices; emissive group materials also join the NEE area-light list. **Limits:** opaque groups only (a transparent group throws — split it out); not supported on a mesh that is **both** listed in `dynamicMeshes` **and** flagged `userData.rtDeforming` — that combination is what the per-frame live-geometry rebake can't express, and it throws. (`rtDeforming` *without* `dynamicMeshes` membership is inert: the flag is ignored, the mesh compiles static, and the library warns — see *[Supported object types](#supported-object-types)*.) |
+
+For full-transmission glass, the lighting pass automatically elides the primary
+direct-lighting, inline-GI, and dielectric-specular work that the glass
+composition discards. Partial transmission, transparency, refraction-off, and
+Kubelka–Munk materials keep their normal lighting path.
 
 ### Lights
 
@@ -637,6 +673,7 @@ naming the object (see *[Diagnostics](#diagnostics-statuswarnings)*).
 | `InstancedMesh` | ❌ | **Instancing is not supported.** The per-instance matrices are a GPU attribute the compiler never reads, so it **collapses to a single instance** in the traced output *and* in the G-buffer. Warns (`instanced-mesh`). Expand it to individual meshes, or exclude it with `userData.rtExclude`. |
 | `Sprite` / `Line` / `LineSegments` / `Points` | — | Not traceable geometry, and their materials write a single `gl_FragColor`, which cannot feed the 4-attachment G-buffer. They are **automatically hidden for the traced frame** (and restored right after), so they simply do not appear. Warns (`untraceable-object`). Draw them yourself in an **overlay pass on top of `rt.render()`**, or set `userData.rtExclude` on them to silence the warning. |
 | `userData.rtExclude` | ✅ honored | Keeps a mesh out of the BVH entirely — it still rasterizes into the G-buffer and gets lit, it just never occludes or bounces light. Also suppresses the warnings above, so it is the way to say "yes, I meant that". |
+| material `userData.rtClearGlass` | collision/gameplay only | Keeps the mesh in the user's scene but omits it from **both** BVHs and the G-buffer. It is not submitted by `rt.render()` and launches no glass rays. |
 | `Group` / `Object3D` / `Bone` | ✅ | Pure transform nodes; traversed for their mesh children. |
 
 ### Geometry & occlusion
@@ -644,6 +681,7 @@ naming the object (see *[Diagnostics](#diagnostics-statuswarnings)*).
 - Every non-excluded visible mesh is **merged into one static BVH at compile time**. Add / remove geometry → recompile.
 - Meshes that move must be declared via `dynamicMeshes` and driven with `updateDynamic()`. Anything not declared is treated as static — moving it on screen won't move its traced shadow. The library **detects this and warns** (`stale-transform` / `stale-geometry`); see *[Diagnostics](#diagnostics-statuswarnings)*.
 - **Transparent materials never occlude** (by design — a glass case shouldn't cast an opaque shadow). They still rasterize normally.
+- **`material.userData.rtClearGlass = true` is fully optically absent**: it neither occludes nor rasterizes in the traced frame. The mesh remains available to application collision/picking code.
 - **Refractive glass occludes fully — unless it absorbs.** A `transmission > 0` material is in the BVH and blocks shadow rays like any solid, *except* when it carries a Beer-Lambert &sigma; and `rt.absorptionShadows` is on: then shadow rays through it are **attenuated per channel** instead of blocked. See *[Coloured shadows](#coloured-shadows-absorptionshadows)*.
 - **`alphaTest` cut-outs** (`transparent: false`) *do* occlude — but as **full triangles**, not per-texel, so their shadows are blocky.
 - `mesh.userData.rtExclude = true` removes a mesh from the BVH entirely (it still rasterizes and gets lit) — handy for water / translucent surfaces.
@@ -731,7 +769,8 @@ than by taste.
 | `restirSamples` | `1` *(new in 0.15.0)* | Reservoir winners shaded per pixel, each with its own visibility ray, averaged (`2`–`4` add 1–3 neighbouring pixels' winners; the spatial stage already wrote them, so only the extra shadow ray is paid for). Estimator noise 16.81 → 11.13 from 1 to 4 — real, but **sub-`1/√N`**, because neighbouring reservoirs were merged from overlapping taps one stage earlier. Through the shipped denoiser the win mostly disappears, so this is a lever for a weaker denoiser or a machine with headroom. |
 | `restirSampleRadius` | `10` *(new in 0.15.0)* | Neighbour-tap radius ceiling for `restirSamples > 1`, in lighting-res texels. Larger taps decorrelate the extra samples more but fail validation more often. |
 | `restirDynamicAccept` / `restirDynamicFreeze` | `false` / `false` *(new in 0.15.0)* | Two treatments for pixels on a **moving mesh**, whose reprojected history is rejected every frame. `Accept` skips the surface test and offers the co-located previous reservoir as a candidate (a wrong one loses on weight); `Freeze` stops a dynamic pixel overwriting the history the background behind it will need. Both work at the mechanism level (reservoir M on the mover 17.97 → 23.14, starved pixels 38% → 5%) and **neither moved the visible noise**, because the shimmer there is dominated by the irradiance EMA. Off, because a change with no measured visible benefit should not be on. |
-| `motionVectors` | `true` *(new in 0.15.0)* | Reproject temporal history through each fragment's **previous screen position** (a fifth `RG32F` G-buffer attachment) instead of through the camera alone. Camera-only reprojection is correct for static geometry and simply wrong for a moving mesh, whose points occupied different world space last frame. Residual on a moving mesh **5.39 → 4.70** mean, **8.69 → 6.57** p95. Consumed by the irradiance EMA and the ReSTIR reservoir; **TAA deliberately does not** (it measured as a clear regression on its own). For a static mesh the vector collapses exactly to camera-only reprojection, so a static scene renders byte-identically either way. Needs ≥ 5 draw buffers (WebGL2 guarantees 4); without them the option is ignored with a one-time warning — check `rt.motionVectorsSupported`. |
+| `motionVectors` | `true` *(new in 0.15.0)* | Reproject temporal history through each fragment's **previous screen position** (a fifth `RG32F` G-buffer attachment) instead of through the camera alone. Camera-only reprojection is correct for static geometry and simply wrong for a moving mesh, whose points occupied different world space last frame. Residual on a moving mesh **5.39 → 4.70** mean, **8.69 → 6.57** p95. Consumed by the irradiance EMA and the ReSTIR reservoir; **TAA deliberately does not** (it measured as a clear regression on its own). The extra attachment is enabled only when the compiled scene has traceable `dynamicMeshes`; a fully static scene automatically uses the equivalent camera-only path and avoids that bandwidth. Needs ≥ 5 draw buffers (WebGL2 guarantees 4); without them the option is ignored with a one-time warning — check `rt.motionVectorsSupported`. |
+| `gbufferMaterialPooling` | `true` *(constructor-only)* | Internal G-buffer draw-state optimization: reuses a small pool of proxy `ShaderMaterial`s keyed by geometry vertex-color presence and culling side, reducing per-mesh material churn. Meshes with custom `onBeforeRender`/`onAfterRender` callbacks automatically use the legacy per-mesh proxy path. Set `false` for diagnostics or unusual integrations. |
 | `gpuTiming` | `"auto"` *(new in 0.15.0)* | GPU-cost timing for the governor (`EXT_disjoint_timer_query_webgl2`). It is what makes the quality ladder **two-way**: wall-clock frame time is pinned to the display's refresh period by vsync, so it can prove a frame is too slow but never that there is headroom to spend. `false` forces the speculative-probe fallback used where the extension is withheld (Safari, iOS). Read `rt.gpuCostMs`, `rt.gpuTimingSupported`, `rt.gpuTimingActive`. |
 | `stochasticLights` | `false` *(was `true` before 0.15.0)* | One direct shadow ray per pixel per frame (random source) instead of one per light. It only ever applies when **ReSTIR is off**, and ReSTIR is the cheap many-light path and is on by default — so what the old default actually did was redefine `restir: false` to mean *one random light per pixel*, the noisiest estimator here, rather than the exact per-light loop. Off, `restir: false` is the exact path, which is what a reference is for. The governor still turns it on when it needs the rays back. |
 | `temporalReprojection` | `true` | Keep samples across camera/object motion. |

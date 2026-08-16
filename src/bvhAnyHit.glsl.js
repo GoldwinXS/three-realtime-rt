@@ -127,3 +127,12 @@ bool bvhIntersectAnyHit( BVH bvh, vec3 rayOrigin, vec3 rayDirection, float maxDi
 
 }
 `;
+
+// Most passes only need the traversal result. Keep the instrumented source for
+// RTLightingPass's opt-in cost heatmap, but compile the normal GI/volumetric
+// programs without an otherwise-unobserved integer write at every visited node.
+// The replacements are intentionally exact and scripts/km-selftest.mjs asserts
+// that no counter reference survives, so formatting drift fails the test.
+export const BVH_ANY_HIT_FAST_GLSL = BVH_ANY_HIT_GLSL
+	.replace("\nint gBvhVisits = 0;\n", "\n")
+	.replace("\n\t\tgBvhVisits ++;\n", "\n");

@@ -872,7 +872,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     );
     this._volumeUnitWarned = false;
 
-    this.gbuffer = new GBufferPass(this._width, this._height, { mixedPrecision });
+    this.gbuffer = new GBufferPass(this._width, this._height, {
+      mixedPrecision,
+      materialPooling: options.gbufferMaterialPooling ?? true,
+    });
     this.rtPass = new RTLightingPass(this._scaledW, this._scaledH, {
       specMRT: this.specMRTSupported,
     });
@@ -3097,20 +3100,40 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
   // _motionTaa` (measurement isolation) and the live `motionVectors` toggle both
   // take effect.
   _syncMotionVectors() {
-    const want = !!(this.motionVectors && this.motionVectorsSupported);
+    // Motion vectors only improve reprojection for geometry whose model/vertex
+    // position changed. On an entirely static compiled scene they reduce exactly
+    // to the existing camera-only path, while still making the G-buffer write a
+    // fifth full-resolution RG32F attachment and run the previous-position math
+    // for every vertex/fragment. Keep that bandwidth for scenes that can use it.
+    // A later compile that introduces/removes dynamic geometry flips this state
+    // on the next render through the existing transition/reset path below.
+    const want = !!(
+      this.motionVectors &&
+      this.motionVectorsSupported &&
+      this.compiled?.hasDynamic
+    );
     if (want !== this._motionVectorsActive) {
       this._motionVectorsActive = want;
       this.gbuffer.setMotionVectors(want);
       if (!want) this._prevModelMatrices.clear();
       this.resetAccumulation();
-      if (this.motionVectors && !this.motionVectorsSupported && !this._motionWarned) {
-        this._motionWarned = true;
-        console.warn(
-          "three-realtime-rt: motionVectors requested but this GPU lacks the " +
-            "5-attachment motion MRT (needs MAX_DRAW_BUFFERS >= 5) — falling back " +
-            "to camera-only reprojection."
-        );
-      }
+    }
+    // `_motionVectorsActive` starts false, so an unsupported GPU also computes
+    // `want === false` on its first frame. Keep the warning outside the state-
+    // transition branch or that common case can never report the fallback.
+    // Static scenes do not need the extra attachment, so stay quiet for them.
+    if (
+      this.motionVectors &&
+      this.compiled?.hasDynamic &&
+      !this.motionVectorsSupported &&
+      !this._motionWarned
+    ) {
+      this._motionWarned = true;
+      console.warn(
+        "three-realtime-rt: motionVectors requested but this GPU lacks the " +
+          "5-attachment motion MRT (needs MAX_DRAW_BUFFERS >= 5) — falling back " +
+          "to camera-only reprojection."
+      );
     }
     if (this._motionVectorsActive) {
       this.gbuffer.setPrevModelMatrices(this._prevModelMatrices);

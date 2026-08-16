@@ -66,10 +66,13 @@ uniform int uLightCount;
 uniform int uEmissiveCount; // NEE area-light triangles in row 1 of uMaterialsTex
 uniform bool uEmissiveCDF;  // importance-sample tris by the power CDF (row 66)
 uniform bool uReflEnabled;  // traced reflections on metallic surfaces
+// >>> RT_REFRACTION
 uniform bool uRefrEnabled;  // traced refraction on transmissive surfaces
-uniform bool uBlendEnabled; // straight-through view continuation on blend surfaces
+uniform bool uGlassPrimarySkip; // exact full-transmission primary-lighting elision
 uniform float uIor;         // index of refraction for transmissive materials
 uniform float uDispersion;  // chromatic dispersion strength for glass (0 = off)
+// <<< RT_REFRACTION
+uniform bool uBlendEnabled; // straight-through view continuation on blend surfaces
 uniform bool uLightStochastic; // 1 direct shadow ray/pixel/frame instead of 1/light
 uniform bool uRestirEnabled;   // shade the reservoir winner instead of sampling
 // >>> RT_RESTIR_MULTISAMPLE
@@ -1164,6 +1167,7 @@ vec3 analyticGlint(vec3 P, vec3 refl) {
   return sum;
 }
 
+// >>> RT_REFRACTION
 // Glass: Fresnel-weighted blend of a surface reflection and a two-interface
 // refraction (enter at P, march to the exit surface, refract again).
 //
@@ -1352,6 +1356,7 @@ vec3 glassRadiance(vec3 P, vec3 N, vec3 V, float rough, float ior) {
   if (uGlassClampScale > 0.0 && glassLum > glassCap) glass *= glassCap / glassLum;
   return glass;
 }
+// <<< RT_REFRACTION
 
 // Compact cold->hot ramp for the BVH-cost heatmap. Piecewise mix of five
 // anchors (deep blue -> green -> yellow -> red -> white) over four equal
@@ -1398,10 +1403,20 @@ void main() {
   float transmission = (matW >= 2.0 && matW < 4.0) ? clamp(matW - 2.0, 0.0, 1.0) : 0.0;
   float metal = matW < 2.0 ? matW : 0.0;
   float rough = clamp(wp.w - 1.0, 0.0, 1.0);
+  // Exact full-transmission pixels discard the primary diffuse/direct result
+  // below when glass is enabled. The CPU-side gate is forced off for RT_KM
+  // variants, which need the normal direct irradiance for their reflected term;
+  // the equality intentionally leaves partial glass and blends on the old path.
+  bool skipGlassPrimary = false;
+// >>> RT_REFRACTION
+  skipGlassPrimary = uGlassPrimarySkip && uRefrEnabled && transmission == 1.0;
+// <<< RT_REFRACTION
   // Per-material IOR rides the [3,4) glass sub-band (full-transmission glass, see
   // GBufferPass). Below 3 (partial glass) or non-glass, fall back to the global
   // rt.ior uniform. material.ior wins whenever it was encoded. (Task 2)
+// >>> RT_REFRACTION
   float ior = (matW >= 3.0 && matW < 4.0) ? (1.0 + (matW - 3.0)) : uIor;
+// <<< RT_REFRACTION
 
   // Cook-Torrance specular state for this primary surface. gWantSpec gates the
   // GGX term to PRIMARY direct lighting only (GI-bounce direct light, below,
@@ -1409,7 +1424,7 @@ void main() {
   gSpec = vec3(0.0);
   gViewDir = normalize(uCameraPos - P);
   gSpecRough = rough;
-  gWantSpec = true;
+  gWantSpec = !skipGlassPrimary;
 
 // >>> RT_KM
   // A global with no initializer is undefined in GLSL until written; this is the
@@ -1421,6 +1436,11 @@ void main() {
   // read once at the end when uCostView is on (see the cost-heatmap branch).
   gBvhVisits = 0;
 
+  vec3 direct = vec3(0.0);
+  vec3 indirect = vec3(0.0);
+  vec3 blendBehind = vec3(0.0);
+
+  if (!skipGlassPrimary) {
   // --- direct lighting ---
   // ReSTIR: shade the reservoir's winner with one visibility ray (flat cost in
   // light count). Stochastic: one blind random sample. Full: one shadow ray
@@ -1459,7 +1479,7 @@ void main() {
   bool useStochastic = !uRestirEnabled && uLightStochastic;
   bool useExact = !useReservoir && !useStochastic;
   int lightMode = useExact ? 0 : (uDirBypass ? 1 : 2);
-  vec3 direct = shadeLightSet(P, N, lightMode);
+  direct = shadeLightSet(P, N, lightMode);
   if (useReservoir) {
     direct += shadeReservoir(P, N);
   } else if (useStochastic) {
@@ -1499,8 +1519,6 @@ void main() {
   // translation silently emits a broken program at a FOURTH inlined call site
   // (clean compile, black output on every iOS browser) — bisected live on an
   // iPad, 2026-07-22. Never add a call site; extend this one.
-  vec3 indirect = vec3(0.0);
-  vec3 blendBehind = vec3(0.0);
   bool wantBehind = uBlendEnabled && blend;
   // uExternalGI (experimental ReSTIR GI): the GIReservoirPass supplies the
   // bounce, so the inline GI ray is skipped — but the blend continuation is
@@ -1524,11 +1542,12 @@ void main() {
   // slightly biased). Applied to indirect only; direct is analytic.
   float lum = dot(indirect, vec3(0.299, 0.587, 0.114));
   if (lum > uFireflyClamp) indirect *= uFireflyClamp / lum;
+  }
 
   vec3 sampleIrr = direct + indirect;
 
   // --- traced specular: mirror/glossy reflections on metals ---
-  if (uReflEnabled && metal > 0.001) {
+  if (!skipGlassPrimary && uReflEnabled && metal > 0.001) {
     vec3 V = normalize(P - uCameraPos);
     vec3 refl = glossyReflect(V, N, rough);
     if (dot(refl, N) > 0.0) {
@@ -1541,11 +1560,13 @@ void main() {
     }
   }
 
+// >>> RT_REFRACTION
   // --- traced glass: Fresnel reflection + two-interface refraction ---
   if (uRefrEnabled && transmission > 0.001) {
     vec3 V = normalize(P - uCameraPos);
     sampleIrr = mix(sampleIrr, glassRadiance(P, N, V, rough, ior), transmission);
   }
+// <<< RT_REFRACTION
 // >>> RT_KM
   // KUBELKA-MUNK. glassRadiance set these when it measured this pixel's chord
   // through a scattering body (see the note there); a scattering body is not a
@@ -1882,6 +1903,7 @@ export class RTLightingPass {
     // Texture tiles: analogous to KM — needs both scene data (hasTextureTiles on
     // the compiled scene) and the caller's opt-in (textureTiles option not false).
     this._tilesData = false;
+    this._transmissionData = false;
     this._tilesOn = false;
 
     this.material = new THREE.ShaderMaterial({
@@ -1939,6 +1961,7 @@ export class RTLightingPass {
         uEmissiveCDF: { value: true },
         uReflEnabled: { value: true },
         uRefrEnabled: { value: true },
+        uGlassPrimarySkip: { value: false },
         uBlendEnabled: { value: true },
         uIor: { value: 1.5 },
         uDispersion: { value: 0 },
@@ -2163,6 +2186,8 @@ export class RTLightingPass {
     // layout. Recorded before the splice so the _applyAbsorptionSplice call knows
     // whether to keep the RT_TEXTURE_TILES blocks.
     this._tilesData = !!compiled.hasTextureTiles;
+    this._transmissionData = !!compiled.hasTransmission;
+    this._syncGlassPrimarySkip();
     this._tileSize = compiled._tileSize || 128;
     this.setAbsorption(!!compiled.absorption);
   }
@@ -2219,7 +2244,17 @@ export class RTLightingPass {
    */
   setKmScattering(on) {
     this._kmOn = !!on;
+    this._syncGlassPrimarySkip();
     this._applyAbsorptionSplice();
+  }
+
+  _syncGlassPrimarySkip() {
+    // Enable the exact optimization for transmissive scenes unless the active
+    // settings select the RT_KM shader variant. The pixel shader still gates it
+    // by refraction being enabled and by decoded transmission being exactly 1.
+    this.material.uniforms.uGlassPrimarySkip.value = !!(
+      this._transmissionData && !(this._kmOn && this._kmData)
+    );
   }
 
   _applyAbsorptionSplice() {
@@ -2242,6 +2277,10 @@ export class RTLightingPass {
       // value so texelFetch coordinates match the CPU-side tile layout.
       src = src.replace("#define TILE 128.0", `#define TILE ${this._tileSize}.0`);
     }
+    // Opaque-only scenes never execute the glass branch. Strip it at compile
+    // time to reduce shader source/register pressure; transmission scenes keep
+    // the complete path and all runtime refraction controls unchanged.
+    if (!this._transmissionData) src = stripMarked(src, "RT_REFRACTION");
     this.material.uniforms.uHasTextureTiles.value = !!(this._tilesOn && this._tilesData);
     if (this.material.fragmentShader === src) return;
     this.material.fragmentShader = src;

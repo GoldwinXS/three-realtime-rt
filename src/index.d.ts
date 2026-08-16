@@ -650,19 +650,28 @@ export interface RealtimeRaytracerOptions {
    * Motion vectors for temporal reprojection (DEFAULT `true` since 0.15.0;
    * `false` restores the pre-0.15 camera-only reprojection). The G-buffer
    * writes each fragment's previous screen position into a fifth RG32F
-   * attachment, and the irradiance EMA, the ReSTIR reservoir, and the TAA
-   * resolve look up history at that position instead of reprojecting the
-   * CURRENT world position through the previous view-projection. That
+   * attachment, and the irradiance EMA and ReSTIR reservoir look up history at
+   * that position instead of reprojecting the CURRENT world position through
+   * the previous view-projection. TAA deliberately stays on camera-only
+   * reprojection because consuming object vectors measured as a regression. That
    * camera-only reprojection is wrong for MOVING meshes (a point on them
    * occupied different world space last frame, so its history is rejected every
-   * frame) and correct for static geometry — for a static mesh the motion vector
-   * collapses exactly to camera-only reprojection, so a static scene renders
-   * byte-identically on or off. Rigid transforms only; deforming/skinned meshes
+   * frame) and correct for static geometry. The fifth attachment is therefore
+   * enabled only when the compiled scene has traceable `dynamicMeshes`; a fully
+   * static scene automatically uses the equivalent camera-only path. Rigid
+   * transforms only; deforming/skinned meshes
    * still use a rigid previous matrix (they need per-vertex history, which is
    * out of scope). Requires a GPU with >= 5 draw buffers (WebGL2 guarantees only
    * 4); on a device without one the option is ignored with a one-time warning.
    */
   motionVectors?: boolean;
+  /**
+   * Pool the internal G-buffer draw materials by vertex-color presence and
+   * culling side (default `true`). This is an internal draw-state optimization;
+   * meshes with custom Object3D render callbacks automatically use the legacy
+   * per-mesh proxy path. Set `false` for diagnostics or unusual integrations.
+   */
+  gbufferMaterialPooling?: boolean;
   /**
    * Temporal anti-aliasing: sub-pixel projection jitter + a full-res history
    * resolve with neighbourhood clamp.
@@ -834,6 +843,13 @@ export interface CompileSceneOptions {
 export class CompiledScene {
   /** Total triangle count across the static and dynamic levels. */
   triangleCount: number;
+  /** Optically absent rtClearGlass meshes omitted from both BVHs and the G-buffer. */
+  clearGlassMeshCount: number;
+  /**
+   * True when any primary-visible material needs the traced refraction shader,
+   * including materials on `rtExclude` meshes that are absent from the BVH.
+   */
+  hasTransmission: boolean;
   /** Number of lights scanned into the compiled light tables. */
   lightCount: number;
   /**

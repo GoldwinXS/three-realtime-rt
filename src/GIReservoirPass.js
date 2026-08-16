@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS } from "./SceneCompiler.js";
 import { SKY_GLSL } from "./sky.glsl.js";
-import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
+import { BVH_ANY_HIT_FAST_GLSL } from "./bvhAnyHit.glsl.js";
 import { makeMRT } from "./mrtCompat.js";
 
 const fullscreenVert = /* glsl */ `
@@ -34,7 +34,7 @@ precision highp usampler2D;
 
 ${shaderStructs}
 ${shaderIntersectFunction}
-${BVH_ANY_HIT_GLSL}
+${BVH_ANY_HIT_FAST_GLSL}
 ${SKY_GLSL}
 
 #define MAX_LIGHTS ${MAX_LIGHTS}

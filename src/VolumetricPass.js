@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS } from "./SceneCompiler.js";
-import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
+import { BVH_ANY_HIT_FAST_GLSL } from "./bvhAnyHit.glsl.js";
 
 // Must match MAX_FOG_ZONES in the fragment shader.
 const MAX_FOG_ZONES = 8;
@@ -27,7 +27,7 @@ precision highp usampler2D;
 
 ${shaderStructs}
 ${shaderIntersectFunction}
-${BVH_ANY_HIT_GLSL}
+${BVH_ANY_HIT_FAST_GLSL}
 
 #define MAX_LIGHTS ${MAX_LIGHTS}
 #define PI 3.14159265358979
