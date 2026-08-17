@@ -1,4 +1,4 @@
-import{R as Je}from"./RealtimeRaytracer-R6uT4GRh.js";const Ze="0.16.2",et=`
+import{R as Je}from"./RealtimeRaytracer-BqsaZYSk.js";const Ze="0.16.7",et=`
 :root { --panel-bg: rgba(14,18,24,0.95); --panel-br: #26323c; --ink: #d7e0e6;
   --ink-dim: #97aab9; --accent: #38d0e0; --accent-2: #7ee787; }
 * { box-sizing: border-box; }
