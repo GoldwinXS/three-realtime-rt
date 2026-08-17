@@ -941,6 +941,23 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * composite consumes.
      */
     this._denoiserPlugin = null;
+    /**
+     * A-trous iterations run on the plugin's OUTPUT irradiance (0.16.4). 0 (the
+     * default) runs nothing and the plugin path is byte-identical to 0.16.3; N
+     * runs the same DenoisePass the built-in pipeline uses, N times, after the
+     * plugin, as a spatial post-filter for a network that still flickers or
+     * leaves residual noise. Live: assign at any time.
+     */
+    this.denoiserPluginPostIterations = options.denoiserPluginPostIterations ?? 0;
+    /**
+     * Temporal smoothing of the plugin's OUTPUT (0.16.4): frames of reprojected
+     * exponential history blended over the network's irradiance (the same
+     * AccumulatePass the built-in pipeline runs on RAW samples, here run on the
+     * network's clean-but-flickering frames), before the spatial post passes.
+     * 0 (default) = off, byte-identical; 4-16 = a young network's flicker
+     * settles at the cost of a little lag on moving lights.
+     */
+    this.denoiserPluginPostHistory = options.denoiserPluginPostHistory ?? 0;
     /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular, 7 bvh cost */
     this.outputMode = 0;
     /**
@@ -1269,6 +1286,22 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * capable hardware instead of being stuck low.
      */
     this.adaptiveQuality = options.adaptiveQuality ?? true;
+    /**
+     * renderScaleMax (0.16.5): the CEILING the adaptive governor may climb to,
+     * 0.2..1 (default 1 = unchanged behaviour). A phone or tablet GPU that
+     * finds headroom otherwise walks renderScale up rung by rung, and every
+     * rung reallocates every pass at the bigger size; on iOS Safari that
+     * memory spike is what loses the WebGL context minutes into a session
+     * (Hangar, 2026-08-17: flat texture/geometry counts, then a loss). The
+     * app pins the ceiling instead of turning the governor off, so the
+     * governor still steps DOWN freely. Live-assignable; lowering it below
+     * the current scale clamps the scale on the next frame.
+     */
+    this.renderScaleMax = Math.min(1, Math.max(0.2, options.renderScaleMax ?? 1));
+    /** 0.16.6: the governor's FLOOR (0.2 default; a plugin's preferences may raise it). */
+    this.renderScaleMin = Math.min(this.renderScaleMax, Math.max(0.2, options.renderScaleMin ?? 0.2));
+    this._pluginRan = false;
+    if (this._renderScale > this.renderScaleMax) this._renderScale = this.renderScaleMax;
     /** Frame-rate target for the adaptive governor. */
     this.targetFps = options.targetFps ?? 55;
     /**
@@ -2452,6 +2485,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       }
     }
     this._denoiserPlugin = plugin || null;
+    this._pluginRan = false;
     if (!this.supported) return;
     if (this._denoiserPlugin) {
       // Size it to the CURRENT lighting resolution before its first frame: a
@@ -2459,9 +2493,56 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       // the wrong texels for one frame.
       this._denoiserPlugin.setSize(this._scaledW, this._scaledH);
       this._denoiserPlugin.resetHistory();
+      // 0.16.6: plugin PREFERENCES for the adaptive governor (NeuralRT's
+      // LIBRARY-HOOKS.md hook 2: "plugin advertises, engine decides, game passes
+      // through"). Plain data: { renderScale: { min, max, preferred } }. min/max
+      // become the governor's bounds (never wider than the app's own
+      // renderScaleMax); preferred is where the scale starts if it lies inside.
+      const pref = this._denoiserPlugin.preferences && this._denoiserPlugin.preferences.renderScale;
+      if (pref) {
+        const appMax = this._appRenderScaleMax ?? this.renderScaleMax;
+        this._appRenderScaleMax = appMax;
+        if (Number.isFinite(pref.max)) this.renderScaleMax = Math.min(appMax, Math.max(0.2, pref.max));
+        if (Number.isFinite(pref.min)) this.renderScaleMin = Math.min(this.renderScaleMax, Math.max(0.2, pref.min));
+        if (Number.isFinite(pref.preferred)) {
+          const start = Math.min(this.renderScaleMax, Math.max(this.renderScaleMin, pref.preferred));
+          if (Math.abs(start - this._renderScale) > 1e-6) this.renderScale = start;
+        }
+      }
+      // 0.16.7: the plugin may also advertise how much of the built-in post
+      // filtering its output wants (`postHistoryFrames`, `postIterations`, the
+      // knobs 0.16.4 added). They fill the app's DEFAULTS only: a value the app
+      // already set (non-zero) wins, and whatever came from the plugin is
+      // cleared again when the plugin is removed.
+      const p2 = this._denoiserPlugin.preferences || {};
+      if (this._postFromPlugin) { this.denoiserPluginPostHistory = 0; this.denoiserPluginPostIterations = 0; }
+      this._postFromPlugin = false;
+      if (!(this.denoiserPluginPostHistory > 0) && Number.isFinite(p2.postHistoryFrames) && p2.postHistoryFrames > 0) {
+        this.denoiserPluginPostHistory = Math.round(p2.postHistoryFrames);
+        this._postFromPlugin = true;
+      }
+      if (!(this.denoiserPluginPostIterations > 0) && Number.isFinite(p2.postIterations) && p2.postIterations > 0) {
+        this.denoiserPluginPostIterations = Math.round(p2.postIterations);
+        this._postFromPlugin = true;
+      }
+    } else {
+      if (this._appRenderScaleMax !== undefined) {
+        // Plugin removed: the app's own ceiling comes back, the floor resets.
+        this.renderScaleMax = this._appRenderScaleMax;
+        this._appRenderScaleMax = undefined;
+        this.renderScaleMin = 0.2;
+      }
+      if (this._postFromPlugin) {
+        this.denoiserPluginPostHistory = 0;
+        this.denoiserPluginPostIterations = 0;
+        this._postFromPlugin = false;
+      }
     }
     this.resetAccumulation();
   }
+
+  /** 0.16.6: did the attached plugin resolve the LAST frame (false while it compiles or is unsupported)? */
+  get denoiserPluginRan() { return !!this._pluginRan; }
 
   /** The attached denoiser plugin, or null. */
   get denoiserPlugin() { return this._denoiserPlugin; }
@@ -2913,6 +2994,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
   // vs 0.65) — canvas scale throws away the G-buffer's edges, which is the one
   // thing the tracer gets for free from the rasterizer.
   _adaptQuality() {
+    // A ceiling lowered live (the app's quality preset) clamps the scale here,
+    // once, through the same setter a manual change uses.
+    if (this._renderScale > this.renderScaleMax) this.renderScale = this.renderScaleMax;
     // Hidden tabs are exempt: browser throttling makes every frame look
     // catastrophic, and adapting on that would drop quality for a tab nobody is
     // watching (same rule as _overloadBrake).
@@ -3029,7 +3113,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       // away the image on a transient. Move at most MAX_SCALE_STEP per adaptation
       // (5 ladder steps) and let the cooldown take the next one if it is still slow.
       s = Math.max(this._renderScale - RealtimeRaytracer.MAX_SCALE_STEP, s);
-      s = Math.round(Math.min(1, Math.max(0.2, s)) * 20) / 20; // 0.05 steps
+      s = Math.round(Math.min(1, Math.max(this.renderScaleMin || 0.2, s)) * 20) / 20; // 0.05 steps (0.16.6: floor)
 
       // When renderScale has ALREADY BOTTOMED OUT — it is at the 0.2 floor, not
       // merely near it — step DOWN the canvas ladder, the deepest,
@@ -3127,9 +3211,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       const from = this._canvasLevelIdx;
       return this._takeUpStep("canvas", from, (L[from - 1] / L[from]) ** 2, util, now);
     }
-    if (this._renderScale < 1) {
+    if (this._renderScale < this.renderScaleMax) {
       const from = this._renderScale;
-      const to = RealtimeRaytracer._scaleUpFrom(from);
+      const to = Math.min(this.renderScaleMax, RealtimeRaytracer._scaleUpFrom(from));
       return this._takeUpStep("scale", from, RealtimeRaytracer._scaleStepCost(from, to), util, now);
     }
     // The free wins are the LAST thing handed back, and the bar is deliberately
@@ -3142,7 +3226,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // "slow". They are cheaper AND no worse, so holding them one level too long
     // costs nothing and churning them costs a reset every two seconds.
     const doubled = util != null ? util < 0.5 : wall < 0.5;
-    if (doubled && this._qFreeWins && this._canvasLevelIdx === 0 && this._renderScale >= 1) {
+    if (doubled && this._qFreeWins && this._canvasLevelIdx === 0 && this._renderScale >= this.renderScaleMax) {
       return this._releaseFreeWins(now);
     }
     return false;
@@ -3739,6 +3823,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       this._denoiseProj[1] = pe[5];  // P11
       this._denoiseProj[2] = pe[8];  // P02 (carries the x jitter)
       this._denoiseProj[3] = pe[9];  // P12 (carries the y jitter)
+      const ls = this._ctxLightingSize || (this._ctxLightingSize = [0, 0]);
+      const gs = this._ctxGbufferSize || (this._ctxGbufferSize = [0, 0]);
+      ls[0] = this._scaledW; ls[1] = this._scaledH;
+      gs[0] = this._width; gs[1] = this._height;
       const out = this._denoiserPlugin.render(
         this.renderer,
         raw.rawIrradiance,
@@ -3756,18 +3844,77 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
           // from", not "was it visible at all".
           motion: this._motionVectorsActive ? this.gbuffer.motion : null,
           frame: this.frame,
+          // 0.16.7: the two grids the plugin is looking at, so a network that
+          // takes rays at lighting resolution and the G-buffer at canvas
+          // resolution (a "quarter" model at renderScale 0.5) knows the ratio
+          // without measuring textures. Reused arrays, no per-frame garbage.
+          lightingSize: this._ctxLightingSize,
+          gbufferSize: this._ctxGbufferSize,
         }
       );
+      // 0.16.6: a plugin may decline a frame by returning false (neuralrt while
+      // its shaders compile asynchronously, or once it has given up as
+      // unsupported on this GPU): the built-in split-accumulate path then
+      // carries the frame from the same raw pair, exactly as if no plugin were
+      // attached, and `denoiserPluginRan` says which happened.
+      const pluginOk = !!(out && out.irradiance);
+      this._pluginRan = pluginOk;
+      if (!pluginOk) {
+        const acc = this.accumulatePass.render(
+          this.renderer, raw.rawIrradiance, raw.rawSpecular, this.gbuffer,
+          this._prevViewProj, this._jitteredViewProj, this._camWorldPos, this.eps,
+          this.maxHistory + (this.maxHistoryMoving - this.maxHistory) * this._mt,
+          { preFireflyClamp: 0.0, historyClampK: 0.0,
+            lightMotion: this.lightAdaptive ? this.lightMotion : 0, gradK: this.lightGradK });
+        irradiance = acc.irradiance;
+        specular = acc.specular;
+        this._momentsTex = acc.moments;
+      } else {
       irradiance = out.irradiance;
       specularTex = this.specular ? out.specular : null;
       this._momentsTex = null;
+      // 0.16.7: the plugin may return its pair at ANY resolution from the
+      // lighting grid up to the G-buffer grid (a network that takes quarter
+      // rays and the full G-buffer and writes full-resolution output). The
+      // composite reads the size below; the post passes are sized for the
+      // lighting grid and would downsample such an output, so they only run
+      // when the output is on the lighting grid (a network that upsamples
+      // itself does its own temporal work).
+      const outImg = out.irradiance.image;
+      const outOnLightingGrid = !outImg || !outImg.width
+        || (outImg.width === this._scaledW && outImg.height === this._scaledH);
       // Debug view: show the plugin's INPUT instead of its output. The plugin
       // above still ran (and still advanced its history), so this only changes
       // which pair of textures the composite gets.
       if (rawView) {
         irradiance = raw.rawIrradiance;
         specularTex = this.specular ? raw.rawSpecular : null;
+      } else if (outOnLightingGrid) {
+        // Optional spatial post-filter on the plugin's output (0 = nothing,
+        // byte-identical to the plain plugin path): the same edge-aware a-trous
+        // the built-in pipeline uses, for a network that still flickers.
+        // Optional temporal smoothing first: the network output goes through
+        // the split-accumulate EMA (reprojected history) as if it were the raw
+        // sample stream, so frame-to-frame flicker averages out.
+        const hist = Math.max(0, Math.round(this.denoiserPluginPostHistory || 0));
+        if (hist > 0 && this.outputMode !== 7) {
+          const acc = this.accumulatePass.render(
+            this.renderer, irradiance, specularTex || raw.rawSpecular, this.gbuffer,
+            this._prevViewProj, this._jitteredViewProj, this._camWorldPos, this.eps, hist,
+            { preFireflyClamp: 0.0, historyClampK: 0.0,
+              lightMotion: this.lightAdaptive ? this.lightMotion : 0, gradK: this.lightGradK });
+          irradiance = acc.irradiance;
+          if (this.specular && specularTex) specularTex = acc.specular;
+        }
+        const post = Math.max(0, Math.round(this.denoiserPluginPostIterations || 0));
+        if (post > 0 && this.outputMode !== 7) {
+          irradiance = this.denoisePass.render(
+            this.renderer, irradiance, this.gbuffer, this._camWorldPos, this.eps, post, giTex,
+            { maxStep: this.denoiseMaxStep, stepJitter: this.denoiseStepJitter, wideDamp: this.denoiseWideDamp,
+              frame: this.frame, momentsTexture: null });
+        }
       }
+      }   // pluginOk
     } else if (rawView) {
       // Same view with no plugin attached: the raw 1-spp samples, straight to
       // the composite. AccumulatePass and the a-trous denoise are not run at
@@ -3891,12 +4038,21 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     const useTaa = this.taa && this.outputMode === 0 && !rawView;
     const cU = this.composite.material.uniforms;
     cU.uOutputMode.value = this.outputMode;
-    cU.uUpsample.value = this._renderScale < 1;
+    // 0.16.7: the lighting pair the composite receives is normally on the
+    // lighting grid (renderScale x canvas), but a denoiser plugin may hand back
+    // a pair on a finer grid, up to the G-buffer's own; the guided upsample
+    // must tap at THAT texel size, and is skipped entirely when the pair is
+    // already at canvas resolution. Byte-identical on every built-in path
+    // (the sizes below equal _scaledW/_scaledH there).
+    const irrImg = irradiance && irradiance.image;
+    const irrW = (irrImg && irrImg.width) || this._scaledW;
+    const irrH = (irrImg && irrImg.height) || this._scaledH;
+    cU.uUpsample.value = irrW < this._width || irrH < this._height;
     // Nearest-neighbour the lighting taps in the raw view: the guided bilateral
     // upsample is a filter, and filtering the 1-spp noise is exactly the lie
     // this view is here to avoid. Inert (false) on every other path.
     cU.uNearestLighting.value = rawView;
-    cU.uIrrTexelSize.value.set(1 / this._scaledW, 1 / this._scaledH);
+    cU.uIrrTexelSize.value.set(1 / irrW, 1 / irrH);
     cU.uCameraPos.value.copy(this._camWorldPos);
     cU.uFogEnabled.value = this.fog.enabled;
     cU.uFogColor.value.copy(this.fog.color);

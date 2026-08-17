@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.16.7
+
+**A denoiser plugin may return its pair at any resolution** from the lighting
+grid up to the G-buffer's own. A network that takes quarter-resolution rays and
+the full-resolution G-buffer and writes full-resolution output returns
+full-resolution textures; the composite now taps `irradiance` / `specular` at
+their own texel size (`uIrrTexelSize` from the texture, not from `renderScale`)
+and skips the guided upsample when they are already at canvas resolution. The
+two must share a size. `denoiserPluginPostHistory` / `PostIterations` apply
+only to output on the lighting grid (their passes are sized for it; a network
+that upsamples itself does its own temporal work). Byte-identical on every
+built-in path and for a plugin that outputs on the lighting grid (the sizes it
+reads equal `_scaledW/_scaledH` there).
+
+**`ctx.lightingSize` / `ctx.gbufferSize`** (`[w, h]`, reused arrays) in the
+plugin's frame context: the two grids it is looking at, without measuring
+textures.
+
+**`preferences.postHistoryFrames` / `postIterations`**: a plugin may advertise
+how much of the built-in post filtering its output wants; they fill the app's
+DEFAULTS for the two 0.16.4 knobs (a non-zero value the app already set wins)
+and are cleared again when the plugin is detached.
+
+Typings: `DenoiserPlugin.render` may return `false | null | undefined`
+(0.16.6), `preferences`, `renderScaleMin`, `denoiserPluginRan`,
+`denoiserPluginPostIterations` / `PostHistory` (options and live properties)
+are declared. README: the plugin section (declining, preferences, output
+resolution, the post knobs) and the governor bounds.
+
+## 0.16.6
+
+**A plugin may decline a frame.** `plugin.render()` returning `false` (or
+nothing) hands the frame to the built-in split-accumulate denoiser, from the
+same raw pair, exactly as if no plugin were attached; `rt.denoiserPluginRan`
+reads whether the plugin resolved the LAST frame. This is what an
+asynchronously compiling or unsupported plugin needs: no flicker, no detach.
+
+**Plugin preferences for the governor** (`plugin.preferences.renderScale = {
+min, max, preferred }`, read on attach): `min` / `max` become the governor's
+bounds, never wider than the app's own `renderScaleMax`; `preferred` is where
+the scale starts if it lies inside them. Detaching restores the app's bounds.
+**`renderScaleMin`** (option + live property, default 0.2) is the floor the
+governor steps down to.
+
+## 0.16.5
+
+**`renderScaleMax`** (option + live property, `0.2..1`, default 1): the ceiling
+the adaptive governor may raise `renderScale` to. A phone or tablet GPU that
+finds headroom otherwise walks the scale up rung by rung, and every rung
+reallocates every pass at the bigger size; on iOS Safari that memory spike is
+what loses the WebGL context minutes into a session (Hangar, 2026-08-17: flat
+texture / geometry counts, then a loss). Pin the ceiling instead of turning the
+governor off, so it still steps DOWN freely. Lowering it below the current
+scale clamps the scale on the next adaptation, through the same setter a manual
+change uses; the up-steps and the free-wins release respect it.
+
+## 0.16.4
+
+**Post filtering on a plugin's output.** `rt.denoiserPluginPostIterations = N`
+(default 0) runs the built-in edge-aware a-trous N times on the plugin's OUTPUT
+irradiance, a spatial post-filter for a network that still leaves residual
+noise; `rt.denoiserPluginPostHistory = N` (default 0) first runs the output
+through the split-accumulate EMA (N frames of reprojected history, the same
+pass the built-in pipeline runs on raw samples) so frame-to-frame flicker
+settles, at the cost of a little lag on moving lights. Both live, both 0 =
+byte-identical to 0.16.3. Order: plugin -> temporal history -> a-trous.
+
 ## 0.16.3
 
 **Denoiser plugin hook (`rt.setDenoiserPlugin`).** The library ships one

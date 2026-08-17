@@ -289,6 +289,44 @@ noise pixel reaches the screen as a square. Your plugin still runs and still
 advances its history while the view is on, so switching back shows the picture
 it would have shown anyway.
 
+**Declining a frame (0.16.6).** `render()` may return `false` (or nothing) while
+your shaders are still compiling, or once you have decided this GPU cannot run
+you: the built-in split-accumulate denoiser carries that frame from the same raw
+pair, exactly as if no plugin were attached, and `rt.denoiserPluginRan` reads
+`false` for it. Nothing flickers, nothing needs re-attaching: return the pair
+again when you are ready.
+
+**Preferences (0.16.6 / 0.16.7).** A plugin may carry a plain-data
+`preferences` object, read when it is attached: `{ renderScale: { min, max,
+preferred }, postHistoryFrames, postIterations }`. `renderScale.min/max` become
+the adaptive governor's bounds (never wider than the app's own
+[`renderScaleMax`](#options)) and `preferred` is where the scale starts if it
+lies inside them, so a network trained at one lighting resolution can pin it
+(`{ min: 0.5, max: 0.5, preferred: 0.5 }` = quarter-resolution rays under a
+full-resolution G-buffer, and the governor keeps steering the canvas ladder and
+the denoise budget). `postHistoryFrames` / `postIterations` fill the app's
+defaults for the two post knobs below (a non-zero value the app set wins).
+Detaching restores the app's bounds and clears what came from the plugin.
+
+**Output resolution (0.16.7).** The pair you return may sit on any grid from the
+lighting grid up to the G-buffer's own: a network that takes quarter-resolution
+rays and the full-resolution G-buffer and writes full-resolution output simply
+returns full-resolution textures, and the composite taps them at their own
+texel size (skipping the guided upsample when they are already at canvas
+resolution). `irradiance` and `specular` must share a size. `ctx.lightingSize`
+and `ctx.gbufferSize` (`[w, h]`, reused arrays) tell you the two grids each
+frame. The two post knobs apply only to output on the lighting grid.
+
+`rt.denoiserPluginPostIterations = N` (0.16.4, default 0) runs the built-in
+edge-aware a-trous N times on the plugin's OUTPUT irradiance, as a spatial
+post-filter for a network that still flickers or leaves residual noise. At 0
+nothing runs and the plugin path is byte-identical to 0.16.3. Live: assign at
+any time. `rt.denoiserPluginPostHistory = N` (0.16.4, default 0) runs the
+plugin's output through the split-accumulate EMA first (N frames of reprojected
+history, the same pass the built-in pipeline runs on raw samples), so a network
+that still flickers frame to frame settles; lag on moving lights grows with N.
+Order: plugin -> temporal history -> a-trous.
+
 ## Moving objects (dynamic BVH)
 
 Mark meshes as dynamic and their motion casts **correct ray traced shadows** —
@@ -1067,6 +1105,15 @@ starting point or take manual control:
   `denoiseIterations` above **3** — past 2 passes accuracy degrades monotonically
   and the à-trous lattice becomes measurable (that is a *governor* policy; the
   option itself still takes any value you set).
+- **`renderScaleMax`** (0.16.5, `0.2..1`, default `1`) and **`renderScaleMin`**
+  (0.16.6, default `0.2`): the ceiling and floor the governor may steer
+  `renderScale` between; both live. Pin the ceiling on a phone or tablet
+  instead of turning the governor off: every rung up reallocates every pass at
+  the bigger size, and on iOS Safari that memory spike is what loses the WebGL
+  context minutes into a session, while the governor still steps DOWN freely.
+  Lowering the ceiling below the current scale clamps the scale on the next
+  frame. A denoiser plugin's `preferences.renderScale` narrows the two further
+  (never wider than yours).
 - **`stochasticLights: true`** (default false): one direct shadow ray per
   pixel per frame instead of one per light — the biggest ray-count lever for
   many-light scenes and mobile GPUs.

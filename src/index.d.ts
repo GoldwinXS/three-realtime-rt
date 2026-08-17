@@ -49,6 +49,13 @@ export interface DenoiserFrameContext {
   motion: Texture | null;
   /** The renderer's frame counter. */
   frame: number;
+  /**
+   * 0.16.7: `[width, height]` of the LIGHTING grid the raw pair is on
+   * (renderScale x the padded canvas). Reused array, read it, do not keep it.
+   */
+  lightingSize: number[];
+  /** 0.16.7: `[width, height]` of the G-buffer (the padded canvas). Reused array. */
+  gbufferSize: number[];
 }
 
 /**
@@ -74,13 +81,38 @@ export interface DenoiserPlugin {
     gbuffer: DenoiserGBuffer,
     viewMatrix: Matrix4,
     ctx: DenoiserFrameContext
-  ): { irradiance: Texture; specular: Texture };
+  ): { irradiance: Texture; specular: Texture } | false | null | undefined;
+  //  ^ 0.16.6: return false (or nothing) to DECLINE the frame while shaders
+  //    compile or once unsupported; the built-in denoiser carries that frame
+  //    from the same raw pair and `rt.denoiserPluginRan` reads false.
+  //    0.16.7: the returned pair may be on ANY grid from the lighting grid up
+  //    to the G-buffer grid (a network that takes quarter rays and the full
+  //    G-buffer and writes full-resolution output); irradiance and specular
+  //    must share a size. The composite reads the size; the post knobs
+  //    (denoiserPluginPostHistory / PostIterations) apply only to output on
+  //    the lighting grid.
   /** Called with the LIGHTING resolution whenever it changes. */
   setSize(width: number, height: number): void;
   /** Called wherever every other temporal history in the pipeline is dropped. */
   resetHistory(): void;
   /** Called from {@link RealtimeRaytracer.dispose}. */
   dispose(): void;
+  /**
+   * 0.16.6, optional: what the plugin would like from the adaptive governor,
+   * read once in {@link RealtimeRaytracer.setDenoiserPlugin} ("plugin
+   * advertises, engine decides, game passes through"). `renderScale.min` /
+   * `.max` become the governor's bounds, never wider than the app's own
+   * `renderScaleMax`; `.preferred` is where the scale starts if it lies inside
+   * them. 0.16.7: `postHistoryFrames` / `postIterations` fill the app's
+   * DEFAULTS for `denoiserPluginPostHistory` / `denoiserPluginPostIterations`
+   * (a non-zero value the app already set wins). Removing the plugin restores
+   * the app's bounds and clears what came from the plugin.
+   */
+  preferences?: {
+    renderScale?: { min?: number; max?: number; preferred?: number };
+    postHistoryFrames?: number;
+    postIterations?: number;
+  };
 }
 
 /**
@@ -99,6 +131,8 @@ export type PresetName = "quality" | "balanced" | "performance" | "motion";
  */
 export interface RealtimeRaytracerPreset {
   renderScale?: number;
+  /** 0.16.5: the ceiling the adaptive governor may raise renderScale to (0.2..1, default 1). */
+  renderScaleMax?: number;
   denoiseIterations?: number;
   maxHistory?: number;
   taa?: boolean;
@@ -311,6 +345,24 @@ export interface RealtimeRaytracerOptions {
    * denoiser reconstruct the difference. Set 1.0 for maximum quality.
    */
   renderScale?: number;
+  /** 0.16.5: the ceiling the adaptive governor may raise renderScale to (0.2..1, default 1). */
+  renderScaleMax?: number;
+  /** 0.16.6: the floor the adaptive governor may lower renderScale to (0.2..renderScaleMax, default 0.2). */
+  renderScaleMin?: number;
+  /**
+   * 0.16.4: a-trous iterations run on an attached denoiser plugin's OUTPUT
+   * irradiance (the same edge-aware DenoisePass the built-in pipeline uses), a
+   * spatial post-filter for a network that still leaves residual noise. Default
+   * `0` = nothing runs, the plugin path is byte-identical to 0.16.3.
+   */
+  denoiserPluginPostIterations?: number;
+  /**
+   * 0.16.4: frames of reprojected exponential history blended over an attached
+   * denoiser plugin's OUTPUT (the split AccumulatePass run on the network's
+   * frames), before the spatial post passes. Default `0` = off; 4-16 settles a
+   * young network's flicker at the cost of a little lag on moving lights.
+   */
+  denoiserPluginPostHistory?: number;
   /**
    * Overscan: render internally at a padded resolution with a proportionally
    * widened field of view, then crop the centre to the canvas on the final draw.
@@ -1296,6 +1348,15 @@ export class RealtimeRaytracer {
   stochasticLights: boolean;
   /** Adaptive quality governor toggle. */
   adaptiveQuality: boolean;
+  /**
+   * 0.16.5: the ceiling the governor may raise renderScale to (0.2..1). Live:
+   * lowering it below the current scale clamps the scale on the next frame; the
+   * governor still steps down freely. Pin it on a phone or tablet instead of
+   * turning the governor off (every rung up reallocates every pass).
+   */
+  renderScaleMax: number;
+  /** 0.16.6: the governor's floor (0.2..renderScaleMax); a plugin's preferences may raise it. */
+  renderScaleMin: number;
   /** Frame-rate target for the adaptive governor. */
   targetFps: number;
   /** GPU-cost timing mode (see RealtimeRaytracerOptions.gpuTiming). Live: set
@@ -1400,6 +1461,24 @@ export class RealtimeRaytracer {
    * is available, i.e. when the next frame will route lighting through it.
    */
   get denoiserPluginActive(): boolean;
+  /**
+   * 0.16.6: did the attached plugin resolve the LAST frame? False while its
+   * `render` returned false (shaders still compiling, or unsupported on this
+   * GPU): the built-in split-accumulate path carried that frame from the same
+   * raw pair, exactly as if no plugin were attached.
+   */
+  get denoiserPluginRan(): boolean;
+  /**
+   * 0.16.4: a-trous iterations run on the plugin's OUTPUT irradiance (0 = none,
+   * byte-identical plugin path). Live.
+   */
+  denoiserPluginPostIterations: number;
+  /**
+   * 0.16.4: frames of reprojected history blended over the plugin's OUTPUT
+   * before the spatial post passes (0 = off). Live. Order: plugin -> temporal
+   * history -> a-trous.
+   */
+  denoiserPluginPostHistory: number;
   /** Discard temporal history and restart accumulation. */
   resetAccumulation(): void;
   /**
