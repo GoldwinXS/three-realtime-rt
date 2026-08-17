@@ -20,3 +20,6 @@ _reviews/
 # Benchmark index dumps and campaign data: our own measurement working files.
 quality-campaign/
 bench-results/
+
+# Master src/ copied in for the dev identity gates (dev/lights-identity.js).
+dev/_masterref/

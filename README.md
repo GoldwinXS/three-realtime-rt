@@ -217,6 +217,78 @@ raw per-frame snapshot. `rt.costScale` sets the mapping (default `1/96`, so ~96
 visits saturate to white); the demo's **cost scale** slider drives it as
 "visits-to-saturate" so you can rescale the range to your scene.
 
+### Replacing the denoiser (`setDenoiserPlugin`)
+
+The library ships one denoiser: the temporal EMA (`AccumulatePass`) followed by
+the edge-aware a-trous blur (`DenoisePass`). If you have a better one - a
+different filter, a learned denoiser, anything - you can drop it into that slot
+instead of forking the renderer:
+
+```js
+rt.setDenoiserPlugin(myDenoiser);   // pass null to go back to the built-in one
+```
+
+While a plugin is attached, the frame runs the G-buffer and the lighting pass as
+usual and then, instead of `AccumulatePass` + a-trous, calls
+
+```js
+plugin.render(renderer, rawIrradiance, rawSpecular, gbuffer, viewMatrix,
+              { warp, proj, motion, frame })
+```
+
+and composites the `{ irradiance, specular }` textures it returns exactly where
+the a-trous output would have gone. Everything downstream is unchanged: the
+composite's guided upsample, fog, sky, the volumetric add, tonemapping and the
+TAA resolve all still run.
+
+| Argument | What it is |
+|---|---|
+| `rawIrradiance`, `rawSpecular` | This frame's **1-spp** lighting at lighting resolution, RGBA16F, straight out of `rtPass.renderRaw()`: no temporal history has been applied. |
+| `gbuffer` | The live G-buffer (`albedoRough`, `normalMetal`, `worldPos`, `emissive`, and `motion` when active) at canvas resolution. Downsample it yourself if your filter runs at lighting resolution. |
+| `viewMatrix` | `camera.matrixWorldInverse`. |
+| `warp` | `prevViewProj * camera.matrixWorld`: takes a view-space position from this frame into the previous frame's clip space, which is what a temporal plugin needs to fetch its own history. `prevViewProj` is the jittered, overscan-widened matrix the previous frame actually rendered with. |
+| `proj` | `[P00, P11, P02, P12]` of this frame's projection, TAA jitter and overscan included, so you can rebuild view-space position from depth on the exact grid the G-buffer was rasterized on. |
+| `motion` | `gbuffer.motion` when per-object motion vectors are active (see [`motionVectors`](#options)), else `null`. Motion vectors answer "where did this surface come from", not "was it visible at all", so a temporal plugin still needs its own disocclusion test. |
+| `frame` | The renderer's frame counter. |
+
+The other three methods are lifecycle. `setSize(width, height)` is called with
+the **lighting** resolution whenever it changes (a `renderScale` step or a canvas
+resize); `resetHistory()` is called wherever every other temporal history in the
+pipeline is dropped (`resetAccumulation()`: scene recompile, camera cut, mode
+switch, resize); `dispose()` is called from `rt.dispose()`. Attaching a plugin
+sizes it, drops its history and resets accumulation; detaching resets
+accumulation. Swapping plugins does **not** dispose the outgoing one - you own
+it and may re-attach it later.
+
+```js
+const myDenoiser = {
+  render(renderer, rawIrr, rawSpec, gbuffer, viewMatrix, ctx) {
+    // ... your passes ...
+    return { irradiance: cleanIrrTexture, specular: cleanSpecTexture };
+  },
+  setSize(w, h) {},
+  resetHistory() {},
+  dispose() {},
+};
+rt.setDenoiserPlugin(myDenoiser);
+```
+
+The raw pair only exists on the split-accumulate MRT path
+(`specMRTSupported && splitAccum`, the default wherever 2-attachment half-float
+MRT is available). On a device without it the plugin is skipped and the built-in
+denoiser runs, so check `rt.denoiserPluginActive` rather than assuming. For
+allocating your own multi-attachment targets across the peer three range, the
+package exports `makeMRT(width, height, count, options)` - the same shim the
+library's passes use, whose result indexes attachments as `.texture[i]` on
+every supported version.
+
+To see what your plugin is being fed, set `rt.rawInputView = true`: the
+composite then shows the raw 1-spp pair instead of the denoised output, with the
+TAA resolve, its jitter and the guided upsample all bypassed so a lighting-res
+noise pixel reaches the screen as a square. Your plugin still runs and still
+advances its history while the view is on, so switching back shows the picture
+it would have shown anyway.
+
 ## Moving objects (dynamic BVH)
 
 Mark meshes as dynamic and their motion casts **correct ray traced shadows** —
