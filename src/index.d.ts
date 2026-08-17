@@ -6,10 +6,82 @@ import type {
   Vector3,
   Object3D,
   Data3DTexture,
+  Texture,
+  Matrix4,
+  WebGLRenderTarget,
 } from "three";
 
 /** Capability tier used to pick sensible defaults. */
 export type Tier = "none" | "mid" | "high";
+
+/**
+ * The G-buffer handed to a {@link DenoiserPlugin}. Attachments are at CANVAS
+ * (overscan-padded) resolution, while the lighting textures are at lighting
+ * resolution: a plugin that mixes the two must downsample the G-buffer itself.
+ */
+export interface DenoiserGBuffer {
+  /** rgb = albedo, a = roughness. */
+  albedoRough: Texture;
+  /** rgb = world normal, a = packed material word. */
+  normalMetal: Texture;
+  /** rgb = world position, a = view depth. */
+  worldPos: Texture;
+  /** rgb = emissive radiance. */
+  emissive: Texture;
+  /** Per-object screen motion (RG), or null when motion vectors are off. */
+  motion: Texture | null;
+}
+
+/** Per-frame temporal context handed to {@link DenoiserPlugin.render}. */
+export interface DenoiserFrameContext {
+  /**
+   * `prevViewProj * camera.matrixWorld`: takes a view-space position from this
+   * frame into the previous frame's clip space. The previous view-projection is
+   * the jittered, overscan-widened matrix that frame actually rendered with.
+   */
+  warp: Matrix4;
+  /**
+   * `[P00, P11, P02, P12]` of this frame's projection, TAA jitter and overscan
+   * included, for rebuilding view-space position from depth.
+   */
+  proj: number[];
+  /** `gbuffer.motion` when motion vectors are active, else null. */
+  motion: Texture | null;
+  /** The renderer's frame counter. */
+  frame: number;
+}
+
+/**
+ * An external denoiser attached with {@link RealtimeRaytracer.setDenoiserPlugin}.
+ * It replaces AccumulatePass + the a-trous denoise + the specular denoise: it
+ * receives the raw 1-spp lighting pair and returns the clean pair the composite
+ * consumes. Everything downstream (upsample, fog, sky, volumetrics, tonemap,
+ * TAA) is unchanged.
+ */
+export interface DenoiserPlugin {
+  /**
+   * @param renderer      the library's WebGLRenderer
+   * @param rawIrradiance this frame's 1-spp irradiance, lighting resolution
+   * @param rawSpecular   this frame's 1-spp specular, lighting resolution
+   * @param gbuffer       the live G-buffer, canvas resolution
+   * @param viewMatrix    `camera.matrixWorldInverse`
+   * @param ctx           warp / projection / motion / frame index
+   */
+  render(
+    renderer: WebGLRenderer,
+    rawIrradiance: Texture,
+    rawSpecular: Texture,
+    gbuffer: DenoiserGBuffer,
+    viewMatrix: Matrix4,
+    ctx: DenoiserFrameContext
+  ): { irradiance: Texture; specular: Texture };
+  /** Called with the LIGHTING resolution whenever it changes. */
+  setSize(width: number, height: number): void;
+  /** Called wherever every other temporal history in the pipeline is dropped. */
+  resetHistory(): void;
+  /** Called from {@link RealtimeRaytracer.dispose}. */
+  dispose(): void;
+}
 
 /**
  * Named quality preset accepted by {@link RealtimeRaytracerOptions.preset} and
@@ -1059,6 +1131,13 @@ export class RealtimeRaytracer {
   frame: number;
   /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular, 7 bvh cost. */
   outputMode: number;
+  /**
+   * Debug view: composite the RAW 1-spp lighting instead of the denoised
+   * lighting, i.e. show what the denoiser is fed. Bypasses AccumulatePass, the
+   * a-trous denoise, TAA and the guided upsample. Needs the split-accumulate
+   * MRT path; inert (and the frame byte-identical) when false. Default false.
+   */
+  rawInputView: boolean;
 
   /**
    * Name of the preset governing this instance: the LAST preset applied
@@ -1309,6 +1388,18 @@ export class RealtimeRaytracer {
   updateDynamic(): void;
   /** Refresh light positions/colors from the scene without a full recompile. */
   updateLights(scene: Scene): void;
+  /**
+   * Attach (or detach, with null) an external denoiser that replaces
+   * AccumulatePass + the a-trous denoise. See {@link DenoiserPlugin}.
+   */
+  setDenoiserPlugin(plugin: DenoiserPlugin | null): void;
+  /** The attached denoiser plugin, or null. */
+  get denoiserPlugin(): DenoiserPlugin | null;
+  /**
+   * True when a plugin is attached AND the raw split-accumulate path it needs
+   * is available, i.e. when the next frame will route lighting through it.
+   */
+  get denoiserPluginActive(): boolean;
   /** Discard temporal history and restart accumulation. */
   resetAccumulation(): void;
   /**
@@ -1331,6 +1422,19 @@ export const MAX_LIGHTS: number;
 
 /** Build a {@link CompiledScene} (BVH + material/light tables) from a scene. */
 export function compileScene(scene: Scene, options?: CompileSceneOptions): CompiledScene;
+
+/**
+ * Multiple-render-target constructor spanning the three versions in the peer
+ * range (three r172 removed `WebGLMultipleRenderTargets`). The result indexes
+ * its attachments as `.texture[i]` on every supported version. Exported for
+ * {@link DenoiserPlugin} implementations, which allocate their own MRTs.
+ */
+export function makeMRT(
+  width: number,
+  height: number,
+  count: number,
+  options?: Record<string, unknown>
+): WebGLRenderTarget;
 
 // --- Kubelka-Munk two-flux maths ---------------------------------------------
 // The same closed form the scattering shader evaluates, exported as plain

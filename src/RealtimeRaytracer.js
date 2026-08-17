@@ -932,8 +932,39 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.compiled = null;
     this.frame = 0;
 
+    /**
+     * OPTIONAL DENOISER PLUGIN (see setDenoiserPlugin). Null by default and
+     * never touched when null, so the default render path is byte-identical to
+     * a build without this hook. When set, the plugin replaces AccumulatePass +
+     * the a-trous denoise + the specular denoise: it is handed the raw 1-spp
+     * irradiance/specular pair and the G-buffer, and returns the clean pair the
+     * composite consumes.
+     */
+    this._denoiserPlugin = null;
     /** Debug view: 0 composite, 1 albedo, 2 normal, 3 irradiance, 4 worldPos, 5 emissive, 6 specular, 7 bvh cost */
     this.outputMode = 0;
+    /**
+     * DEBUG VIEW: composite the RAW 1-spp lighting instead of the cleaned-up
+     * lighting, i.e. show what the denoiser (the a-trous chain or a plugin) is
+     * FED rather than what it produces. Off by default and inert when off, so
+     * every existing mode renders byte-identically to a build without it.
+     *
+     * The buffer shown is exactly `rtPass.renderRaw()`'s output, so it needs the
+     * split-accumulate MRT path; on a device without it the flag is simply
+     * unavailable and does not half-apply.
+     *
+     * When it is on, three things are bypassed so nothing on screen is
+     * smoothed: AccumulatePass (the temporal EMA), DenoisePass (the a-trous
+     * blur), and the TAA resolve + its jitter. The composite's joint-bilateral
+     * upsample is swapped for nearest-neighbour as well, so a lighting-res
+     * noise pixel stays a square on screen instead of being filtered into its
+     * neighbours.
+     *
+     * It does NOT change whether a denoiser plugin runs: the plugin still
+     * executes and still advances its temporal history, so switching back shows
+     * the picture it would have shown anyway.
+     */
+    this.rawInputView = false;
     /**
      * BVH-cost heatmap scale (outputMode 7): the per-pixel shadow-ray node-visit
      * count is multiplied by this before the palette, so 1/costScale visits map
@@ -1730,6 +1761,13 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this._camWorldPos = new THREE.Vector3();
     this._needsClear = true;
 
+    // Scratch handed to a denoiser plugin every frame (see setDenoiserPlugin):
+    // the history warp matrix and the four projection terms it needs to
+    // reproject last frame's output. Allocated once, filled in render(), and
+    // only read while a plugin is attached.
+    this._denoiseWarp = new THREE.Matrix4();
+    this._denoiseProj = [1, 1, 0, 0];
+
     // First-frame guard: a 4K/5K drawing buffer at high lighting scale can
     // hang a weak GPU on the very first frame — before any frame-time
     // measurement can react. Start those safe; adaptiveQuality (or the app)
@@ -2338,10 +2376,115 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.restirPass.setLightGrid(this.lightGridPass.texture, !!this.restirLightGrid);
   }
 
+  /**
+   * Attach (or detach, with null) an EXTERNAL denoiser.
+   *
+   * The library ships one denoiser: the temporal EMA (AccumulatePass) followed
+   * by the edge-aware a-trous blur (DenoisePass). This hook lets an application
+   * replace that stage wholesale with its own - a different filter, a learned
+   * denoiser, anything - without forking the renderer. Nothing about the plugin
+   * is assumed beyond the four methods below; the library ships no plugin and
+   * no plugin-specific code.
+   *
+   * WHERE IT SITS. The frame runs the G-buffer, the lighting pass (ReSTIR,
+   * GI, the works) and then, instead of AccumulatePass + a-trous, calls
+   *
+   *   plugin.render(renderer, rawIrradiance, rawSpecular, gbuffer, viewMatrix,
+   *                 { warp, proj, motion, frame })
+   *
+   * and composites the `{ irradiance, specular }` textures it returns exactly
+   * where the a-trous output would have gone. Everything downstream is
+   * unchanged: the composite's bilateral upsample, fog, sky, the volumetric
+   * add, tonemapping and the TAA resolve all still run.
+   *
+   * WHAT IT IS GIVEN.
+   *   rawIrradiance / rawSpecular  this frame's 1-spp lighting, at lighting
+   *                                resolution, RGBA16F - `rtPass.renderRaw()`,
+   *                                i.e. NO temporal history has been applied.
+   *   gbuffer                      the live GBufferPass (albedoRough, normalMetal,
+   *                                worldPos, emissive, and motion when active),
+   *                                at canvas resolution.
+   *   viewMatrix                   camera.matrixWorldInverse.
+   *   warp                         prevViewProj * camera.matrixWorld: takes a
+   *                                view-space position from this frame to the
+   *                                previous frame's clip space, which is what a
+   *                                temporal plugin needs to fetch its own
+   *                                history. `prevViewProj` is the JITTERED,
+   *                                overscan-widened matrix the previous frame
+   *                                actually rendered with.
+   *   proj                         [P00, P11, P02, P12] of this frame's
+   *                                projection, jitter and overscan included, so
+   *                                a plugin can rebuild view-space position
+   *                                from depth on the exact grid the G-buffer
+   *                                was rasterized on.
+   *   motion                       gbuffer.motion when per-object motion
+   *                                vectors are active (see `motionVectors`),
+   *                                else null.
+   *   frame                        the renderer's frame counter.
+   *
+   * REQUIREMENTS. The raw pair only exists on the split-accumulate MRT path
+   * (`specMRTSupported && splitAccum`, the default on any device with
+   * 2-attachment half-float MRT). On a device without it the plugin is skipped
+   * and the built-in denoiser runs, so an app must not assume it ran; check
+   * `rt.denoiserPluginActive`.
+   *
+   * LIFECYCLE. The renderer calls `plugin.setSize(w, h)` with the LIGHTING
+   * resolution whenever that changes (a renderScale step or a canvas resize),
+   * `plugin.resetHistory()` wherever every other temporal history in the
+   * pipeline is dropped (resetAccumulation: scene recompile, camera cut, mode
+   * switch, resize), and `plugin.dispose()` from `rt.dispose()`. Attaching a
+   * plugin sizes it, drops its history and resets accumulation; detaching
+   * resets accumulation. Swapping plugins does NOT dispose the outgoing one:
+   * the application owns it and may re-attach it later.
+   *
+   * @param {{render: Function, setSize: Function, resetHistory: Function,
+   *          dispose: Function} | null} plugin
+   */
+  setDenoiserPlugin(plugin) {
+    if (plugin) {
+      for (const m of ["render", "setSize", "resetHistory", "dispose"]) {
+        if (typeof plugin[m] !== "function") {
+          throw new Error(
+            `RealtimeRaytracer.setDenoiserPlugin: plugin is missing ${m}(). A ` +
+            "denoiser plugin must implement render, setSize, resetHistory and dispose."
+          );
+        }
+      }
+    }
+    this._denoiserPlugin = plugin || null;
+    if (!this.supported) return;
+    if (this._denoiserPlugin) {
+      // Size it to the CURRENT lighting resolution before its first frame: a
+      // plugin constructed at some other size would otherwise read and write
+      // the wrong texels for one frame.
+      this._denoiserPlugin.setSize(this._scaledW, this._scaledH);
+      this._denoiserPlugin.resetHistory();
+    }
+    this.resetAccumulation();
+  }
+
+  /** The attached denoiser plugin, or null. */
+  get denoiserPlugin() { return this._denoiserPlugin; }
+
+  /**
+   * True when a plugin is attached AND the raw split-accumulate path it needs
+   * is available, i.e. when the next frame will actually route the lighting
+   * through it. False on a device without 2-attachment half-float MRT (or with
+   * `splitAccum: false`), where the built-in denoiser runs instead.
+   */
+  get denoiserPluginActive() {
+    return !!(this._denoiserPlugin && this.specMRTSupported && this._splitAccum);
+  }
+
   resetAccumulation() {
     if (!this.supported) return;
     this._needsClear = true;
     if (this.taaPass) this.taaPass.reset();
+    // A denoiser plugin's temporal history is accumulation too: every other
+    // history in the pipeline is dropped here, and leaving the plugin's alone
+    // would feed it a frame from before a scene recompile / mode switch /
+    // resize. It costs one frame of stability and buys correctness.
+    if (this._denoiserPlugin) this._denoiserPlugin.resetHistory();
   }
 
   /**
@@ -2610,6 +2753,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       this.denoisePass.setSize(sw, sh); // display-only, no temporal state
       this.specDenoisePass.setSize(sw, sh); // ditto; spec history lives in rtPass
       this.accumulatePass.setSize(sw, sh);
+      // An external denoiser runs at the lighting resolution too (see
+      // setDenoiserPlugin), so it resizes on the same trigger.
+      if (this._denoiserPlugin) this._denoiserPlugin.setSize(sw, sh);
       // ReSTIR reservoirs store packed id·64+M encodings — invalid to linearly
       // resample — but they reconverge in a few frames, so just reallocate and
       // clear them.
@@ -3352,9 +3498,19 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       proj.elements[0] *= inv;
       proj.elements[5] *= inv;
     }
+    // The raw-input debug view, resolved ONCE for the whole frame. It needs the
+    // split-accumulate path, because that is the only configuration in which the
+    // raw samples exist as their own textures; on a device without the
+    // 2-attachment half-float MRT the flag is simply unavailable and must not
+    // half-apply (bypassing TAA and the bilateral upsample for a picture that
+    // would still be the DENOISED one is worse than not offering the view).
+    const rawView = this.rawInputView && this.specMRTSupported && this._splitAccum;
     // Debug views (outputMode != 0) bypass the TAA resolve, so skip the jitter
-    // too — otherwise the raw buffers visibly shake.
-    if (this.taa && this.outputMode === 0) {
+    // too — otherwise the raw buffers visibly shake. rawView is a debug view of
+    // the composite itself (outputMode stays 0), so it joins them: TAA would
+    // average the 1-spp noise away, which is the one thing this view exists to
+    // show.
+    if (this.taa && this.outputMode === 0 && !rawView) {
       this._jitterIndex = (this._jitterIndex + 1) % 16;
       // taaJitterScale: when the app renders a REDUCED drawing buffer and CSS-
       // stretches it to the screen (the canvas-scale ladder), a half-buffer-pixel
@@ -3560,10 +3716,68 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       );
     }
 
-    // Part 2: split accumulation pipeline. Set bypassAccum=true to use the
-    // old inline-EMA path for baseline comparison (mean-luminance fence).
+    // Part 2: lighting resolve. With a denoiser plugin attached, the raw 1-spp
+    // samples + G-buffer go to the plugin, which replaces AccumulatePass +
+    // DenoisePass + the specular denoise below; otherwise the original
+    // split-accumulate + a-trous pipeline runs byte-identical.
     let irradiance, specular;
-    if (this.specMRTSupported && this._splitAccum) {
+    let specularTex;
+    // Resolved once: a plugin only runs on the split-accumulate MRT path, and
+    // the three blocks below (the branch, the a-trous denoise, the specular
+    // denoise) must all agree on whether it did.
+    const pluginResolved = !!(this._denoiserPlugin && this.specMRTSupported && this._splitAccum);
+    if (pluginResolved) {
+      const raw = this.rtPass.renderRaw(this.renderer, this.gbuffer, this.frame, reservoirTex);
+      // Temporal history warp. `camera.projectionMatrix` is the JITTERED matrix
+      // here (the jitter is applied at the top of render() and restored at the
+      // bottom), which is exactly the projection the G-buffer was rasterized
+      // with, so reconstructing view-space position from depth and projecting
+      // it back lands on the pixel centre and needs no jitter-correction term.
+      this._denoiseWarp.multiplyMatrices(this._prevViewProj, camera.matrixWorld);
+      const pe = camera.projectionMatrix.elements;
+      this._denoiseProj[0] = pe[0];  // P00
+      this._denoiseProj[1] = pe[5];  // P11
+      this._denoiseProj[2] = pe[8];  // P02 (carries the x jitter)
+      this._denoiseProj[3] = pe[9];  // P12 (carries the y jitter)
+      const out = this._denoiserPlugin.render(
+        this.renderer,
+        raw.rawIrradiance,
+        raw.rawSpecular,
+        this.gbuffer,
+        camera.matrixWorldInverse,
+        {
+          warp: this._denoiseWarp,
+          proj: this._denoiseProj,
+          // Per-object motion vectors when the G-buffer is carrying them: a
+          // temporal plugin's history then reprojects moving surfaces correctly
+          // instead of sampling whatever was behind them. Null when motion
+          // vectors are off, and a plugin still needs its own disocclusion test
+          // either way - motion vectors answer "where did this surface come
+          // from", not "was it visible at all".
+          motion: this._motionVectorsActive ? this.gbuffer.motion : null,
+          frame: this.frame,
+        }
+      );
+      irradiance = out.irradiance;
+      specularTex = this.specular ? out.specular : null;
+      this._momentsTex = null;
+      // Debug view: show the plugin's INPUT instead of its output. The plugin
+      // above still ran (and still advanced its history), so this only changes
+      // which pair of textures the composite gets.
+      if (rawView) {
+        irradiance = raw.rawIrradiance;
+        specularTex = this.specular ? raw.rawSpecular : null;
+      }
+    } else if (rawView) {
+      // Same view with no plugin attached: the raw 1-spp samples, straight to
+      // the composite. AccumulatePass and the a-trous denoise are not run at
+      // all, so this is the honest cost of the input as well as the honest look
+      // of it.
+      const raw = this.rtPass.renderRaw(this.renderer, this.gbuffer, this.frame, reservoirTex);
+      irradiance = raw.rawIrradiance;
+      specularTex = this.specular ? raw.rawSpecular : null;
+      this._momentsTex = null;
+    } else if (this.specMRTSupported && this._splitAccum) {
       const raw = this.rtPass.renderRaw(this.renderer, this.gbuffer, this.frame, reservoirTex);
       const acc = this.accumulatePass.render(
         this.renderer,
@@ -3599,7 +3813,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // double-counts through it. The bvh-cost heatmap (mode 7) is a per-pixel
     // debug signal, not lighting — the edge-aware blur would smear its bands,
     // so it bypasses the denoiser (which also keeps the GI add out of mode 7).
-    if (this.denoise && this.denoiseIterations > 0 && this.outputMode !== 7) {
+    // Skipped when a plugin already resolved the lighting above, and when the
+    // raw view is showing the denoiser's input rather than its output.
+    if (!pluginResolved && !rawView &&
+        this.denoise && this.denoiseIterations > 0 && this.outputMode !== 7) {
       irradiance = this.denoisePass.render(
         this.renderer,
         irradiance,
@@ -3625,16 +3842,19 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // 3a. light denoise on the specular buffer. specKeep (DenoisePass) already
     // spares near-mirror pixels, so reflections stay crisp; capped at 2 passes
     // to avoid washing out sharp dielectric highlights.
-    let specularTex = this.specular ? specular : null;
-    if (specularTex && this.denoise && this.denoiseIterations > 0) {
-      specularTex = this.specDenoisePass.render(
-        this.renderer,
-        specularTex,
-        this.gbuffer,
-        this._camWorldPos,
-        this.eps,
-        Math.min(this.denoiseIterations, 2)
-      );
+    // The plugin and raw-view branches above set specularTex themselves.
+    if (!pluginResolved && !rawView) {
+      specularTex = this.specular ? specular : null;
+      if (specularTex && this.denoise && this.denoiseIterations > 0) {
+        specularTex = this.specDenoisePass.render(
+          this.renderer,
+          specularTex,
+          this.gbuffer,
+          this._camWorldPos,
+          this.eps,
+          Math.min(this.denoiseIterations, 2)
+        );
+      }
     }
 
     // 3b. volumetric single-scatter (optional): one BVH-shadowed light sample
@@ -3647,6 +3867,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     if (
       this.volumetric.enabled &&
       this.outputMode === 0 &&
+      // In-scatter is a separate, temporally accumulated buffer, not part of
+      // what the denoiser is fed, and smooth by construction.
+      !rawView &&
       (this.volumetric.density > 0 || hasZones)
     ) {
       volumetricTex = this.volumetricPass.render(
@@ -3665,10 +3888,14 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // 4. composite (bilateral upsample if lighting is sub-res). With TAA on,
     // render to an offscreen colour target so the resolve can accumulate it;
     // otherwise straight to screen. Debug views bypass TAA (raw buffers).
-    const useTaa = this.taa && this.outputMode === 0;
+    const useTaa = this.taa && this.outputMode === 0 && !rawView;
     const cU = this.composite.material.uniforms;
     cU.uOutputMode.value = this.outputMode;
     cU.uUpsample.value = this._renderScale < 1;
+    // Nearest-neighbour the lighting taps in the raw view: the guided bilateral
+    // upsample is a filter, and filtering the 1-spp noise is exactly the lie
+    // this view is here to avoid. Inert (false) on every other path.
+    cU.uNearestLighting.value = rawView;
     cU.uIrrTexelSize.value.set(1 / this._scaledW, 1 / this._scaledH);
     cU.uCameraPos.value.copy(this._camWorldPos);
     cU.uFogEnabled.value = this.fog.enabled;
@@ -3786,6 +4013,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.rtPass.dispose();
     this.denoisePass.dispose();
     this.specDenoisePass.dispose();
+    if (this._denoiserPlugin) this._denoiserPlugin.dispose();
     this.composite.dispose();
     this.taaPass.dispose();
     this.volumetricPass.dispose();

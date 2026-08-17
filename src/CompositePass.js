@@ -40,6 +40,13 @@ uniform bool uUpsample;
 uniform vec2 uIrrTexelSize;
 uniform vec3 uCameraPos;
 
+// Debug (RealtimeRaytracer.rawInputView): point-sample the lighting textures at
+// their own texel centres instead of filtering them, so a lighting-res pixel of
+// 1-spp noise reaches the screen as a square. Default false, and the branch is
+// only reachable when the renderer sets it, so every normal frame takes exactly
+// the path it took before this uniform existed.
+uniform bool uNearestLighting;
+
 // Overscan crop: maps this on-screen pixel's UV into the central region of the
 // padded internal image (scale.xy, offset.zw). Identity (1,1,0,0) when overscan
 // is 0 or when compositing into the offscreen target that TAA later crops.
@@ -74,6 +81,9 @@ vec3 acesFilm(vec3 x) {
 // bilinear weights modulated by geometric similarity (plane distance + normal)
 // so lighting never bleeds across depth or orientation discontinuities.
 vec3 upsampleGuided(sampler2D tex, vec2 uv, vec3 P, vec3 N) {
+  if (uNearestLighting) {
+    return texture(tex, (floor(uv / uIrrTexelSize) + 0.5) * uIrrTexelSize).rgb;
+  }
   if (!uUpsample) return texture(tex, uv).rgb;
 
   float planeTol = 0.01 * distance(P, uCameraPos) + 1e-3;
@@ -233,6 +243,7 @@ export class CompositePass {
         uUpsample: { value: false },
         uIrrTexelSize: { value: new THREE.Vector2() },
         uCameraPos: { value: new THREE.Vector3() },
+        uNearestLighting: { value: false },
         uCrop: { value: new THREE.Vector4(1, 1, 0, 0) },
         uFogEnabled: { value: false },
         uFogColor: { value: new THREE.Color(0.5, 0.6, 0.7) },

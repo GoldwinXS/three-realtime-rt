@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+**Denoiser plugin hook (`rt.setDenoiserPlugin`).** The library ships one
+denoiser: the temporal EMA (`AccumulatePass`) followed by the edge-aware a-trous
+blur (`DenoisePass`). An application can now replace that stage wholesale with
+its own filter, without forking the renderer. While a plugin is attached (and
+the split-accumulate MRT path it needs is available, `rt.denoiserPluginActive`),
+the frame runs `rtPass.renderRaw()` and calls
+
+```js
+plugin.render(renderer, rawIrradiance, rawSpecular, gbuffer, viewMatrix,
+              { warp, proj, motion, frame })
+```
+
+then composites the `{ irradiance, specular }` textures it returns exactly where
+the a-trous output would have gone; everything downstream (guided upsample, fog,
+sky, the volumetric add, tonemap and the TAA resolve) is unchanged. `warp` is
+`prevViewProj * camera.matrixWorld` and `proj` is `[P00, P11, P02, P12]` of the
+jittered, overscan-widened projection, which together are what a temporal plugin
+needs to reproject its own history; `motion` is `gbuffer.motion` when motion
+vectors are active and `null` otherwise. Lifecycle: `setSize(w, h)` on every
+lighting-resolution change, `resetHistory()` wherever every other temporal
+history in the pipeline is dropped (`resetAccumulation`), `dispose()` from
+`rt.dispose()`. Nothing about the plugin is assumed beyond those four methods,
+and the library ships no plugin and no plugin-specific code. With no plugin set
+the render path is unchanged and byte-identical (see the gates below).
+
+**`rt.rawInputView`** (debug, default `false`): composite the RAW 1-spp lighting
+instead of the denoised lighting, i.e. show what the denoiser is FED rather than
+what it produces. Bypasses `AccumulatePass`, the a-trous blur, the TAA resolve
+and its jitter, and swaps the composite's guided upsample for nearest-neighbour
+so a lighting-res noise pixel stays a square on screen. Needs the
+split-accumulate MRT path (it is the only configuration in which the raw samples
+exist as their own textures) and is inert otherwise. It does not change whether
+a plugin runs: the plugin still executes and still advances its history.
+
+**`makeMRT` is exported** from the package root. It is the multiple-render-target
+constructor that spans the three peer range (three r172 removed
+`WebGLMultipleRenderTargets`); a denoiser plugin allocates its own MRTs and
+needs the same shim the library's own passes use.
+
+Identity gates on this change, all green with no plugin set: `npm run test:km`
+(27/27, including the shader-source byte identity against master), `npm run
+test:render` (chromium + chromium@3latest + empty-scene + warnings + presets +
+ambient + lights + lightgrid + governor), `dev/dynamic-partial-gates.mjs
+identity` (0 diff on every buffer at frames 1/30/60/90), and the frozen museum
+render (`dev/legacy-render.html`) against master's `src/`. `dev/legacy-identity.mjs`
+reports one differing shader variant, `CompositePass.composite` (+8 / -0 lines):
+the `uNearestLighting` uniform and its branch, which is uniform-gated and never
+reachable with `rawInputView` off; the frozen render is the gate for it and it
+matches master's hash bit for bit.
+
 ## 0.16.2
 
 **The volumetric pass marches only where there is something to scatter.** With

@@ -2,7 +2,8 @@
 // (tsc --strict against a real call site rather than tsc over the .d.ts alone,
 // which never exercises the option object).
 import * as THREE from "three";
-import { RealtimeRaytracer } from "../../src/index.js";
+import { RealtimeRaytracer, makeMRT } from "../../src/index.js";
+import type { DenoiserPlugin } from "../../src/index.js";
 
 const renderer = new THREE.WebGLRenderer();
 const scene = new THREE.Scene();
@@ -56,5 +57,26 @@ const power: number = rt.compiled!.emissivePower;
 const row: number = rt.compiled!.lightRow;
 const compiledCap: number = rt.compiled!.maxLights;
 
+// The denoiser plugin hook: a minimal conforming plugin, attached and detached.
+const plugin: DenoiserPlugin = {
+  render(_renderer, rawIrr, rawSpec, gbuffer, _viewMatrix, ctx) {
+    const hasMotion: boolean = ctx.motion !== null && gbuffer.motion !== null;
+    const p00: number = ctx.proj[0];
+    void hasMotion; void p00; void ctx.warp; void ctx.frame;
+    return { irradiance: rawIrr, specular: rawSpec };
+  },
+  setSize(_w: number, _h: number) {},
+  resetHistory() {},
+  dispose() {},
+};
+rt.setDenoiserPlugin(plugin);
+const pluginActive: boolean = rt.denoiserPluginActive;
+const attached: DenoiserPlugin | null = rt.denoiserPlugin;
+rt.rawInputView = true;
+rt.setDenoiserPlugin(null);
+// The MRT shim a plugin uses for its own targets.
+const mrt = makeMRT(64, 64, 3, { depthBuffer: false });
+
 rt.render(scene, camera);
-export { supported, cost, g, a, clamp, power, cap, lit, gridDefault, row, compiledCap };
+export { supported, cost, g, a, clamp, power, cap, lit, gridDefault, row, compiledCap,
+         pluginActive, attached, mrt };
