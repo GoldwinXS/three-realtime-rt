@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.3
 
 **Denoiser plugin hook (`rt.setDenoiserPlugin`).** The library ships one
 denoiser: the temporal EMA (`AccumulatePass`) followed by the edge-aware a-trous
