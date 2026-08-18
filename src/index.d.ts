@@ -88,9 +88,9 @@ export interface DenoiserPlugin {
   //    0.16.7: the returned pair may be on ANY grid from the lighting grid up
   //    to the G-buffer grid (a network that takes quarter rays and the full
   //    G-buffer and writes full-resolution output); irradiance and specular
-  //    must share a size. The composite reads the size; the post knobs
-  //    (denoiserPluginPostHistory / PostIterations) apply only to output on
-  //    the lighting grid.
+  //    must share a size. The composite reads the size; since 0.16.8 the post
+  //    knobs (denoiserPluginPostHistory / PostIterations) apply to output on
+  //    ANY grid, running on passes sized to the output.
   /** Called with the LIGHTING resolution whenever it changes. */
   setSize(width: number, height: number): void;
   /** Called wherever every other temporal history in the pipeline is dropped. */
@@ -353,7 +353,8 @@ export interface RealtimeRaytracerOptions {
    * 0.16.4: a-trous iterations run on an attached denoiser plugin's OUTPUT
    * irradiance (the same edge-aware DenoisePass the built-in pipeline uses), a
    * spatial post-filter for a network that still leaves residual noise. Default
-   * `0` = nothing runs, the plugin path is byte-identical to 0.16.3.
+   * `0` = nothing runs, the plugin path is byte-identical to 0.16.3. Applies to
+   * plugin output on any grid since 0.16.8.
    */
   denoiserPluginPostIterations?: number;
   /**
@@ -361,6 +362,7 @@ export interface RealtimeRaytracerOptions {
    * denoiser plugin's OUTPUT (the split AccumulatePass run on the network's
    * frames), before the spatial post passes. Default `0` = off; 4-16 settles a
    * young network's flicker at the cost of a little lag on moving lights.
+   * Applies to plugin output on any grid since 0.16.8.
    */
   denoiserPluginPostHistory?: number;
   /**
@@ -1479,6 +1481,12 @@ export class RealtimeRaytracer {
    * history -> a-trous.
    */
   denoiserPluginPostHistory: number;
+  /**
+   * 0.16.8: `[width, height]` of the grid the plugin post passes last ran on,
+   * or null if they did not run this frame (no plugin, a declined frame, the
+   * raw debug view, or both knobs at 0). Read-only.
+   */
+  readonly denoiserPluginPostGrid: number[] | null;
   /** Discard temporal history and restart accumulation. */
   resetAccumulation(): void;
   /**

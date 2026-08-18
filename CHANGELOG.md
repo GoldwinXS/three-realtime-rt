@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.16.8
+
+**The plugin post passes apply to output on any grid.** `denoiserPluginPostHistory`
+(temporal smoothing) and `denoiserPluginPostIterations` (a-trous) used to run only
+when a denoiser plugin returned its pair on the lighting grid, because the passes
+that implement them are the shared ones allocated at that grid. An upsampling
+network (quarter rays in, higher-resolution pair out, 0.16.7) therefore got no
+smoothing at all, which is exactly the network that needs it most. Both passes
+were already grid-agnostic (AccumulatePass separates `uTexSize` from `uGbSize`;
+DenoisePass taps at its own texel size and reads the G-buffer by `vUv`), so an
+off-grid output now gets its own AccumulatePass + DenoisePass sized to the output,
+created lazily the first time such a frame arrives with a non-zero knob and freed
+on `setDenoiserPlugin(null)` / `dispose()`. Output on the lighting grid is
+unchanged and still uses the shared passes. New read-only
+`rt.denoiserPluginPostGrid` = `[w, h]` of the grid the post passes last ran on, or
+null.
+
+**The renderScale floor is no longer hard-wired at 0.2.** New
+`RealtimeRaytracer.MIN_RENDER_SCALE = 0.05` is the hard floor under every bound
+(constructor options, the overload brake, and a plugin's `preferences.renderScale`
+min/max). The DEFAULT floor for an app that says nothing is still 0.2, so nothing
+changes unless something asks: the case that asked is an upsampling plugin, for
+which 0.2 was a floor on the wrong quantity (it traces at the low grid and
+reconstructs above it).
+
 ## 0.16.7
 
 **A denoiser plugin may return its pair at any resolution** from the lighting

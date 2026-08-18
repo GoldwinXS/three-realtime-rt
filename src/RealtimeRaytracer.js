@@ -475,6 +475,18 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
   static MAX_SCALE_STEP = 0.25;
 
   /**
+   * 0.16.8: the hard floor under every renderScale bound. It used to be 0.2
+   * everywhere, which was right while the lighting grid WAS the output grid: a
+   * fifth-resolution image upscaled to the canvas is already at the edge of
+   * usable. An upsampling denoiser plugin breaks that assumption (it traces at
+   * the low grid and reconstructs to a higher one), so a plugin that advertises
+   * `preferences.renderScale.min` below 0.2 may now have it. The DEFAULT floor
+   * for an app that says nothing is still 0.2: only an explicit request goes
+   * lower, and the governor still never goes below what it is given.
+   */
+  static MIN_RENDER_SCALE = 0.05;
+
+  /**
    * Largest renderScale change the governor may commit UPWARD in one step. One
    * 0.05 rung, against the 0.25 (five rungs) it may drop in one step. The
    * asymmetry is deliberate and is the whole reason a raise is safe to enable at
@@ -1297,10 +1309,28 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * governor still steps DOWN freely. Live-assignable; lowering it below
      * the current scale clamps the scale on the next frame.
      */
-    this.renderScaleMax = Math.min(1, Math.max(0.2, options.renderScaleMax ?? 1));
-    /** 0.16.6: the governor's FLOOR (0.2 default; a plugin's preferences may raise it). */
-    this.renderScaleMin = Math.min(this.renderScaleMax, Math.max(0.2, options.renderScaleMin ?? 0.2));
+    this.renderScaleMax = Math.min(1, Math.max(RealtimeRaytracer.MIN_RENDER_SCALE, options.renderScaleMax ?? 1));
+    /**
+     * 0.16.6: the governor's FLOOR (0.2 default; a plugin's preferences may
+     * raise it, and since 0.16.8 an upsampling plugin may lower it as far as
+     * MIN_RENDER_SCALE).
+     */
+    this.renderScaleMin = Math.min(
+      this.renderScaleMax,
+      Math.max(RealtimeRaytracer.MIN_RENDER_SCALE, options.renderScaleMin ?? 0.2)
+    );
     this._pluginRan = false;
+    // 0.16.8: the post passes (temporal smoothing + a-trous) for a plugin whose
+    // output pair sits OFF the lighting grid, e.g. a network that takes quarter
+    // rays and upsamples. Created lazily at the OUTPUT size the first time such
+    // a frame arrives with a non-zero knob, so a plugin that stays on the
+    // lighting grid allocates nothing and that path stays byte-identical.
+    this._pluginPostAccum = null;
+    this._pluginPostDenoise = null;
+    this._pluginPostW = 0;
+    this._pluginPostH = 0;
+    this._pluginPostGrid = null;   // [w, h] of the last post pass that ran, else null
+    this._zeroSpec = null;         // 1x1 black: stands in for a specular the plugin did not return
     if (this._renderScale > this.renderScaleMax) this._renderScale = this.renderScaleMax;
     /** Frame-rate target for the adaptive governor. */
     this.targetFps = options.targetFps ?? 55;
@@ -2087,10 +2117,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     if (this._overloadStrikes < 3) return;
     this._overloadStrikes = 0;
 
-    if (this._renderScale > 0.2) {
+    if (this._renderScale > this.renderScaleMin) {
       this.denoiseIterations = Math.min(this.denoiseIterations, 3);
       this.stochasticLights = true;
-      this.renderScale = Math.max(0.2, Math.round(this._renderScale * 0.5 * 20) / 20);
+      this.renderScale = Math.max(this.renderScaleMin, Math.round(this._renderScale * 0.5 * 20) / 20);
       console.warn(
         `three-realtime-rt: frames exceeding 400ms — overload brake cut lighting to ` +
           `${Math.round(this._renderScale * 100)}%. Lower your canvas resolution or enable adaptiveQuality.`
@@ -2473,6 +2503,51 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
    * @param {{render: Function, setSize: Function, resetHistory: Function,
    *          dispose: Function} | null} plugin
    */
+  /**
+   * 0.16.8: the grid the plugin post passes last ran on, `[width, height]`, or
+   * null if they did not run this frame (no plugin, a declined frame, the raw
+   * debug view, or both knobs at 0). Read it to confirm the smoothing and the
+   * a-trous are working on the resolution the plugin actually returned.
+   * @returns {number[]|null}
+   */
+  get denoiserPluginPostGrid() {
+    return this._pluginPostGrid ? [this._pluginPostGrid[0], this._pluginPostGrid[1]] : null;
+  }
+
+  /**
+   * Allocate (or resize) the off-grid plugin post passes. Called only on a
+   * frame whose plugin output is off the lighting grid AND has a non-zero post
+   * knob, so nothing is allocated for a plugin that never needs them.
+   * @private
+   */
+  _ensurePluginPost(w, h) {
+    if (!this._pluginPostAccum) this._pluginPostAccum = new AccumulatePass(w, h);
+    else if (this._pluginPostW !== w || this._pluginPostH !== h) this._pluginPostAccum.setSize(w, h);
+    if (!this._pluginPostDenoise) this._pluginPostDenoise = new DenoisePass(w, h);
+    else if (this._pluginPostW !== w || this._pluginPostH !== h) this._pluginPostDenoise.setSize(w, h);
+    this._pluginPostW = w;
+    this._pluginPostH = h;
+  }
+
+  /** 1x1 black, lazily made: a specular stand-in on a grid that has no raw pair. @private */
+  _zeroSpecTex() {
+    if (!this._zeroSpec) {
+      this._zeroSpec = new THREE.DataTexture(new Float32Array([0, 0, 0, 1]), 1, 1, THREE.RGBAFormat, THREE.FloatType);
+      this._zeroSpec.needsUpdate = true;
+    }
+    return this._zeroSpec;
+  }
+
+  /** @private */
+  _disposePluginPost() {
+    if (this._pluginPostAccum) { this._pluginPostAccum.dispose(); this._pluginPostAccum = null; }
+    if (this._pluginPostDenoise) { this._pluginPostDenoise.dispose(); this._pluginPostDenoise = null; }
+    if (this._zeroSpec) { this._zeroSpec.dispose(); this._zeroSpec = null; }
+    this._pluginPostW = 0;
+    this._pluginPostH = 0;
+    this._pluginPostGrid = null;
+  }
+
   setDenoiserPlugin(plugin) {
     if (plugin) {
       for (const m of ["render", "setSize", "resetHistory", "dispose"]) {
@@ -2486,6 +2561,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     }
     this._denoiserPlugin = plugin || null;
     this._pluginRan = false;
+    // 0.16.8: the off-grid post passes belong to the plugin that needed them.
+    // Detaching (or swapping) frees them; the next plugin that needs them
+    // allocates its own at its own output size.
+    this._disposePluginPost();
     if (!this.supported) return;
     if (this._denoiserPlugin) {
       // Size it to the CURRENT lighting resolution before its first frame: a
@@ -2502,8 +2581,13 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       if (pref) {
         const appMax = this._appRenderScaleMax ?? this.renderScaleMax;
         this._appRenderScaleMax = appMax;
-        if (Number.isFinite(pref.max)) this.renderScaleMax = Math.min(appMax, Math.max(0.2, pref.max));
-        if (Number.isFinite(pref.min)) this.renderScaleMin = Math.min(this.renderScaleMax, Math.max(0.2, pref.min));
+        // 0.16.8: the clamp is MIN_RENDER_SCALE, not the old 0.2. An upsampling
+        // plugin traces at the low grid and reconstructs above it, so 0.2 was a
+        // floor on the wrong quantity for it. An app that never attaches such a
+        // plugin is unaffected: its own default floor is still 0.2.
+        const FLOOR = RealtimeRaytracer.MIN_RENDER_SCALE;
+        if (Number.isFinite(pref.max)) this.renderScaleMax = Math.min(appMax, Math.max(FLOOR, pref.max));
+        if (Number.isFinite(pref.min)) this.renderScaleMin = Math.min(this.renderScaleMax, Math.max(FLOOR, pref.min));
         if (Number.isFinite(pref.preferred)) {
           const start = Math.min(this.renderScaleMax, Math.max(this.renderScaleMin, pref.preferred));
           if (Math.abs(start - this._renderScale) > 1e-6) this.renderScale = start;
@@ -3859,6 +3943,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       // attached, and `denoiserPluginRan` says which happened.
       const pluginOk = !!(out && out.irradiance);
       this._pluginRan = pluginOk;
+      // 0.16.8: reported per frame, so a declined frame or the raw debug view
+      // reads null rather than last frame's grid.
+      this._pluginPostGrid = null;
       if (!pluginOk) {
         const acc = this.accumulatePass.render(
           this.renderer, raw.rawIrradiance, raw.rawSpecular, this.gbuffer,
@@ -3889,29 +3976,54 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       if (rawView) {
         irradiance = raw.rawIrradiance;
         specularTex = this.specular ? raw.rawSpecular : null;
-      } else if (outOnLightingGrid) {
+      } else {
         // Optional spatial post-filter on the plugin's output (0 = nothing,
         // byte-identical to the plain plugin path): the same edge-aware a-trous
         // the built-in pipeline uses, for a network that still flickers.
         // Optional temporal smoothing first: the network output goes through
         // the split-accumulate EMA (reprojected history) as if it were the raw
         // sample stream, so frame-to-frame flicker averages out.
+        //
+        // 0.16.8: these run on ANY output grid. Until 0.16.7 they were skipped
+        // unless the plugin returned its pair on the lighting grid, because the
+        // shared passes are allocated there and would have downsampled a larger
+        // output. That was plumbing, not a principle: both passes are already
+        // grid-agnostic (AccumulatePass separates uTexSize from uGbSize,
+        // DenoisePass taps at its own texel size and reads the G-buffer by
+        // vUv), so an off-grid output just needs its own pair of passes at the
+        // output size. A network that upsamples still needed the smoothing.
         const hist = Math.max(0, Math.round(this.denoiserPluginPostHistory || 0));
-        if (hist > 0 && this.outputMode !== 7) {
-          const acc = this.accumulatePass.render(
-            this.renderer, irradiance, specularTex || raw.rawSpecular, this.gbuffer,
+        const post = Math.max(0, Math.round(this.denoiserPluginPostIterations || 0));
+        const ow = (outImg && outImg.width) ? outImg.width : this._scaledW;
+        const oh = (outImg && outImg.height) ? outImg.height : this._scaledH;
+        if (!outOnLightingGrid && (hist > 0 || post > 0) && this.outputMode !== 7) {
+          this._ensurePluginPost(ow, oh);
+        }
+        const accum = outOnLightingGrid ? this.accumulatePass : this._pluginPostAccum;
+        const den = outOnLightingGrid ? this.denoisePass : this._pluginPostDenoise;
+        if (hist > 0 && this.outputMode !== 7 && accum) {
+          // The specular the accumulate pass reads must be on the SAME grid as
+          // the irradiance it is fed. On the lighting grid the raw specular is,
+          // and is the long-standing fallback; off it, the raw pair is the
+          // wrong size, so a 1x1 black stands in (it is only ever consumed when
+          // the plugin returned a specular of its own, which is used instead).
+          const spec = specularTex
+            || (outOnLightingGrid ? raw.rawSpecular : this._zeroSpecTex());
+          const acc = accum.render(
+            this.renderer, irradiance, spec, this.gbuffer,
             this._prevViewProj, this._jitteredViewProj, this._camWorldPos, this.eps, hist,
             { preFireflyClamp: 0.0, historyClampK: 0.0,
               lightMotion: this.lightAdaptive ? this.lightMotion : 0, gradK: this.lightGradK });
           irradiance = acc.irradiance;
           if (this.specular && specularTex) specularTex = acc.specular;
+          this._pluginPostGrid = [ow, oh];
         }
-        const post = Math.max(0, Math.round(this.denoiserPluginPostIterations || 0));
-        if (post > 0 && this.outputMode !== 7) {
-          irradiance = this.denoisePass.render(
+        if (post > 0 && this.outputMode !== 7 && den) {
+          irradiance = den.render(
             this.renderer, irradiance, this.gbuffer, this._camWorldPos, this.eps, post, giTex,
             { maxStep: this.denoiseMaxStep, stepJitter: this.denoiseStepJitter, wideDamp: this.denoiseWideDamp,
               frame: this.frame, momentsTexture: null });
+          this._pluginPostGrid = [ow, oh];
         }
       }
       }   // pluginOk
@@ -4170,6 +4282,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.denoisePass.dispose();
     this.specDenoisePass.dispose();
     if (this._denoiserPlugin) this._denoiserPlugin.dispose();
+    this._disposePluginPost();
     this.composite.dispose();
     this.taaPass.dispose();
     this.volumetricPass.dispose();

@@ -315,7 +315,12 @@ returns full-resolution textures, and the composite taps them at their own
 texel size (skipping the guided upsample when they are already at canvas
 resolution). `irradiance` and `specular` must share a size. `ctx.lightingSize`
 and `ctx.gbufferSize` (`[w, h]`, reused arrays) tell you the two grids each
-frame. The two post knobs apply only to output on the lighting grid.
+frame. **0.16.8:** the two post knobs below apply to output on ANY grid. Until
+0.16.7 they were skipped unless the pair came back on the lighting grid, because
+the passes that implement them are allocated there; an off-grid output now gets
+its own pair of passes at the output size, allocated the first time one arrives
+with a non-zero knob. `rt.denoiserPluginPostGrid` reports `[w, h]` of the grid
+they last ran on, or null if they did not run this frame.
 
 `rt.denoiserPluginPostIterations = N` (0.16.4, default 0) runs the built-in
 edge-aware a-trous N times on the plugin's OUTPUT irradiance, as a spatial
