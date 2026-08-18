@@ -1396,6 +1396,16 @@ every mesh is static. Call `compileScene(scene, options)` yourself first.
 and cannot write the G-buffer, so they are hidden for the traced frame
 (`untraceable-object`). Draw them in your own pass on top of `rt.render()`.
 
+**`rt:lighting: ERROR: 0:NNN: '_ubvh' : undeclared identifier` on an Android
+phone.** Fixed in **0.16.9**; upgrade. Some Adreno drivers reject a struct that
+contains samplers when it is passed as a FUNCTION PARAMETER, which is how the
+any-hit (shadow ray) traversal used to take three-mesh-bvh's `BVH` struct;
+`_ubvh` is the driver's mangled name for that parameter. The program fails to
+link and the device loses ray tracing entirely. 0.16.9 expands the struct into
+its four samplers at the call site with a macro, exactly as three-mesh-bvh
+already does for its own closest-hit traversal. Output is byte-identical, so the
+upgrade is a straight swap.
+
 ## Render self-test
 
 The renderer can pass every compile and framebuffer check and still draw a black

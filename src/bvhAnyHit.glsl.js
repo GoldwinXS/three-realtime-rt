@@ -18,6 +18,10 @@
 //     - #define BVH_STACK_DEPTH 60   : REUSED (this file uses the same define, defaulting to 60)
 //     - #define INFINITY             : available but unused here
 //   (bvh_ray_functions.glsl.js also provides #define TRI_INTERSECT_EPSILON used inside intersectsTriangle.)
+//     - the bvhIntersectFirstHit MACRO : REUSED AS A PATTERN. Upstream never passes the BVH struct
+//       across a function boundary either: a one-line #define expands bvh.position / bvh.index /
+//       bvh.bvhBounds / bvh.bvhContents at the call site and _bvhIntersectFirstHit takes four plain
+//       samplers. This file does the same (0.16.9); see the macro below for the device that forced it.
 //
 // Layout assumptions (must hold for the reused decode to be correct):
 //   - bvhContents texel per node: .x packs (isLeaf flag in high 16 bits | (count if leaf else splitAxis) in low 16 bits),
@@ -46,9 +50,33 @@ export const BVH_ANY_HIT_GLSL = /* glsl */ `
 // still compiles and runs unchanged.
 int gBvhVisits = 0;
 
+// A struct containing samplers is legal as a UNIFORM but passing one as a
+// FUNCTION PARAMETER is a corner of GLSL ES that drivers disagree about: an
+// Adreno driver (Nothing Phone 2, 2026-08-18) rejects it with
+// "'_ubvh' : undeclared identifier" and the whole tracer goes dark on that
+// device. So the struct is expanded into its four samplers at the CALL SITE by
+// a macro and never crosses a function boundary, exactly the way three-mesh-bvh
+// itself hands bvhIntersectFirstHit its BVH (bvh_ray_functions.glsl.js). The
+// call sites are unchanged: they still write bvhIntersectAnyHit( bvhStatic, ... ).
+#define\
+	bvhIntersectAnyHit(\
+		bvh,\
+		rayOrigin, rayDirection, maxDist\
+	)\
+	_bvhIntersectAnyHit(\
+		bvh.position, bvh.index, bvh.bvhBounds, bvh.bvhContents,\
+		rayOrigin, rayDirection, maxDist\
+	)
+
 // Returns true if ANY triangle in the BVH is hit by the ray within (0, maxDist).
 // Unordered traversal with early-out; no closest-hit bookkeeping.
-bool bvhIntersectAnyHit( BVH bvh, vec3 rayOrigin, vec3 rayDirection, float maxDist ) {
+bool _bvhIntersectAnyHit(
+	// bvh info, expanded from the struct by the macro above
+	sampler2D bvh_position, usampler2D bvh_index, sampler2D bvh_bvhBounds, usampler2D bvh_bvhContents,
+
+	// ray
+	vec3 rayOrigin, vec3 rayDirection, float maxDist
+) {
 
 	// Same fixed-size stack as _bvhIntersectFirstHit: sized for the tree's max depth,
 	// large enough because we push both children each internal node.
@@ -72,7 +100,7 @@ bool bvhIntersectAnyHit( BVH bvh, vec3 rayOrigin, vec3 rayDirection, float maxDi
 		// prune: skip nodes the ray misses or whose entry distance is already past maxDist
 		float boundsHitDistance;
 		if (
-			! intersectsBVHNodeBounds( rayOrigin, rayDirection, bvh.bvhBounds, currNodeIndex, boundsHitDistance )
+			! intersectsBVHNodeBounds( rayOrigin, rayDirection, bvh_bvhBounds, currNodeIndex, boundsHitDistance )
 			|| boundsHitDistance > maxDist
 		) {
 
@@ -80,7 +108,7 @@ bool bvhIntersectAnyHit( BVH bvh, vec3 rayOrigin, vec3 rayDirection, float maxDi
 
 		}
 
-		uvec2 boundsInfo = uTexelFetch1D( bvh.bvhContents, currNodeIndex ).xy;
+		uvec2 boundsInfo = uTexelFetch1D( bvh_bvhContents, currNodeIndex ).xy;
 		bool isLeaf = bool( boundsInfo.x & 0xffff0000u );
 
 		if ( isLeaf ) {
@@ -91,10 +119,10 @@ bool bvhIntersectAnyHit( BVH bvh, vec3 rayOrigin, vec3 rayDirection, float maxDi
 			// test each triangle in the leaf; early-out on the first valid occluder
 			for ( uint i = offset, l = offset + count; i < l; i ++ ) {
 
-				uvec3 indices = uTexelFetch1D( bvh.index, i ).xyz;
-				vec3 a = texelFetch1D( bvh.position, indices.x ).rgb;
-				vec3 b = texelFetch1D( bvh.position, indices.y ).rgb;
-				vec3 c = texelFetch1D( bvh.position, indices.z ).rgb;
+				uvec3 indices = uTexelFetch1D( bvh_index, i ).xyz;
+				vec3 a = texelFetch1D( bvh_position, indices.x ).rgb;
+				vec3 b = texelFetch1D( bvh_position, indices.y ).rgb;
+				vec3 c = texelFetch1D( bvh_position, indices.z ).rgb;
 
 				if (
 					intersectsTriangle( rayOrigin, rayDirection, a, b, c, triBarycoord, triNormal, triDist, triSide )

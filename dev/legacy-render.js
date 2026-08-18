@@ -31,6 +31,13 @@ import { buildScene } from "../examples/scene.js";
 const P = new URLSearchParams(location.search);
 const ARM = P.get("opts") === "new" ? "new" : "legacy";
 const FRAMES = parseInt(P.get("frames") || "120", 10);
+// ?plus=1 turns on the three consumers of the shared BVH traversal chunk that
+// the default option set leaves off: restirGI (GIReservoirPass), volumetric
+// (VolumetricPass) and reflections/refraction (more shadow rays out of
+// RTLightingPass). Added for the 0.16.9 portability change, whose whole risk is
+// in that shared chunk, so the frozen render has to compile and drive every
+// program that includes it rather than just the lighting pass.
+const PLUS = P.get("plus") === "1";
 const W = 1280, H = 720;
 
 const out = document.getElementById("verdict");
@@ -88,6 +95,12 @@ async function main() {
     sky: { enabled: false },
     // The arm.
     ...(ARM === "legacy" ? LEGACY : {}),
+    ...(PLUS ? {
+      restirGI: true,
+      reflections: true,
+      refraction: true,
+      volumetric: { enabled: true },
+    } : {}),
   });
   rt.compileScene(scene); // STATIC: no dynamicMeshes, so nothing moves
   rt.updateLights(scene);
@@ -114,6 +127,10 @@ async function main() {
 
   const verdict = {
     arm: ARM,
+    plus: PLUS,
+    restirGI: !!rt.restirGI,
+    volumetric: !!(rt.volumetric && rt.volumetric.enabled),
+    reflections: !!rt.reflections,
     frames: FRAMES,
     hash: h.toString(16).padStart(8, "0"),
     meanLum: Math.round((lum / (W * H)) * 100) / 100,

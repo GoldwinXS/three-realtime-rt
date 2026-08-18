@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.16.9
+
+**No struct crosses a function boundary in the traced shaders any more, so an
+Adreno driver that refused to build them now does.** On a Nothing Phone 2 the
+game using this library reported
+
+    Ray tracing unavailable on this GPU: a shader failed to build:
+    rt:lighting: ERROR: 0:240: '_ubvh' : undeclared identifier
+
+`_ubvh` is the driver's mangled name for `bvh`, the parameter of
+`bvhIntersectAnyHit( BVH bvh, vec3 rayOrigin, vec3 rayDirection, float maxDist )`
+in `bvhAnyHit.glsl.js`. `BVH` is three-mesh-bvh's struct of four samplers
+(`index`, `position`, `bvhBounds`, `bvhContents`). A struct containing samplers
+is legal as a UNIFORM, but passing one as a FUNCTION PARAMETER is a corner of
+GLSL ES that drivers disagree about: desktop GL, Apple and other Android parts
+accept it, this Adreno driver does not, and it fails the whole program, so the
+device loses ray tracing entirely.
+
+The any-hit traversal now does what three-mesh-bvh already does for its own
+closest-hit traversal: a one-line `#define` expands the struct into its four
+samplers AT THE CALL SITE, and the real function `_bvhIntersectAnyHit` takes
+four plain samplers. Every call site is unchanged (`bvhIntersectAnyHit( bvhStatic,
+ro, rd, d )` still reads the same in RTLightingPass, GIReservoirPass and
+VolumetricPass), the `uniform BVH bvhStatic / bvhDynamic` declarations are
+unchanged (a struct uniform is fine), and no public API moves: `index.d.ts` is
+untouched.
+
+Byte-identical output, checked on the GPU rather than assumed:
+`dev/legacy-render.html` (the museum, static compile, pinned camera, 120 renders,
+FNV-1a over the drawing buffer) gives the same hash before and after the change,
+in both arms: `opts=new` `04bf92af` and, with `?plus=1`, `45022e94`. That second
+arm is new here: it turns on `restirGI`, `volumetric` and `reflections/refraction`
+so the frozen render compiles and drives every program that includes the shared
+traversal chunk, not just the lighting pass.
+
 ## 0.16.8
 
 **The plugin post passes apply to output on any grid.** `denoiserPluginPostHistory`
