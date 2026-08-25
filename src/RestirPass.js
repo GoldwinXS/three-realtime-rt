@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { LIGHTING_RECT_GLSL, rectUniforms, setRectUniforms, setTargetRect } from "./lightingRect.js";
 import { MAX_LIGHTS, clampMaxLights } from "./SceneCompiler.js";
 import { makeMRT } from "./mrtCompat.js";
 
@@ -14,6 +15,7 @@ void main() {
 // first, PCG after) and the candidate contribution — which MUST stay in
 // agreement with RTLightingPass.shadeReservoir (minus visibility).
 const RESTIR_COMMON = /* glsl */ `
+${LIGHTING_RECT_GLSL}
 #define MAX_LIGHTS RT_MAX_LIGHTS_VALUE
 #define PI 3.14159265358979
 
@@ -463,7 +465,7 @@ void main() {
     }
     // <<< RT_RESTIR_REPROJ
     if (histOk) {
-      vec4 h = texture(uPrevReservoir, useUv);
+      vec4 h = texture(uPrevReservoir, rectUv(useUv));
       // Staleness cap; ALSO keeps total M within the 6 bits the encoding
       // stores (8 fresh + 40 history < 64).
       float hM = min(mod(h.r, 64.0), uMCap);
@@ -493,7 +495,7 @@ void main() {
   // crossing it and the trailing edge stops disoccluding. The live reservoir
   // (attachment 0) still streams the aeroplane's fresh candidates for shading.
   outHistory = (uFreezeDynamic > 0.5 && isDynamic > 0.5)
-    ? texture(uPrevReservoir, vUv)
+    ? texture(uPrevReservoir, rectUv(vUv))
     : outReservoir;
 }
 `;
@@ -535,7 +537,7 @@ void main() {
   gBlueNoise = fetchBlueNoise();
   gBnDim = 3; // decorrelate from the temporal stage's blue-noise dims
 
-  vec4 c = texture(uReservoirIn, vUv);
+  vec4 c = texture(uReservoirIn, rectUv(vUv));
   float rId = floor(c.r / 64.0);
   float M = mod(c.r, 64.0);
   float wSum = c.a;
@@ -565,7 +567,7 @@ void main() {
     vec3 nN = normalize(texture(uGNormalMetal, nUv).xyz);
     if (dot(N, nN) < 0.9) continue;
 
-    vec4 h = texture(uReservoirIn, nUv);
+    vec4 h = texture(uReservoirIn, rectUv(nUv));
     float hM = mod(h.r, 64.0);
     if (hM < 1.0 || h.a <= 0.0) continue;
     float hId = floor(h.r / 64.0);
@@ -638,6 +640,9 @@ export class RestirPass {
           uEps: { value: 1e-3 },
           // Declared by RESTIR_COMMON, so BOTH stages carry it.
           uDirBypass: { value: 0.0 },
+          // Sub-rect remap (lightingRect.js): reservoirs are allocated at the
+          // renderScale cap and only a rect of them is live.
+          ...rectUniforms(),
           ...(frag === temporalFrag
             ? {
                 // >>> RT_RESTIR_CAND_CDF
@@ -895,8 +900,28 @@ export class RestirPass {
     this.targetA.setSize(width, height);
     this.targetB.setSize(width, height);
     this.spatialTarget.setSize(width, height);
-    this.spatialMaterial.uniforms.uTexelSize.value.set(1 / width, 1 / height);
-    this.material.uniforms.uTexelSizeT.value.set(1 / width, 1 / height);
+    this.setRect(width, height); // setSize resets three's per-target viewport
+  }
+
+  /**
+   * Point the stages at a `w x h` rect of their (larger) allocated targets. The
+   * texel-size uniforms stay 1/RECT: a neighbour tap is computed in rect uv
+   * space and `rectUv` maps it onto the allocation, so `off / rect` lands on
+   * exactly `off` allocated texels. Reservoir textures are NearestFilter, so
+   * the remap picks the identical texel it picked before this existed.
+   *
+   * Reservoir history is a packed id.64+M encoding that cannot be resampled, so
+   * a rect change clears it exactly as a reallocation did (clearHistory) and it
+   * reconverges in a few frames.
+   */
+  setRect(w, h) {
+    for (const t of [this.targetA, this.targetB, this.spatialTarget]) setTargetRect(t, w, h);
+    this.spatialMaterial.uniforms.uTexelSize.value.set(1 / w, 1 / h);
+    this.material.uniforms.uTexelSizeT.value.set(1 / w, 1 / h);
+    const aw = this.targetA.width;
+    const ah = this.targetA.height;
+    setRectUniforms(this.material, w, h, aw, ah);
+    setRectUniforms(this.spatialMaterial, w, h, aw, ah);
   }
 
   /**

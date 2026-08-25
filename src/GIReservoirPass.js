@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { LIGHTING_RECT_GLSL, rectUniforms, setRectUniforms, setTargetRect } from "./lightingRect.js";
 import { shaderStructs, shaderIntersectFunction } from "three-mesh-bvh";
 import { MAX_LIGHTS, clampMaxLights } from "./SceneCompiler.js";
 import { SKY_GLSL } from "./sky.glsl.js";
@@ -39,6 +40,11 @@ ${SKY_GLSL}
 
 #define MAX_LIGHTS RT_MAX_LIGHTS_VALUE
 #define PI 3.14159265358979
+
+${LIGHTING_RECT_GLSL}
+// The ACTIVE lighting rect in texels (see lightingRect.js): the reservoir
+// targets are allocated at the renderScale cap, so textureSize() is not it.
+uniform vec2 uLightRes;
 
 // MRT: [0] reservoir hit position + packed(M, oct-normal) (fp32),
 //      [1] reservoir radiance + W,
@@ -520,8 +526,8 @@ void main() {
   if (haveReproj) {
     vec4 pPos = texture(uPrevGWorldPos, prevUv);
     if (pPos.w > 0.5 && abs(dot(P - pPos.xyz, N)) < tol) {
-      vec4 hp = texture(uPrevResPos, prevUv);  // hitPos.xyz + packed(M, n_s)
-      vec4 hr = texture(uPrevResRad, prevUv);  // radiance.rgb + W
+      vec4 hp = texture(uPrevResPos, rectUv(prevUv));  // hitPos.xyz + packed(M, n_s)
+      vec4 hr = texture(uPrevResRad, rectUv(prevUv));  // radiance.rgb + W
       unpackMN(hp.w, Mprev, nPrev);
       Wprev = hr.w;
       if (Mprev > 0.0 && Wprev > 0.0) {
@@ -716,7 +722,7 @@ void main() {
   // pixel's primary point; x_r is the NEIGHBOUR's primary point read from the
   // previous frame's gWorldPos. A final visibility ray (below) prevents leaks. ---
   if (haveReproj && uSpatialTaps > 0) {
-    vec2 texel = 1.0 / vec2(textureSize(uPrevResPos, 0));
+    vec2 texel = 1.0 / uLightRes;
     for (int k = 0; k < 4; k++) {
       if (k >= uSpatialTaps) break;
       // Offset: radius uniform in [4, 20] lighting-res pixels, angle from RNG,
@@ -730,8 +736,8 @@ void main() {
       // against q's plane (same tolerance as the temporal validation).
       vec4 nPrimary = texture(uPrevGWorldPos, nUv);   // x_r + validFlag
       if (nPrimary.w < 0.5 || abs(dot(P - nPrimary.xyz, N)) >= tol) continue;
-      vec4 nhp = texture(uPrevResPos, nUv);   // x_s + packed(M_r, n_s)
-      vec4 nhr = texture(uPrevResRad, nUv);   // L_s + W_r
+      vec4 nhp = texture(uPrevResPos, rectUv(nUv));   // x_s + packed(M_r, n_s)
+      vec4 nhr = texture(uPrevResRad, rectUv(nUv));   // L_s + W_r
       float Mr; vec3 nS;
       unpackMN(nhp.w, Mr, nS);
       float Wr = nhr.w;
@@ -1007,6 +1013,8 @@ export class GIReservoirPass {
         uPrevGWorldPos: { value: null },
         uPrevResPos: { value: null },
         uPrevResRad: { value: null },
+        uLightRes: { value: new THREE.Vector2(1, 1) },
+        ...rectUniforms(),
         uPrevViewProj: { value: new THREE.Matrix4() },
         uLightRow: { value: 0 },
         uLightCount: { value: 0 },
@@ -1113,6 +1121,20 @@ export class GIReservoirPass {
   setSize(width, height) {
     this.targetA.setSize(width, height);
     this.targetB.setSize(width, height);
+    this.setRect(width, height); // setSize resets three's per-target viewport
+  }
+
+  /**
+   * Point the pass at a `w x h` rect of its (larger) allocated targets. GI
+   * reservoirs are packed (hit position + M + radiance + W) and cannot be
+   * resampled, so a rect change clears the history exactly as a reallocation
+   * did; it reconverges in a few frames.
+   */
+  setRect(w, h) {
+    setTargetRect(this.targetA, w, h);
+    setTargetRect(this.targetB, w, h);
+    this.material.uniforms.uLightRes.value.set(w, h);
+    setRectUniforms(this.material, w, h, this.targetA.width, this.targetA.height);
   }
 
   /**

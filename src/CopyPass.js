@@ -20,8 +20,11 @@ layout(location = 0) out vec4 outColor;
 in vec2 vUv;
 uniform sampler2D uTex;
 uniform float uCountClamp;
+// The live rect of the SOURCE target as a fraction of its allocated size
+// (see lightingRect.js). (1,1) when the source is whole.
+uniform vec2 uSrcScale;
 void main() {
-  vec4 c = texture(uTex, vUv);
+  vec4 c = texture(uTex, vUv * uSrcScale);
   if (uCountClamp >= 0.0) c.a = min(c.a, uCountClamp);
   outColor = c;
 }
@@ -46,6 +49,7 @@ export class CopyPass {
       uniforms: {
         uTex: { value: null },
         uCountClamp: { value: -1 },
+        uSrcScale: { value: new THREE.Vector2(1, 1) },
       },
       depthTest: false,
       depthWrite: false,
@@ -60,11 +64,15 @@ export class CopyPass {
 
   /**
    * Blit srcTexture into dstTarget. countClamp < 0 copies rgba verbatim; >= 0
-   * caps the alpha (accumulation-count) channel to that value.
+   * caps the alpha (accumulation-count) channel to that value. `srcScale`
+   * restricts the read to the source's live sub-rect; the WRITE rect is the
+   * destination target's own viewport/scissor, so a rect-to-rect resample is
+   * `setTargetRect(dst, ...)` plus this call.
    */
-  blit(renderer, srcTexture, dstTarget, countClamp = -1) {
+  blit(renderer, srcTexture, dstTarget, countClamp = -1, srcScaleX = 1, srcScaleY = 1) {
     this.material.uniforms.uTex.value = srcTexture;
     this.material.uniforms.uCountClamp.value = countClamp;
+    this.material.uniforms.uSrcScale.value.set(srcScaleX, srcScaleY);
     const prev = renderer.getRenderTarget();
     renderer.setRenderTarget(dstTarget);
     renderer.render(this.scene, this.camera);

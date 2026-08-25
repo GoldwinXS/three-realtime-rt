@@ -20,6 +20,7 @@ import { LightGridPass } from "./LightGridPass.js";
 import { CopyPass } from "./CopyPass.js";
 import { GpuTimer } from "./GpuTimer.js";
 import { makeMRT } from "./mrtCompat.js";
+import { setRectUniforms } from "./lightingRect.js";
 
 // Van der Corput / Halton radical inverse — deterministic low-discrepancy
 // sub-pixel offsets for temporal jitter.
@@ -497,6 +498,44 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
   static MAX_SCALE_UP_STEP = 0.05;
 
   /**
+   * THE LADDER (0.16.10). The governor no longer picks a renderScale off a
+   * continuous 0.05 grid; it picks a RUNG, and a rung is a fixed fraction of
+   * the renderScale CAP. Five rungs spanning cap..0.4*cap is enough range to
+   * rescue a struggling device (0.4x the cap is 0.16 of the frame's lighting
+   * pixels) and few enough that the whole session's states are enumerable,
+   * which is what makes the allocation gate below checkable at all.
+   */
+  static SCALE_LADDER = [1.0, 0.85, 0.7, 0.55, 0.4];
+
+  /**
+   * HYSTERESIS, and the numbers are the point of this wave. The owner's phone
+   * trace has renderScale moving roughly ONCE A SECOND for seven minutes
+   * (0.13, 0.25, 0.2, 0.3, 0.15 ...) before the context died. Three independent
+   * locks now make that impossible by construction rather than unlikely:
+   *
+   *   DOWN_STREAK 10   consecutive slow governor samples (~0.2s at 60fps, ~0.5s
+   *                    at 20fps) before a rung is given up. Small on purpose: a
+   *                    device in trouble has to escape quickly, and a step down
+   *                    is the cheap direction.
+   *   UP_STREAK  180   consecutive samples with real headroom before one is
+   *                    taken back (18x the down streak, ~3s at 60fps and
+   *                    ~9s at 20fps. N << M is what stops the ladder hunting:
+   *                    a device that is borderline spends almost all its time
+   *                    at the lower rung instead of trading between two.
+   *   DWELL     4000ms minimum between ANY two rung moves, whatever the streaks
+   *                    say.
+   *   REVERSAL 20000ms minimum before a move in the OPPOSITE direction to the
+   *                    last one. This is the lock that bounds the flapping: a
+   *                    complete down-up (or up-down) cycle cannot take less
+   *                    than 20 seconds, so the trace's 1Hz cycle is not a
+   *                    tuning question any more, it is unreachable.
+   */
+  static LADDER_DOWN_STREAK = 10;
+  static LADDER_UP_STREAK = 180;
+  static LADDER_DWELL_MS = 4000;
+  static LADDER_REVERSAL_MS = 20000;
+
+  /**
    * The tracer's GPU cost as a fraction of the frame period, at which the
    * governor calls the frame OVER budget. Deliberately 1.0, i.e. "the whole
    * period": this is a safety net behind the wall clock, not a second opinion
@@ -919,21 +958,31 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       );
     }
 
+    // [wave 14K] the render-target byte ledger the app hands in (src/memLedger.js
+    // in the library; the game creates one, sets rt.memLedger, and logs the
+    // drawing buffer through it). Every pass-target group reallocation logs a NEW
+    // generation with its computed bytes; the ledger retires the old generation
+    // under the deferred-free assumption, which is the peak-concurrent-bytes
+    // measurement the iOS context-loss hunt needs. Null when no app attaches one,
+    // and then every call below is a two-field check.
+    this.memLedger = null;
+    this._ledgerKeys = null;
+
     this.gbuffer = new GBufferPass(this._width, this._height, {
       mixedPrecision,
       materialPooling: options.gbufferMaterialPooling ?? true,
     });
-    this.rtPass = new RTLightingPass(this._scaledW, this._scaledH, {
+    this.rtPass = new RTLightingPass(this._allocW, this._allocH, {
       specMRT: this.specMRTSupported,
       maxLights: this._maxLights,
     });
-    this.denoisePass = new DenoisePass(this._scaledW, this._scaledH);
+    this.denoisePass = new DenoisePass(this._allocW, this._allocH);
     // Separate à-trous instance for the specular buffer (its own ping-pong
     // targets, so the specular denoise cannot clobber the irradiance result).
-    this.specDenoisePass = new DenoisePass(this._scaledW, this._scaledH, {
+    this.specDenoisePass = new DenoisePass(this._allocW, this._allocH, {
       blendIsSpec: true, // blend pixels here hold the behind-the-pane image
     });
-    this.accumulatePass = new AccumulatePass(this._scaledW, this._scaledH);
+    this.accumulatePass = new AccumulatePass(this._allocW, this._allocH);
     this.composite = new CompositePass();
     this.taaPass = new TAAPass(this._width, this._height);
     this._sceneColor = this._makeColorTarget(this._width, this._height);
@@ -1309,7 +1358,42 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * governor still steps DOWN freely. Live-assignable; lowering it below
      * the current scale clamps the scale on the next frame.
      */
-    this.renderScaleMax = Math.min(1, Math.max(RealtimeRaytracer.MIN_RENDER_SCALE, options.renderScaleMax ?? 1));
+    /**
+     * 0.16.10: the lighting-resolution targets are allocated ONCE, at the
+     * renderScale CAP, and a renderScale step renders into a SUB-RECT of them
+     * (see lightingRect.js). Default ON. `false` restores the pre-0.16.10
+     * behaviour (every step reallocates the whole lighting-resolution set)
+     * and exists so a host can A/B the two paths (dev/governor-check.py does).
+     */
+    this.fixedLightingTargets = options.fixedLightingTargets !== false;
+    // `renderScaleCap` is an alias for renderScaleMax: with fixed targets the
+    // ceiling IS the allocation size, and that is what a host means by "cap".
+    this._renderScaleMax = Math.min(
+      1,
+      Math.max(
+        RealtimeRaytracer.MIN_RENDER_SCALE,
+        options.renderScaleCap ?? options.renderScaleMax ?? 1
+      )
+    );
+    /**
+     * Allocation counters, for hosts and gates that need to PROVE the governor
+     * stopped churning render targets. `lightingAllocations` counts (re)allocations
+     * of the lighting-resolution set, `lightingRectChanges` counts governor steps
+     * that only moved the sub-rect, `denoiserPluginAllocations` counts the
+     * resizes handed to an attached plugin that has no setRect of its own.
+     */
+    this.lightingAllocations = 0;
+    this.lightingRectChanges = 0;
+    this.denoiserPluginAllocations = 0;
+    this._rectW = 0;
+    this._rectH = 0;
+    this._ladder = null;
+    this._ladderKey = null;
+    this._ladderIdx = 0;
+    this._ladderSlow = 0;      // consecutive slow governor samples
+    this._ladderFast = 0;      // consecutive samples with headroom
+    this._ladderLastMove = 0;  // performance.now() of the last rung move
+    this._ladderLastDir = 0;   // -1 down, +1 up, 0 none yet
     /**
      * 0.16.6: the governor's FLOOR (0.2 default; a plugin's preferences may
      * raise it, and since 0.16.8 an upsampling plugin may lower it as far as
@@ -1329,6 +1413,8 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this._pluginPostDenoise = null;
     this._pluginPostW = 0;
     this._pluginPostH = 0;
+    this._pluginPostRw = 0;
+    this._pluginPostRh = 0;
     this._pluginPostGrid = null;   // [w, h] of the last post pass that ran, else null
     this._zeroSpec = null;         // 1x1 black: stands in for a specular the plugin did not return
     if (this._renderScale > this.renderScaleMax) this._renderScale = this.renderScaleMax;
@@ -1612,7 +1698,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * spike (those are 100x) and lets a fully lit surface reach its own total.
      */
     this.restirClampRel = options.restirClampRel ?? 2;
-    this.restirPass = new RestirPass(this._scaledW, this._scaledH, {
+    this.restirPass = new RestirPass(this._allocW, this._allocH, {
       maxLights: this._maxLights,
     });
     /**
@@ -1788,7 +1874,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      * the old path.
      */
     this.restirGIVisFallback = options.restirGIVisFallback ?? true;
-    this.giReservoirPass = new GIReservoirPass(this._scaledW, this._scaledH, {
+    this.giReservoirPass = new GIReservoirPass(this._allocW, this._allocH, {
       maxLights: this._maxLights,
     });
     this._giMissWarned = false;
@@ -1843,6 +1929,14 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       );
       this._renderScale = 0.375;
     }
+
+    // 0.16.10: the passes above were built at the ALLOCATION size; point them
+    // at the live rect once, before the first frame. No history to carry yet,
+    // so oldW/oldH are 0 (see _applyLightingRect).
+    this._ladderIdx = this._nearestRung(this._renderScale);
+    this._applyLightingRect(this._scaledW, this._scaledH, 0, 0);
+    this._rectW = this._scaledW;
+    this._rectH = this._scaledH;
 
     // ---- compile-failure status surface -----------------------------------
     // The pipeline is a stack of ShaderMaterial passes; a program that fails to
@@ -2520,13 +2614,29 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
    * knob, so nothing is allocated for a plugin that never needs them.
    * @private
    */
-  _ensurePluginPost(w, h) {
+  /**
+   * The post passes for a plugin output that is NOT on the lighting grid.
+   * `w x h` is the ALLOCATION they are sized to; `rw x rh` is the live rect
+   * inside it (0.16.11: a sub-rect plugin's output is an allocation with a rect
+   * of its own, so these follow it the same way the lighting passes follow the
+   * engine's). `rw/rh` default to the whole target, which is what a plugin
+   * without `setRect` always hands over.
+   * @private
+   */
+  _ensurePluginPost(w, h, rw = w, rh = h) {
+    const resized = this._pluginPostW !== w || this._pluginPostH !== h;
     if (!this._pluginPostAccum) this._pluginPostAccum = new AccumulatePass(w, h);
-    else if (this._pluginPostW !== w || this._pluginPostH !== h) this._pluginPostAccum.setSize(w, h);
+    else if (resized) this._pluginPostAccum.setSize(w, h);
     if (!this._pluginPostDenoise) this._pluginPostDenoise = new DenoisePass(w, h);
-    else if (this._pluginPostW !== w || this._pluginPostH !== h) this._pluginPostDenoise.setSize(w, h);
+    else if (resized) this._pluginPostDenoise.setSize(w, h);
     this._pluginPostW = w;
     this._pluginPostH = h;
+    if (rw !== this._pluginPostRw || rh !== this._pluginPostRh || resized) {
+      this._pluginPostAccum.setRect(rw, rh);
+      this._pluginPostDenoise.setRect(rw, rh);
+      this._pluginPostRw = rw;
+      this._pluginPostRh = rh;
+    }
   }
 
   /** 1x1 black, lazily made: a specular stand-in on a grid that has no raw pair. @private */
@@ -2545,6 +2655,8 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     if (this._zeroSpec) { this._zeroSpec.dispose(); this._zeroSpec = null; }
     this._pluginPostW = 0;
     this._pluginPostH = 0;
+    this._pluginPostRw = 0;
+    this._pluginPostRh = 0;
     this._pluginPostGrid = null;
   }
 
@@ -2570,7 +2682,12 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       // Size it to the CURRENT lighting resolution before its first frame: a
       // plugin constructed at some other size would otherwise read and write
       // the wrong texels for one frame.
-      this._denoiserPlugin.setSize(this._scaledW, this._scaledH);
+      if (typeof this._denoiserPlugin.setRect === "function") {
+        this._denoiserPlugin.setSize(this._allocW, this._allocH);
+        this._denoiserPlugin.setRect(this._scaledW, this._scaledH, this._allocW, this._allocH);
+      } else {
+        this._denoiserPlugin.setSize(this._scaledW, this._scaledH);
+      }
       this._denoiserPlugin.resetHistory();
       // 0.16.6: plugin PREFERENCES for the adaptive governor (NeuralRT's
       // LIBRARY-HOOKS.md hook 2: "plugin advertises, engine decides, game passes
@@ -2754,11 +2871,28 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     );
   }
 
+  // The scale the lighting-resolution targets are ALLOCATED at: the cap with
+  // fixed targets (and never below the live scale, so a host that sets
+  // renderScale above its own ceiling still gets a target it fits in), the live
+  // scale without them (the pre-0.16.10 behaviour).
+  get _allocScale() {
+    if (!this.fixedLightingTargets) return this._renderScale;
+    return Math.min(1, Math.max(this._renderScale, this._renderScaleMax));
+  }
+  get _allocW() {
+    return Math.max(1, Math.floor(this._width * this._allocScale));
+  }
+  get _allocH() {
+    return Math.max(1, Math.floor(this._height * this._allocScale));
+  }
+  // The LIVE lighting rect: what renderScale actually asks for, never larger
+  // than the allocation. Every pass's resolution/texel uniform is this size, so
+  // shader-side arithmetic is identical to the reallocating path.
   get _scaledW() {
-    return Math.max(1, Math.floor(this._width * this._renderScale));
+    return Math.min(this._allocW, Math.max(1, Math.floor(this._width * this._renderScale)));
   }
   get _scaledH() {
-    return Math.max(1, Math.floor(this._height * this._renderScale));
+    return Math.min(this._allocH, Math.max(1, Math.floor(this._height * this._renderScale)));
   }
   get _volW() {
     return Math.max(1, this._width >> 2);
@@ -2862,7 +2996,82 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
   }
   set renderScale(v) {
     this._renderScale = v;
+    this._ladderIdx = this._nearestRung(v);
     this.setSize(this._canvasW, this._canvasH);
+  }
+
+  /**
+   * The ceiling the adaptive governor may climb to, and since 0.16.10 also the
+   * size the lighting-resolution targets are ALLOCATED at. An accessor rather
+   * than a field because those two jobs cannot drift apart: raising or lowering
+   * the cap is now the one governor-adjacent thing that legitimately
+   * reallocates, and it has to happen when the cap moves, not at some later
+   * resize. Apps change it rarely (a quality preset, a plugin's preferences),
+   * which is exactly why it is a safe place to put the allocation.
+   */
+  get renderScaleMax() {
+    return this._renderScaleMax;
+  }
+  set renderScaleMax(v) {
+    const next = Math.min(1, Math.max(RealtimeRaytracer.MIN_RENDER_SCALE, v));
+    if (next === this._renderScaleMax) return;
+    this._renderScaleMax = next;
+    this._ladder = null; // rungs are fractions of the cap; rebuild on next use
+    if (!this.supported || !this.rtPass) return;
+    if (this._renderScale > next) this.renderScale = next; // setSize via the setter
+    else this.setSize(this._canvasW, this._canvasH);
+  }
+
+  /** The renderScale ladder in force: descending absolute scales. */
+  get scaleLadder() {
+    const cap = this._renderScaleMax;
+    const floor = Math.max(RealtimeRaytracer.MIN_RENDER_SCALE, this.renderScaleMin || 0.2);
+    if (!this._ladder || this._ladderKey !== cap + ":" + floor) {
+      this._ladderKey = cap + ":" + floor;
+      const seen = new Set();
+      this._ladder = [];
+      for (const f of RealtimeRaytracer.SCALE_LADDER) {
+        const v = Math.round(Math.min(cap, Math.max(floor, cap * f)) * 1000) / 1000;
+        if (seen.has(v)) continue;
+        seen.add(v);
+        this._ladder.push(v);
+      }
+    }
+    return this._ladder;
+  }
+
+  /** Index of the ladder rung closest to `s`. */
+  _nearestRung(s) {
+    const L = this.scaleLadder;
+    let best = 0;
+    for (let i = 1; i < L.length; i++) {
+      if (Math.abs(L[i] - s) < Math.abs(L[best] - s)) best = i;
+    }
+    return best;
+  }
+
+  /**
+   * What the sub-rect machinery is doing right now. Hosts (and dev/governor-check.py)
+   * read this rather than guessing from sizes.
+   */
+  get lightingRect() {
+    return {
+      fixed: !!this.fixedLightingTargets,
+      allocW: this._allocW,
+      allocH: this._allocH,
+      rectW: this._rectW,
+      rectH: this._rectH,
+      scale: this._renderScale,
+      cap: this._renderScaleMax,
+      ladder: this.scaleLadder.slice(),
+      rung: this._ladderIdx || 0,
+      allocations: this.lightingAllocations,
+      rectChanges: this.lightingRectChanges,
+      pluginAllocations: this.denoiserPluginAllocations,
+      // A plugin that cannot follow a sub-rect keeps reallocating its own
+      // targets on every step; the engine's do not. See setDenoiserPlugin.
+      pluginFixed: !this._denoiserPlugin || typeof this._denoiserPlugin.setRect === "function",
+    };
   }
 
   get overscan() {
@@ -2896,46 +3105,70 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this._height = Math.round(this._canvasH * this._padFactor);
     this._updateCrop();
 
+    // 0.16.10: two independent quantities. The ALLOCATION (aw x ah) is the
+    // renderScale cap and changes only when the cap or the canvas does; the
+    // RECT (sw x sh) is what renderScale asks for this instant and is free.
+    const aw = this._allocW;
+    const ah = this._allocH;
     const sw = this._scaledW;
     const sh = this._scaledH;
-    const scaledChanged =
-      this.rtPass.targetA.width !== sw || this.rtPass.targetA.height !== sh;
+    const oldAw = this.rtPass.targetA.width;
+    const oldAh = this.rtPass.targetA.height;
+    const oldRectW = this._rectW || oldAw;
+    const oldRectH = this._rectH || oldAh;
+    const scaledChanged = oldAw !== aw || oldAh !== ah;
+    const rectChanged = !scaledChanged && (oldRectW !== sw || oldRectH !== sh);
     const canvasChanged =
       this.taaPass.targetA.width !== this._width ||
       this.taaPass.targetA.height !== this._height;
 
     // Lighting-resolution targets (change on both a renderScale step and a
-    // canvas resize). Carry the irradiance history — the buffer whose reset
-    // causes the flash — and reallocate the rest.
+    // canvas resize). Carry the irradiance history, the buffer whose reset
+    // causes the flash, and reallocate the rest. The ledger logs the NEW
+    // generation first; it retires the old bytes under the deferred-free
+    // assumption, which is the peak-concurrent-bytes reading a ladder move
+    // produces on iOS.
     if (scaledChanged) {
+      this._ledgerScaled();
+      this.lightingAllocations++;
       this.rtPass.resizeCarry(
         this.renderer,
         this._copyPass,
-        sw,
-        sh,
-        RealtimeRaytracer.HISTORY_CARRY_FRAMES
+        aw,
+        ah,
+        RealtimeRaytracer.HISTORY_CARRY_FRAMES,
+        // Read the OLD allocation's live rect, write the NEW allocation's.
+        { srcScaleX: oldRectW / oldAw, srcScaleY: oldRectH / oldAh, rectW: sw, rectH: sh }
       );
-      this.denoisePass.setSize(sw, sh); // display-only, no temporal state
-      this.specDenoisePass.setSize(sw, sh); // ditto; spec history lives in rtPass
-      this.accumulatePass.setSize(sw, sh);
-      // An external denoiser runs at the lighting resolution too (see
-      // setDenoiserPlugin), so it resizes on the same trigger.
-      if (this._denoiserPlugin) this._denoiserPlugin.setSize(sw, sh);
+      this.denoisePass.setSize(aw, ah); // display-only, no temporal state
+      this.specDenoisePass.setSize(aw, ah); // ditto; spec history lives in rtPass
+      this.accumulatePass.setSize(aw, ah);
       // ReSTIR reservoirs store packed id·64+M encodings — invalid to linearly
       // resample — but they reconverge in a few frames, so just reallocate and
       // clear them.
-      this.restirPass.setSize(sw, sh);
+      this.restirPass.setSize(aw, ah);
       this.restirPass.clearHistory(this.renderer);
       // Reservoir GI history is packed (hit position + M + radiance + W) —
       // invalid to linearly resample — but reconverges in a few frames, so
       // reallocate and clear like the DI reservoirs.
-      this.giReservoirPass.setSize(sw, sh);
+      this.giReservoirPass.setSize(aw, ah);
       this.giReservoirPass.clearHistory(this.renderer);
+      // The rect inside the fresh allocation, plus the plugin's own resize.
+      this._applyLightingRect(sw, sh, 0, 0);
+    } else if (rectChanged) {
+      // THE GOVERNOR'S PATH since 0.16.10: no allocation at all, just a smaller
+      // (or larger) rect of the same targets, with the temporal history carried
+      // across it. This is the line the owner's iPhone was paying for.
+      this.lightingRectChanges++;
+      this._applyLightingRect(sw, sh, oldRectW, oldRectH);
     }
+    this._rectW = sw;
+    this._rectH = sh;
 
     // Full-res / canvas-res targets: only touched on a real canvas resize (a
     // renderScale step leaves them alone, so TAA keeps its resolved history).
     if (canvasChanged) {
+      this._ledgerFull();
       this.gbuffer.setSize(this._width, this._height);
       // Quarter-canvas fog: low-frequency and reconverges instantly, so a plain
       // reallocation + clear is fine.
@@ -2946,6 +3179,118 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       this.taaPass.resizeCarry(this.renderer, this._copyPass, this._width, this._height);
       this._sceneColor.setSize(this._width, this._height);
     }
+  }
+
+  /**
+   * Point every lighting-resolution pass at a `sw x sh` rect of the (already
+   * allocated) targets. `oldW/oldH` is the rect the temporal history was
+   * written at; 0 means there is no history worth carrying (a fresh allocation
+   * just wrote it, or this is the first call).
+   *
+   * WHAT SURVIVES A RUNG STEP, and it is exactly what survived a reallocation:
+   *   irradiance + specular EMA   carried (resampled rect -> rect, count clamped
+   *                               to HISTORY_CARRY_FRAMES, no reset flash)
+   *   TAA resolved history        untouched: it is canvas-res, and a rung step
+   *                               does not touch canvas-res targets at all
+   *   volumetric history          untouched (quarter-canvas, same reason)
+   *   AccumulatePass EMA          cleared, as setSize always cleared it: a count
+   *                               written on another grid freezes the EMA
+   *   ReSTIR / GI reservoirs      cleared, as before: packed encodings cannot be
+   *                               resampled, and they reconverge in a few frames
+   */
+  _applyLightingRect(sw, sh, oldW, oldH) {
+    this.rtPass.setRect(sw, sh);
+    if (oldW > 0 && oldH > 0 && (oldW !== sw || oldH !== sh)) {
+      this.rtPass.rectCarry(
+        this.renderer,
+        this._copyPass,
+        oldW,
+        oldH,
+        RealtimeRaytracer.HISTORY_CARRY_FRAMES
+      );
+    }
+    this.denoisePass.setRect(sw, sh);
+    this.specDenoisePass.setRect(sw, sh);
+    this.accumulatePass.setRect(sw, sh);
+    this.restirPass.setRect(sw, sh);
+    this.giReservoirPass.setRect(sw, sh);
+    if (oldW > 0) {
+      this.restirPass.clearHistory(this.renderer);
+      this.giReservoirPass.clearHistory(this.renderer);
+    }
+    // An external denoiser runs on the lighting grid too. A plugin that
+    // implements the optional `setRect(rectW, rectH, allocW, allocH)` follows
+    // the sub-rect and allocates nothing; one that does not gets the old
+    // `setSize(rect)` contract and reallocates its own targets, which is
+    // counted (denoiserPluginAllocations) rather than hidden.
+    const p = this._denoiserPlugin;
+    if (p) {
+      if (typeof p.setRect === "function") p.setRect(sw, sh, this._allocW, this._allocH);
+      else {
+        p.setSize(sw, sh);
+        this.denoiserPluginAllocations++;
+      }
+    }
+  }
+
+  // -------------------------------------------------- [wave 14K] byte ledger ---
+  // The app hands in a memLedger (src/memLedger.js). Every render-target group
+  // this engine allocates/reallocates reports its COMPUTED bytes here, named, so
+  // the loss forensics can say what was resident and what the peak was across a
+  // ladder move. A reallocation is logged as a NEW generation (the ledger retires
+  // the old bytes under the deferred-free assumption), which is exactly the
+  // concurrent-resident measurement the ladder suspect needs.
+  _ledgerAlloc(key, w, h, attachments, bpp, label) {
+    const ml = this.memLedger;
+    if (!ml) return;
+    const bytes = Math.max(0, Math.round(w * h * attachments * bpp));
+    if (!this._ledgerKeys) this._ledgerKeys = new Set();
+    this._ledgerKeys.add(key);
+    ml.alloc(key, bytes, { w, h, attachments, bpp, label });
+  }
+
+  // The lighting-resolution set: reallocated on both a renderScale step and a
+  // canvas resize. Attachments and bytes-per-texel per pass target group, from
+  // each pass class's makeTarget/_makeTarget (fp16 RGBA = 8 B/texel, fp32 RGBA
+  // = 16).
+  _ledgerScaled() {
+    // The ALLOCATION, not the live rect: this ledger measures resident bytes,
+    // and since 0.16.10 those are the cap's, whatever rung the governor is on.
+    const w = this._allocW, h = this._allocH;
+    if (w < 1 || h < 1) return;
+    const spec = this.specMRTSupported;
+    this._ledgerAlloc('rt.lighting', w, h, spec ? 4 : 2, 8,
+      'lighting main+history' + (spec ? ' (2x2 fp16)' : ' (2x1 fp16)'));
+    if (spec) this._ledgerAlloc('rt.lighting.spec', w, h, 2, 8, 'specular main+history');
+    this._ledgerAlloc('rt.denoise', w, h, 2, 8, 'a-trous ping-pong');
+    this._ledgerAlloc('rt.specDenoise', w, h, 2, 8, 'specular a-trous ping-pong');
+    this._ledgerAlloc('rt.accumulate', w, h, 6, 8, 'EMA irradiance+spec+moments (2x3)');
+    this._ledgerAlloc('rt.restir', w, h, 5, 16, 'reservoirs (2x2 fp32) + spatial');
+    this._ledgerAlloc('rt.giReservoir', w, h, 6, 16, 'GI reservoirs (2x3 fp32)');
+  }
+
+  // The canvas-res set (plus the quarter-canvas fog): reallocated only on a real
+  // canvas resize, never on a renderScale step.
+  _ledgerFull() {
+    const w = this._width, h = this._height;
+    if (w < 1 || h < 1) return;
+    const motion = !!(this.gbuffer && this.gbuffer._motionEnabled);
+    // 3x fp16 + 1x fp32 position (+1x RG32F motion) + depth24, mixed precision:
+    // 4 attachments at ~13 B/texel, 5 at ~12.
+    this._ledgerAlloc('rt.gbuffer', w, h, motion ? 5 : 4, motion ? 12 : 13,
+      'G-buffer MRT mixed + depth' + (motion ? ' + motion' : ''));
+    this._ledgerAlloc('rt.taa', w, h, 2, 8, 'TAA ping-pong');
+    this._ledgerAlloc('rt.sceneColor', w, h, 1, 8, 'final composite target');
+    this._ledgerAlloc('rt.volumetric', this._volW, this._volH, 2, 8, 'quarter-canvas fog ping-pong');
+  }
+
+  // Log the whole current footprint at once. The app calls this right after
+  // attaching the ledger at boot, so the ledger starts from the real state
+  // rather than empty (the passes are constructed before the app can attach).
+  _ledgerSync() {
+    if (!this.memLedger) return;
+    this._ledgerScaled();
+    this._ledgerFull();
   }
 
   /**
@@ -3081,6 +3426,15 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // A ceiling lowered live (the app's quality preset) clamps the scale here,
     // once, through the same setter a manual change uses.
     if (this._renderScale > this.renderScaleMax) this.renderScale = this.renderScaleMax;
+    // Ladder mode: a scale set from outside the ladder (a URL override, an app
+    // preset, a plugin's preferred start) is snapped to the nearest rung once,
+    // so every later move is a rung move and the rung set is closed.
+    if (this._ladderOn && !this._ladderSnapped) {
+      this._ladderSnapped = true;
+      const L = this.scaleLadder;
+      const r = L[this._nearestRung(this._renderScale)];
+      if (Math.abs(r - this._renderScale) > 1e-6) this._commitScale(r, 0, performance.now());
+    }
     // Hidden tabs are exempt: browser throttling makes every frame look
     // catastrophic, and adapting on that would drop quality for a tab nobody is
     // watching (same rule as _overloadBrake).
@@ -3130,6 +3484,29 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     const budget = 1000 / this.targetFps;
     const wall = this._qEma / budget;
     const util = this._gpuUtilisation(now, budget);
+
+    // LADDER HYSTERESIS (0.16.10). Counted on EVERY governor sample, not only
+    // on the ones that survive the cooldown: the streaks are the evidence that
+    // a condition PERSISTED, and sampling them once per cooldown window would
+    // make them a second cooldown rather than a second opinion.
+    if (this._ladderOn) {
+      const slowNow = wall > (this._qOscillating ? 1.24 : 1.12) ||
+        (util != null && util > (this._qOscillating
+          ? RealtimeRaytracer.GPU_BUDGET_DROP_OSC
+          : RealtimeRaytracer.GPU_BUDGET_DROP));
+      // Headroom. With a GPU timer that is a measurement. Without one (Safari,
+      // iOS) a vsync-capped wall clock can never read "fast", so a COMFORTABLE
+      // frame counts instead: the speculative climb, but now it has to hold for
+      // LADDER_UP_STREAK samples and clear the dwell and reversal locks before
+      // it moves anything.
+      const fastNow = util != null
+        ? util < (this._qOscillating
+            ? RealtimeRaytracer.GPU_TARGET_UTIL_OSC
+            : RealtimeRaytracer.GPU_TARGET_UTIL)
+        : !slowNow && (wall < (this._qOscillating ? 0.6 : 0.8) || !this.gpuTimingActive);
+      this._ladderSlow = slowNow ? this._ladderSlow + 1 : 0;
+      this._ladderFast = fastNow ? this._ladderFast + 1 : 0;
+    }
 
     // A probe in flight is judged on its OWN clock, which is shorter than the
     // cooldown, and nothing else may move until it has been judged: the probe
@@ -3186,6 +3563,25 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       this._qFastStreak = 0;
       // STEP 1 (down): the free wins, before any resolution is given up.
       if (this._takeFreeWins(now)) return;
+
+      // STEP 2 (down), ladder mode: one rung, and only once the slow condition
+      // has held for LADDER_DOWN_STREAK samples and the dwell / reversal locks
+      // allow it. The canvas ladder still takes over at the bottom rung.
+      if (this._ladderOn) {
+        if (this._ladderIdx >= this.scaleLadder.length - 1) {
+          if (
+            this.canvasScaleHook &&
+            this._canvasLevelIdx < RealtimeRaytracer.CANVAS_LEVELS.length - 1 &&
+            this._ladderSlow >= RealtimeRaytracer.LADDER_DOWN_STREAK
+          ) {
+            this._setCanvasLevel(this._canvasLevelIdx + 1, -1, now);
+            this._ladderSlow = 0;
+          }
+          return;
+        }
+        this._ladderMove(-1, now);
+        return;
+      }
 
       // Proportional step, on whichever clock is the more alarmed. Lighting cost
       // ≈ scale², so the correction is a damped power of the error.
@@ -3295,7 +3691,14 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       const from = this._canvasLevelIdx;
       return this._takeUpStep("canvas", from, (L[from - 1] / L[from]) ** 2, util, now);
     }
-    if (this._renderScale < this.renderScaleMax) {
+    if (this._ladderOn) {
+      // Ladder mode has NO scale probe. A probe is "raise, then maybe put it
+      // back a second later", which is the flapping this wave exists to end;
+      // the streak plus the dwell plus the reversal lock do the same job with a
+      // floor under the period. A rung that does not pay is given back through
+      // the ordinary down path, no sooner than LADDER_DWELL_MS later.
+      if (this._ladderIdx > 0) return this._ladderMove(1, now);
+    } else if (this._renderScale < this.renderScaleMax) {
       const from = this._renderScale;
       const to = Math.min(this.renderScaleMax, RealtimeRaytracer._scaleUpFrom(from));
       return this._takeUpStep("scale", from, RealtimeRaytracer._scaleStepCost(from, to), util, now);
@@ -3314,6 +3717,55 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       return this._releaseFreeWins(now);
     }
     return false;
+  }
+
+  /**
+   * Is the governor on the discrete ladder? Tied to fixedLightingTargets: the
+   * ladder exists so the set of renderScales is closed and small, which is what
+   * makes one allocation at the cap the right size for every one of them.
+   * Turning the fixed targets off restores the continuous 0.05 governor too, so
+   * an A/B of the two paths is one flag.
+   */
+  get _ladderOn() {
+    return !!this.fixedLightingTargets && this.scaleLadder.length > 1;
+  }
+
+  /**
+   * Move one rung, if the hysteresis allows it. `dir` is -1 (down, cheaper) or
+   * +1 (up). Returns true if the rung moved.
+   *
+   * Three locks, checked in this order. Each is a separate claim:
+   *   streak    the condition has persisted (10 samples down, 180 up)
+   *   dwell     at least LADDER_DWELL_MS since the last rung move, whatever the
+   *             streak says
+   *   reversal  a move in the opposite direction to the last one waits
+   *             LADDER_REVERSAL_MS, which puts a hard 20s floor under the
+   *             period of any down-up-down cycle
+   */
+  _ladderMove(dir, now) {
+    const L = this.scaleLadder;
+    const idx = Math.min(L.length - 1, Math.max(0, this._ladderIdx + (dir < 0 ? 1 : -1)));
+    if (idx === this._ladderIdx) return false;
+    const streak = dir < 0 ? this._ladderSlow : this._ladderFast;
+    const need = dir < 0
+      ? RealtimeRaytracer.LADDER_DOWN_STREAK
+      : RealtimeRaytracer.LADDER_UP_STREAK;
+    if (streak < need) return false;
+    if (now - this._ladderLastMove < RealtimeRaytracer.LADDER_DWELL_MS) return false;
+    if (
+      this._ladderLastDir !== 0 &&
+      this._ladderLastDir !== dir &&
+      now - this._ladderLastMove < RealtimeRaytracer.LADDER_REVERSAL_MS
+    ) {
+      return false;
+    }
+    this._ladderIdx = idx;
+    this._ladderLastMove = now;
+    this._ladderLastDir = dir;
+    this._ladderSlow = 0;
+    this._ladderFast = 0;
+    this._commitScale(L[idx], dir, now);
+    return true;
   }
 
   /** The next renderScale rung above `from`, on the 0.05 ladder. */
@@ -3386,7 +3838,10 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     const q = RealtimeRaytracer._qualityFor(s);
     this.denoiseIterations = q.denoiseIterations;
     this.stochasticLights = q.stochasticLights;
-    this.renderScale = s; // reallocates targets, carrying history over (no reset)
+    // 0.16.10: with fixedLightingTargets this moves the sub-rect and carries the
+    // history across it, allocating nothing. Without them it is the old realloc.
+    this.renderScale = s;
+    this._ladderIdx = this._nearestRung(s);
     this._recordChange(dir, now);
     this._freshMeasurement();
     console.info(
@@ -3398,6 +3853,12 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
 
   /** Commit a canvas-ladder rung through the app's hook. */
   _setCanvasLevel(idx, dir, now) {
+    // [wave 14K] session pin: rt.pinCanvasLevel stops EVERY canvas-ladder move
+    // (down, up and probe revert all funnel through here) without touching the
+    // renderScale ladder. One line of policy, no damping: the owner's phone can
+    // run a whole session with the canvas rung fixed while this wave measures
+    // whether the ladder is what loses the context.
+    if (this.pinCanvasLevel) return;
     this._canvasLevelIdx = idx;
     this.canvasScaleHook(RealtimeRaytracer.CANVAS_LEVELS[idx]);
     this._recordChange(dir, now);
@@ -3890,6 +4351,36 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // split-accumulate + a-trous pipeline runs byte-identical.
     let irradiance, specular;
     let specularTex;
+    // 0.16.10: the composite has to know, for each lighting texture it is
+    // handed, how much of it is LIVE: an engine target is allocated at the
+    // renderScale cap and only its rect carries this frame's lighting, while a
+    // plugin's output is a whole target of its own size. Guessing from the
+    // texture's dimensions is not safe (a plugin may return a texture with no
+    // image metadata at all), so each assignment below states its grid as
+    // [validW, validH, allocW, allocH].
+    const engineGrid = () => [this._rectW, this._rectH, this._allocW, this._allocH];
+    const wholeGrid = (tex) => {
+      const im = tex && tex.image;
+      const w = (im && im.width) || this._rectW;
+      const h = (im && im.height) || this._rectH;
+      return [w, h, w, h];
+    };
+    // 0.16.11: a plugin that follows the sub-rect (one with `setRect`) has the
+    // same problem the engine's own targets have - its output texture is the
+    // ALLOCATION and only a rect of it is this frame's picture - so it may say
+    // so, by returning `grid: [validW, validH, allocW, allocH]` beside the
+    // pair. Absent or malformed, the texture's own dimensions still decide,
+    // which is byte-identical to 0.16.10 for every plugin that predates this.
+    const pluginGrid = (out, tex) => {
+      const g = out && out.grid;
+      if (Array.isArray(g) && g.length === 4) {
+        const vw = g[0] | 0, vh = g[1] | 0, aw = g[2] | 0, ah = g[3] | 0;
+        if (vw > 0 && vh > 0 && aw >= vw && ah >= vh) return [vw, vh, aw, ah];
+      }
+      return wholeGrid(tex);
+    };
+    let irrGrid = null;
+    let specGrid = null;
     // Resolved once: a plugin only runs on the split-accumulate MRT path, and
     // the three blocks below (the branch, the a-trous denoise, the specular
     // denoise) must all agree on whether it did.
@@ -3956,9 +4447,12 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
         irradiance = acc.irradiance;
         specular = acc.specular;
         this._momentsTex = acc.moments;
+        irrGrid = specGrid = engineGrid();
       } else {
       irradiance = out.irradiance;
       specularTex = this.specular ? out.specular : null;
+      irrGrid = pluginGrid(out, irradiance);
+      specGrid = specularTex ? pluginGrid(out, specularTex) : irrGrid;
       this._momentsTex = null;
       // 0.16.7: the plugin may return its pair at ANY resolution from the
       // lighting grid up to the G-buffer grid (a network that takes quarter
@@ -3967,15 +4461,17 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       // lighting grid and would downsample such an output, so they only run
       // when the output is on the lighting grid (a network that upsamples
       // itself does its own temporal work).
-      const outImg = out.irradiance.image;
-      const outOnLightingGrid = !outImg || !outImg.width
-        || (outImg.width === this._scaledW && outImg.height === this._scaledH);
+      // 0.16.11: the LIVE size, off irrGrid, not the texture's dimensions - a
+      // sub-rect plugin's output texture is its whole allocation and reads
+      // "off the lighting grid" by size alone while sitting exactly on it.
+      const outOnLightingGrid = irrGrid[0] === this._scaledW && irrGrid[1] === this._scaledH;
       // Debug view: show the plugin's INPUT instead of its output. The plugin
       // above still ran (and still advanced its history), so this only changes
       // which pair of textures the composite gets.
       if (rawView) {
         irradiance = raw.rawIrradiance;
         specularTex = this.specular ? raw.rawSpecular : null;
+        irrGrid = specGrid = engineGrid(); // the plugin's INPUT is an engine target
       } else {
         // Optional spatial post-filter on the plugin's output (0 = nothing,
         // byte-identical to the plain plugin path): the same edge-aware a-trous
@@ -3994,10 +4490,17 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
         // output size. A network that upsamples still needed the smoothing.
         const hist = Math.max(0, Math.round(this.denoiserPluginPostHistory || 0));
         const post = Math.max(0, Math.round(this.denoiserPluginPostIterations || 0));
-        const ow = (outImg && outImg.width) ? outImg.width : this._scaledW;
-        const oh = (outImg && outImg.height) ? outImg.height : this._scaledH;
+        // The output's own grid: live size, then the allocation it sits in.
+        // The off-grid post passes are ALLOCATED at [oaw, oah] and RECTED to
+        // [ow, oh], so they carry the plugin's rect through instead of being
+        // rebuilt on every step (and DenoisePass, which samples its input by
+        // uv, then has the same rect/allocation ratio as the texture it reads).
+        const ow = irrGrid[0];
+        const oh = irrGrid[1];
+        const oaw = irrGrid[2];
+        const oah = irrGrid[3];
         if (!outOnLightingGrid && (hist > 0 || post > 0) && this.outputMode !== 7) {
-          this._ensurePluginPost(ow, oh);
+          this._ensurePluginPost(oaw, oah, ow, oh);
         }
         const accum = outOnLightingGrid ? this.accumulatePass : this._pluginPostAccum;
         const den = outOnLightingGrid ? this.denoisePass : this._pluginPostDenoise;
@@ -4015,7 +4518,11 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
             { preFireflyClamp: 0.0, historyClampK: 0.0,
               lightMotion: this.lightAdaptive ? this.lightMotion : 0, gradK: this.lightGradK });
           irradiance = acc.irradiance;
-          if (this.specular && specularTex) specularTex = acc.specular;
+          irrGrid = outOnLightingGrid ? engineGrid() : [ow, oh, oaw, oah];
+          if (this.specular && specularTex) {
+            specularTex = acc.specular;
+            specGrid = irrGrid;
+          }
           this._pluginPostGrid = [ow, oh];
         }
         if (post > 0 && this.outputMode !== 7 && den) {
@@ -4023,6 +4530,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
             this.renderer, irradiance, this.gbuffer, this._camWorldPos, this.eps, post, giTex,
             { maxStep: this.denoiseMaxStep, stepJitter: this.denoiseStepJitter, wideDamp: this.denoiseWideDamp,
               frame: this.frame, momentsTexture: null });
+          irrGrid = outOnLightingGrid ? engineGrid() : [ow, oh, oaw, oah];
           this._pluginPostGrid = [ow, oh];
         }
       }
@@ -4036,6 +4544,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       irradiance = raw.rawIrradiance;
       specularTex = this.specular ? raw.rawSpecular : null;
       this._momentsTex = null;
+      irrGrid = specGrid = engineGrid();
     } else if (this.specMRTSupported && this._splitAccum) {
       const raw = this.rtPass.renderRaw(this.renderer, this.gbuffer, this.frame, reservoirTex);
       const acc = this.accumulatePass.render(
@@ -4061,9 +4570,11 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       irradiance = acc.irradiance;
       specular = acc.specular;
       this._momentsTex = acc.moments;
+      irrGrid = specGrid = engineGrid();
     } else {
       ({ irradiance, specular } = this.rtPass.render(this.renderer, this.gbuffer, this.frame, reservoirTex));
       this._momentsTex = null;
+      irrGrid = specGrid = engineGrid();
     }
 
     // 3. denoise (display-only: history keeps accumulating raw samples). The
@@ -4076,6 +4587,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // raw view is showing the denoiser's input rather than its output.
     if (!pluginResolved && !rawView &&
         this.denoise && this.denoiseIterations > 0 && this.outputMode !== 7) {
+      irrGrid = engineGrid();
       irradiance = this.denoisePass.render(
         this.renderer,
         irradiance,
@@ -4104,6 +4616,7 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // The plugin and raw-view branches above set specularTex themselves.
     if (!pluginResolved && !rawView) {
       specularTex = this.specular ? specular : null;
+      specGrid = engineGrid();
       if (specularTex && this.denoise && this.denoiseIterations > 0) {
         specularTex = this.specDenoisePass.render(
           this.renderer,
@@ -4156,15 +4669,24 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     // must tap at THAT texel size, and is skipped entirely when the pair is
     // already at canvas resolution. Byte-identical on every built-in path
     // (the sizes below equal _scaledW/_scaledH there).
-    const irrImg = irradiance && irradiance.image;
-    const irrW = (irrImg && irrImg.width) || this._scaledW;
-    const irrH = (irrImg && irrImg.height) || this._scaledH;
-    cU.uUpsample.value = irrW < this._width || irrH < this._height;
+    // 0.16.10: tap at the LIVE size of the lighting pair (irrGrid/specGrid,
+    // stated by whichever branch above produced them) and remap every tap into
+    // that live rect. On an engine target the rect is a sub-rect of the cap
+    // allocation; on a plugin's own target it is the whole thing and the remap
+    // is the identity, which is byte-identical to the pre-0.16.10 composite.
+    const ig = irrGrid || engineGrid();
+    const sg = specGrid || ig;
+    const tapW = ig[0];
+    const tapH = ig[1];
+    setRectUniforms(this.composite.material, ig[0], ig[1], ig[2], ig[3]);
+    cU.uSpecRectScale.value.set(sg[0] / sg[2], sg[1] / sg[3]);
+    cU.uSpecRectMax.value.set(sg[0] / sg[2] - 0.5 / sg[2], sg[1] / sg[3] - 0.5 / sg[3]);
+    cU.uUpsample.value = tapW < this._width || tapH < this._height;
     // Nearest-neighbour the lighting taps in the raw view: the guided bilateral
     // upsample is a filter, and filtering the 1-spp noise is exactly the lie
     // this view is here to avoid. Inert (false) on every other path.
     cU.uNearestLighting.value = rawView;
-    cU.uIrrTexelSize.value.set(1 / irrW, 1 / irrH);
+    cU.uIrrTexelSize.value.set(1 / tapW, 1 / tapH);
     cU.uCameraPos.value.copy(this._camWorldPos);
     cU.uFogEnabled.value = this.fog.enabled;
     cU.uFogColor.value.copy(this.fog.color);
@@ -4277,6 +4799,12 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
 
   dispose() {
     if (!this.supported) return;
+    // [wave 14K] retire every engine target in the ledger (the deferred-free
+    // countdown then drains them on the next ticks, exactly as a real teardown
+    // on iOS would).
+    if (this.memLedger && this._ledgerKeys) {
+      for (const k of this._ledgerKeys) this.memLedger.free(k);
+    }
     this.gbuffer.dispose();
     this.rtPass.dispose();
     this.denoisePass.dispose();

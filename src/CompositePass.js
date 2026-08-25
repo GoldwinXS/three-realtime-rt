@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { LIGHTING_RECT_GLSL, rectUniforms, setRectUniforms } from "./lightingRect.js";
 import { SKY_GLSL } from "./sky.glsl.js";
 
 const fullscreenVert = /* glsl */ `
@@ -11,6 +12,9 @@ void main() {
 
 const compositeFrag = /* glsl */ `
 precision highp float;
+
+${LIGHTING_RECT_GLSL}
+
 
 layout(location = 0) out vec4 outColor;
 
@@ -46,6 +50,12 @@ uniform vec3 uCameraPos;
 // only reachable when the renderer sets it, so every normal frame takes exactly
 // the path it took before this uniform existed.
 uniform bool uNearestLighting;
+// The SPECULAR texture's own sub-rect (see lightingRect.js). Normally the same
+// grid as the irradiance, but a denoiser plugin can hand back a resolved
+// specular on its own whole target while the irradiance rides an engine one,
+// so the two are carried separately rather than assumed equal.
+uniform vec2 uSpecRectScale;
+uniform vec2 uSpecRectMax;
 
 // Overscan crop: maps this on-screen pixel's UV into the central region of the
 // padded internal image (scale.xy, offset.zw). Identity (1,1,0,0) when overscan
@@ -80,11 +90,15 @@ vec3 acesFilm(vec3 x) {
 // Upsample low-res irradiance to this full-res pixel: 4 nearest low-res taps,
 // bilinear weights modulated by geometric similarity (plane distance + normal)
 // so lighting never bleeds across depth or orientation discontinuities.
-vec3 upsampleGuided(sampler2D tex, vec2 uv, vec3 P, vec3 N) {
+// The first argument is a LIGHTING-resolution texture, so every tap goes through rectUv
+// (see lightingRect.js); the G-buffer taps inside the loop do not, they are at
+// canvas resolution. uIrrTexelSize stays 1/RECT, which is what snaps the uv to a
+// lighting texel centre before the remap.
+vec3 upsampleGuided(sampler2D tex, vec2 uv, vec3 P, vec3 N, vec2 rs, vec2 rmax) {
   if (uNearestLighting) {
-    return texture(tex, (floor(uv / uIrrTexelSize) + 0.5) * uIrrTexelSize).rgb;
+    return texture(tex, clamp((floor(uv / uIrrTexelSize) + 0.5) * uIrrTexelSize * rs, vec2(0.0), rmax)).rgb;
   }
-  if (!uUpsample) return texture(tex, uv).rgb;
+  if (!uUpsample) return texture(tex, clamp(uv * rs, vec2(0.0), rmax)).rgb;
 
   float planeTol = 0.01 * distance(P, uCameraPos) + 1e-3;
   vec2 base = uv / uIrrTexelSize - 0.5;
@@ -100,7 +114,7 @@ vec3 upsampleGuided(sampler2D tex, vec2 uv, vec3 P, vec3 N) {
   for (int dy = 0; dy <= 1; dy++) {
     for (int dx = 0; dx <= 1; dx++) {
       vec2 tuv = uv00 + vec2(float(dx), float(dy)) * uIrrTexelSize;
-      vec3 irr = texture(tex, tuv).rgb;
+      vec3 irr = texture(tex, clamp(tuv * rs, vec2(0.0), rmax)).rgb;
       float bw = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);
       if (bw > bestBilW) { bestBilW = bw; bestBil = irr; }
 
@@ -133,8 +147,9 @@ void main() {
   vec4 albedoRough = texture(uGAlbedoRough, uv);
   vec4 nmFull = texture(uGNormalMetal, uv);
   vec3 N = normalize(nmFull.xyz);
-  vec3 irradiance = upsampleGuided(uIrradiance, uv, wp.xyz, N);
-  vec3 specular = uSpecEnabled ? upsampleGuided(uSpecular, uv, wp.xyz, N) : vec3(0.0);
+  vec3 irradiance = upsampleGuided(uIrradiance, uv, wp.xyz, N, uRectScale, uRectMax);
+  vec3 specular = uSpecEnabled
+    ? upsampleGuided(uSpecular, uv, wp.xyz, N, uSpecRectScale, uSpecRectMax) : vec3(0.0);
   vec3 emissive = texture(uGEmissive, uv).rgb;
 
   vec3 color;
@@ -244,6 +259,9 @@ export class CompositePass {
         uIrrTexelSize: { value: new THREE.Vector2() },
         uCameraPos: { value: new THREE.Vector3() },
         uNearestLighting: { value: false },
+        ...rectUniforms(),
+        uSpecRectScale: { value: new THREE.Vector2(1, 1) },
+        uSpecRectMax: { value: new THREE.Vector2(1, 1) },
         uCrop: { value: new THREE.Vector4(1, 1, 0, 0) },
         uFogEnabled: { value: false },
         uFogColor: { value: new THREE.Color(0.5, 0.6, 0.7) },

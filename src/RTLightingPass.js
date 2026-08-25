@@ -4,6 +4,7 @@ import { MAX_LIGHTS, clampMaxLights } from "./SceneCompiler.js";
 import { SKY_GLSL } from "./sky.glsl.js";
 import { BVH_ANY_HIT_GLSL } from "./bvhAnyHit.glsl.js";
 import { makeMRT } from "./mrtCompat.js";
+import { LIGHTING_RECT_GLSL, rectUniforms, setRectUniforms, setTargetRect } from "./lightingRect.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -25,6 +26,12 @@ ${SKY_GLSL}
 
 #define MAX_LIGHTS RT_MAX_LIGHTS_VALUE
 #define PI 3.14159265358979
+
+${LIGHTING_RECT_GLSL}
+// The ACTIVE lighting rect in texels. Not textureSize() of a lighting target:
+// since 0.16.10 those are allocated at the renderScale CAP and only a rect of
+// them is live, so a neighbour tap has to step by the rect's texel size.
+uniform vec2 uLightRes;
 
 layout(location = 0) out vec4 outIrradiance;
 layout(location = 1) out vec4 outSpecular; // dielectric direct specular (fresh, this frame)
@@ -957,13 +964,13 @@ vec3 shadeReservoirSample(vec4 res, vec3 P, vec3 N, float wgt) {
 // being dropped: dropping it while still dividing by N would darken every
 // geometry edge, trading noise for a visible bias.
 vec3 shadeReservoir(vec3 P, vec3 N) {
-  vec4 own = texture(uReservoir, vUv);
+  vec4 own = texture(uReservoir, rectUv(vUv));
   int n = clamp(uRestirSamples, 1, RESTIR_MAX_SAMPLES);
   float wgt = 1.0 / float(n);
   // Taps use the SAME validation and radius as the spatial stage: a neighbour
   // on another surface would import light across a geometry edge, which is
   // bias, not noise.
-  vec2 ts = 1.0 / vec2(textureSize(uReservoir, 0));
+  vec2 ts = 1.0 / uLightRes;
   float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
   float dA = (2.0 * PI) / float(max(n - 1, 1)); // stratify the N-1 taps
   vec3 sum = vec3(0.0);
@@ -979,7 +986,7 @@ vec3 shadeReservoir(vec3 P, vec3 N) {
         && nwp.w >= 0.5
         && abs(dot(nwp.xyz - P, N)) <= tol
         && dot(N, normalize(texture(uGNormalMetal, nUv).xyz)) >= 0.9;
-      if (ok) res = texture(uReservoir, nUv);
+      if (ok) res = texture(uReservoir, rectUv(nUv));
     }
     sum += shadeReservoirSample(res, P, N, wgt);
   }
@@ -1464,7 +1471,7 @@ void main() {
   // Same family as the three-site traceRadiance limit below. So the two exact
   // arms are merged into one else, and the directional-bypass sum is a MODE of
   // the same single call rather than a second loop.
-  vec4 resTap = uRestirEnabled ? texture(uReservoir, vUv) : vec4(0.0);
+  vec4 resTap = uRestirEnabled ? texture(uReservoir, rectUv(vUv)) : vec4(0.0);
   bool restirWarm = uRestirWarmAge <= 0.0 || resTap.b >= uRestirWarmAge;
   // >>> RT_RESTIR_DIR_BYPASS
   // The three estimators are unchanged; what is new is that the directional
@@ -1663,7 +1670,7 @@ void main() {
         bool valid = prevPos.w > 0.5
           && abs(dot(P - prevPos.xyz, N)) < tol;
         if (valid) {
-          vec4 h = texture(uPrevAccum, prevUv); // bilinear
+          vec4 h = texture(uPrevAccum, rectUv(prevUv)); // bilinear
           // Mirror-like pixels keep a SHORT history: their reflected content
           // moves differently from the surface, so long history smears the
           // reflection under camera motion — and specular rays are nearly
@@ -1710,6 +1717,8 @@ void main() {
 const specAccumFrag = /* glsl */ `
 precision highp float;
 
+${LIGHTING_RECT_GLSL}
+
 layout(location = 0) out vec4 outSpec;
 
 in vec2 vUv;
@@ -1732,7 +1741,7 @@ void main() {
   vec3 P = wp.xyz;
   vec3 N = normalize(texture(uGNormalMetal, vUv).xyz);
   float rough = clamp(wp.w - 1.0, 0.0, 1.0);
-  vec3 fresh = texture(uFreshSpec, vUv).rgb;
+  vec3 fresh = texture(uFreshSpec, rectUv(vUv)).rgb;
 
   float count = 1.0;
   vec3 history = vec3(0.0);
@@ -1747,7 +1756,7 @@ void main() {
         vec4 prevPos = texture(uPrevGWorldPos, prevUv);
         float tol = 0.005 * distance(P, uCameraPos) + 20.0 * uEps;
         if (prevPos.w > 0.5 && abs(dot(P - prevPos.xyz, N)) < tol) {
-          vec4 h = texture(uPrevSpec, prevUv);
+          vec4 h = texture(uPrevSpec, rectUv(prevUv));
           // Short history: specular is view-dependent, so a long EMA smears the
           // highlight under motion. Smoother (sharper) highlights react fastest.
           float specHist = 1.0 - rough;
@@ -1777,8 +1786,11 @@ layout(location = 1) out vec4 o1;
 in vec2 vUv;
 uniform sampler2D uTex;
 uniform float uCountClamp;
+// The SOURCE rect as a fraction of the source target (see lightingRect.js).
+// (1,1) on a genuine reallocation, where the source target is whole.
+uniform vec2 uSrcScale;
 void main() {
-  vec4 c = texture(uTex, vUv);
+  vec4 c = texture(uTex, vUv * uSrcScale);
   if (uCountClamp >= 0.0) c.a = min(c.a, uCountClamp);
   o0 = c;
   o1 = vec4(0.0);
@@ -1995,6 +2007,8 @@ export class RTLightingPass {
         uVolumeOrigin: { value: new THREE.Vector3() },
         uVolumeSize: { value: new THREE.Vector3(1, 1, 1) },
         uVolumeMatIndex: { value: -1 },
+        uLightRes: { value: new THREE.Vector2(1, 1) },
+        ...rectUniforms(),
       },
       depthTest: false,
       depthWrite: false,
@@ -2021,6 +2035,7 @@ export class RTLightingPass {
         uEps: { value: 1e-3 },
         uMaxHistory: { value: 128 },
         uTemporalReprojection: { value: true },
+        ...rectUniforms(),
       },
       depthTest: false,
       depthWrite: false,
@@ -2041,7 +2056,11 @@ export class RTLightingPass {
             "layout(location = 1) out vec4 o1;",
             "vec4 o1; // single-target fallback: dead store"
           ),
-      uniforms: { uTex: { value: null }, uCountClamp: { value: -1 } },
+      uniforms: {
+        uTex: { value: null },
+        uCountClamp: { value: -1 },
+        uSrcScale: { value: new THREE.Vector2(1, 1) },
+      },
       depthTest: false,
       depthWrite: false,
     });
@@ -2116,6 +2135,54 @@ export class RTLightingPass {
     this.targetB.setSize(width, height);
     if (this.specA) this.specA.setSize(width, height);
     if (this.specB) this.specB.setSize(width, height);
+    this.setRect(width, height); // setSize resets three's per-target viewport
+  }
+
+  /**
+   * Point this pass at a `w x h` rect of its (larger) allocated targets: the
+   * draws are clipped to it and every lighting-resolution tap is remapped into
+   * it. No allocation, so this is what a renderScale step costs now.
+   */
+  setRect(w, h) {
+    for (const t of [this.targetA, this.targetB, this.specA, this.specB]) setTargetRect(t, w, h);
+    const aw = this.targetA.width;
+    const ah = this.targetA.height;
+    this.material.uniforms.uLightRes.value.set(w, h);
+    setRectUniforms(this.material, w, h, aw, ah);
+    setRectUniforms(this.specMaterial, w, h, aw, ah);
+  }
+
+  /**
+   * Carry the irradiance (and specular) history from the rect it was written at
+   * to a NEW rect of the SAME allocation. Same job as resizeCarry: keep the
+   * temporal EMA alive across a governor step instead of strobing back to 1-spp
+   * noise, with no allocation at all: the freshest history (targetB, see the
+   * swap in render()) is resampled into targetA's new rect and the pair swapped,
+   * which restores the invariant render() expects.
+   *
+   * Call AFTER setRect(newW, newH): the destination rect is the target's own
+   * viewport, and `oldW/oldH` only says where to read from.
+   */
+  rectCarry(renderer, copyPass, oldW, oldH, carryFrames) {
+    const aw = this.targetA.width;
+    const ah = this.targetA.height;
+    const prev = renderer.getRenderTarget();
+    const cu = this.carryMaterial.uniforms;
+    cu.uTex.value = this._irrTex(this.targetB);
+    cu.uCountClamp.value = carryFrames;
+    cu.uSrcScale.value.set(oldW / aw, oldH / ah);
+    this.quad.material = this.carryMaterial;
+    renderer.setRenderTarget(this.targetA);
+    renderer.render(this.scene, this.camera);
+    renderer.setRenderTarget(prev);
+    this.quad.material = this.material;
+    cu.uSrcScale.value.set(1, 1);
+    [this.targetA, this.targetB] = [this.targetB, this.targetA];
+
+    if (this.specMRT) {
+      copyPass.blit(renderer, this.specB.texture, this.specA, carryFrames, oldW / aw, oldH / ah);
+      [this.specA, this.specB] = [this.specB, this.specA];
+    }
   }
 
   /**
@@ -2131,21 +2198,32 @@ export class RTLightingPass {
    * values. targetA is overwritten on the next render, so it only needs the
    * fresh allocation, not a copy.
    */
-  resizeCarry(renderer, copyPass, width, height, carryFrames) {
+  resizeCarry(renderer, copyPass, width, height, carryFrames, opts = {}) {
+    // The rect the history was written at, as a fraction of the OLD allocation,
+    // and the rect the new allocation will run at (both default to "whole", the
+    // pre-0.16.10 behaviour).
+    const sx = opts.srcScaleX ?? 1;
+    const sy = opts.srcScaleY ?? 1;
+    const dw = opts.rectW ?? width;
+    const dh = opts.rectH ?? height;
     const newA = this._makeTarget(width, height);
     const newB = this._makeTarget(width, height);
+    setTargetRect(newA, dw, dh);
+    setTargetRect(newB, dw, dh);
     // Carry the irradiance history (attachment 0) with the 2-output carry
     // material so the draw matches the MRT's draw buffers (a 1-output CopyPass
     // blit here is INVALID_OPERATION on ANGLE/D3D11). Attachment 1 is fresh-
     // written every frame, so it needs no carry.
     this.carryMaterial.uniforms.uTex.value = this._irrTex(this.targetB);
     this.carryMaterial.uniforms.uCountClamp.value = carryFrames;
+    this.carryMaterial.uniforms.uSrcScale.value.set(sx, sy);
     this.quad.material = this.carryMaterial;
     const prev = renderer.getRenderTarget();
     renderer.setRenderTarget(newB);
     renderer.render(this.scene, this.camera);
     renderer.setRenderTarget(prev);
     this.quad.material = this.material;
+    this.carryMaterial.uniforms.uSrcScale.value.set(1, 1);
     this.targetA.dispose();
     this.targetB.dispose();
     this.targetA = newA;
@@ -2155,7 +2233,9 @@ export class RTLightingPass {
     if (this.specMRT) {
       const newSpecA = this._makeSpecTarget(width, height);
       const newSpecB = this._makeSpecTarget(width, height);
-      copyPass.blit(renderer, this.specB.texture, newSpecB, carryFrames);
+      setTargetRect(newSpecA, dw, dh);
+      setTargetRect(newSpecB, dw, dh);
+      copyPass.blit(renderer, this.specB.texture, newSpecB, carryFrames, sx, sy);
       this.specA.dispose();
       this.specB.dispose();
       this.specA = newSpecA;

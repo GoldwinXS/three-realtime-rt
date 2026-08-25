@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { makeMRT } from "./mrtCompat.js";
+import { setTargetRect } from "./lightingRect.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -340,7 +341,7 @@ export class AccumulatePass {
     this._height = h;
     this.targetA.setSize(w, h);
     this.targetB.setSize(w, h);
-    this.material.uniforms.uTexSize.value.set(w, h);
+    this.setRect(w, h); // setSize resets three's per-target viewport
     // setSize reallocates the ping-pong textures with UNDEFINED contents. A
     // garbage count in the history alpha makes the EMA weight ~1/garbage, so
     // whatever brightness landed there never blends out: a renderScale step
@@ -348,6 +349,25 @@ export class AccumulatePass {
     // (mosquito clip, 0:04). Clear on the next render, when we have the
     // renderer. Cost: one accumulation reset per quality step, same brief
     // reconvergence the governor already causes elsewhere.
+    this._needsClear = true;
+  }
+
+  /**
+   * Point the pass at a `w x h` rect of its (larger) allocated targets. This
+   * pass reads history by texelFetch against uTexSize, and the rect is anchored
+   * at the origin, so no shader remap is needed: integer texel coordinates are
+   * the same numbers they were when the target WAS the rect.
+   *
+   * The history still has to go: it was written on a different grid, and a
+   * garbage count in the alpha freezes the EMA (see setSize). That is exactly
+   * what a reallocation did, so a rect step is no worse.
+   */
+  setRect(w, h) {
+    this._width = w;
+    this._height = h;
+    setTargetRect(this.targetA, w, h);
+    setTargetRect(this.targetB, w, h);
+    this.material.uniforms.uTexSize.value.set(w, h);
     this._needsClear = true;
   }
 

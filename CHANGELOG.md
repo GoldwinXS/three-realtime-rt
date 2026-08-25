@@ -1,5 +1,112 @@
 # Changelog
 
+## 0.16.11
+
+**A denoiser plugin may state the grid its output is on.** 0.16.10 gave a plugin
+the optional `setRect(rectW, rectH, allocW, allocH)` hook, so it can allocate
+once at the renderScale cap and write a sub-rect like the renderer does. That
+left one thing unsaid: a plugin that does this returns a texture whose OWN
+dimensions are the allocation, not this frame's picture, and the composite was
+still reading the size off the texture.
+
+So the pair a plugin returns may now carry a grid beside it:
+
+```js
+return { irradiance, specular, grid: [validW, validH, allocW, allocH] };
+```
+
+Absent or malformed, the texture's dimensions decide exactly as before, so every
+plugin written against 0.16.10 and earlier is unaffected. Three things read it:
+the composite's tap size and rect remap, the "is this output on the lighting
+grid" test (which used to compare texture dimensions and therefore read a
+sub-rect plugin as off-grid while it sat exactly on it), and the optional post
+filters, which are now ALLOCATED at the plugin's allocation and RECTED to its
+live rect (`_ensurePluginPost(allocW, allocH, rectW, rectH)`) instead of being
+rebuilt whenever the rect moved.
+
+With `neuralrt` 0.2.0 attached, a renderScale ladder step now costs zero render
+target allocations end to end: 64 forced rung steps measured 0 raw GL
+render-target allocations with the plugin attached, against 41.0 per step in
+0.16.10 (`dev/plugin-rect-check.py`, `dev/governor-check.py` section 6).
+
+
+## 0.16.10
+
+**The adaptive governor stops reallocating render targets.** A host reported
+`webglcontextlost (memory)` on an iPhone 12 Pro after seven minutes of play with
+every COUNTED resource flat (533 textures, 1830 geometries, 51 programs stable
+for the final half minute, a 23.5 MB live JS ledger) and one thing moving:
+renderScale, which this governor stepped roughly once a second for the whole
+session (trace samples 0.13, 0.25, 0.2, 0.3, 0.15 ...). Every one of those steps
+reallocated the entire lighting-resolution target set: the lighting MRT pair,
+the specular pair, two a-trous ping-pongs, the accumulate MRT pair, the ReSTIR
+reservoirs and the GI reservoirs. At dpr 3 that is sustained driver-side
+reallocation, which is the classic way to fragment GPU memory on iOS until the
+context is taken away.
+
+Two changes, and neither of them removes the adaptation.
+
+**1. Fixed targets, sub-rect rendering (`fixedLightingTargets`, default on).**
+The lighting-resolution targets are allocated ONCE, at the renderScale CAP
+(`renderScaleMax`, also accepted as the `renderScaleCap` option). A renderScale
+step now renders into a sub-rect of them, anchored at the origin:
+
+* WRITE through each render target's own `viewport` + `scissor` (never
+  `renderer.setViewport`, which would persist onto the canvas). `vUv` still
+  spans 0..1 across the rect, `gl_FragCoord` still starts at 0, and every
+  resolution / texel-size uniform stays the RECT's, so shader arithmetic is
+  unchanged.
+* READ through `rectUv()` (new `src/lightingRect.js`), which squeezes a sample
+  point into the live rect and clamps it half a texel inside, so a LinearFilter
+  tap at the rect edge cannot pull in the unused region. The remap is exact
+  rather than approximate: a tap written as `uv + off / rectSize` lands on
+  exactly `off` texels of the allocation, so not one texel offset had to change.
+  Passes that only `texelFetch` their history (`AccumulatePass`) needed no
+  shader change at all.
+
+At the cap rung the remap is the identity and the whole path is byte-identical
+to 0.16.9.
+
+`renderScaleMax` is now an accessor: raising or lowering the cap is the one
+governor-adjacent thing that legitimately reallocates, and it has to happen when
+the cap moves. A genuine canvas resize still reallocates too. Nothing else does.
+
+**2. A discrete ladder with hysteresis.** The governor picks a RUNG, not a
+number off a continuous 0.05 grid: `SCALE_LADDER = [1.0, 0.85, 0.7, 0.55, 0.4]`
+as fractions of the cap, clamped to the existing bounds. Three locks stand
+between it and the trace's 1 Hz flapping:
+
+    LADDER_DOWN_STREAK   10 consecutive slow samples before a rung is given up
+    LADDER_UP_STREAK    180 consecutive samples with headroom before one is
+                            taken back (18x the down streak)
+    LADDER_DWELL_MS    4000 minimum between any two rung moves
+    LADDER_REVERSAL_MS 20000 minimum before a move in the opposite direction
+
+The reversal lock is what bounds the period: a complete down-up cycle cannot
+take less than twenty seconds. Ladder mode also has no scale PROBE, because a
+probe is "raise, then maybe put it back a second later" - the streak plus the
+dwell do the same job with a floor under the period. The canvas ladder, the free
+wins and the overload brake are untouched.
+
+**History across a rung step.** The carry that a reallocation used to do is now
+a rect-to-rect resample of the same allocation (`RTLightingPass.rectCarry`,
+`CopyPass.blit(..., srcScaleX, srcScaleY)`), so the irradiance and specular EMAs
+survive a step exactly as they survived a reallocation. TAA's resolved history
+and the volumetric history are canvas-resolution and a rung step does not touch
+them at all. The accumulate EMA and both reservoir sets are cleared on a step,
+which is what `setSize` already did to them.
+
+**Denoiser plugins.** The plugin protocol gains an OPTIONAL
+`setRect(rectW, rectH, allocW, allocH)`. A plugin that implements it follows the
+sub-rect and allocates nothing; a plugin that does not gets the old
+`setSize(rect)` contract and reallocates its own targets, which is now COUNTED
+(`denoiserPluginAllocations`) rather than hidden.
+
+**New surface.** `fixedLightingTargets` and `renderScaleCap` options;
+`lightingRect`, `scaleLadder`, `lightingAllocations`, `lightingRectChanges` and
+`denoiserPluginAllocations` on the instance; `setRect` on every
+lighting-resolution pass.
+
 ## 0.16.9
 
 **No struct crosses a function boundary in the traced shaders any more, so an

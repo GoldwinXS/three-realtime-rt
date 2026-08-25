@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { LIGHTING_RECT_GLSL, rectUniforms, setRectUniforms, setTargetRect } from "./lightingRect.js";
 
 const fullscreenVert = /* glsl */ `
 out vec2 vUv;
@@ -10,6 +11,8 @@ void main() {
 
 const atrousFrag = /* glsl */ `
 precision highp float;
+
+${LIGHTING_RECT_GLSL}
 
 layout(location = 0) out vec4 outColor;
 
@@ -80,7 +83,9 @@ float rtLum(vec3 c) {
 // metal word (GBufferPass): metalness lives in [0,1]; glass [2,4) and alpha
 // blend [4,5] are non-metal (weight 1, unchanged from before).
 vec4 sampleIrr(vec2 uv) {
-  vec4 c = texture(uIrradiance, uv);
+  // Lighting-resolution taps go through rectUv (see lightingRect.js); the
+  // G-buffer taps below do not, they are already at canvas resolution.
+  vec4 c = texture(uIrradiance, rectUv(uv));
   if (uHasAdd) {
     float mw = texture(uGNormalMetal, uv).w;
     float metalT = mw < 2.0 ? clamp(mw, 0.0, 1.0) : 0.0;
@@ -92,7 +97,7 @@ vec4 sampleIrr(vec2 uv) {
     // on the material least able to hide it: a solid dielectric, transmission
     // 1.0, which should take none of it at all.
     float transT = (mw >= 2.0 && mw < 4.0) ? clamp(mw - 2.0, 0.0, 1.0) : 0.0;
-    c.rgb += texture(uAddTex, uv).rgb * (1.0 - metalT) * (1.0 - transT);
+    c.rgb += texture(uAddTex, rectUv(uv)).rgb * (1.0 - metalT) * (1.0 - transT);
   }
   return c;
 }
@@ -153,7 +158,7 @@ void main() {
   // Step 6: temporal variance sigmaL from moments (min: only narrow, never widen).
   float sigmaL;
   if (uHasVar && count >= 4.0) {
-    vec2 m = texture(uVarTex, vUv).rg;
+    vec2 m = texture(uVarTex, rectUv(vUv)).rg;
     float var = max(m.g - m.r * m.r, 0.0);
     float cntSigma = uLumSigma * clamp(8.0 / sqrt(count), 0.75, 3.0);
     float varSigma = uLumSigma * clamp(sqrt(var), 0.75, 3.0);
@@ -279,6 +284,7 @@ export class DenoisePass {
         uHasAdd: { value: false },
         uVarTex: { value: null },
         uHasVar: { value: false },
+        ...rectUniforms(),
       },
       depthTest: false,
       depthWrite: false,
@@ -312,6 +318,22 @@ export class DenoisePass {
     this._height = height;
     this.targetA.setSize(width, height);
     this.targetB.setSize(width, height);
+    // setSize resets three's per-target viewport/scissor, so re-apply the rect.
+    this.setRect(width, height);
+  }
+
+  /**
+   * Render (and sample) a `w x h` rect of the allocated targets. Display-only
+   * pass: it holds no temporal state, so a rect change costs it nothing beyond
+   * these uniforms. `_width/_height` stay the RECT size, which is what
+   * `uTexelSize` must be for the a-trous taps to step one lighting texel.
+   */
+  setRect(w, h) {
+    this._width = w;
+    this._height = h;
+    setTargetRect(this.targetA, w, h);
+    setTargetRect(this.targetB, w, h);
+    setRectUniforms(this.material, w, h, this.targetA.width, this.targetA.height);
   }
 
   /**

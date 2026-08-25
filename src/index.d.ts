@@ -81,7 +81,8 @@ export interface DenoiserPlugin {
     gbuffer: DenoiserGBuffer,
     viewMatrix: Matrix4,
     ctx: DenoiserFrameContext
-  ): { irradiance: Texture; specular: Texture } | false | null | undefined;
+  ): { irradiance: Texture; specular: Texture; grid?: [number, number, number, number] }
+     | false | null | undefined;
   //  ^ 0.16.6: return false (or nothing) to DECLINE the frame while shaders
   //    compile or once unsupported; the built-in denoiser carries that frame
   //    from the same raw pair and `rt.denoiserPluginRan` reads false.
@@ -91,6 +92,11 @@ export interface DenoiserPlugin {
   //    must share a size. The composite reads the size; since 0.16.8 the post
   //    knobs (denoiserPluginPostHistory / PostIterations) apply to output on
   //    ANY grid, running on passes sized to the output.
+  //    0.16.11: OPTIONAL `grid` = [validW, validH, allocW, allocH]. A plugin
+  //    that implements `setRect` allocates once and writes a sub-rect, so its
+  //    output texture's own dimensions are the ALLOCATION, not this frame's
+  //    picture; `grid` states which is which. Omit it and the texture's
+  //    dimensions decide, exactly as before.
   /** Called with the LIGHTING resolution whenever it changes. */
   setSize(width: number, height: number): void;
   /** Called wherever every other temporal history in the pipeline is dropped. */
@@ -113,6 +119,18 @@ export interface DenoiserPlugin {
     postHistoryFrames?: number;
     postIterations?: number;
   };
+  /**
+   * 0.16.10, OPTIONAL. Since the renderer allocates its lighting-resolution
+   * targets at the renderScale cap and renders a step into a sub-rect of them,
+   * a plugin can do the same: implement this and the renderer calls
+   * `setSize(allocW, allocH)` once and `setRect(...)` on every step, so a
+   * renderScale change costs the plugin no allocation either.
+   *
+   * A plugin WITHOUT it keeps the original contract - `setSize(rectW, rectH)`
+   * on every step, i.e. it reallocates - and those resizes are counted in
+   * {@link RealtimeRaytracer.denoiserPluginAllocations}.
+   */
+  setRect?(rectW: number, rectH: number, allocW: number, allocH: number): void;
 }
 
 /**
@@ -349,6 +367,22 @@ export interface RealtimeRaytracerOptions {
   renderScaleMax?: number;
   /** 0.16.6: the floor the adaptive governor may lower renderScale to (0.2..renderScaleMax, default 0.2). */
   renderScaleMin?: number;
+  /**
+   * 0.16.10: an alias for {@link renderScaleMax}. With fixed lighting targets
+   * the ceiling IS the allocation size, and "cap" is what a host means by it.
+   */
+  renderScaleCap?: number;
+  /**
+   * 0.16.10: allocate the lighting-resolution targets ONCE, at the renderScale
+   * cap, and render a renderScale step into a SUB-RECT of them. Default `true`.
+   *
+   * Before this, every governor step reallocated the whole lighting-resolution
+   * set; on iOS that sustained reallocation fragments GPU memory until the
+   * context is lost. `false` restores the pre-0.16.10 behaviour (realloc per
+   * step, and the governor back on its continuous 0.05 grid rather than the
+   * discrete ladder), which is there to A/B the two paths.
+   */
+  fixedLightingTargets?: boolean;
   /**
    * 0.16.4: a-trous iterations run on an attached denoiser plugin's OUTPUT
    * irradiance (the same edge-aware DenoisePass the built-in pipeline uses), a
@@ -1359,6 +1393,40 @@ export class RealtimeRaytracer {
   renderScaleMax: number;
   /** 0.16.6: the governor's floor (0.2..renderScaleMax); a plugin's preferences may raise it. */
   renderScaleMin: number;
+  /**
+   * 0.16.10: sub-rect lighting targets (see the option). Live-assignable, but
+   * treat it as a boot-time choice: it also decides whether the governor is on
+   * the discrete ladder or the old continuous grid.
+   */
+  fixedLightingTargets: boolean;
+  /**
+   * 0.16.10: the renderScale ladder in force, descending. Rungs are fractions
+   * of the cap (1.0, 0.85, 0.7, 0.55, 0.4) clamped to renderScaleMin.
+   */
+  get scaleLadder(): number[];
+  /**
+   * 0.16.10: what the sub-rect machinery is doing right now. `allocations`
+   * counts (re)allocations of the lighting-resolution set (a cap change or a
+   * canvas resize, never a governor step), `rectChanges` counts governor steps
+   * that only moved the sub-rect, and `pluginAllocations` counts the resizes
+   * handed to a denoiser plugin with no `setRect` of its own. `pluginFixed` is
+   * false exactly when such a plugin is attached.
+   */
+  get lightingRect(): {
+    fixed: boolean;
+    allocW: number; allocH: number;
+    rectW: number; rectH: number;
+    scale: number; cap: number;
+    ladder: number[]; rung: number;
+    allocations: number; rectChanges: number;
+    pluginAllocations: number; pluginFixed: boolean;
+  };
+  /** 0.16.10: (re)allocations of the lighting-resolution target set so far. */
+  lightingAllocations: number;
+  /** 0.16.10: governor steps that only moved the sub-rect (no allocation). */
+  lightingRectChanges: number;
+  /** 0.16.10: resizes handed to a denoiser plugin that cannot follow a sub-rect. */
+  denoiserPluginAllocations: number;
   /** Frame-rate target for the adaptive governor. */
   targetFps: number;
   /** GPU-cost timing mode (see RealtimeRaytracerOptions.gpuTiming). Live: set
