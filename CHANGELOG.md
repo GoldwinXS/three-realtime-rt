@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.12
+
+**A denoiser plugin may report its bytes into the app's memory ledger.** Apps
+that keep a render-target byte ledger (`rt.memLedger`) could account for every
+engine target but not the plugin's own pyramid and history. `setDenoiserPlugin`
+now checks the incoming plugin for an optional `reportLedger(ledger)` method:
+if the app holds a ledger and the plugin exposes the hook, the engine hands the
+ledger over on attach and passes `null` on detach or swap so the plugin
+releases its entry. A plugin without the hook, or an app without a ledger, is
+unchanged. `neuralrt` 0.2.1 implements the hook (18 targets, reported under
+`rt.neuralPlugin`).
+
 ## 0.16.11
 
 **A denoiser plugin may state the grid its output is on.** 0.16.10 gave a plugin

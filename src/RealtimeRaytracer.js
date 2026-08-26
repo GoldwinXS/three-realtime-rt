@@ -2671,12 +2671,19 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
         }
       }
     }
+    const outgoing = this._denoiserPlugin;
     this._denoiserPlugin = plugin || null;
     this._pluginRan = false;
     // 0.16.8: the off-grid post passes belong to the plugin that needed them.
     // Detaching (or swapping) frees them; the next plugin that needs them
     // allocates its own at its own output size.
     this._disposePluginPost();
+    // [wave 33] the app's byte ledger follows the plugin: a detaching plugin
+    // releases its entry (reportLedger is the optional hook the plugin exposes,
+    // library-quality, so an older plugin that lacks it is unchanged).
+    if (outgoing && outgoing !== this._denoiserPlugin && typeof outgoing.reportLedger === "function") {
+      outgoing.reportLedger(null);
+    }
     if (!this.supported) return;
     if (this._denoiserPlugin) {
       // Size it to the CURRENT lighting resolution before its first frame: a
@@ -2689,6 +2696,13 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
         this._denoiserPlugin.setSize(this._scaledW, this._scaledH);
       }
       this._denoiserPlugin.resetHistory();
+      // [wave 33] report the plugin's target bytes into the app's ledger, so the
+      // glloss forensics line and HANGAR readouts include it. A no-op for a
+      // plugin that does not expose reportLedger (and for one the app does not
+      // hold a ledger for).
+      if (this.memLedger && typeof this._denoiserPlugin.reportLedger === "function") {
+        this._denoiserPlugin.reportLedger(this.memLedger);
+      }
       // 0.16.6: plugin PREFERENCES for the adaptive governor (NeuralRT's
       // LIBRARY-HOOKS.md hook 2: "plugin advertises, engine decides, game passes
       // through"). Plain data: { renderScale: { min, max, preferred } }. min/max
