@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.16.13
+
+**The byte ledger stops over-reporting when the render loop stalls.** A retired
+render-target generation was presumed freed after `freeAfterFrames` frames
+(default 3), and that deferral decayed only in `tick()`, which runs once per
+RENDERED frame. A stalled or crawling loop (a public-build boot holding 3.2 s
+frames at the title screen) therefore kept the retired bytes on the books for
+ever, and the loss forensics reported a resident/peak number that may already
+have been free. A generation is now presumed freed after `freeAfterFrames`
+frames OR `freeAfterMs` milliseconds, whichever comes first (default 2000 ms,
+~6x the frame floor at 10 fps, so a healthy loop still frees on the frame
+count and the pessimistic peak is unchanged; a stalled loop simply cannot hold
+the bytes open-ended). The wall-clock test is applied on every read
+(`retiredBytes`, `residentBytes`, `summary`, `entries`) as well as on `tick()`,
+so a stopped loop's summary is honest without a frame ever rendering.
+`createMemLedger` also records a per-key allocation count (`allocCount(key)` /
+`summary().counts`) so a host can prove a boot allocated each pass target
+exactly once.
+
 ## 0.16.12
 
 **A denoiser plugin may report its bytes into the app's memory ledger.** Apps

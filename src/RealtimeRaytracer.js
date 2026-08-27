@@ -968,6 +968,29 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.memLedger = null;
     this._ledgerKeys = null;
 
+    // [wave 37] resolve the fixed-target cap BEFORE the lighting passes are
+    // built, so every pass is ALLOCATED ONCE at the cap and a renderScale step
+    // is a sub-rect move, never a reallocation. These three fields used to be
+    // assigned later (after the passes), so the passes built first landed at
+    // `_renderScale` (the low start) while the restir/GI passes built after
+    // landed at the cap; the first renderScale change then reallocated the whole
+    // set. Assigning them here makes the constructor's first allocation the only
+    // one (and `_ledgerSync` honest about it). The later assignments below
+    // recompute the same values and are no-ops.
+    this.fixedLightingTargets = options.fixedLightingTargets !== false;
+    this._renderScaleMax = Math.min(
+      1,
+      Math.max(
+        RealtimeRaytracer.MIN_RENDER_SCALE,
+        options.renderScaleCap ?? options.renderScaleMax ?? 1
+      )
+    );
+    this.renderScaleMin = Math.min(
+      this.renderScaleMax,
+      Math.max(RealtimeRaytracer.MIN_RENDER_SCALE, options.renderScaleMin ?? 0.2)
+    );
+    if (this._renderScale > this.renderScaleMax) this._renderScale = this.renderScaleMax;
+
     this.gbuffer = new GBufferPass(this._width, this._height, {
       mixedPrecision,
       materialPooling: options.gbufferMaterialPooling ?? true,
