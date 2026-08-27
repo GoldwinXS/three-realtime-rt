@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.16.14
+
+**The adaptive governor climbs back without a GPU timer.** On a machine whose
+`EXT_disjoint_timer_query_webgl2` timer is present but silently empty (the
+friend's Windows Chrome: `gpuMs` null for nine straight minutes, `gpuTimingActive`
+true while `_gpuGaveUp` waits out its stale clock), the ladder's no-measurement
+headroom test was `!slowNow && (wall < 0.8 || !gpuTimingActive)`. On a
+vsync-capped display whose frame time sits between 0.8x and 1.12x of the budget
+("comfortable", never "fast") the `wall < 0.8` term is never true, so
+`_ladderFast` never accumulated 180 and a scale dropped to the 0.2 floor during
+one bad minute was held there for the whole session. The no-measurement fallback
+is now keyed on the honest signal — `util == null` — and simply counts a
+comfortable frame as headroom (`fastNow = !slowNow`); the comfortable branch also
+drives the ladder climb regardless of `gpuTimingActive`, since the ladder's
+up-streak, dwell and reversal lock are the anti-flap protection, not a probe.
+Every wave 24 protection is unchanged: no reallocation on a rung move, the
+4000 ms dwell, the 20000 ms reversal lock, and the 180-sample up-streak.
+
 ## 0.16.13
 
 **The byte ledger stops over-reporting when the render loop stalls.** A retired

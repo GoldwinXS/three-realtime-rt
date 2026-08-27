@@ -1371,6 +1371,15 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
      */
     this.adaptiveQuality = options.adaptiveQuality ?? true;
     /**
+     * 0.16.14: `false` (default) keys the no-GPU-timer climb on `util == null`
+     * (the honest "no measurement this frame" signal) so a comfortable frame
+     * counts as headroom. `true` restores the 0.16.13 behaviour, which keyed the
+     * same fallback on `!gpuTimingActive` (the timer having given up). Exists so
+     * a host can falsify the climb-back fix against the pre-wave engine
+     * (dev/climb-back-check.py does).
+     */
+    this.climbKeyedOnTimer = options.climbKeyedOnTimer === true;
+    /**
      * renderScaleMax (0.16.5): the CEILING the adaptive governor may climb to,
      * 0.2..1 (default 1 = unchanged behaviour). A phone or tablet GPU that
      * finds headroom otherwise walks renderScale up rung by rung, and every
@@ -3536,11 +3545,25 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       // frame counts instead: the speculative climb, but now it has to hold for
       // LADDER_UP_STREAK samples and clear the dwell and reversal locks before
       // it moves anything.
+      //
+      // 0.16.14: the no-measurement fallback is keyed on `util == null` (the
+      // honest "no GPU reading this frame") rather than `!gpuTimingActive` (the
+      // timer having given up). A machine whose timer is present but silently
+      // empty - the friend's Windows Chrome, gpuMs null for nine minutes - has
+      // gpuTimingActive true while `_gpuGaveUp` waits out its stale clock, so
+      // the old `wall < 0.8` test was the only thing feeding the up-streak. On a
+      // vsync-capped display whose frame time sits between 0.8x and 1.12x of the
+      // budget ("comfortable", never "fast") that test is never true, the
+      // up-streak never accumulates, and the ladder never climbs back. A
+      // comfortable frame IS the headroom signal when there is no measurement,
+      // so `!slowNow` is the whole test.
       const fastNow = util != null
         ? util < (this._qOscillating
             ? RealtimeRaytracer.GPU_TARGET_UTIL_OSC
             : RealtimeRaytracer.GPU_TARGET_UTIL)
-        : !slowNow && (wall < (this._qOscillating ? 0.6 : 0.8) || !this.gpuTimingActive);
+        : (this.climbKeyedOnTimer
+          ? !slowNow && (wall < (this._qOscillating ? 0.6 : 0.8) || !this.gpuTimingActive)
+          : !slowNow);
       this._ladderSlow = slowNow ? this._ladderSlow + 1 : 0;
       this._ladderFast = fastNow ? this._ladderFast + 1 : 0;
     }
@@ -3588,11 +3611,13 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       this._qFastStreak = 0;
       // Comfortable. On a capped display with NO GPU timer this is the only
       // place the governor can ever be — "fast" is unreachable there — so it is
-      // where the speculative climb has to be driven from. Gated on
-      // gpuTimingActive rather than on `util == null` so a momentary gap in the
-      // timer's samples (a GPU_DISJOINT, the window just after a quality step)
-      // does not start a probe on a machine that has a real measurement coming.
-      if (!this.gpuTimingActive) this._raiseQuality(now, null, wall);
+      // where the speculative climb has to be driven from. On the LADDER the
+      // climb is the up-streak, not a probe, so it is always safe to drive it
+      // from here; on the continuous path it stays gated on gpuTimingActive so
+      // a momentary gap in the timer's samples (a GPU_DISJOINT, the window just
+      // after a quality step) does not start a probe on a machine that has a
+      // real measurement coming.
+      if (!this.gpuTimingActive || (this._ladderOn && !this.climbKeyedOnTimer)) this._raiseQuality(now, null, wall);
       return;
     }
 
