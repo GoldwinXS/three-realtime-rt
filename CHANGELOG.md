@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.16.15
+
+**The target stack can be deferred and handed back: a raster fallback stops
+paying for a tracer it never runs.** Until now a `RealtimeRaytracer` allocated
+its whole render-target stack in the constructor, whether or not a traced frame
+was ever rendered. A host with a cheap raster mode for weak machines therefore
+paid the tracer's full footprint on exactly the machines that mode exists to
+rescue. Three new members, all opt-in and inert when unused:
+
+- `deferTargets: true` (constructor option) builds the pipeline with no GPU
+  storage at all. The pass objects, programs, status surface and every getter
+  read as before; nothing is allocated, nothing is reported to `memLedger`, and
+  `setSize` only records the numbers.
+- `releaseTargets()` frees the GPU storage of every pass target (the objects,
+  materials and caches stay, so three re-creates the textures the next time
+  anything binds them) and tells the ledger every `rt.*` key is freed.
+  `ensureTargets()` funds the stack again, applies any size that arrived while
+  it was released, re-reports the footprint, and resets the temporal histories.
+  `render()` calls `ensureTargets()` itself if the host forgot, so a released
+  pipeline can never render a broken frame.
+- `releaseScene()` drops the compiled scene (the BVH texture arrays, attribute
+  and material textures, the light table): tens of megabytes of typed arrays a
+  host that has left traced rendering cannot use. The next `compileScene()`
+  rebuilds it.
+
+The light-grid table is deliberately not released (a few rows of texels, and
+releasing it could leave the grid stale on the way back), and a pipeline that
+was never released behaves exactly as it did in 0.16.14.
+
 ## 0.16.14
 
 **The adaptive governor climbs back without a GPU timer.** On a machine whose

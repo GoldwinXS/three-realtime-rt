@@ -2138,6 +2138,14 @@ export class RTLightingPass {
     this.setRect(width, height); // setSize resets three's per-target viewport
   }
 
+  /** [0.16.15] Free the GPU storage, keep the pass. See GBufferPass.releaseTargets. */
+  releaseTargets() {
+    this.targetA.dispose();
+    this.targetB.dispose();
+    if (this.specA) this.specA.dispose();
+    if (this.specB) this.specB.dispose();
+  }
+
   /**
    * Point this pass at a `w x h` rect of its (larger) allocated targets: the
    * draws are clipped to it and every lighting-resolution tap is remapped into

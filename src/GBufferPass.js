@@ -442,6 +442,18 @@ export class GBufferPass {
     for (const t of this._targets) t.setSize(width, height);
   }
 
+  /**
+   * [0.16.15] Give the GPU storage back WITHOUT tearing the pass down: the
+   * target objects, materials and caches stay, only the textures/framebuffers
+   * are freed. three re-creates them from the same objects the next time
+   * anything binds them, so this is reversible at zero API cost. Used by
+   * RealtimeRaytracer.releaseTargets() when the host stops rendering traced
+   * frames (a raster / FAST mode) and should not be paying for the stack.
+   */
+  releaseTargets() {
+    for (const t of this._targets) t.dispose();
+  }
+
   _makeGbufferMaterial(mesh) {
     const material = new THREE.ShaderMaterial({
       // Stable program name for the compile-failure self-diagnosis (see

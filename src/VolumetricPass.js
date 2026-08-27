@@ -425,6 +425,12 @@ export class VolumetricPass {
     this.targetB.setSize(width, height);
   }
 
+  /** [0.16.15] Free the GPU storage, keep the pass. See GBufferPass.releaseTargets. */
+  releaseTargets() {
+    this.targetA.dispose();
+    this.targetB.dispose();
+  }
+
   /** Renders into targetA (reading targetB as history), swaps, returns the texture. */
   render(renderer, gbuffer, prevViewProj, cameraPos, frame, eps, density, maxDist, zones) {
     const u = this.material.uniforms;

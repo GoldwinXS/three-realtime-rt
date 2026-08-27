@@ -1124,6 +1124,12 @@ export class GIReservoirPass {
     this.setRect(width, height); // setSize resets three's per-target viewport
   }
 
+  /** [0.16.15] Free the GPU storage, keep the pass. See GBufferPass.releaseTargets. */
+  releaseTargets() {
+    this.targetA.dispose();
+    this.targetB.dispose();
+  }
+
   /**
    * Point the pass at a `w x h` rect of its (larger) allocated targets. GI
    * reservoirs are packed (hit position + M + radiance + W) and cannot be

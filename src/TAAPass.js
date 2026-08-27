@@ -211,6 +211,13 @@ export class TAAPass {
     this._reset = true;
   }
 
+  /** [0.16.15] Free the GPU storage, keep the pass. See GBufferPass.releaseTargets. */
+  releaseTargets() {
+    this.targetA.dispose();
+    this.targetB.dispose();
+    this._reset = true;
+  }
+
   /**
    * Reallocate to a new size while carrying the resolved history forward (linear
    * resample), so a canvas-ladder resize doesn't force a one-frame TAA reset and

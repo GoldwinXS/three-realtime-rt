@@ -968,6 +968,25 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this.memLedger = null;
     this._ledgerKeys = null;
 
+    /**
+     * [0.16.15] LAZY TARGETS. `deferTargets: true` constructs the pipeline
+     * without ever giving its render targets GPU storage: the pass objects and
+     * their programs exist (so the host's panels, harness and status surface
+     * read exactly as before), but nothing is allocated, nothing is reported to
+     * the ledger, and `setSize` only records the numbers. The first
+     * `ensureTargets()` (or the first `render()`) funds the stack; a later
+     * `releaseTargets()` hands it back.
+     *
+     * WHY. A host with a raster fallback (a "FAST" mode for a machine that
+     * cannot afford tracing) used to pay for the whole target stack anyway,
+     * because a tracer allocated its targets in the constructor whether or not
+     * a traced frame was ever rendered. On the machines that mode exists for,
+     * that is the difference between a tab that loads and a tab the browser
+     * kills.
+     */
+    this.targetsReleased = !!options.deferTargets;
+    this._sizeDirtyWhileReleased = false;
+
     // [wave 37] resolve the fixed-target cap BEFORE the lighting passes are
     // built, so every pass is ALLOCATED ONCE at the cap and a renderScale step
     // is a sub-rect move, never a reallocation. These three fields used to be
@@ -3151,6 +3170,15 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
     this._height = Math.round(this._canvasH * this._padFactor);
     this._updateCrop();
 
+    // [0.16.15] Released targets: the numbers above are the whole job. Resizing
+    // the passes here would hand every target GPU storage again (and the carry
+    // blits would render), which is exactly what a released pipeline is not
+    // paying for. `ensureTargets()` applies the size when the stack is funded.
+    if (this.targetsReleased) {
+      this._sizeDirtyWhileReleased = true;
+      return;
+    }
+
     // 0.16.10: two independent quantities. The ALLOCATION (aw x ah) is the
     // renderScale cap and changes only when the cap or the canvas does; the
     // RECT (sw x sh) is what renderScale asks for this instant and is free.
@@ -3335,8 +3363,81 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
   // rather than empty (the passes are constructed before the app can attach).
   _ledgerSync() {
     if (!this.memLedger) return;
+    // [0.16.15] A released pipeline owns no bytes, so it reports none. This is
+    // what makes "FAST mode allocates nothing" a number a gate can read rather
+    // than a claim.
+    if (this.targetsReleased) return;
     this._ledgerScaled();
     this._ledgerFull();
+  }
+
+  /**
+   * [0.16.15] Hand the render-target stack back to the driver without tearing
+   * the pipeline down. Every pass keeps its object, its programs and its
+   * settings; only the GPU storage goes, and the ledger is told so (every rt.*
+   * key is freed, so a host reading the ledger sees zero rather than a stack it
+   * is no longer paying for). Reversible with `ensureTargets()`.
+   *
+   * Call this when the host stops rendering traced frames: a raster fallback, a
+   * "FAST" quality mode, a hidden canvas. Returns true when it did something.
+   */
+  releaseTargets() {
+    if (!this.supported || this.targetsReleased) return false;
+    this.targetsReleased = true;
+    this._sizeDirtyWhileReleased = false;
+    if (this.memLedger && this._ledgerKeys) {
+      for (const k of this._ledgerKeys) this.memLedger.free(k);
+    }
+    this.gbuffer.releaseTargets();
+    this.rtPass.releaseTargets();
+    this.denoisePass.releaseTargets();
+    this.specDenoisePass.releaseTargets();
+    this.accumulatePass.releaseTargets();
+    this.taaPass.releaseTargets();
+    this.volumetricPass.releaseTargets();
+    this.restirPass.releaseTargets();
+    this.giReservoirPass.releaseTargets();
+    this._sceneColor.dispose();
+    // The optional post-plugin scratch targets are rebuilt on demand by
+    // _ensurePluginPost, so they are dropped rather than released.
+    this._disposePluginPost();
+    // The light-grid table is a few rows of texels and is rebuilt by
+    // updateLights / compileScene, so it is left alone on purpose: releasing it
+    // would buy nothing and could leave the grid stale on the way back.
+    return true;
+  }
+
+  /**
+   * [0.16.15] Fund the render-target stack again (or for the first time, after
+   * `deferTargets`). Applies any size the host asked for while the stack was
+   * released, re-reports the footprint to the ledger, and drops every temporal
+   * history (there is nothing behind the textures to carry). Returns true when
+   * it did something.
+   */
+  ensureTargets() {
+    if (!this.supported || !this.targetsReleased) return false;
+    this.targetsReleased = false;
+    if (this._sizeDirtyWhileReleased) {
+      this._sizeDirtyWhileReleased = false;
+      this.setSize(this._canvasW, this._canvasH);
+    }
+    this._ledgerSync();
+    this.resetAccumulation();
+    return true;
+  }
+
+  /**
+   * [0.16.15] Drop the compiled scene: the BVH texture arrays, the attribute
+   * and material textures, the light table. A host that has left traced
+   * rendering behind is holding tens of megabytes of typed arrays it cannot
+   * use; the next `compileScene()` (or the implicit one inside `render()`)
+   * rebuilds it. Returns true when there was a scene to drop.
+   */
+  releaseScene() {
+    if (!this.compiled) return false;
+    this.compiled.dispose();
+    this.compiled = null;
+    return true;
   }
 
   /**
@@ -4126,6 +4227,9 @@ uniform sampler2D uTex; void main(){ outColor = vec4(texture(uTex, vUv).rg, 0.0,
       this.renderer.render(scene, camera);
       return;
     }
+    // [0.16.15] A traced frame is being asked for, so the stack is funded now
+    // whether or not the host remembered to ask. One boolean test per frame.
+    if (this.targetsReleased) this.ensureTargets();
     if (this.adaptiveQuality) this._adaptQuality();
     if (this.overloadProtection) this._overloadBrake();
     if (!this.compiled) {

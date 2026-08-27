@@ -322,6 +322,12 @@ export class DenoisePass {
     this.setRect(width, height);
   }
 
+  /** [0.16.15] Free the GPU storage, keep the pass. See GBufferPass.releaseTargets. */
+  releaseTargets() {
+    this.targetA.dispose();
+    this.targetB.dispose();
+  }
+
   /**
    * Render (and sample) a `w x h` rect of the allocated targets. Display-only
    * pass: it holds no temporal state, so a rect change costs it nothing beyond

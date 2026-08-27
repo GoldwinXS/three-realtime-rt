@@ -903,6 +903,13 @@ export class RestirPass {
     this.setRect(width, height); // setSize resets three's per-target viewport
   }
 
+  /** [0.16.15] Free the GPU storage, keep the pass. See GBufferPass.releaseTargets. */
+  releaseTargets() {
+    this.targetA.dispose();
+    this.targetB.dispose();
+    this.spatialTarget.dispose();
+  }
+
   /**
    * Point the stages at a `w x h` rect of their (larger) allocated targets. The
    * texel-size uniforms stay 1/RECT: a neighbour tap is computed in rect uv

@@ -352,6 +352,13 @@ export class AccumulatePass {
     this._needsClear = true;
   }
 
+  /** [0.16.15] Free the GPU storage, keep the pass. See GBufferPass.releaseTargets. */
+  releaseTargets() {
+    this.targetA.dispose();
+    this.targetB.dispose();
+    this._needsClear = true;
+  }
+
   /**
    * Point the pass at a `w x h` rect of its (larger) allocated targets. This
    * pass reads history by texelFetch against uTexSize, and the rect is anchored
